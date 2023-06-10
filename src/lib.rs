@@ -121,12 +121,14 @@ pub struct UblkCtrl {
 
 impl Drop for UblkCtrl {
     fn drop(&mut self) {
-        trace!("ctrl: device {} dropped", self.dev_info.dev_id,);
+        let id = self.dev_info.dev_id;
+        trace!("ctrl: device {} dropped", id);
         if self.for_add {
             if let Err(r) = self.del() {
                 //Maybe deleted from other utilities, so no warn or error:w
                 trace!("Delete char device {} failed {}", self.dev_info.dev_id, r);
             }
+            fs::remove_file(ublk_run_path(id)).unwrap();
         }
     }
 }
@@ -259,6 +261,10 @@ impl UblkCtrl {
 
     pub fn flush_json(&mut self) -> AnyRes<i32> {
         let run_path = ublk_run_path(self.dev_info.dev_id);
+
+        if let Some(parent_dir) = std::path::Path::new(&run_path).parent() {
+            fs::create_dir_all(parent_dir)?;
+        }
         let mut run_file = fs::File::create(&run_path)?;
 
         run_file.write_all(self.json.to_string().as_bytes())?;
@@ -349,11 +355,6 @@ impl UblkDev {
             .write(true)
             .open(cdev_path)?;
 
-        let run_path = ublk_run_path(info.dev_id);
-        if let Some(parent_dir) = std::path::Path::new(&run_path).parent() {
-            fs::create_dir_all(parent_dir)?;
-        }
-
         data.fds[0] = cdev_file.as_raw_fd();
         data.nr_fds = 1;
 
@@ -376,7 +377,6 @@ impl UblkDev {
         let id = self.dev_info.dev_id;
 
         self.ops.deinit_tgt(self);
-        fs::remove_file(ublk_run_path(id))?;
 
         info!("dev {} deinitialized", id);
         Ok(0)
