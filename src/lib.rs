@@ -7,7 +7,7 @@ use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use std::cell::RefCell;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::{env, fs};
 
@@ -102,6 +102,13 @@ fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> AnyRes<i32> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct queue_affinity_json {
+    affinity: Vec<u32>,
+    qid: u32,
+    tid: u32,
+}
+
 /// UBLK controller
 ///
 /// Responsible for:
@@ -147,7 +154,8 @@ impl UblkCtrl {
         let fd = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open("/dev/ublk-control")?;
+            .open("/dev/ublk-control")
+            .unwrap();
 
         let mut dev = UblkCtrl {
             file: fd,
@@ -164,6 +172,63 @@ impl UblkCtrl {
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    fn dev_state_desc(&self) -> String {
+        match self.dev_info.state as u32 {
+            UBLK_S_DEV_DEAD => "DEAD".to_string(),
+            UBLK_S_DEV_LIVE => "LIVE".to_string(),
+            _ => "UNKNOWN".to_string(),
+        }
+    }
+
+    pub fn dump_queues(&self) {
+        let mut file = fs::File::open(self.run_path()).expect("Failed to open file");
+        let mut json_str = String::new();
+
+        file.read_to_string(&mut json_str)
+            .expect("Failed to read file");
+
+        let json_value: serde_json::Value =
+            serde_json::from_str(&json_str).expect("Failed to parse JSON");
+        let queues = &json_value["queues"];
+
+        for i in 0..self.dev_info.nr_hw_queues {
+            let queue = &queues[i.to_string()];
+            let this_queue: Result<queue_affinity_json, _> = serde_json::from_value(queue.clone());
+
+            match this_queue {
+                Ok(p) => println!("Deserialized queue affinity: {:?}", p),
+                Err(e) => println!("Failed to deserialize queue affinity: {}", e),
+            }
+        }
+    }
+    pub fn dump(&mut self) {
+        let mut p = ublk_params {
+            ..Default::default()
+        };
+
+        self.get_info().unwrap();
+        p = self.get_params(p).unwrap();
+
+        let info = &self.dev_info;
+        println!(
+            "dev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
+            info.dev_id,
+            info.nr_hw_queues,
+            info.queue_depth,
+            1 << p.basic.logical_bs_shift,
+            p.basic.dev_sectors
+        );
+        println!(
+            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}\n",
+            info.max_io_buf_bytes,
+            info.ublksrv_pid,
+            info.flags,
+            self.dev_state_desc()
+        );
+
+        self.dump_queues();
     }
 
     pub fn run_dir() -> String {
