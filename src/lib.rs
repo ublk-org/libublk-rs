@@ -128,7 +128,7 @@ impl Drop for UblkCtrl {
                 //Maybe deleted from other utilities, so no warn or error:w
                 trace!("Delete char device {} failed {}", self.dev_info.dev_id, r);
             }
-            fs::remove_file(ublk_run_path(id)).unwrap();
+            fs::remove_file(self.run_path()).unwrap();
         }
     }
 }
@@ -164,6 +164,14 @@ impl UblkCtrl {
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    pub fn run_dir() -> String {
+        format!("{}/ublk", std::env::temp_dir().display())
+    }
+
+    fn run_path(&self) -> String {
+        format!("{}/{:04}.json", UblkCtrl::run_dir(), self.dev_info.dev_id)
     }
 
     fn add(&mut self) -> AnyRes<i32> {
@@ -260,7 +268,7 @@ impl UblkCtrl {
     }
 
     pub fn flush_json(&mut self) -> AnyRes<i32> {
-        let run_path = ublk_run_path(self.dev_info.dev_id);
+        let run_path = self.run_path();
 
         if let Some(parent_dir) = std::path::Path::new(&run_path).parent() {
             fs::create_dir_all(parent_dir)?;
@@ -322,11 +330,6 @@ pub struct UblkDev {
 
     pub tgt: RefCell<UblkTgt>,
     pub tdata: RefCell<UblkTgtData>,
-}
-
-#[inline(always)]
-fn ublk_run_path(dev_id: u32) -> String {
-    format!("{}/ublk/{:04}.json", std::env::temp_dir().display(), dev_id)
 }
 
 unsafe impl Send for UblkDev {}
