@@ -141,14 +141,22 @@ impl Drop for UblkCtrl {
 }
 
 impl UblkCtrl {
-    pub fn new(id: i32, nr_queues: u32, depth: u32, for_add: bool) -> AnyRes<UblkCtrl> {
+    pub fn new(
+        id: i32,
+        nr_queues: u32,
+        depth: u32,
+        io_buf_bytes: u32,
+        flags: u64,
+        for_add: bool,
+    ) -> AnyRes<UblkCtrl> {
         let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder().build(16)?;
         let info = ublksrv_ctrl_dev_info {
             nr_hw_queues: nr_queues as u16,
             queue_depth: depth as u16,
-            max_io_buf_bytes: 512_u32 << 10,
+            max_io_buf_bytes: io_buf_bytes,
             dev_id: id as u32,
             ublksrv_pid: unsafe { libc::getpid() } as i32,
+            flags: flags,
             ..Default::default()
         };
         let fd = fs::OpenOptions::new()
