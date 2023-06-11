@@ -182,7 +182,7 @@ impl UblkCtrl {
         }
     }
 
-    pub fn dump_queues(&self) {
+    pub fn dump_from_json(&self) {
         let mut file = fs::File::open(self.run_path()).expect("Failed to open file");
         let mut json_str = String::new();
 
@@ -198,9 +198,27 @@ impl UblkCtrl {
             let this_queue: Result<queue_affinity_json, _> = serde_json::from_value(queue.clone());
 
             match this_queue {
-                Ok(p) => println!("Deserialized queue affinity: {:?}", p),
-                Err(e) => println!("Failed to deserialize queue affinity: {}", e),
+                Ok(p) => println!(
+                    "\tqueue {} tid: {} affinity({})",
+                    i,
+                    p.tid,
+                    p.affinity
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<String>>()
+                        .join(" ")
+                ),
+                Err(_) => {}
             }
+        }
+        let tgt_val = &json_value["target"];
+        let tgt: Result<UblkTgt, _> = serde_json::from_value(tgt_val.clone());
+        match tgt {
+            Ok(p) => println!(
+                "\ttarget {{\"dev_size\":{},\"name\":\"{}\",\"type\":0}}",
+                p.dev_size, p.tgt_type
+            ),
+            Err(_) => {}
         }
     }
     pub fn dump(&mut self) {
@@ -213,7 +231,7 @@ impl UblkCtrl {
 
         let info = &self.dev_info;
         println!(
-            "dev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
+            "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
             info.dev_id,
             info.nr_hw_queues,
             info.queue_depth,
@@ -221,14 +239,14 @@ impl UblkCtrl {
             p.basic.dev_sectors
         );
         println!(
-            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}\n",
+            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}",
             info.max_io_buf_bytes,
             info.ublksrv_pid,
             info.flags,
             self.dev_state_desc()
         );
 
-        self.dump_queues();
+        self.dump_from_json();
     }
 
     pub fn run_dir() -> String {
