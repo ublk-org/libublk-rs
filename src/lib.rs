@@ -227,7 +227,8 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn get_params(&mut self, params: &mut ublk_params) -> AnyRes<i32> {
+    /// Can't pass params by reference(&mut), why?
+    pub fn get_params(&mut self, mut params: ublk_params) -> AnyRes<ublk_params> {
         params.len = core::mem::size_of::<ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_GET_PARAMS,
@@ -237,7 +238,8 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        ublk_ctrl_cmd(self, &data).unwrap();
+        Ok(params)
     }
 
     pub fn set_params(&mut self, params: &ublk_params) -> AnyRes<i32> {
