@@ -433,6 +433,7 @@ impl UblkDev {
         ops: Box<dyn UblkTgtOps>,
         ctrl: &mut UblkCtrl,
         tgt_type: &String,
+        tgt_data: serde_json::Value,
     ) -> AnyRes<UblkDev> {
         let tgt = UblkTgt {
             tgt_type: tgt_type.to_string(),
@@ -462,7 +463,7 @@ impl UblkDev {
             tdata: RefCell::new(data),
         };
 
-        ctrl.json = dev.ops.init_tgt(&dev)?;
+        ctrl.json = dev.ops.init_tgt(&dev, tgt_data)?;
         info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
@@ -493,7 +494,15 @@ pub trait UblkQueueOps {
 }
 
 pub trait UblkTgtOps {
-    fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value>;
+    /// Init this target
+    ///
+    /// Initialize this target, dev_data is usually built from command line, so
+    /// it is produced and consumed by target code.
+    fn init_tgt(&self, dev: &UblkDev, tgt_data: serde_json::Value) -> AnyRes<serde_json::Value>;
+
+    /// Deinit this target
+    ///
+    /// Release target specific resource.
     fn deinit_tgt(&self, dev: &UblkDev);
 }
 
