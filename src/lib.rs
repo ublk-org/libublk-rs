@@ -6,12 +6,23 @@ use anyhow::Result as AnyRes;
 use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
+use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::{env, fs};
 
 const UBLK_IO_RES_ABORT: i32 = -libc::ENODEV;
+
+fn alloc_buf(size: usize, align: usize) -> *mut u8 {
+    let layout = Layout::from_size_align(size, align).unwrap();
+    unsafe { alloc(layout) as *mut u8 }
+}
+
+fn dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
+    let layout = Layout::from_size_align(size, align).unwrap();
+    unsafe { dealloc(ptr as *mut u8, layout) };
+}
 
 #[inline(always)]
 fn round_up(val: u32, rnd: u32) -> u32 {
@@ -410,7 +421,11 @@ pub struct UblkTgt {
 pub struct UblkTgtData {
     pub fds: [i32; 32],
     pub nr_fds: i32,
-    pub data: Option<*const u8>,
+
+    /// data needs to be managed via alloc:{alloc, dealloc}, and
+    /// can be used by target code by cast to target type
+    data_sz: usize,
+    pub data: Option<*mut u8>,
 }
 
 pub struct UblkDev {
@@ -433,7 +448,8 @@ impl UblkDev {
         ops: Box<dyn UblkTgtOps>,
         ctrl: &mut UblkCtrl,
         tgt_type: &String,
-        tgt_data: serde_json::Value,
+        tgt_data_size: usize,
+        tgt_params: serde_json::Value,
     ) -> AnyRes<UblkDev> {
         let tgt = UblkTgt {
             tgt_type: tgt_type.to_string(),
@@ -442,7 +458,12 @@ impl UblkDev {
         let mut data = UblkTgtData {
             fds: [0_i32; 32],
             nr_fds: 0,
-            data: None,
+            data_sz: tgt_data_size,
+            data: if tgt_data_size == 0 {
+                None
+            } else {
+                Some(alloc_buf(tgt_data_size, 8))
+            },
         };
 
         let info = ctrl.dev_info.clone();
@@ -463,7 +484,7 @@ impl UblkDev {
             tdata: RefCell::new(data),
         };
 
-        ctrl.json = dev.ops.init_tgt(&dev, tgt_data)?;
+        ctrl.json = dev.ops.init_tgt(&dev, tgt_params)?;
         info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
@@ -474,6 +495,11 @@ impl UblkDev {
         let id = self.dev_info.dev_id;
 
         self.ops.deinit_tgt(self);
+
+        let tdata = self.tdata.borrow_mut();
+        if let Some(buf) = tdata.data {
+            dealloc_buf(buf, tdata.data_sz, 8);
+        }
 
         info!("dev {} deinitialized", id);
         Ok(0)
