@@ -725,9 +725,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn __queue_io_cmd(&self, ring: &mut IoUring<squeue::Entry>, tag: u16) -> i32 {
-        let ios = self.ios.borrow();
-        let io = &ios[tag as usize];
+    fn __queue_io_cmd(&self, ring: &mut IoUring<squeue::Entry>, io: &UblkIO, tag: u16) -> i32 {
         let mut cmd_op = 0_u32;
 
         if (io.flags & UBLK_IO_FREE) == 0 {
@@ -777,14 +775,12 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn queue_io_cmd(&self, tag: u16) -> i32 {
+    fn queue_io_cmd(&self, io: &mut UblkIO, tag: u16) -> i32 {
         let mut ring = self.q_ring.borrow_mut();
-        let res = self.__queue_io_cmd(&mut ring, tag);
+        let res = self.__queue_io_cmd(&mut ring, io, tag);
 
         if res > 0 {
             let mut cnt = self.cmd_inflight.borrow_mut();
-            let mut ios = self.ios.borrow_mut();
-            let mut io = &mut ios[tag as usize];
 
             *cnt += 1;
             io.flags = 0;
@@ -795,8 +791,10 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     pub fn submit_fetch_commands(&self) {
+        let ios = &mut self.ios.borrow_mut();
         for i in 0..self.q_depth {
-            self.queue_io_cmd(i as u16);
+            let io = &mut ios[i as usize];
+            self.queue_io_cmd(io, i as u16);
         }
     }
 
@@ -815,7 +813,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     pub fn complete_io(&self, io: &mut UblkIO, tag: u16, res: i32) {
         self.mark_io_done(io, tag, res);
-        self.queue_io_cmd(tag as u16);
+        self.queue_io_cmd(io, tag as u16);
     }
 
     #[inline(always)]
