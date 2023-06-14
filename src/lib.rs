@@ -631,6 +631,12 @@ impl Drop for UblkQueue<'_> {
         unsafe {
             libc::munmap(self.io_cmd_buf as *mut libc::c_void, cmd_buf_sz);
         }
+
+        let ios = &self.ios.borrow_mut();
+        for i in 0..depth {
+            let io = &ios[i as usize];
+            dealloc_buf(io.buf_addr, dev.dev_info.max_io_buf_bytes as usize, 512);
+        }
     }
 }
 
@@ -688,9 +694,7 @@ impl UblkQueue<'_> {
             ios.set_len(depth as usize);
         }
         for io in &mut ios {
-            io.buf_addr =
-                Vec::<ublk_dio_buf>::with_capacity(dev.dev_info.max_io_buf_bytes as usize / 512)
-                    .as_mut_ptr() as *mut u8;
+            io.buf_addr = alloc_buf(dev.dev_info.max_io_buf_bytes as usize, 512);
             io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
             io.result = -1;
         }
