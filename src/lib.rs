@@ -558,8 +558,8 @@ pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> 
     assert!((op >> 8) == 0 && (tgt_data >> 16) == 0);
 
     match is_target_io {
-        true => (tag as u32 | (op << 16) | (tgt_data << 24) | (1 << 63)) as u64,
-        false => (tag as u32 | (op << 16) | (tgt_data << 24)) as u64,
+        true => tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | (1_u64 << 63),
+        false => tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64,
     }
 }
 
