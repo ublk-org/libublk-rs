@@ -823,7 +823,7 @@ impl UblkQueue<'_> {
         let io = &mut ios[tag as usize];
 
         if res < 0 && res != -(libc::EAGAIN) {
-            info!(
+            error!(
                 "{}: failed tgt io: res {} qid {} tag {}, cmd_op {}\n",
                 "handle_tgt_cqe",
                 res,
