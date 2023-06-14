@@ -428,6 +428,18 @@ pub struct UblkTgtData {
     pub data: Option<*mut u8>,
 }
 
+#[inline(always)]
+pub fn ublk_tgt_priv_data<T>(td: &UblkTgtData) -> Option<*mut T> {
+    if core::mem::size_of::<T>() > td.data_sz {
+        return None;
+    }
+
+    match td.data {
+        Some(v) => Some(v as *mut T),
+        _ => None,
+    }
+}
+
 pub struct UblkDev {
     pub dev_info: ublksrv_ctrl_dev_info,
     //q: Vec<ublk_queue>,
