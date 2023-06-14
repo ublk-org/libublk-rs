@@ -528,7 +528,7 @@ impl Drop for UblkDev {
 
 pub trait UblkQueueOps {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32>;
-    fn tgt_io_done(&self, q: &UblkQueue, tag: u32, res: i32, user_data: u64);
+    fn tgt_io_done(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32, res: i32, user_data: u64);
 }
 
 pub trait UblkTgtOps {
@@ -554,7 +554,7 @@ union IOCmd {
 
 #[inline(always)]
 #[allow(arithmetic_overflow)]
-fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
+pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
     assert!((op >> 8) == 0 && (tgt_data >> 16) == 0);
 
     match is_target_io {
@@ -564,17 +564,17 @@ fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 
 }
 
 #[inline(always)]
-fn is_target_io(user_data: u64) -> bool {
+pub fn is_target_io(user_data: u64) -> bool {
     (user_data & (1_u64 << 63)) != 0
 }
 
 #[inline(always)]
-fn user_data_to_tag(user_data: u64) -> u32 {
+pub fn user_data_to_tag(user_data: u64) -> u32 {
     (user_data & 0xffff) as u32
 }
 
 #[inline(always)]
-fn user_data_to_op(user_data: u64) -> u32 {
+pub fn user_data_to_op(user_data: u64) -> u32 {
     ((user_data >> 16) & 0xff) as u32
 }
 
@@ -582,7 +582,7 @@ const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
 const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
 const UBLK_IO_FREE: u32 = 1u32 << 2;
 pub struct UblkIO {
-    buf_addr: *mut u8,
+    pub buf_addr: *mut u8,
     flags: u32,
     result: i32,
 }
@@ -818,6 +818,8 @@ impl UblkQueue<'_> {
     #[inline(always)]
     fn handle_tgt_cqe(&self, res: i32, data: u64) {
         let tag = user_data_to_tag(data);
+        let ios = &mut self.ios.borrow_mut();
+        let io = &mut ios[tag as usize];
 
         if res < 0 && res != -(libc::EAGAIN) {
             info!(
@@ -828,9 +830,8 @@ impl UblkQueue<'_> {
                 user_data_to_tag(data),
                 user_data_to_op(data)
             );
-
-            self.ops.tgt_io_done(self, tag, res, data);
         }
+        self.ops.tgt_io_done(self, io, tag, res, data);
     }
 
     #[inline(always)]
