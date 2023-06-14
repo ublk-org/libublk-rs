@@ -888,9 +888,11 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn reap_events_uring(&self, ring: &mut IoUring<squeue::Entry>) -> usize {
+    fn reap_events_uring(&self) -> usize {
         let mut count = 0;
         let mut done = Vec::<u16>::with_capacity(32);
+
+        let mut ring = self.q_ring.borrow_mut();
         for cqe in ring.completion() {
             let data = cqe.user_data();
             self.handle_cqe(&cqe);
@@ -907,7 +909,7 @@ impl UblkQueue<'_> {
         }
 
         for tag in done {
-            self.queue_io_cmd(ring, tag as u16);
+            self.queue_io_cmd(&mut ring, tag as u16);
         }
 
         count
@@ -928,8 +930,10 @@ impl UblkQueue<'_> {
             );
         }
 
+        let mut ret = 0;
         {
             let mut ring = self.q_ring.borrow_mut();
+            let rr = &mut ret;
 
             if self.queue_is_done() {
                 if ring.submission().is_empty() {
@@ -937,15 +941,19 @@ impl UblkQueue<'_> {
                 }
             }
 
-            let ret = ring.submit_and_wait(1).unwrap();
-            let reapped = self.reap_events_uring(&mut ring);
+            *rr = ring.submit_and_wait(1).unwrap();
+        }
+
+        {
+            let reapped = self.reap_events_uring();
 
             {
+                let r_reapped = &reapped;
                 let state = self.q_state.borrow();
                 info!(
                     "submit result {}, reapped {} stop {} idle {}",
                     ret,
-                    reapped,
+                    *r_reapped,
                     (*state & UBLK_QUEUE_STOPPING),
                     (*state & UBLK_QUEUE_IDLE)
                 );
