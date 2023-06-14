@@ -842,18 +842,21 @@ impl UblkQueue<'_> {
         let res = e.result();
         let tag = user_data_to_tag(data);
         let cmd_op = user_data_to_op(data);
-        let mut state = self.q_state.borrow_mut();
 
-        trace!(
-            "{}: res {} (qid {} tag {} cmd_op {} target {}) state {}",
-            "handle_cqe",
-            res,
-            self.q_id,
-            tag,
-            cmd_op,
-            is_target_io(data),
-            *state
-        );
+        {
+            let state = self.q_state.borrow();
+
+            trace!(
+                "{}: res {} (qid {} tag {} cmd_op {} target {}) state {}",
+                "handle_cqe",
+                res,
+                self.q_id,
+                tag,
+                cmd_op,
+                is_target_io(data),
+                *state
+            );
+        }
 
         /* Don't retrieve io in case of target io */
         if is_target_io(data) {
@@ -867,9 +870,12 @@ impl UblkQueue<'_> {
 
         *cnt -= 1;
 
-        if res == UBLK_IO_RES_ABORT || ((*state & UBLK_QUEUE_STOPPING) != 0) {
-            *state |= UBLK_QUEUE_STOPPING;
-            io.flags &= !UBLK_IO_NEED_FETCH_RQ;
+        {
+            let mut state = self.q_state.borrow_mut();
+            if res == UBLK_IO_RES_ABORT || ((*state & UBLK_QUEUE_STOPPING) != 0) {
+                *state |= UBLK_QUEUE_STOPPING;
+                io.flags &= !UBLK_IO_NEED_FETCH_RQ;
+            }
         }
 
         if res == UBLK_IO_RES_OK as i32 {
