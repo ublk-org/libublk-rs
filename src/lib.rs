@@ -726,7 +726,6 @@ impl UblkQueue<'_> {
     #[inline(always)]
     #[allow(unused_assignments)]
     fn __queue_io_cmd(&self, ring: &mut IoUring<squeue::Entry>, tag: u16) -> i32 {
-        let state = self.q_state.borrow();
         let ios = self.ios.borrow();
         let io = &ios[tag as usize];
         let mut cmd_op = 0_u32;
@@ -761,15 +760,18 @@ impl UblkQueue<'_> {
             ring.submission().push(&sqe).expect("submission fail");
         }
 
-        trace!(
-            "{}: (qid {} tag {} cmd_op {}) iof {} stopping {}",
-            "queue_io_cmd",
-            self.q_id,
-            tag,
-            cmd_op,
-            io.flags,
-            (*state & UBLK_QUEUE_STOPPING) != 0
-        );
+        {
+            let state = self.q_state.borrow();
+            trace!(
+                "{}: (qid {} tag {} cmd_op {}) iof {} stopping {}",
+                "queue_io_cmd",
+                self.q_id,
+                tag,
+                cmd_op,
+                io.flags,
+                (*state & UBLK_QUEUE_STOPPING) != 0
+            );
+        }
 
         1
     }
