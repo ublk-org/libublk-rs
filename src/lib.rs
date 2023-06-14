@@ -868,11 +868,12 @@ impl UblkQueue<'_> {
             return;
         }
 
-        let mut cnt = self.cmd_inflight.borrow_mut();
+        {
+            let mut cnt = self.cmd_inflight.borrow_mut();
+            *cnt -= 1;
+        }
         let ios = &mut self.ios.borrow_mut();
         let io = &mut ios[tag as usize];
-
-        *cnt -= 1;
 
         {
             let mut state = self.q_state.borrow_mut();
