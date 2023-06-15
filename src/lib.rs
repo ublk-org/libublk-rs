@@ -971,3 +971,18 @@ impl UblkQueue<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn add_ctrl_dev() {
+        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, true).unwrap();
+        let dev_path = format!("/dev/ublkc{}", ctrl.dev_info.dev_id);
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert!(Path::new(&dev_path).exists() == true);
+    }
+}
