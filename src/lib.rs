@@ -146,7 +146,9 @@ impl Drop for UblkCtrl {
                 //Maybe deleted from other utilities, so no warn or error:w
                 trace!("Delete char device {} failed {}", self.dev_info.dev_id, r);
             }
-            fs::remove_file(self.run_path()).unwrap();
+            if std::path::Path::new(&self.run_path()).exists() == true {
+                fs::remove_file(self.run_path()).unwrap();
+            }
         }
     }
 }
@@ -202,6 +204,9 @@ impl UblkCtrl {
     }
 
     pub fn dump_from_json(&self) {
+        if std::path::Path::new(&self.run_path()).exists() == false {
+            return;
+        }
         let mut file = fs::File::open(self.run_path()).expect("Failed to open file");
         let mut json_str = String::new();
 
