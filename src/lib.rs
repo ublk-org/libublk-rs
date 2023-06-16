@@ -12,7 +12,11 @@ use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::{env, fs};
 
+//todo: fix bindgen to cover the following definition
 const UBLK_IO_RES_ABORT: i32 = -libc::ENODEV;
+
+const CTRL_PATH: &str = "/dev/ublk-control";
+const DEV_PATH: &str = "/dev/ublkc";
 
 fn alloc_buf(size: usize, align: usize) -> *mut u8 {
     let layout = Layout::from_size_align(size, align).unwrap();
@@ -189,7 +193,7 @@ impl UblkCtrl {
         let fd = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open("/dev/ublk-control")
+            .open(CTRL_PATH)
             .unwrap();
 
         let mut dev = UblkCtrl {
@@ -510,7 +514,7 @@ impl UblkDev {
         };
 
         let info = ctrl.dev_info.clone();
-        let cdev_path = format!("/dev/ublkc{}", info.dev_id);
+        let cdev_path = format!("{}{}", DEV_PATH, info.dev_id);
         let cdev_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1019,7 +1023,7 @@ mod tests {
     #[test]
     fn add_ctrl_dev() {
         let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, true).unwrap();
-        let dev_path = format!("/dev/ublkc{}", ctrl.dev_info.dev_id);
+        let dev_path = format!("{}{}", DEV_PATH, ctrl.dev_info.dev_id);
 
         std::thread::sleep(std::time::Duration::from_secs(1));
         assert!(Path::new(&dev_path).exists() == true);
