@@ -154,6 +154,20 @@ impl Drop for UblkCtrl {
 }
 
 impl UblkCtrl {
+    /// New one ublk control device
+    ///
+    /// # Arguments:
+    ///
+    /// * `id`: device id, or let driver allocate one if -1 is passed
+    /// * `nr_queues`: how many hw queues allocated for this device
+    /// * `depth`: each hw queue's depth
+    /// * `io_buf_bytes`: max buf size for each IO
+    /// * `flags`: flags for setting ublk device
+    /// * `for_add`: is for adding new device
+    ///
+    /// ublk control device is for sending command to driver, and maintain
+    /// device exported json file, dump, or any misc management task.
+    ///
     pub fn new(
         id: i32,
         nr_queues: u32,
@@ -461,6 +475,18 @@ unsafe impl Send for UblkDev {}
 unsafe impl Sync for UblkDev {}
 
 impl UblkDev {
+    /// New one ublk device
+    ///
+    /// # Arguments:
+    ///
+    /// * `ops`: target operation functions
+    /// * `ctrl`: control device reference
+    /// * `tgt_type`: target type, such as 'loop', 'null', ...
+    /// * `tgt_data_size`: target private data size for target code
+    /// * `tgt_params`: describe target and pass to .init_tgt()
+    ///
+    /// ublk device is abstraction for target, and prepare for setting
+    /// up target
     pub fn new(
         ops: Box<dyn UblkTgtOps>,
         ctrl: &mut UblkCtrl,
@@ -654,6 +680,19 @@ impl UblkQueue<'_> {
         return round_up(size, page_sz);
     }
 
+    /// New one ublk queue
+    ///
+    /// # Arguments:
+    ///
+    /// * `ops`: queue operation functions
+    /// * `q_id`: queue id, [0, nr_queues)
+    /// * `dev`: ublk device reference
+    /// * `sq_depth`: io_uring sq depth
+    /// * `cq_depth`: io_uring cq depth
+    /// * `_ring_flags`: io uring flags for setup this qeuue's uring
+    ///
+    ///ublk queue is handling IO from driver, so far we use dedicated
+    ///io_uring for handling both IO command and IO
     pub fn new(
         ops: Box<dyn UblkQueueOps>,
         q_id: u16,
