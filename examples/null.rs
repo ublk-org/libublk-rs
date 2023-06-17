@@ -1,7 +1,6 @@
 use anyhow::Result;
-use libublk::{UblkCtrl, UblkDev, UblkIO, UblkQueue};
+use libublk::{UblkCtrl, UblkDev, UblkIO, UblkQueue, UblkQueueImpl};
 use std::sync::Arc;
-use std::thread;
 
 pub struct NullTgt {}
 pub struct NullQueue {}
@@ -53,23 +52,15 @@ fn __test_ublk_null(dev_id: i32) {
     let mut ctrl = UblkCtrl::new(dev_id, 2, 64, 512_u32 * 1024, 0, true).unwrap();
     let ublk_dev =
         Arc::new(UblkDev::new(Box::new(NullTgt {}), &mut ctrl, &"null".to_string()).unwrap());
+    let depth = ublk_dev.dev_info.queue_depth as u32;
 
-    let mut threads = Vec::new();
-    let nr_queues = ublk_dev.dev_info.nr_hw_queues;
-
-    for q in 0..nr_queues {
-        let _dev = Arc::clone(&ublk_dev);
-        let _q_id = q.clone();
-
-        threads.push(thread::spawn(move || {
-            let depth = _dev.dev_info.queue_depth as u32;
-
-            UblkQueue::new(Box::new(NullQueue {}), _q_id, &_dev, depth, depth, 0)
-                .unwrap()
-                .handler();
-        }));
-    }
-
+    let (threads, _) = ctrl.create_queue_handler(
+        &ublk_dev,
+        depth,
+        depth,
+        0,
+        Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
+    );
     ctrl.start_dev(&ublk_dev).unwrap();
     ctrl.dump();
 

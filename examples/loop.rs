@@ -1,6 +1,6 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
-use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkIO, UblkQueue};
+use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkIO, UblkQueue, UblkQueueImpl};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
@@ -174,20 +174,23 @@ fn __test_ublk_loop(back_file: String) {
         )
         .unwrap(),
     );
-    let _dev = Arc::clone(&ublk_dev);
-    let qh = std::thread::spawn(move || {
-        let depth = _dev.dev_info.queue_depth as u32;
+    let depth = ublk_dev.dev_info.queue_depth as u32;
 
-        UblkQueue::new(Box::new(LoopQueue {}), 0, &_dev, depth, depth, 0)
-            .unwrap()
-            .handler();
-    });
+    let (threads, _) = ctrl.create_queue_handler(
+        &ublk_dev,
+        depth,
+        depth,
+        0,
+        Arc::new(|| Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>),
+    );
 
     ctrl.start_dev(&ublk_dev).unwrap();
     ctrl.dump();
 
     //wait queue threads are done
-    qh.join().unwrap();
+    for qh in threads {
+        qh.join().unwrap();
+    }
     ctrl.stop_dev(&ublk_dev).unwrap();
 }
 
