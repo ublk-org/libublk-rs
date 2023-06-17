@@ -985,6 +985,15 @@ impl UblkQueue<'_> {
             return reapped as i32;
         }
     }
+
+    pub fn handler(&self) {
+        self.submit_fetch_commands();
+        loop {
+            if self.process_io() < 0 {
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

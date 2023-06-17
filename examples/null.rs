@@ -49,16 +49,11 @@ impl libublk::UblkQueueImpl for NullQueue {
 
 // All following functions are just boilerplate code
 fn ublk_queue_fn(dev: &UblkDev, q_id: u16) {
-    let cq_depth = dev.dev_info.queue_depth as u32;
-    let sq_depth = cq_depth;
-    let q = UblkQueue::new(Box::new(NullQueue {}), q_id, dev, sq_depth, cq_depth, 0).unwrap();
+    let depth = dev.dev_info.queue_depth as u32;
 
-    q.submit_fetch_commands();
-    loop {
-        if q.process_io() < 0 {
-            break;
-        }
-    }
+    UblkQueue::new(Box::new(NullQueue {}), q_id, dev, depth, depth, 0)
+        .unwrap()
+        .handler();
 }
 
 fn __test_ublk_null(dev_id: i32) {
