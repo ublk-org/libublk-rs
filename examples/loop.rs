@@ -153,53 +153,39 @@ impl libublk::UblkQueueImpl for LoopQueue {
     }
 }
 
-// All following functions are just boilerplate code
-
-fn __test_ublk_loop(back_file: String) {
-    let mut ctrl = UblkCtrl::new(-1, 1, 128, 512_u32 * 1024, 0, true).unwrap();
-    let tgt_type = "loop".to_string();
-    let ublk_dev = Arc::new(
-        UblkDev::new(
-            Box::new(LoopTgt {
-                back_file: std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&back_file)
-                    .unwrap(),
-                direct_io: 1,
-                back_file_path: back_file,
-            }),
-            &mut ctrl,
-            &tgt_type,
-        )
-        .unwrap(),
-    );
-    let depth = ublk_dev.dev_info.queue_depth as u32;
-
-    let (threads, _) = ctrl.create_queue_handler(
-        &ublk_dev,
-        depth,
-        depth,
-        0,
-        Arc::new(|| Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>),
-    );
-
-    ctrl.start_dev(&ublk_dev).unwrap();
-    ctrl.dump();
-
-    //wait queue threads are done
-    for qh in threads {
-        qh.join().unwrap();
-    }
-    ctrl.stop_dev(&ublk_dev).unwrap();
-}
-
 fn test_add() {
-    let s = std::env::args().nth(2).unwrap();
+    let back_file = std::env::args().nth(2).unwrap();
     let _pid = unsafe { libc::fork() };
 
     if _pid == 0 {
-        __test_ublk_loop(s);
+        libublk::ublk_tgt_worker(
+            -1,
+            1,
+            64,
+            512_u32 * 1024,
+            0,
+            "loop".to_string(),
+            || {
+                Box::new(LoopTgt {
+                    back_file: std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&back_file)
+                        .unwrap(),
+                    direct_io: 1,
+                    back_file_path: back_file.clone(),
+                })
+            },
+            Arc::new(|| Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>),
+            |dev_id| {
+                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+
+                ctrl.dump();
+            },
+        )
+        .unwrap()
+        .join()
+        .unwrap();
     }
 }
 

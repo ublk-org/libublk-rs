@@ -46,39 +46,29 @@ impl libublk::UblkQueueImpl for NullQueue {
     }
 }
 
-// All following functions are just boilerplate code
-
-fn __test_ublk_null(dev_id: i32) {
-    let mut ctrl = UblkCtrl::new(dev_id, 2, 64, 512_u32 * 1024, 0, true).unwrap();
-    let ublk_dev =
-        Arc::new(UblkDev::new(Box::new(NullTgt {}), &mut ctrl, &"null".to_string()).unwrap());
-    let depth = ublk_dev.dev_info.queue_depth as u32;
-
-    let (threads, _) = ctrl.create_queue_handler(
-        &ublk_dev,
-        depth,
-        depth,
-        0,
-        Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
-    );
-    ctrl.start_dev(&ublk_dev).unwrap();
-    ctrl.dump();
-
-    for qh in threads {
-        qh.join().unwrap_or_else(|_| {
-            eprintln!("dev-{} join queue thread failed", ublk_dev.dev_info.dev_id)
-        });
-    }
-
-    ctrl.stop_dev(&ublk_dev).unwrap();
-}
-
 fn test_add() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "-1".to_string());
     let dev_id = s.parse::<i32>().unwrap();
     let _pid = unsafe { libc::fork() };
     if _pid == 0 {
-        __test_ublk_null(dev_id);
+        libublk::ublk_tgt_worker(
+            dev_id,
+            2,
+            64,
+            512_u32 * 1024,
+            0,
+            "null".to_string(),
+            || Box::new(NullTgt {}),
+            Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
+            |dev_id| {
+                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+
+                ctrl.dump();
+            },
+        )
+        .unwrap()
+        .join()
+        .unwrap();
     }
 }
 
