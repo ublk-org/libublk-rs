@@ -421,17 +421,17 @@ impl UblkCtrl {
         Ok(0)
     }
 
-    pub fn build_json(&mut self, dev: &UblkDev, qdata: Vec<(UblkQueueAffinity, i32)>) {
+    pub fn build_json(&mut self, dev: &UblkDev, affi: Vec<UblkQueueAffinity>, tids: Vec<i32>) {
         let tgt_data = self.json["target_data"].clone();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
-        for (qid, (data, tid)) in qdata.iter().enumerate() {
+        for qid in 0..dev.dev_info.nr_hw_queues {
             map.insert(
                 format!("{}", qid),
                 serde_json::json!({
                     "qid": qid,
-                    "tid": tid,
-                    "affinity": data.to_bits_vec(),
+                    "tid": tids[qid as usize],
+                    "affinity": affi[qid as usize].to_bits_vec(),
                 }),
             );
         }
@@ -469,8 +469,9 @@ impl UblkCtrl {
         cq_depth: u32,
         ring_flags: u64,
         f: Arc<F>,
-    ) -> (Vec<std::thread::JoinHandle<()>>, Vec<i32>) {
+    ) -> Vec<std::thread::JoinHandle<()>> {
         let mut q_threads = Vec::new();
+        let mut q_affi = Vec::new();
         let mut q_tids = Vec::new();
         let nr_queues = dev.dev_info.nr_hw_queues;
         let mut tids = Vec::<Arc<(Mutex<i32>, Condvar)>>::with_capacity(nr_queues as usize);
@@ -484,6 +485,7 @@ impl UblkCtrl {
             let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
             let _tid = Arc::clone(&tid);
             let _fn = f.clone();
+            let _affinity = affinity.clone();
 
             q_threads.push(std::thread::spawn(move || {
                 let (lock, cvar) = &*_tid;
@@ -495,8 +497,8 @@ impl UblkCtrl {
                 unsafe {
                     libc::pthread_setaffinity_np(
                         libc::pthread_self(),
-                        affinity.buf_len(),
-                        affinity.addr() as *const libc::cpu_set_t,
+                        _affinity.buf_len(),
+                        _affinity.addr() as *const libc::cpu_set_t,
                     );
                 }
                 UblkQueue::new(_fn(), _q_id, &_dev, sq_depth, cq_depth, ring_flags)
@@ -504,6 +506,7 @@ impl UblkCtrl {
                     .handler();
             }));
             tids.push(tid);
+            q_affi.push(affinity);
         }
         for q in 0..nr_queues {
             let (lock, cvar) = &*tids[q as usize];
@@ -515,7 +518,11 @@ impl UblkCtrl {
             q_tids.push(*guard);
         }
 
-        (q_threads, q_tids)
+        //Now we are up, and build & export json
+        self.build_json(&dev, q_affi, q_tids);
+        self.flush_json().unwrap();
+
+        q_threads
     }
 }
 
@@ -1121,7 +1128,7 @@ where
     let ublk_dev = Arc::new(UblkDev::new(tgt_fn(), &mut ctrl, &tgt_type).unwrap());
     let depth = ublk_dev.dev_info.queue_depth as u32;
 
-    let (threads, _) = ctrl.create_queue_handler(&ublk_dev, depth, depth, 0, q_fn);
+    let threads = ctrl.create_queue_handler(&ublk_dev, depth, depth, 0, q_fn);
 
     ctrl.start_dev(&ublk_dev).unwrap();
 
