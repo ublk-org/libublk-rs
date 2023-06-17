@@ -1082,6 +1082,65 @@ impl UblkQueue<'_> {
     }
 }
 
+/// create ublk target device (high level)
+///
+/// # Arguments:
+///
+/// * `id`: device id, or let driver allocate one if -1 is passed
+/// * `nr_queues`: how many hw queues allocated for this device
+/// * `depth`: each hw queue's depth
+/// * `io_buf_bytes`: max buf size for each IO
+/// * `flags`: flags for setting ublk device
+/// * `tgt_type`: target type
+/// * `tgt_fn`: closure for allocating Target Trait object
+/// * `q_fn`: closure for allocating Target Queue Trait object
+/// * `worker_fn`: closure for running workerload
+///
+/// # Return: JoinHandle of thread for running workload
+///
+/// Note: This method is one high level API, and handles each queue in
+/// one dedicated thread. If your target won't take this approach, please
+/// don't use this API.
+pub fn ublk_tgt_worker<T, Q, W>(
+    id: i32,
+    nr_queues: u32,
+    depth: u32,
+    io_buf_bytes: u32,
+    flags: u64,
+    tgt_type: String,
+    tgt_fn: T,
+    q_fn: Arc<Q>,
+    worker_fn: W,
+) -> AnyRes<std::thread::JoinHandle<()>>
+where
+    T: Fn() -> Box<dyn UblkTgtImpl> + Send + Sync,
+    Q: Fn() -> Box<dyn UblkQueueImpl> + Send + Sync + 'static,
+    W: Fn(i32) + Send + Sync + 'static,
+{
+    let mut ctrl = UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, true).unwrap();
+    let ublk_dev = Arc::new(UblkDev::new(tgt_fn(), &mut ctrl, &tgt_type).unwrap());
+    let depth = ublk_dev.dev_info.queue_depth as u32;
+
+    let (threads, _) = ctrl.create_queue_handler(&ublk_dev, depth, depth, 0, q_fn);
+
+    ctrl.start_dev(&ublk_dev).unwrap();
+
+    let dev_id = ublk_dev.dev_info.dev_id as i32;
+    let worker_qh = std::thread::spawn(move || {
+        worker_fn(dev_id);
+    });
+
+    for qh in threads {
+        qh.join().unwrap_or_else(|_| {
+            eprintln!("dev-{} join queue thread failed", ublk_dev.dev_info.dev_id)
+        });
+    }
+
+    ctrl.stop_dev(&ublk_dev).unwrap();
+
+    Ok(worker_qh)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1148,48 +1207,30 @@ mod tests {
         }
     }
 
-    // All following functions are just boilerplate code
-    fn __test_ublk_null() -> std::thread::JoinHandle<()> {
-        let mut ctrl = UblkCtrl::new(-1, 2, 64, 512_u32 * 1024, 0, true).unwrap();
-        let ublk_dev =
-            Arc::new(UblkDev::new(Box::new(NullTgt {}), &mut ctrl, &"null".to_string()).unwrap());
-        let depth = ublk_dev.dev_info.queue_depth as u32;
-
-        let (threads, _) = ctrl.create_queue_handler(
-            &ublk_dev,
-            depth,
-            depth,
-            0,
-            Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
-        );
-
-        ctrl.start_dev(&ublk_dev).unwrap();
-
-        let dev_id = ublk_dev.dev_info.dev_id as i32;
-        let _qh = std::thread::spawn(move || {
-            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
-            let dev_path = format!("{}{}", BDEV_PATH, dev_id);
-
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            assert!(Path::new(&dev_path).exists() == true);
-
-            ctrl.del().unwrap();
-        });
-
-        for qh in threads {
-            qh.join().unwrap_or_else(|_| {
-                eprintln!("dev-{} join queue thread failed", ublk_dev.dev_info.dev_id)
-            });
-        }
-
-        ctrl.stop_dev(&ublk_dev).unwrap();
-
-        _qh
-    }
-
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
-        __test_ublk_null().join().unwrap();
+        ublk_tgt_worker(
+            -1,
+            2,
+            64,
+            512_u32 * 1024,
+            0,
+            "null".to_string(),
+            || Box::new(NullTgt {}),
+            Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
+            |dev_id| {
+                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+                let dev_path = format!("{}{}", BDEV_PATH, dev_id);
+
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                assert!(Path::new(&dev_path).exists() == true);
+
+                ctrl.del().unwrap();
+            },
+        )
+        .unwrap()
+        .join()
+        .unwrap();
     }
 }
