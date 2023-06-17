@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::thread;
 
 pub struct NullTgt {}
-pub struct NullQueueOps {}
+pub struct NullQueue {}
 
 // setup null target
 impl libublk::UblkTgtImpl for NullTgt {
@@ -35,7 +35,7 @@ impl libublk::UblkTgtImpl for NullTgt {
 }
 
 // implement io logic, and it is the main job for writing new ublk target
-impl libublk::UblkQueueOps for NullQueueOps {
+impl libublk::UblkQueueImpl for NullQueue {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> Result<i32> {
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
@@ -51,7 +51,7 @@ impl libublk::UblkQueueOps for NullQueueOps {
 fn ublk_queue_fn(dev: &UblkDev, q_id: u16) {
     let cq_depth = dev.dev_info.queue_depth as u32;
     let sq_depth = cq_depth;
-    let q = UblkQueue::new(Box::new(NullQueueOps {}), q_id, dev, sq_depth, cq_depth, 0).unwrap();
+    let q = UblkQueue::new(Box::new(NullQueue {}), q_id, dev, sq_depth, cq_depth, 0).unwrap();
 
     q.submit_fetch_commands();
     loop {

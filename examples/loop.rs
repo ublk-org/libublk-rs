@@ -17,7 +17,7 @@ struct LoopTgt {
     back_file: std::fs::File,
     direct_io: i32,
 }
-struct LoopQueueOps {}
+struct LoopQueue {}
 
 fn lo_file_size(f: &std::fs::File) -> Result<u64> {
     if let Ok(meta) = f.metadata() {
@@ -129,7 +129,7 @@ fn loop_queue_tgt_io(
 }
 
 // implement loop IO logic, and it is the main job for writing new ublk target
-impl libublk::UblkQueueOps for LoopQueueOps {
+impl libublk::UblkQueueImpl for LoopQueue {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> Result<i32> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
@@ -157,7 +157,7 @@ impl libublk::UblkQueueOps for LoopQueueOps {
 fn ublk_queue_fn(dev: &UblkDev, q_id: u16) {
     let cq_depth = dev.dev_info.queue_depth as u32;
     let sq_depth = cq_depth;
-    let q = UblkQueue::new(Box::new(LoopQueueOps {}), q_id, dev, sq_depth, cq_depth, 0).unwrap();
+    let q = UblkQueue::new(Box::new(LoopQueue {}), q_id, dev, sq_depth, cq_depth, 0).unwrap();
 
     q.submit_fetch_commands();
     loop {

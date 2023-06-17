@@ -531,7 +531,7 @@ impl Drop for UblkDev {
     }
 }
 
-pub trait UblkQueueOps {
+pub trait UblkQueueImpl {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32>;
     fn tgt_io_done(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32, res: i32, user_data: u64);
 }
@@ -611,7 +611,7 @@ pub struct UblkQueue<'a> {
     pub q_id: u16,
     pub q_depth: u32,
     io_cmd_buf: u64,
-    ops: Box<dyn UblkQueueOps>,
+    ops: Box<dyn UblkQueueImpl>,
     pub dev: &'a UblkDev,
     cmd_inflight: RefCell<u32>,
     q_state: RefCell<u32>,
@@ -658,7 +658,7 @@ impl UblkQueue<'_> {
     ///
     /// # Arguments:
     ///
-    /// * `ops`: queue operation functions
+    /// * `ops`: target specific queue implementation
     /// * `q_id`: queue id, [0, nr_queues)
     /// * `dev`: ublk device reference
     /// * `sq_depth`: io_uring sq depth
@@ -668,7 +668,9 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     pub fn new(
-        ops: Box<dyn UblkQueueOps>,
+        //not like C's ops, here ops points to one object which implements
+        //trait of UblkQueueImpl
+        ops: Box<dyn UblkQueueImpl>,
         q_id: u16,
         dev: &UblkDev,
         sq_depth: u32,
