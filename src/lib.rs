@@ -444,29 +444,14 @@ pub struct UblkTgt {
 pub struct UblkTgtData {
     pub fds: [i32; 32],
     pub nr_fds: i32,
-
-    /// data needs to be managed via alloc:{alloc, dealloc}, and
-    /// can be used by target code by cast to target type
-    data_sz: usize,
-    pub data: Option<*mut u8>,
-}
-
-#[inline(always)]
-pub fn ublk_tgt_priv_data<T>(td: &UblkTgtData) -> Option<*mut T> {
-    if core::mem::size_of::<T>() > td.data_sz {
-        return None;
-    }
-
-    match td.data {
-        Some(v) => Some(v as *mut T),
-        _ => None,
-    }
 }
 
 pub struct UblkDev {
     pub dev_info: ublksrv_ctrl_dev_info,
-    //q: Vec<ublk_queue>,
-    ops: Box<dyn UblkTgtOps>,
+
+    // not like C's ops, here ops actually points to one object which
+    // implements the trait of UblkTgtImpl
+    ops: Box<dyn UblkTgtImpl>,
 
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
@@ -486,17 +471,14 @@ impl UblkDev {
     /// * `ops`: target operation functions
     /// * `ctrl`: control device reference
     /// * `tgt_type`: target type, such as 'loop', 'null', ...
-    /// * `tgt_data_size`: target private data size for target code
-    /// * `tgt_params`: describe target and pass to .init_tgt()
     ///
     /// ublk device is abstraction for target, and prepare for setting
-    /// up target
+    /// up target. Any target private data can be defined in the data
+    /// structure which implements UblkTgtImpl.
     pub fn new(
-        ops: Box<dyn UblkTgtOps>,
+        ops: Box<dyn UblkTgtImpl>,
         ctrl: &mut UblkCtrl,
         tgt_type: &String,
-        tgt_data_size: usize,
-        tgt_params: serde_json::Value,
     ) -> AnyRes<UblkDev> {
         let tgt = UblkTgt {
             tgt_type: tgt_type.to_string(),
@@ -505,12 +487,6 @@ impl UblkDev {
         let mut data = UblkTgtData {
             fds: [0_i32; 32],
             nr_fds: 0,
-            data_sz: tgt_data_size,
-            data: if tgt_data_size == 0 {
-                None
-            } else {
-                Some(alloc_buf(tgt_data_size, 8))
-            },
         };
 
         let info = ctrl.dev_info.clone();
@@ -531,7 +507,7 @@ impl UblkDev {
             tdata: RefCell::new(data),
         };
 
-        ctrl.json = dev.ops.init_tgt(&dev, tgt_params)?;
+        ctrl.json = dev.ops.init_tgt(&dev)?;
         info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
@@ -542,12 +518,6 @@ impl UblkDev {
         let id = self.dev_info.dev_id;
 
         self.ops.deinit_tgt(self);
-
-        let tdata = self.tdata.borrow_mut();
-        if let Some(buf) = tdata.data {
-            dealloc_buf(buf, tdata.data_sz, 8);
-        }
-
         info!("dev {} deinitialized", id);
         Ok(0)
     }
@@ -566,12 +536,12 @@ pub trait UblkQueueOps {
     fn tgt_io_done(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32, res: i32, user_data: u64);
 }
 
-pub trait UblkTgtOps {
+pub trait UblkTgtImpl {
     /// Init this target
     ///
     /// Initialize this target, dev_data is usually built from command line, so
     /// it is produced and consumed by target code.
-    fn init_tgt(&self, dev: &UblkDev, tgt_data: serde_json::Value) -> AnyRes<serde_json::Value>;
+    fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value>;
 
     /// Deinit this target
     ///

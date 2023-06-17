@@ -3,12 +3,12 @@ use libublk::{UblkCtrl, UblkDev, UblkIO, UblkQueue};
 use std::sync::Arc;
 use std::thread;
 
-pub struct NullOps {}
+pub struct NullTgt {}
 pub struct NullQueueOps {}
 
 // setup null target
-impl libublk::UblkTgtOps for NullOps {
-    fn init_tgt(&self, dev: &UblkDev, _tgt_data: serde_json::Value) -> Result<serde_json::Value> {
+impl libublk::UblkTgtImpl for NullTgt {
+    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value> {
         let info = dev.dev_info;
         let dev_size = 250_u64 << 30;
 
@@ -63,16 +63,8 @@ fn ublk_queue_fn(dev: &UblkDev, q_id: u16) {
 
 fn __test_ublk_null(dev_id: i32) {
     let mut ctrl = UblkCtrl::new(dev_id, 2, 64, 512_u32 * 1024, 0, true).unwrap();
-    let ublk_dev = Arc::new(
-        UblkDev::new(
-            Box::new(NullOps {}),
-            &mut ctrl,
-            &"null".to_string(),
-            0,
-            serde_json::json!({}),
-        )
-        .unwrap(),
-    );
+    let ublk_dev =
+        Arc::new(UblkDev::new(Box::new(NullTgt {}), &mut ctrl, &"null".to_string()).unwrap());
 
     let mut threads = Vec::new();
     let nr_queues = ublk_dev.dev_info.nr_hw_queues;

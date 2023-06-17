@@ -1,38 +1,25 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
-use libublk::{ublk_tgt_priv_data, ublksrv_io_desc, UblkCtrl, UblkDev, UblkIO, UblkQueue};
+use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkIO, UblkQueue};
 use log::trace;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
-#[derive(Debug)]
-struct LoPriData {
-    file: std::fs::File,
-}
-
-struct LoopOps {}
-struct LoopQueueOps {}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct LoopArgs {
-    back_file: String,
+#[derive(Debug, Serialize)]
+struct LoJson {
+    back_file_path: String,
     direct_io: i32,
 }
 
-fn loop_build_args_json(a: String) -> (usize, serde_json::Value) {
-    (
-        core::mem::size_of::<LoPriData>(),
-        serde_json::json!({"loop":
-        LoopArgs {
-            back_file: a,
-            direct_io: 1,
-        },
-        }),
-    )
+struct LoopTgt {
+    back_file_path: String,
+    back_file: std::fs::File,
+    direct_io: i32,
 }
+struct LoopQueueOps {}
 
-fn lo_file_size(f: &mut std::fs::File) -> Result<u64> {
+fn lo_file_size(f: &std::fs::File) -> Result<u64> {
     if let Ok(meta) = f.metadata() {
         if meta.file_type().is_file() {
             Ok(f.metadata().unwrap().len())
@@ -45,34 +32,24 @@ fn lo_file_size(f: &mut std::fs::File) -> Result<u64> {
 }
 
 // setup loop target
-impl libublk::UblkTgtOps for LoopOps {
-    fn init_tgt(&self, dev: &UblkDev, _tdj: serde_json::Value) -> Result<serde_json::Value> {
+impl libublk::UblkTgtImpl for LoopTgt {
+    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value> {
         trace!("loop: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
 
-        let mut td = dev.tdata.borrow_mut();
-        let tdj = _tdj.get("loop").unwrap().clone();
-        let lo_arg = serde_json::from_value::<LoopArgs>(tdj).unwrap();
-
-        let mut _pd = ublk_tgt_priv_data::<LoPriData>(&td).unwrap();
-        let mut pd = unsafe { &mut *_pd };
-        pd.file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lo_arg.back_file)?;
-
-        if lo_arg.direct_io != 0 {
+        if self.direct_io != 0 {
             unsafe {
-                libc::fcntl(pd.file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
+                libc::fcntl(self.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
             }
         }
 
+        let mut td = dev.tdata.borrow_mut();
         let nr_fds = td.nr_fds;
-        td.fds[nr_fds as usize] = pd.file.as_raw_fd();
+        td.fds[nr_fds as usize] = self.back_file.as_raw_fd();
         td.nr_fds = nr_fds + 1;
 
         let mut tgt = dev.tgt.borrow_mut();
-        tgt.dev_size = lo_file_size(&mut pd.file).unwrap();
+        tgt.dev_size = lo_file_size(&self.back_file).unwrap();
 
         //todo: figure out correct block size
         tgt.params = libublk::ublk_params {
@@ -89,16 +66,12 @@ impl libublk::UblkTgtOps for LoopOps {
             ..Default::default()
         };
 
-        Ok(serde_json::json!({"loop": lo_arg,}))
+        Ok(
+            serde_json::json!({"loop": LoJson { back_file_path: self.back_file_path.clone(), direct_io: 1 } }),
+        )
     }
     fn deinit_tgt(&self, dev: &UblkDev) {
         trace!("loop: deinit_tgt {}", dev.dev_info.dev_id);
-
-        let td = dev.tdata.borrow_mut();
-        let mut _pd = ublk_tgt_priv_data::<LoPriData>(&td).unwrap();
-        let pd = unsafe { &mut *_pd };
-
-        drop(pd);
     }
 }
 
@@ -197,14 +170,19 @@ fn ublk_queue_fn(dev: &UblkDev, q_id: u16) {
 fn __test_ublk_loop(back_file: String) {
     let mut ctrl = UblkCtrl::new(-1, 1, 128, 512_u32 * 1024, 0, true).unwrap();
     let tgt_type = "loop".to_string();
-    let lo_params = loop_build_args_json(back_file);
     let ublk_dev = Arc::new(
         UblkDev::new(
-            Box::new(LoopOps {}),
+            Box::new(LoopTgt {
+                back_file: std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&back_file)
+                    .unwrap(),
+                direct_io: 1,
+                back_file_path: back_file,
+            }),
             &mut ctrl,
             &tgt_type,
-            lo_params.0,
-            lo_params.1,
         )
         .unwrap(),
     );
