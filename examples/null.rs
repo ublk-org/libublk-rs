@@ -82,7 +82,7 @@ fn __test_ublk_null(dev_id: i32) {
         });
     }
 
-    ctrl.stop().unwrap();
+    ctrl.stop_dev(&ublk_dev).unwrap();
 }
 
 fn test_add() {

@@ -404,6 +404,10 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    pub fn stop_dev(&mut self, _dev: &UblkDev) -> AnyRes<i32> {
+        self.stop()
+    }
+
     pub fn flush_json(&mut self) -> AnyRes<i32> {
         let run_path = self.run_path();
 
@@ -1117,7 +1121,7 @@ mod tests {
             });
         }
 
-        ctrl.stop().unwrap();
+        ctrl.stop_dev(&ublk_dev).unwrap();
 
         _qh
     }

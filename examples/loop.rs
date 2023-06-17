@@ -191,7 +191,7 @@ fn __test_ublk_loop(back_file: String) {
 
     //wait queue threads are done
     qh.join().unwrap();
-    ctrl.stop().unwrap();
+    ctrl.stop_dev(&ublk_dev).unwrap();
 }
 
 fn test_add() {
