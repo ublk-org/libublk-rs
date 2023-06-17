@@ -152,9 +152,6 @@ impl Drop for UblkCtrl {
                 //Maybe deleted from other utilities, so no warn or error:w
                 trace!("Delete char device {} failed {}", self.dev_info.dev_id, r);
             }
-            if std::path::Path::new(&self.run_path()).exists() == true {
-                fs::remove_file(self.run_path()).unwrap();
-            }
         }
     }
 }
@@ -396,16 +393,37 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Start ublk device
+    ///
+    /// # Arguments:
+    ///
+    /// * `_dev`: ublk device
+    ///
+    /// Send parameter to driver, and flush json to storage, finally
+    /// send START command
+    ///
     pub fn start_dev(&mut self, dev: &UblkDev) -> AnyRes<i32> {
         let params = dev.tgt.borrow();
 
         self.set_params(&params.params)?;
+        self.flush_json().unwrap();
         self.start(unsafe { libc::getpid() as i32 })?;
 
         Ok(0)
     }
 
+    /// Stop ublk device
+    ///
+    /// # Arguments:
+    ///
+    /// * `_dev`: ublk device
+    ///
+    /// Remove json export, and send stop command to control device
+    ///
     pub fn stop_dev(&mut self, _dev: &UblkDev) -> AnyRes<i32> {
+        if self.for_add && std::path::Path::new(&self.run_path()).exists() == true {
+            fs::remove_file(self.run_path()).unwrap();
+        }
         self.stop()
     }
 
@@ -520,7 +538,6 @@ impl UblkCtrl {
 
         //Now we are up, and build & export json
         self.build_json(&dev, q_affi, q_tids);
-        self.flush_json().unwrap();
 
         q_threads
     }
@@ -1229,7 +1246,12 @@ mod tests {
                 let dev_path = format!("{}{}", BDEV_PATH, dev_id);
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
+
+                //ublk block device should be observed now
                 assert!(Path::new(&dev_path).exists() == true);
+
+                //ublk exported json file should be observed
+                assert!(Path::new(&ctrl.run_path()).exists() == true);
 
                 ctrl.del().unwrap();
             },
