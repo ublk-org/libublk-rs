@@ -16,7 +16,8 @@ use std::{env, fs};
 const UBLK_IO_RES_ABORT: i32 = -libc::ENODEV;
 
 const CTRL_PATH: &str = "/dev/ublk-control";
-const DEV_PATH: &str = "/dev/ublkc";
+const CDEV_PATH: &str = "/dev/ublkc";
+const BDEV_PATH: &str = "/dev/ublkb";
 
 fn alloc_buf(size: usize, align: usize) -> *mut u8 {
     let layout = Layout::from_size_align(size, align).unwrap();
@@ -490,7 +491,7 @@ impl UblkDev {
         };
 
         let info = ctrl.dev_info.clone();
-        let cdev_path = format!("{}{}", DEV_PATH, info.dev_id);
+        let cdev_path = format!("{}{}", CDEV_PATH, info.dev_id);
         let cdev_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1000,13 +1001,123 @@ impl UblkQueue<'_> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Arc;
 
     #[test]
     fn add_ctrl_dev() {
         let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, true).unwrap();
-        let dev_path = format!("{}{}", DEV_PATH, ctrl.dev_info.dev_id);
+        let dev_path = format!("{}{}", CDEV_PATH, ctrl.dev_info.dev_id);
 
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(Path::new(&dev_path).exists() == true);
+    }
+
+    struct NullTgt {}
+    struct NullQueue {}
+
+    // setup null target
+    impl UblkTgtImpl for NullTgt {
+        fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
+            let info = dev.dev_info;
+            let dev_size = 250_u64 << 30;
+
+            let mut tgt = dev.tgt.borrow_mut();
+
+            tgt.dev_size = dev_size;
+            tgt.params = ublk_params {
+                types: UBLK_PARAM_TYPE_BASIC,
+                basic: ublk_param_basic {
+                    logical_bs_shift: 9,
+                    physical_bs_shift: 12,
+                    io_opt_shift: 12,
+                    io_min_shift: 9,
+                    max_sectors: info.max_io_buf_bytes >> 9,
+                    dev_sectors: dev_size >> 9,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            Ok(serde_json::json!({}))
+        }
+        fn deinit_tgt(&self, _dev: &UblkDev) {}
+    }
+
+    // implement io logic, and it is the main job for writing new ublk target
+    impl UblkQueueImpl for NullQueue {
+        fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
+            let iod = q.get_iod(tag);
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+            q.complete_io(io, tag as u16, bytes);
+            Ok(0)
+        }
+        fn tgt_io_done(
+            &self,
+            _q: &UblkQueue,
+            _io: &mut UblkIO,
+            _tag: u32,
+            _res: i32,
+            _user_data: u64,
+        ) {
+        }
+    }
+
+    // All following functions are just boilerplate code
+    fn ublk_queue_fn(dev: &UblkDev, q_id: u16) {
+        let depth = dev.dev_info.queue_depth as u32;
+
+        UblkQueue::new(Box::new(NullQueue {}), q_id, dev, depth, depth, 0)
+            .unwrap()
+            .handler();
+    }
+
+    fn __test_ublk_null() -> std::thread::JoinHandle<()> {
+        let mut ctrl = UblkCtrl::new(-1, 2, 64, 512_u32 * 1024, 0, true).unwrap();
+        let ublk_dev =
+            Arc::new(UblkDev::new(Box::new(NullTgt {}), &mut ctrl, &"null".to_string()).unwrap());
+
+        let mut threads = Vec::new();
+        let nr_queues = ublk_dev.dev_info.nr_hw_queues;
+
+        for q in 0..nr_queues {
+            let _dev = Arc::clone(&ublk_dev);
+            let _q = q.clone();
+
+            threads.push(std::thread::spawn(move || {
+                ublk_queue_fn(&_dev, _q);
+            }));
+        }
+
+        let params = ublk_dev.tgt.borrow();
+        ctrl.set_params(&params.params).unwrap();
+        ctrl.start(unsafe { libc::getpid() as i32 }).unwrap();
+
+        let dev_id = ublk_dev.dev_info.dev_id as i32;
+        let _qh = std::thread::spawn(move || {
+            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            let dev_path = format!("{}{}", BDEV_PATH, dev_id);
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert!(Path::new(&dev_path).exists() == true);
+
+            ctrl.del().unwrap();
+        });
+
+        for qh in threads {
+            qh.join().unwrap_or_else(|_| {
+                eprintln!("dev-{} join queue thread failed", ublk_dev.dev_info.dev_id)
+            });
+        }
+
+        ctrl.stop().unwrap();
+
+        _qh
+    }
+
+    /// make one ublk-null and test if /dev/ublkbN can be created successfully
+    #[test]
+    fn test_ublk_null() {
+        __test_ublk_null().join().unwrap();
     }
 }
