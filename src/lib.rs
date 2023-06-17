@@ -395,6 +395,15 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    pub fn start_dev(&mut self, dev: &UblkDev) -> AnyRes<i32> {
+        let params = dev.tgt.borrow();
+
+        self.set_params(&params.params)?;
+        self.start(unsafe { libc::getpid() as i32 })?;
+
+        Ok(0)
+    }
+
     pub fn flush_json(&mut self) -> AnyRes<i32> {
         let run_path = self.run_path();
 
@@ -1089,9 +1098,7 @@ mod tests {
             }));
         }
 
-        let params = ublk_dev.tgt.borrow();
-        ctrl.set_params(&params.params).unwrap();
-        ctrl.start(unsafe { libc::getpid() as i32 }).unwrap();
+        ctrl.start_dev(&ublk_dev).unwrap();
 
         let dev_id = ublk_dev.dev_info.dev_id as i32;
         let _qh = std::thread::spawn(move || {

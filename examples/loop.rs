@@ -186,13 +186,7 @@ fn __test_ublk_loop(back_file: String) {
         ublk_queue_fn(&_dev, 0);
     });
 
-    //target has setup parameter, so we have to notify ublk driver:w
-    let params = ublk_dev.tgt.borrow();
-    ctrl.set_params(&params.params).unwrap();
-
-    //start device, once it returns, IO requeues are setup, and
-    //we are ready to go
-    ctrl.start(unsafe { libc::getpid() as i32 }).unwrap();
+    ctrl.start_dev(&ublk_dev).unwrap();
     ctrl.dump();
 
     //wait queue threads are done

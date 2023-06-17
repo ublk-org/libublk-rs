@@ -73,10 +73,7 @@ fn __test_ublk_null(dev_id: i32) {
         }));
     }
 
-    let params = ublk_dev.tgt.borrow();
-    ctrl.set_params(&params.params).unwrap();
-    ctrl.start(unsafe { libc::getpid() as i32 }).unwrap();
-
+    ctrl.start_dev(&ublk_dev).unwrap();
     ctrl.dump();
 
     for qh in threads {
