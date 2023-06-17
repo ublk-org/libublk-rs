@@ -31,6 +31,9 @@ impl libublk::UblkTgtImpl for NullTgt {
         Ok(serde_json::json!({}))
     }
     fn deinit_tgt(&self, _dev: &UblkDev) {}
+    fn tgt_type(&self) -> &'static str {
+        "null"
+    }
 }
 
 // implement io logic, and it is the main job for writing new ublk target
@@ -57,7 +60,6 @@ fn test_add() {
             64,
             512_u32 * 1024,
             0,
-            "null".to_string(),
             || Box::new(NullTgt {}),
             Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
             |dev_id| {

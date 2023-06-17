@@ -73,6 +73,9 @@ impl libublk::UblkTgtImpl for LoopTgt {
     fn deinit_tgt(&self, dev: &UblkDev) {
         trace!("loop: deinit_tgt {}", dev.dev_info.dev_id);
     }
+    fn tgt_type(&self) -> &'static str {
+        "loop"
+    }
 }
 
 fn loop_queue_tgt_io(
@@ -164,7 +167,6 @@ fn test_add() {
             64,
             512_u32 * 1024,
             0,
-            "loop".to_string(),
             || {
                 Box::new(LoopTgt {
                     back_file: std::fs::OpenOptions::new()

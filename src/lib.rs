@@ -568,13 +568,9 @@ impl UblkDev {
     /// ublk device is abstraction for target, and prepare for setting
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
-    pub fn new(
-        ops: Box<dyn UblkTgtImpl>,
-        ctrl: &mut UblkCtrl,
-        tgt_type: &String,
-    ) -> AnyRes<UblkDev> {
+    pub fn new(ops: Box<dyn UblkTgtImpl>, ctrl: &mut UblkCtrl) -> AnyRes<UblkDev> {
         let tgt = UblkTgt {
-            tgt_type: tgt_type.to_string(),
+            tgt_type: ops.tgt_type().to_string(),
             ..Default::default()
         };
         let mut data = UblkTgtData {
@@ -640,6 +636,8 @@ pub trait UblkTgtImpl {
     ///
     /// Release target specific resource.
     fn deinit_tgt(&self, dev: &UblkDev);
+
+    fn tgt_type(&self) -> &'static str;
 }
 
 #[repr(C, align(512))]
@@ -1098,7 +1096,6 @@ impl UblkQueue<'_> {
 /// * `depth`: each hw queue's depth
 /// * `io_buf_bytes`: max buf size for each IO
 /// * `flags`: flags for setting ublk device
-/// * `tgt_type`: target type
 /// * `tgt_fn`: closure for allocating Target Trait object
 /// * `q_fn`: closure for allocating Target Queue Trait object
 /// * `worker_fn`: closure for running workerload
@@ -1114,7 +1111,6 @@ pub fn ublk_tgt_worker<T, Q, W>(
     depth: u32,
     io_buf_bytes: u32,
     flags: u64,
-    tgt_type: String,
     tgt_fn: T,
     q_fn: Arc<Q>,
     worker_fn: W,
@@ -1125,7 +1121,7 @@ where
     W: Fn(i32) + Send + Sync + 'static,
 {
     let mut ctrl = UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, true).unwrap();
-    let ublk_dev = Arc::new(UblkDev::new(tgt_fn(), &mut ctrl, &tgt_type).unwrap());
+    let ublk_dev = Arc::new(UblkDev::new(tgt_fn(), &mut ctrl).unwrap());
     let depth = ublk_dev.dev_info.queue_depth as u32;
 
     let threads = ctrl.create_queue_handler(&ublk_dev, depth, depth, 0, q_fn);
@@ -1192,6 +1188,9 @@ mod tests {
             Ok(serde_json::json!({}))
         }
         fn deinit_tgt(&self, _dev: &UblkDev) {}
+        fn tgt_type(&self) -> &'static str {
+            "null"
+        }
     }
 
     // implement io logic, and it is the main job for writing new ublk target
@@ -1223,7 +1222,6 @@ mod tests {
             64,
             512_u32 * 1024,
             0,
-            "null".to_string(),
             || Box::new(NullTgt {}),
             Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
             |dev_id| {
