@@ -1077,14 +1077,6 @@ mod tests {
     }
 
     // All following functions are just boilerplate code
-    fn ublk_queue_fn(dev: &UblkDev, q_id: u16) {
-        let depth = dev.dev_info.queue_depth as u32;
-
-        UblkQueue::new(Box::new(NullQueue {}), q_id, dev, depth, depth, 0)
-            .unwrap()
-            .handler();
-    }
-
     fn __test_ublk_null() -> std::thread::JoinHandle<()> {
         let mut ctrl = UblkCtrl::new(-1, 2, 64, 512_u32 * 1024, 0, true).unwrap();
         let ublk_dev =
@@ -1095,10 +1087,14 @@ mod tests {
 
         for q in 0..nr_queues {
             let _dev = Arc::clone(&ublk_dev);
-            let _q = q.clone();
+            let _q_id = q.clone();
 
             threads.push(std::thread::spawn(move || {
-                ublk_queue_fn(&_dev, _q);
+                let depth = _dev.dev_info.queue_depth as u32;
+
+                UblkQueue::new(Box::new(NullQueue {}), _q_id, &_dev, depth, depth, 0)
+                    .unwrap()
+                    .handler();
             }));
         }
 
