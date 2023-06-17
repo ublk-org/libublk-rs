@@ -10,6 +10,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::sync::{Arc, Condvar, Mutex};
 use std::{env, fs};
 
 //todo: fix bindgen to cover the following definition
@@ -444,6 +445,77 @@ impl UblkCtrl {
         json["queues"] = serde_json::Value::Object(map);
 
         self.json = json;
+    }
+    /// Create queue thread handler(high level)
+    ///
+    /// # Arguments:
+    ///
+    /// * `_dev`: UblkDev reference, which is required for creating queue
+    /// * `sq_depth`: uring submission queue depth
+    /// * `cq_depth`: uring completion queue depth
+    /// * `ring_flags`: uring flags
+    /// *  `f`: closure for allocating queue trait object, and Arc() is
+    /// required since the closure is called for multiple threads
+    ///
+    /// # Return: Vectors for holding each queue thread JoinHandler and tid
+    ///
+    /// Note: This method is one high level API, and handles each queue in
+    /// one dedicated thread. If your target won't take this approach, please
+    /// don't use this API.
+    pub fn create_queue_handler<F: Fn() -> Box<dyn UblkQueueImpl> + Send + Sync + 'static>(
+        &mut self,
+        dev: &Arc<UblkDev>,
+        sq_depth: u32,
+        cq_depth: u32,
+        ring_flags: u64,
+        f: Arc<F>,
+    ) -> (Vec<std::thread::JoinHandle<()>>, Vec<i32>) {
+        let mut q_threads = Vec::new();
+        let mut q_tids = Vec::new();
+        let nr_queues = dev.dev_info.nr_hw_queues;
+        let mut tids = Vec::<Arc<(Mutex<i32>, Condvar)>>::with_capacity(nr_queues as usize);
+
+        for q in 0..nr_queues {
+            let mut affinity = UblkQueueAffinity::new();
+            self.get_queue_affinity(q as u32, &mut affinity).unwrap();
+
+            let _dev = Arc::clone(dev);
+            let _q_id = q.clone();
+            let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
+            let _tid = Arc::clone(&tid);
+            let _fn = f.clone();
+
+            q_threads.push(std::thread::spawn(move || {
+                let (lock, cvar) = &*_tid;
+                unsafe {
+                    let mut guard = lock.lock().unwrap();
+                    *guard = libc::gettid();
+                    cvar.notify_one();
+                }
+                unsafe {
+                    libc::pthread_setaffinity_np(
+                        libc::pthread_self(),
+                        affinity.buf_len(),
+                        affinity.addr() as *const libc::cpu_set_t,
+                    );
+                }
+                UblkQueue::new(_fn(), _q_id, &_dev, sq_depth, cq_depth, ring_flags)
+                    .unwrap()
+                    .handler();
+            }));
+            tids.push(tid);
+        }
+        for q in 0..nr_queues {
+            let (lock, cvar) = &*tids[q as usize];
+
+            let mut guard = lock.lock().unwrap();
+            while *guard == 0 {
+                guard = cvar.wait(guard).unwrap();
+            }
+            q_tids.push(*guard);
+        }
+
+        (q_threads, q_tids)
     }
 }
 
@@ -1081,22 +1153,15 @@ mod tests {
         let mut ctrl = UblkCtrl::new(-1, 2, 64, 512_u32 * 1024, 0, true).unwrap();
         let ublk_dev =
             Arc::new(UblkDev::new(Box::new(NullTgt {}), &mut ctrl, &"null".to_string()).unwrap());
+        let depth = ublk_dev.dev_info.queue_depth as u32;
 
-        let mut threads = Vec::new();
-        let nr_queues = ublk_dev.dev_info.nr_hw_queues;
-
-        for q in 0..nr_queues {
-            let _dev = Arc::clone(&ublk_dev);
-            let _q_id = q.clone();
-
-            threads.push(std::thread::spawn(move || {
-                let depth = _dev.dev_info.queue_depth as u32;
-
-                UblkQueue::new(Box::new(NullQueue {}), _q_id, &_dev, depth, depth, 0)
-                    .unwrap()
-                    .handler();
-            }));
-        }
+        let (threads, _) = ctrl.create_queue_handler(
+            &ublk_dev,
+            depth,
+            depth,
+            0,
+            Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
+        );
 
         ctrl.start_dev(&ublk_dev).unwrap();
 
