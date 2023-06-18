@@ -1,4 +1,5 @@
 use anyhow::Result;
+use core::any::Any;
 use libublk::{UblkCtrl, UblkDev, UblkIO, UblkQueue, UblkQueueImpl};
 use std::sync::Arc;
 
@@ -33,6 +34,10 @@ impl libublk::UblkTgtImpl for NullTgt {
     fn deinit_tgt(&self, _dev: &UblkDev) {}
     fn tgt_type(&self) -> &'static str {
         "null"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

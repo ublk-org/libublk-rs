@@ -7,6 +7,7 @@ use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use std::alloc::{alloc, dealloc, Layout};
+use std::any::Any;
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -20,12 +21,12 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 const CDEV_PATH: &str = "/dev/ublkc";
 const BDEV_PATH: &str = "/dev/ublkb";
 
-fn alloc_buf(size: usize, align: usize) -> *mut u8 {
+pub fn ublk_alloc_buf(size: usize, align: usize) -> *mut u8 {
     let layout = Layout::from_size_align(size, align).unwrap();
     unsafe { alloc(layout) as *mut u8 }
 }
 
-fn dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
+pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
     let layout = Layout::from_size_align(size, align).unwrap();
     unsafe { dealloc(ptr as *mut u8, layout) };
 }
@@ -629,6 +630,18 @@ impl UblkDev {
     }
 }
 
+#[inline(always)]
+pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> AnyRes<&T> {
+    let a = dev.ops.as_any();
+
+    let tgt: &T = match a.downcast_ref::<T>() {
+        Some(b) => b,
+        _ => return Err(anyhow::anyhow!("downcast failed")),
+    };
+
+    Ok(tgt)
+}
+
 impl Drop for UblkDev {
     fn drop(&mut self) {
         if let Err(err) = self.deinit_cdev() {
@@ -640,6 +653,9 @@ impl Drop for UblkDev {
 pub trait UblkQueueImpl {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32>;
     fn tgt_io_done(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32, res: i32, user_data: u64);
+    fn setup_queue(&mut self, _q: &UblkQueue, _dev: &UblkDev) -> AnyRes<i32> {
+        Ok(0)
+    }
 }
 
 pub trait UblkTgtImpl {
@@ -655,6 +671,8 @@ pub trait UblkTgtImpl {
     fn deinit_tgt(&self, dev: &UblkDev);
 
     fn tgt_type(&self) -> &'static str;
+
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[repr(C, align(512))]
@@ -748,7 +766,7 @@ impl Drop for UblkQueue<'_> {
         let ios = &self.ios.borrow_mut();
         for i in 0..depth {
             let io = &ios[i as usize];
-            dealloc_buf(io.buf_addr, dev.dev_info.max_io_buf_bytes as usize, 512);
+            ublk_dealloc_buf(io.buf_addr, dev.dev_info.max_io_buf_bytes as usize, 512);
         }
     }
 }
@@ -822,7 +840,7 @@ impl UblkQueue<'_> {
             ios.set_len(depth as usize);
         }
         for io in &mut ios {
-            io.buf_addr = alloc_buf(dev.dev_info.max_io_buf_bytes as usize, 512);
+            io.buf_addr = ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, 512);
             io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
             io.result = -1;
         }
@@ -1208,6 +1226,10 @@ mod tests {
         fn tgt_type(&self) -> &'static str {
             "null"
         }
+        #[inline(always)]
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
     }
 
     // implement io logic, and it is the main job for writing new ublk target
@@ -1259,5 +1281,132 @@ mod tests {
         .unwrap()
         .join()
         .unwrap();
+    }
+
+    struct RamdiskTgt {
+        size: u64,
+        start: u64,
+    }
+
+    struct RamdiskQueue {}
+
+    // setup ramdisk target
+    impl UblkTgtImpl for RamdiskTgt {
+        fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
+            let info = dev.dev_info;
+            let dev_size = self.size;
+
+            let mut tgt = dev.tgt.borrow_mut();
+
+            tgt.dev_size = dev_size;
+            tgt.params = ublk_params {
+                types: UBLK_PARAM_TYPE_BASIC,
+                basic: ublk_param_basic {
+                    logical_bs_shift: 12,
+                    physical_bs_shift: 12,
+                    io_opt_shift: 12,
+                    io_min_shift: 12,
+                    max_sectors: info.max_io_buf_bytes >> 9,
+                    dev_sectors: dev_size >> 9,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            Ok(serde_json::json!({}))
+        }
+        fn deinit_tgt(&self, _dev: &UblkDev) {}
+        fn tgt_type(&self) -> &'static str {
+            "ramdisk"
+        }
+        #[inline(always)]
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    // implement io logic, and it is the main job for writing new ublk target
+    impl UblkQueueImpl for RamdiskQueue {
+        fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
+            let _iod = q.get_iod(tag);
+            let iod = unsafe { &*_iod };
+            let off = (iod.start_sector << 9) as u64;
+            let bytes = (iod.nr_sectors << 9) as u32;
+            let op = iod.op_flags & 0xff;
+            let tgt = ublk_tgt_data_from_queue::<RamdiskTgt>(q.dev).unwrap();
+            let start = tgt.start;
+
+            match op {
+                UBLK_IO_OP_FLUSH => {}
+                UBLK_IO_OP_READ => unsafe {
+                    libc::memcpy(
+                        io.buf_addr as *mut libc::c_void,
+                        (start + off) as *mut libc::c_void,
+                        bytes as usize,
+                    );
+                },
+                UBLK_IO_OP_WRITE => unsafe {
+                    libc::memcpy(
+                        (start + off) as *mut libc::c_void,
+                        io.buf_addr as *mut libc::c_void,
+                        bytes as usize,
+                    );
+                },
+                _ => return Err(anyhow::anyhow!("unexpected op")),
+            }
+
+            q.complete_io(io, tag as u16, bytes as i32);
+            Ok(0)
+        }
+        fn tgt_io_done(
+            &self,
+            _q: &UblkQueue,
+            _io: &mut UblkIO,
+            _tag: u32,
+            _res: i32,
+            _user_data: u64,
+        ) {
+        }
+    }
+
+    /// make one ublk-null and test if /dev/ublkbN can be created successfully
+    #[test]
+    fn test_ublk_ramdisk() {
+        let size = 32_u64 << 20;
+        let buf = ublk_alloc_buf(size as usize, 4096);
+        let buf_addr = buf as u64;
+
+        ublk_tgt_worker(
+            -1,
+            1,
+            64,
+            512_u32 * 1024,
+            0,
+            || {
+                Box::new(RamdiskTgt {
+                    size: size,
+                    start: buf_addr,
+                })
+            },
+            Arc::new(|| Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>),
+            |dev_id| {
+                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+                let dev_path = format!("{}{}", BDEV_PATH, dev_id);
+
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                //ublk block device should be observed now
+                assert!(Path::new(&dev_path).exists() == true);
+
+                //ublk exported json file should be observed
+                assert!(Path::new(&ctrl.run_path()).exists() == true);
+
+                ctrl.del().unwrap();
+            },
+        )
+        .unwrap()
+        .join()
+        .unwrap();
+        ublk_dealloc_buf(buf, size as usize, 4096);
     }
 }

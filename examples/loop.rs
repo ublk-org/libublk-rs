@@ -1,4 +1,5 @@
 use anyhow::Result;
+use core::any::Any;
 use io_uring::{opcode, squeue, types};
 use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkIO, UblkQueue, UblkQueueImpl};
 use log::trace;
@@ -75,6 +76,9 @@ impl libublk::UblkTgtImpl for LoopTgt {
     }
     fn tgt_type(&self) -> &'static str {
         "loop"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
