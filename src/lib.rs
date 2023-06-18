@@ -630,6 +630,17 @@ impl UblkDev {
     }
 }
 
+///
+/// Return the target concrete object from UblkTgtImpl trait object
+///
+/// # parameters
+///
+/// * `dev`: UblkDev instance
+/// * `T`: The concrete target data type
+///
+/// Use as_any()/Downcast trick for doing this job, see [downcast_trait_object]
+/// (https://bennett.dev/rust/downcast-trait-object/)
+///
 #[inline(always)]
 pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> AnyRes<&T> {
     let a = dev.ops.as_any();
