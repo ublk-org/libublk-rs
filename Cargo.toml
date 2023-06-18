@@ -19,3 +19,6 @@ serde = {version = "1.0.99", features = ["derive"]}
 serde_json = "1.0.79"
 bitmaps = "3.2.0"
 log = {version = "0.4", features = ["release_max_level_off"]}
+
+[dev-dependencies]
+block-utils = "0.11.0"

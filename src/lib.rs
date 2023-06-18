@@ -1401,6 +1401,16 @@ mod tests {
                 //ublk exported json file should be observed
                 assert!(Path::new(&ctrl.run_path()).exists() == true);
 
+                //format as ext4 test over the ramdisk
+                {
+                    let ext4_options = block_utils::Filesystem::Ext4 {
+                        inode_size: 512,
+                        stride: Some(2),
+                        stripe_width: None,
+                        reserved_blocks_percentage: 10,
+                    };
+                    block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
+                }
                 ctrl.del().unwrap();
             },
         )
