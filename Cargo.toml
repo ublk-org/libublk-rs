@@ -22,3 +22,4 @@ log = {version = "0.4", features = ["release_max_level_off"]}
 
 [dev-dependencies]
 block-utils = "0.11.0"
+tempfile = "3.6.0"

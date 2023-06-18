@@ -1394,6 +1394,12 @@ mod tests {
                         reserved_blocks_percentage: 10,
                     };
                     block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
+
+                    let tmp_dir = tempfile::TempDir::new().unwrap();
+                    let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
+
+                    block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
+                    block_utils::unmount_device(tmp_dir.path()).unwrap();
                 }
                 ctrl.del().unwrap();
             },
