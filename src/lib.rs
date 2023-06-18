@@ -652,7 +652,9 @@ impl Drop for UblkDev {
 
 pub trait UblkQueueImpl {
     fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32>;
-    fn tgt_io_done(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32, res: i32, user_data: u64);
+    #[inline(always)]
+    fn tgt_io_done(&self, _q: &UblkQueue, _io: &mut UblkIO, _tag: u32, _res: i32, _user_data: u64) {
+    }
     fn setup_queue(&mut self, _q: &UblkQueue, _dev: &UblkDev) -> AnyRes<i32> {
         Ok(0)
     }
@@ -1241,15 +1243,6 @@ mod tests {
             q.complete_io(io, tag as u16, bytes);
             Ok(0)
         }
-        fn tgt_io_done(
-            &self,
-            _q: &UblkQueue,
-            _io: &mut UblkIO,
-            _tag: u32,
-            _res: i32,
-            _user_data: u64,
-        ) {
-        }
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -1357,15 +1350,6 @@ mod tests {
 
             q.complete_io(io, tag as u16, bytes as i32);
             Ok(0)
-        }
-        fn tgt_io_done(
-            &self,
-            _q: &UblkQueue,
-            _io: &mut UblkIO,
-            _tag: u32,
-            _res: i32,
-            _user_data: u64,
-        ) {
         }
     }
 
