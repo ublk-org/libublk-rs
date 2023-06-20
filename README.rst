@@ -6,11 +6,13 @@ Introduction
 ============
 
 Rust library for help to build any ublk[1] target device, which talks with
-linux ``ublk driver`` [#userspace]_ for exposing standard linux block device,
+linux ``ublk driver`` [#ublk_driver]_ for exposing standard linux block device,
 meantime help target code to implement its own IO logic, which is totally
 done in userspace target code.
 
-So Rust's advantage can be taken for building user ublk target.
+So Rust's advantage can be taken for building userspace block device.
+
+Linux kernel 6.0 starts to support ublk covered by config option CONFIG_BLK_DEV_UBLK.
 
 Related documentations
 ======================
