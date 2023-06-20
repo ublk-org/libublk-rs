@@ -520,9 +520,10 @@ impl UblkCtrl {
                         _affinity.addr() as *const libc::cpu_set_t,
                     );
                 }
-                UblkQueue::new(_fn(), _q_id, &_dev, sq_depth, cq_depth, ring_flags)
+                let ops: &dyn UblkQueueImpl = &*_fn();
+                UblkQueue::new(_q_id, &_dev, sq_depth, cq_depth, ring_flags)
                     .unwrap()
-                    .handler();
+                    .handler(ops);
             }));
             tids.push(tid);
             q_affi.push(affinity);
@@ -750,7 +751,7 @@ pub struct UblkQueue<'a> {
     pub q_id: u16,
     pub q_depth: u32,
     io_cmd_buf: u64,
-    ops: Box<dyn UblkQueueImpl>,
+    //ops: Box<dyn UblkQueueImpl>,
     pub dev: &'a UblkDev,
     cmd_inflight: RefCell<u32>,
     q_state: RefCell<u32>,
@@ -809,7 +810,7 @@ impl UblkQueue<'_> {
     pub fn new(
         //not like C's ops, here ops points to one object which implements
         //trait of UblkQueueImpl
-        ops: Box<dyn UblkQueueImpl>,
+        //ops: Box<dyn UblkQueueImpl>,
         q_id: u16,
         dev: &UblkDev,
         sq_depth: u32,
@@ -859,7 +860,6 @@ impl UblkQueue<'_> {
         }
 
         let q = UblkQueue {
-            ops: ops,
             q_id: q_id,
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
@@ -980,7 +980,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn handle_tgt_cqe(&self, res: i32, data: u64) {
+    fn handle_tgt_cqe(&self, ops: &dyn UblkQueueImpl, res: i32, data: u64) {
         let tag = user_data_to_tag(data);
         let ios = &mut self.ios.borrow_mut();
         let io = &mut ios[tag as usize];
@@ -995,12 +995,12 @@ impl UblkQueue<'_> {
                 user_data_to_op(data)
             );
         }
-        self.ops.tgt_io_done(self, io, tag, res, data);
+        ops.tgt_io_done(self, io, tag, res, data);
     }
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe(&self, e: &cqueue::Entry) {
+    fn handle_cqe(&self, ops: &dyn UblkQueueImpl, e: &cqueue::Entry) {
         let data = e.user_data();
         let res = e.result();
         let tag = user_data_to_tag(data);
@@ -1023,7 +1023,7 @@ impl UblkQueue<'_> {
 
         /* Don't retrieve io in case of target io */
         if is_target_io(data) {
-            self.handle_tgt_cqe(res, data);
+            self.handle_tgt_cqe(ops, res, data);
             return;
         }
 
@@ -1044,7 +1044,7 @@ impl UblkQueue<'_> {
 
         if res == UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            self.ops.queue_io(self, io, tag).unwrap();
+            ops.queue_io(self, io, tag).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
@@ -1066,18 +1066,18 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn reap_events_uring(&self) -> usize {
+    fn reap_events_uring(&self, ops: &dyn UblkQueueImpl) -> usize {
         let cqes = self.get_cqes();
         let count = cqes.len();
 
         for cqe in cqes {
-            self.handle_cqe(&cqe);
+            self.handle_cqe(ops, &cqe);
         }
 
         count
     }
 
-    pub fn process_io(&self) -> i32 {
+    pub fn process_io(&self, ops: &dyn UblkQueueImpl) -> i32 {
         {
             let cnt = self.cmd_inflight.borrow();
             let state = self.q_state.borrow();
@@ -1107,7 +1107,7 @@ impl UblkQueue<'_> {
         }
 
         {
-            let reapped = self.reap_events_uring();
+            let reapped = self.reap_events_uring(ops);
 
             {
                 let r_reapped = &reapped;
@@ -1124,10 +1124,10 @@ impl UblkQueue<'_> {
         }
     }
 
-    pub fn handler(&self) {
+    pub fn handler(&self, ops: &dyn UblkQueueImpl) {
         self.submit_fetch_commands();
         loop {
-            if self.process_io() < 0 {
+            if self.process_io(ops) < 0 {
                 break;
             }
         }
