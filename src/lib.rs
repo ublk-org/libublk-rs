@@ -1054,45 +1054,32 @@ impl UblkQueue<'_> {
     }
 
     pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> i32 {
-        {
-            info!(
-                "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
-                self.dev.dev_info.dev_id,
-                self.q_id,
-                0,
-                self.cmd_inflight,
-                (self.q_state & UBLK_QUEUE_STOPPING)
-            );
-        }
+        info!(
+            "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
+            self.dev.dev_info.dev_id,
+            self.q_id,
+            0,
+            self.cmd_inflight,
+            (self.q_state & UBLK_QUEUE_STOPPING)
+        );
 
-        let mut ret = 0;
-        {
-            let rr = &mut ret;
-
-            if self.queue_is_done() {
-                if self.q_ring.submission().is_empty() {
-                    return -libc::ENODEV;
-                }
+        if self.queue_is_done() {
+            if self.q_ring.submission().is_empty() {
+                return -libc::ENODEV;
             }
-
-            *rr = self.q_ring.submit_and_wait(1).unwrap();
         }
 
-        {
-            let reapped = self.reap_events_uring(ops);
+        let ret = self.q_ring.submit_and_wait(1).unwrap();
+        let reapped = self.reap_events_uring(ops);
 
-            {
-                let r_reapped = &reapped;
-                info!(
-                    "submit result {}, reapped {} stop {} idle {}",
-                    ret,
-                    *r_reapped,
-                    (self.q_state & UBLK_QUEUE_STOPPING),
-                    (self.q_state & UBLK_QUEUE_IDLE)
-                );
-            }
-            return reapped as i32;
-        }
+        info!(
+            "submit result {}, reapped {} stop {} idle {}",
+            ret,
+            reapped,
+            (self.q_state & UBLK_QUEUE_STOPPING),
+            (self.q_state & UBLK_QUEUE_IDLE)
+        );
+        return reapped as i32;
     }
 
     pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
