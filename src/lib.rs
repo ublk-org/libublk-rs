@@ -1059,17 +1059,16 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn reap_events_uring(&self) -> usize {
-        let mut count = 0;
-        let mut cqes = Vec::<cqueue::Entry>::with_capacity(32);
+    fn get_cqes(&self) -> Vec<cqueue::Entry> {
+        let mut ring = self.q_ring.borrow_mut();
 
-        {
-            let mut ring = self.q_ring.borrow_mut();
-            for cqe in ring.completion() {
-                cqes.push(cqe);
-                count += 1;
-            }
-        }
+        ring.completion().map(Into::into).collect()
+    }
+
+    #[inline(always)]
+    fn reap_events_uring(&self) -> usize {
+        let cqes = self.get_cqes();
+        let count = cqes.len();
 
         for cqe in cqes {
             self.handle_cqe(&cqe);
