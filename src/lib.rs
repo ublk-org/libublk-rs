@@ -193,8 +193,7 @@ impl UblkCtrl {
         let fd = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(CTRL_PATH)
-            .unwrap();
+            .open(CTRL_PATH)?;
 
         let mut dev = UblkCtrl {
             file: fd,
@@ -268,8 +267,18 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        self.get_info().unwrap();
-        p = self.get_params(p).unwrap();
+        if let Err(_) = self.get_info() {
+            error!("Dump dev {} failed\n", self.dev_info.dev_id);
+            return;
+        }
+
+        match self.get_params(p) {
+            Ok(r) => p = r,
+            Err(_) => {
+                error!("Dump dev {} failed\n", self.dev_info.dev_id);
+                return;
+            }
+        }
 
         let info = &self.dev_info;
         println!(
@@ -363,7 +372,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data).unwrap();
+        ublk_ctrl_cmd(self, &data)?;
         Ok(params)
     }
 
@@ -407,7 +416,7 @@ impl UblkCtrl {
         let params = dev.tgt.borrow();
 
         self.set_params(&params.params)?;
-        self.flush_json().unwrap();
+        self.flush_json()?;
         self.start(unsafe { libc::getpid() as i32 })?;
 
         Ok(0)
@@ -423,7 +432,7 @@ impl UblkCtrl {
     ///
     pub fn stop_dev(&mut self, _dev: &UblkDev) -> AnyRes<i32> {
         if self.for_add && std::path::Path::new(&self.run_path()).exists() == true {
-            fs::remove_file(self.run_path()).unwrap();
+            fs::remove_file(self.run_path())?;
         }
         self.stop()
     }
@@ -814,15 +823,13 @@ impl UblkQueue<'_> {
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth)
             .setup_coop_taskrun()
-            .build(sq_depth)
-            .unwrap();
+            .build(sq_depth)?;
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
 
         ring.submitter()
-            .register_files(&td.fds[0..td.nr_fds as usize])
-            .unwrap();
+            .register_files(&td.fds[0..td.nr_fds as usize])?;
 
         let off = UBLKSRV_CMD_BUF_OFFSET as i64
             + q_id as i64
