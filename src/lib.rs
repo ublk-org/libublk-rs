@@ -529,7 +529,7 @@ impl UblkCtrl {
                         _affinity.addr() as *const libc::cpu_set_t,
                     );
                 }
-                let ops: &dyn UblkQueueImpl = &*_fn();
+                let ops: &'static dyn UblkQueueImpl = &*Box::leak(_fn());
                 UblkQueue::new(_q_id, &_dev, sq_depth, cq_depth, ring_flags)
                     .unwrap()
                     .handler(ops);
