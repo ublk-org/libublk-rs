@@ -786,7 +786,11 @@ impl Drop for UblkQueue<'_> {
 
         for i in 0..depth {
             let io = &self.ios[i as usize];
-            ublk_dealloc_buf(io.buf_addr, dev.dev_info.max_io_buf_bytes as usize, 512);
+            ublk_dealloc_buf(
+                io.buf_addr,
+                dev.dev_info.max_io_buf_bytes as usize,
+                unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() },
+            );
         }
     }
 }
@@ -854,7 +858,9 @@ impl UblkQueue<'_> {
             ios.set_len(depth as usize);
         }
         for io in &mut ios {
-            io.buf_addr = ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, 512);
+            io.buf_addr = ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
+                libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+            });
             io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
             io.result = -1;
         }
