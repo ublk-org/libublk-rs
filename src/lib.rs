@@ -1053,7 +1053,7 @@ impl UblkQueue<'_> {
         count
     }
 
-    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> i32 {
+    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> AnyRes<i32> {
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
@@ -1065,11 +1065,11 @@ impl UblkQueue<'_> {
 
         if self.queue_is_done() {
             if self.q_ring.submission().is_empty() {
-                return -libc::ENODEV;
+                return Err(anyhow::anyhow!("queue is down"));
             }
         }
 
-        let ret = self.q_ring.submit_and_wait(1).unwrap();
+        let ret = self.q_ring.submit_and_wait(1)?;
         let reapped = self.reap_events_uring(ops);
 
         info!(
@@ -1079,14 +1079,15 @@ impl UblkQueue<'_> {
             (self.q_state & UBLK_QUEUE_STOPPING),
             (self.q_state & UBLK_QUEUE_IDLE)
         );
-        return reapped as i32;
+        return Ok(reapped as i32);
     }
 
     pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
         self.submit_fetch_commands();
         loop {
-            if self.process_io(ops) < 0 {
-                break;
+            match self.process_io(ops) {
+                Err(_) => break,
+                _ => continue,
             }
         }
     }
