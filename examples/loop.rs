@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkIO, UblkQueue, UblkQueueImpl};
+use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkQueue, UblkQueueImpl};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
@@ -82,17 +82,12 @@ impl libublk::UblkTgtImpl for LoopTgt {
     }
 }
 
-fn loop_queue_tgt_io(
-    q: &UblkQueue,
-    io: &mut UblkIO,
-    tag: u32,
-    iod: &ublksrv_io_desc,
-) -> Result<i32> {
+fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Result<i32> {
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
     let data = libublk::build_user_data(tag as u16, op, 0, true);
-    let mut r = q.q_ring.borrow_mut();
+    let buf_addr = q.get_buf_addr(tag);
 
     if op == libublk::UBLK_IO_OP_WRITE_ZEROES || op == libublk::UBLK_IO_OP_DISCARD {
         return Err(anyhow::anyhow!("unexpected discard"));
@@ -106,27 +101,27 @@ fn loop_queue_tgt_io(
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                r.submission().push(sqe).expect("submission fail");
+                q.q_ring.submission().push(sqe).expect("submission fail");
             }
         }
         libublk::UBLK_IO_OP_READ => {
-            let sqe = &opcode::Read::new(types::Fixed(1), io.buf_addr, bytes)
+            let sqe = &opcode::Read::new(types::Fixed(1), buf_addr, bytes)
                 .offset(off)
                 .build()
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                r.submission().push(sqe).expect("submission fail");
+                q.q_ring.submission().push(sqe).expect("submission fail");
             }
         }
         libublk::UBLK_IO_OP_WRITE => {
-            let sqe = &opcode::Write::new(types::Fixed(1), io.buf_addr, bytes)
+            let sqe = &opcode::Write::new(types::Fixed(1), buf_addr, bytes)
                 .offset(off)
                 .build()
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                r.submission().push(sqe).expect("submission fail");
+                q.q_ring.submission().push(sqe).expect("submission fail");
             }
         }
         _ => return Err(anyhow::anyhow!("unexpected op")),
@@ -137,25 +132,25 @@ fn loop_queue_tgt_io(
 
 // implement loop IO logic, and it is the main job for writing new ublk target
 impl libublk::UblkQueueImpl for LoopQueue {
-    fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> Result<i32> {
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
 
-        loop_queue_tgt_io(q, io, tag, iod)
+        loop_queue_tgt_io(q, tag, iod)
     }
 
-    fn tgt_io_done(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32, res: i32, user_data: u64) {
+    fn tgt_io_done(&self, q: &mut UblkQueue, tag: u32, res: i32, user_data: u64) {
         let cqe_tag = libublk::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io(io, tag as u16, res);
+            q.complete_io(tag as u16, res);
         } else {
             let _iod = q.get_iod(tag);
             let iod = unsafe { &*_iod };
 
-            loop_queue_tgt_io(q, io, tag, iod).unwrap();
+            loop_queue_tgt_io(q, tag, iod).unwrap();
         }
     }
 }

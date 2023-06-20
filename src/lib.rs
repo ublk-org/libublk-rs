@@ -663,10 +663,9 @@ impl Drop for UblkDev {
 }
 
 pub trait UblkQueueImpl {
-    fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32>;
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32>;
     #[inline(always)]
-    fn tgt_io_done(&self, _q: &UblkQueue, _io: &mut UblkIO, _tag: u32, _res: i32, _user_data: u64) {
-    }
+    fn tgt_io_done(&self, _q: &mut UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
     fn setup_queue(&mut self, _q: &UblkQueue, _dev: &UblkDev) -> AnyRes<i32> {
         Ok(0)
     }
@@ -753,19 +752,18 @@ pub struct UblkQueue<'a> {
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
     pub dev: &'a UblkDev,
-    cmd_inflight: RefCell<u32>,
-    q_state: RefCell<u32>,
-    ios: RefCell<Vec<UblkIO>>,
-    pub q_ring: RefCell<IoUring<squeue::Entry>>,
+    cmd_inflight: u32,
+    q_state: u32,
+    ios: Vec<UblkIO>,
+    pub q_ring: IoUring<squeue::Entry>,
 }
 
 impl Drop for UblkQueue<'_> {
     fn drop(&mut self) {
-        let ring = self.q_ring.borrow_mut();
         let dev = self.dev;
         trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
-        if let Err(r) = ring.submitter().unregister_files() {
+        if let Err(r) = self.q_ring.submitter().unregister_files() {
             error!("unregister fixed files failed {}", r);
         }
 
@@ -777,9 +775,8 @@ impl Drop for UblkQueue<'_> {
             libc::munmap(self.io_cmd_buf as *mut libc::c_void, cmd_buf_sz);
         }
 
-        let ios = &self.ios.borrow_mut();
         for i in 0..depth {
-            let io = &ios[i as usize];
+            let io = &self.ios[i as usize];
             ublk_dealloc_buf(io.buf_addr, dev.dev_info.max_io_buf_bytes as usize, 512);
         }
     }
@@ -798,7 +795,6 @@ impl UblkQueue<'_> {
     ///
     /// # Arguments:
     ///
-    /// * `ops`: target specific queue implementation
     /// * `q_id`: queue id, [0, nr_queues)
     /// * `dev`: ublk device reference
     /// * `sq_depth`: io_uring sq depth
@@ -808,9 +804,6 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     pub fn new(
-        //not like C's ops, here ops points to one object which implements
-        //trait of UblkQueueImpl
-        //ops: Box<dyn UblkQueueImpl>,
         q_id: u16,
         dev: &UblkDev,
         sq_depth: u32,
@@ -864,10 +857,10 @@ impl UblkQueue<'_> {
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
             dev: dev,
-            cmd_inflight: RefCell::new(0),
-            q_state: RefCell::new(0),
-            q_ring: RefCell::new(ring),
-            ios: RefCell::new(ios),
+            cmd_inflight: 0,
+            q_state: 0,
+            q_ring: ring,
+            ios: ios,
         };
 
         trace!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
@@ -876,9 +869,14 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn mark_io_done(&self, io: &mut UblkIO, _tag: u16, res: i32) {
-        io.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
-        io.result = res;
+    pub fn get_buf_addr(&self, tag: u32) -> *mut u8 {
+        return self.ios[tag as usize].buf_addr;
+    }
+
+    #[inline(always)]
+    fn mark_io_done(&mut self, tag: u16, res: i32) {
+        self.ios[tag as usize].flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
+        self.ios[tag as usize].result = res;
     }
 
     #[inline(always)]
@@ -888,8 +886,9 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn __queue_io_cmd(&self, ring: &mut IoUring<squeue::Entry>, io: &UblkIO, tag: u16) -> i32 {
+    fn __queue_io_cmd(&mut self, tag: u16) -> i32 {
         let mut cmd_op = 0_u32;
+        let io = &self.ios[tag as usize];
 
         if (io.flags & UBLK_IO_FREE) == 0 {
             return 0;
@@ -918,72 +917,63 @@ impl UblkQueue<'_> {
             .user_data(data);
 
         unsafe {
-            ring.submission().push(&sqe).expect("submission fail");
+            self.q_ring
+                .submission()
+                .push(&sqe)
+                .expect("submission fail");
         }
 
-        {
-            let state = self.q_state.borrow();
-            trace!(
-                "{}: (qid {} tag {} cmd_op {}) iof {} stopping {}",
-                "queue_io_cmd",
-                self.q_id,
-                tag,
-                cmd_op,
-                io.flags,
-                (*state & UBLK_QUEUE_STOPPING) != 0
-            );
-        }
+        trace!(
+            "{}: (qid {} tag {} cmd_op {}) iof {} stopping {}",
+            "queue_io_cmd",
+            self.q_id,
+            tag,
+            cmd_op,
+            io.flags,
+            (self.q_state & UBLK_QUEUE_STOPPING) != 0
+        );
 
         1
     }
 
     #[inline(always)]
-    fn queue_io_cmd(&self, io: &mut UblkIO, tag: u16) -> i32 {
-        let mut ring = self.q_ring.borrow_mut();
-        let res = self.__queue_io_cmd(&mut ring, io, tag);
+    fn queue_io_cmd(&mut self, tag: u16) -> i32 {
+        let res = self.__queue_io_cmd(tag);
 
         if res > 0 {
-            let mut cnt = self.cmd_inflight.borrow_mut();
-
-            *cnt += 1;
-            io.flags = 0;
+            self.cmd_inflight += 1;
+            self.ios[tag as usize].flags = 0;
         }
 
         res
     }
 
     #[inline(always)]
-    pub fn submit_fetch_commands(&self) {
-        let ios = &mut self.ios.borrow_mut();
+    pub fn submit_fetch_commands(&mut self) {
         for i in 0..self.q_depth {
-            let io = &mut ios[i as usize];
-            self.queue_io_cmd(io, i as u16);
+            self.queue_io_cmd(i as u16);
         }
     }
 
     #[inline(always)]
     fn queue_is_idle(&self) -> bool {
-        let cnt = self.cmd_inflight.borrow();
-        *cnt == 0
+        self.cmd_inflight == 0
     }
 
     #[inline(always)]
     fn queue_is_done(&self) -> bool {
-        let state = self.q_state.borrow();
-        (*state & UBLK_QUEUE_STOPPING) != 0 && self.queue_is_idle()
+        (self.q_state & UBLK_QUEUE_STOPPING) != 0 && self.queue_is_idle()
     }
 
     #[inline(always)]
-    pub fn complete_io(&self, io: &mut UblkIO, tag: u16, res: i32) {
-        self.mark_io_done(io, tag, res);
-        self.queue_io_cmd(io, tag as u16);
+    pub fn complete_io(&mut self, tag: u16, res: i32) {
+        self.mark_io_done(tag, res);
+        self.queue_io_cmd(tag as u16);
     }
 
     #[inline(always)]
-    fn handle_tgt_cqe(&self, ops: &dyn UblkQueueImpl, res: i32, data: u64) {
+    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, res: i32, data: u64) {
         let tag = user_data_to_tag(data);
-        let ios = &mut self.ios.borrow_mut();
-        let io = &mut ios[tag as usize];
 
         if res < 0 && res != -(libc::EAGAIN) {
             error!(
@@ -995,31 +985,27 @@ impl UblkQueue<'_> {
                 user_data_to_op(data)
             );
         }
-        ops.tgt_io_done(self, io, tag, res, data);
+        ops.tgt_io_done(self, tag, res, data);
     }
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe(&self, ops: &dyn UblkQueueImpl, e: &cqueue::Entry) {
+    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &cqueue::Entry) {
         let data = e.user_data();
         let res = e.result();
         let tag = user_data_to_tag(data);
         let cmd_op = user_data_to_op(data);
 
-        {
-            let state = self.q_state.borrow();
-
-            trace!(
-                "{}: res {} (qid {} tag {} cmd_op {} target {}) state {}",
-                "handle_cqe",
-                res,
-                self.q_id,
-                tag,
-                cmd_op,
-                is_target_io(data),
-                *state
-            );
-        }
+        trace!(
+            "{}: res {} (qid {} tag {} cmd_op {} target {}) state {}",
+            "handle_cqe",
+            res,
+            self.q_id,
+            tag,
+            cmd_op,
+            is_target_io(data),
+            self.q_state,
+        );
 
         /* Don't retrieve io in case of target io */
         if is_target_io(data) {
@@ -1027,24 +1013,16 @@ impl UblkQueue<'_> {
             return;
         }
 
-        {
-            let mut cnt = self.cmd_inflight.borrow_mut();
-            *cnt -= 1;
-        }
-        let ios = &mut self.ios.borrow_mut();
-        let io = &mut ios[tag as usize];
+        self.cmd_inflight -= 1;
 
-        {
-            let mut state = self.q_state.borrow_mut();
-            if res == UBLK_IO_RES_ABORT || ((*state & UBLK_QUEUE_STOPPING) != 0) {
-                *state |= UBLK_QUEUE_STOPPING;
-                io.flags &= !UBLK_IO_NEED_FETCH_RQ;
-            }
+        if res == UBLK_IO_RES_ABORT || ((self.q_state & UBLK_QUEUE_STOPPING) != 0) {
+            self.q_state |= UBLK_QUEUE_STOPPING;
+            self.ios[tag as usize].flags &= !UBLK_IO_NEED_FETCH_RQ;
         }
 
         if res == UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.queue_io(self, io, tag).unwrap();
+            ops.queue_io(self, tag).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
@@ -1054,19 +1032,17 @@ impl UblkQueue<'_> {
              * we only issue io with (UBLKSRV_IO_FREE | UBLKSRV_NEED_*)
              *
              * */
-            io.flags = UBLK_IO_FREE;
+            self.ios[tag as usize].flags = UBLK_IO_FREE;
         }
     }
 
     #[inline(always)]
-    fn get_cqes(&self) -> Vec<cqueue::Entry> {
-        let mut ring = self.q_ring.borrow_mut();
-
-        ring.completion().map(Into::into).collect()
+    fn get_cqes(&mut self) -> Vec<cqueue::Entry> {
+        self.q_ring.completion().map(Into::into).collect()
     }
 
     #[inline(always)]
-    fn reap_events_uring(&self, ops: &dyn UblkQueueImpl) -> usize {
+    fn reap_events_uring(&mut self, ops: &dyn UblkQueueImpl) -> usize {
         let cqes = self.get_cqes();
         let count = cqes.len();
 
@@ -1077,33 +1053,29 @@ impl UblkQueue<'_> {
         count
     }
 
-    pub fn process_io(&self, ops: &dyn UblkQueueImpl) -> i32 {
+    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> i32 {
         {
-            let cnt = self.cmd_inflight.borrow();
-            let state = self.q_state.borrow();
-
             info!(
                 "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
                 self.dev.dev_info.dev_id,
                 self.q_id,
                 0,
-                *cnt,
-                (*state & UBLK_QUEUE_STOPPING)
+                self.cmd_inflight,
+                (self.q_state & UBLK_QUEUE_STOPPING)
             );
         }
 
         let mut ret = 0;
         {
-            let mut ring = self.q_ring.borrow_mut();
             let rr = &mut ret;
 
             if self.queue_is_done() {
-                if ring.submission().is_empty() {
+                if self.q_ring.submission().is_empty() {
                     return -libc::ENODEV;
                 }
             }
 
-            *rr = ring.submit_and_wait(1).unwrap();
+            *rr = self.q_ring.submit_and_wait(1).unwrap();
         }
 
         {
@@ -1111,20 +1083,19 @@ impl UblkQueue<'_> {
 
             {
                 let r_reapped = &reapped;
-                let state = self.q_state.borrow();
                 info!(
                     "submit result {}, reapped {} stop {} idle {}",
                     ret,
                     *r_reapped,
-                    (*state & UBLK_QUEUE_STOPPING),
-                    (*state & UBLK_QUEUE_IDLE)
+                    (self.q_state & UBLK_QUEUE_STOPPING),
+                    (self.q_state & UBLK_QUEUE_IDLE)
                 );
             }
             return reapped as i32;
         }
     }
 
-    pub fn handler(&self, ops: &dyn UblkQueueImpl) {
+    pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
         self.submit_fetch_commands();
         loop {
             if self.process_io(ops) < 0 {
@@ -1246,11 +1217,11 @@ mod tests {
 
     // implement io logic, and it is the main job for writing new ublk target
     impl UblkQueueImpl for NullQueue {
-        fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
+        fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32> {
             let iod = q.get_iod(tag);
             let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            q.complete_io(io, tag as u16, bytes);
+            q.complete_io(tag as u16, bytes);
             Ok(0)
         }
     }
@@ -1330,7 +1301,7 @@ mod tests {
 
     // implement io logic, and it is the main job for writing new ublk target
     impl UblkQueueImpl for RamdiskQueue {
-        fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> AnyRes<i32> {
+        fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32> {
             let _iod = q.get_iod(tag);
             let iod = unsafe { &*_iod };
             let off = (iod.start_sector << 9) as u64;
@@ -1338,12 +1309,13 @@ mod tests {
             let op = iod.op_flags & 0xff;
             let tgt = ublk_tgt_data_from_queue::<RamdiskTgt>(q.dev).unwrap();
             let start = tgt.start;
+            let buf_addr = q.get_buf_addr(tag);
 
             match op {
                 UBLK_IO_OP_FLUSH => {}
                 UBLK_IO_OP_READ => unsafe {
                     libc::memcpy(
-                        io.buf_addr as *mut libc::c_void,
+                        buf_addr as *mut libc::c_void,
                         (start + off) as *mut libc::c_void,
                         bytes as usize,
                     );
@@ -1351,14 +1323,14 @@ mod tests {
                 UBLK_IO_OP_WRITE => unsafe {
                     libc::memcpy(
                         (start + off) as *mut libc::c_void,
-                        io.buf_addr as *mut libc::c_void,
+                        buf_addr as *mut libc::c_void,
                         bytes as usize,
                     );
                 },
                 _ => return Err(anyhow::anyhow!("unexpected op")),
             }
 
-            q.complete_io(io, tag as u16, bytes as i32);
+            q.complete_io(tag as u16, bytes as i32);
             Ok(0)
         }
     }

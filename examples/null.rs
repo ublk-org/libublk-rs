@@ -1,6 +1,6 @@
 use anyhow::Result;
 use core::any::Any;
-use libublk::{UblkCtrl, UblkDev, UblkIO, UblkQueue, UblkQueueImpl};
+use libublk::{UblkCtrl, UblkDev, UblkQueue, UblkQueueImpl};
 use std::sync::Arc;
 
 pub struct NullTgt {}
@@ -43,11 +43,11 @@ impl libublk::UblkTgtImpl for NullTgt {
 
 // implement io logic, and it is the main job for writing new ublk target
 impl libublk::UblkQueueImpl for NullQueue {
-    fn queue_io(&self, q: &UblkQueue, io: &mut UblkIO, tag: u32) -> Result<i32> {
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32> {
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        q.complete_io(io, tag as u16, bytes);
+        q.complete_io(tag as u16, bytes);
         Ok(0)
     }
 }
