@@ -909,13 +909,14 @@ impl UblkQueue<'_> {
             return 0;
         }
 
-        let cmd = ublksrv_io_cmd {
-            tag: tag,
-            addr: io.buf_addr as u64,
-            q_id: self.q_id,
-            result: io.result,
+        let io_cmd = IOCmd {
+            cmd: ublksrv_io_cmd {
+                tag: tag,
+                addr: io.buf_addr as u64,
+                q_id: self.q_id,
+                result: io.result,
+            },
         };
-        let io_cmd = IOCmd { cmd: cmd };
         let data = build_user_data(tag, cmd_op, 0, false);
 
         let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
@@ -1060,6 +1061,7 @@ impl UblkQueue<'_> {
         count
     }
 
+    #[inline(always)]
     pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> AnyRes<i32> {
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
