@@ -221,7 +221,7 @@ impl UblkCtrl {
     }
 
     pub fn dump_from_json(&self) {
-        if std::path::Path::new(&self.run_path()).exists() == false {
+        if !std::path::Path::new(&self.run_path()).exists() {
             return;
         }
         let mut file = fs::File::open(self.run_path()).expect("Failed to open file");
@@ -267,7 +267,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        if let Err(_) = self.get_info() {
+        if self.get_info().is_err() {
             error!("Dump dev {} failed\n", self.dev_info.dev_id);
             return;
         }
@@ -398,7 +398,6 @@ impl UblkCtrl {
             addr: bm.addr() as u64,
             data: [q as u64, 0],
             len: bm.buf_len() as u32,
-            ..Default::default()
         };
         ublk_ctrl_cmd(self, &data)
     }
@@ -431,7 +430,7 @@ impl UblkCtrl {
     /// Remove json export, and send stop command to control device
     ///
     pub fn stop_dev(&mut self, _dev: &UblkDev) -> AnyRes<i32> {
-        if self.for_add && std::path::Path::new(&self.run_path()).exists() == true {
+        if self.for_add && std::path::Path::new(&self.run_path()).exists() {
             fs::remove_file(self.run_path())?;
         }
         self.stop()
@@ -548,7 +547,7 @@ impl UblkCtrl {
         }
 
         //Now we are up, and build & export json
-        self.build_json(&dev, q_affi, q_tids);
+        self.build_json(dev, q_affi, q_tids);
 
         q_threads
     }
@@ -802,7 +801,7 @@ impl UblkQueue<'_> {
         let size = depth * core::mem::size_of::<ublksrv_io_desc>() as u32;
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
 
-        return round_up(size, page_sz);
+        round_up(size, page_sz)
     }
 
     /// New one ublk queue
@@ -842,7 +841,7 @@ impl UblkQueue<'_> {
                     as i64);
         let io_cmd_buf = unsafe {
             libc::mmap(
-                0 as *mut libc::c_void,
+                std::ptr::null_mut::<libc::c_void>(),
                 cmd_buf_sz,
                 libc::PROT_READ,
                 libc::MAP_SHARED | libc::MAP_POPULATE,
@@ -884,7 +883,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     pub fn get_buf_addr(&self, tag: u32) -> *mut u8 {
-        return self.ios[tag as usize].buf_addr;
+        self.ios[tag as usize].buf_addr
     }
 
     #[inline(always)]
@@ -1095,7 +1094,7 @@ impl UblkQueue<'_> {
             (self.q_state & UBLK_QUEUE_STOPPING),
             (self.q_state & UBLK_QUEUE_IDLE)
         );
-        return Ok(reapped as i32);
+        Ok(reapped as i32)
     }
 
     pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
