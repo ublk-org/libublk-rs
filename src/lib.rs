@@ -238,8 +238,8 @@ impl UblkCtrl {
             let queue = &queues[i.to_string()];
             let this_queue: Result<queue_affinity_json, _> = serde_json::from_value(queue.clone());
 
-            match this_queue {
-                Ok(p) => println!(
+            if let Ok(p) = this_queue {
+                println!(
                     "\tqueue {} tid: {} affinity({})",
                     i,
                     p.tid,
@@ -248,18 +248,16 @@ impl UblkCtrl {
                         .map(ToString::to_string)
                         .collect::<Vec<String>>()
                         .join(" ")
-                ),
-                Err(_) => {}
+                );
             }
         }
         let tgt_val = &json_value["target"];
         let tgt: Result<UblkTgt, _> = serde_json::from_value(tgt_val.clone());
-        match tgt {
-            Ok(p) => println!(
+        if let Ok(p) = tgt {
+            println!(
                 "\ttarget {{\"dev_size\":{},\"name\":\"{}\",\"type\":0}}",
                 p.dev_size, p.tgt_type
-            ),
-            Err(_) => {}
+            );
         }
     }
     pub fn dump(&mut self) {
