@@ -94,7 +94,7 @@ fn ublk_ctrl_prep_cmd(fd: i32, dev_id: u32, data: &UblkCtrlCmdData) -> squeue::E
         } else {
             [0]
         },
-        dev_id: dev_id,
+        dev_id,
         queue_id: u16::MAX,
         ..Default::default()
     };
@@ -187,7 +187,7 @@ impl UblkCtrl {
             max_io_buf_bytes: io_buf_bytes,
             dev_id: id as u32,
             ublksrv_pid: unsafe { libc::getpid() } as i32,
-            flags: flags,
+            flags,
             ..Default::default()
         };
         let fd = fs::OpenOptions::new()
@@ -199,8 +199,8 @@ impl UblkCtrl {
             file: fd,
             dev_info: info,
             json: serde_json::json!({}),
-            ring: ring,
-            for_add: for_add,
+            ring,
+            for_add,
         };
 
         //add cdev if the device is for adding device
@@ -616,9 +616,9 @@ impl UblkDev {
         data.nr_fds = 1;
 
         let dev = UblkDev {
-            ops: ops,
+            ops,
             dev_info: info,
-            cdev_file: cdev_file,
+            cdev_file,
             tgt: RefCell::new(tgt),
             tdata: RefCell::new(data),
         };
@@ -866,14 +866,14 @@ impl UblkQueue<'_> {
         }
 
         let q = UblkQueue {
-            q_id: q_id,
+            q_id,
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
-            dev: dev,
+            dev,
             cmd_inflight: 0,
             q_state: 0,
             q_ring: ring,
-            ios: ios,
+            ios,
         };
 
         trace!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
@@ -917,7 +917,7 @@ impl UblkQueue<'_> {
 
         let io_cmd = IOCmd {
             cmd: ublksrv_io_cmd {
-                tag: tag,
+                tag,
                 addr: io.buf_addr as u64,
                 q_id: self.q_id,
                 result: io.result,
