@@ -734,8 +734,9 @@ pub fn user_data_to_op(user_data: u64) -> u32 {
 const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
 const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
 const UBLK_IO_FREE: u32 = 1u32 << 2;
-pub struct UblkIO {
-    pub buf_addr: *mut u8,
+
+struct UblkIO {
+    buf_addr: *mut u8,
     flags: u32,
     result: i32,
 }
@@ -1338,7 +1339,9 @@ mod tests {
         }
     }
 
-    /// make one ublk-null and test if /dev/ublkbN can be created successfully
+    /// make one ublk-ramdisk and test:
+    /// - if /dev/ublkbN can be created successfully
+    /// - if yes, then test format/mount/umount over this ublk-ramdisk
     #[test]
     fn test_ublk_ramdisk() {
         let size = 32_u64 << 20;
@@ -1370,7 +1373,7 @@ mod tests {
                 //ublk exported json file should be observed
                 assert!(Path::new(&ctrl.run_path()).exists() == true);
 
-                //format as ext4 test over the ramdisk
+                //format as ext4 and mount over the created ublk-ramdisk
                 {
                     let ext4_options = block_utils::Filesystem::Ext4 {
                         inode_size: 512,
