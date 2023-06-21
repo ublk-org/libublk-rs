@@ -375,7 +375,7 @@ impl UblkCtrl {
     }
 
     pub fn set_params(&mut self, params: &ublk_params) -> AnyRes<i32> {
-        let mut p = params.clone();
+        let mut p = *params;
 
         p.len = core::mem::size_of::<ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
@@ -506,7 +506,7 @@ impl UblkCtrl {
             self.get_queue_affinity(q as u32, &mut affinity).unwrap();
 
             let _dev = Arc::clone(dev);
-            let _q_id = q.clone();
+            let _q_id = q;
             let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
             let _tid = Arc::clone(&tid);
             let _fn = f.clone();
@@ -814,6 +814,7 @@ impl UblkQueue<'_> {
     ///
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
+    #[allow(clippy::uninit_vec)]
     pub fn new(
         q_id: u16,
         dev: &UblkDev,
@@ -1076,10 +1077,8 @@ impl UblkQueue<'_> {
             (self.q_state & UBLK_QUEUE_STOPPING)
         );
 
-        if self.queue_is_done() {
-            if self.q_ring.submission().is_empty() {
-                return Err(anyhow::anyhow!("queue is down"));
-            }
+        if self.queue_is_done() && self.q_ring.submission().is_empty() {
+            return Err(anyhow::anyhow!("queue is down"));
         }
 
         let ret = self.q_ring.submit_and_wait(1)?;
