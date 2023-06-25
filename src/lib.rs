@@ -14,9 +14,6 @@ use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Condvar, Mutex};
 use std::{env, fs};
 
-//todo: fix bindgen to cover the following definition
-const UBLK_IO_RES_ABORT: i32 = -libc::ENODEV;
-
 const CTRL_PATH: &str = "/dev/ublk-control";
 const CDEV_PATH: &str = "/dev/ublkc";
 const BDEV_PATH: &str = "/dev/ublkb";

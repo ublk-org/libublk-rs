@@ -30,6 +30,7 @@ fn main() {
 
     const INCLUDE: &str = r#"
 #include <asm/ioctl.h>
+#include <linux/errno.h>
 #include <linux/ublk_cmd.h>
 
 #ifdef UBLK_F_CMD_IOCTL_ENCODE
@@ -48,6 +49,7 @@ MARK_FIX_753(UBLK_U_CMD_GET_PARAMS);
 MARK_FIX_753(UBLK_U_CMD_START_USER_RECOVERY);
 MARK_FIX_753(UBLK_U_CMD_END_USER_RECOVERY);
 MARK_FIX_753(UBLK_U_CMD_GET_DEV_INFO2);
+const int Fix753_UBLK_IO_RES_ABORT = UBLK_IO_RES_ABORT;
     "#;
 
     #[cfg(not(feature = "overwrite"))]
@@ -65,6 +67,8 @@ MARK_FIX_753(UBLK_U_CMD_GET_DEV_INFO2);
         .derive_default(true)
         .generate_comments(true)
         .use_core()
+        .allowlist_var("UBLKSRV_.*|UBLK_.*|UBLK_U_.*|Fix753_.*")
+        .allowlist_type("ublksrv_.*|ublk_.*")
         .parse_callbacks(Box::new(Fix753 {}))
         .generate()
         .unwrap()
