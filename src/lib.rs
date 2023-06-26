@@ -256,6 +256,7 @@ impl UblkCtrl {
                 p.dev_size, p.tgt_type
             );
         }
+        println!("\ttarget_data {}", &json_value["target_data"]);
     }
     pub fn dump(&mut self) {
         let mut p = ublk_params {
@@ -444,7 +445,7 @@ impl UblkCtrl {
     }
 
     pub fn build_json(&mut self, dev: &UblkDev, affi: Vec<UblkQueueAffinity>, tids: Vec<i32>) {
-        let tgt_data = self.json["target_data"].clone();
+        let tgt_data = self.json.clone();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
