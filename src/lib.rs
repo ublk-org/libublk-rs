@@ -213,7 +213,20 @@ impl UblkCtrl {
         match self.dev_info.state as u32 {
             UBLK_S_DEV_DEAD => "DEAD".to_string(),
             UBLK_S_DEV_LIVE => "LIVE".to_string(),
+            UBLK_S_DEV_QUIESCED => "QUIESCED".to_string(),
             _ => "UNKNOWN".to_string(),
+        }
+    }
+
+    pub fn get_queue_tid(&self, qid: u32) -> AnyRes<i32> {
+        let queues = &self.json["queues"];
+        let queue = &queues[qid.to_string()];
+        let this_queue: Result<queue_affinity_json, _> = serde_json::from_value(queue.clone());
+
+        if let Ok(p) = this_queue {
+            Ok(p.tid.try_into().unwrap())
+        } else {
+            Err(anyhow::anyhow!("downcast failed"))
         }
     }
 
@@ -411,6 +424,26 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    pub fn start_user_recover(&mut self) -> AnyRes<i32> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: UBLK_CMD_START_USER_RECOVERY,
+            ..Default::default()
+        };
+
+        ublk_ctrl_cmd(self, &data)
+    }
+
+    pub fn end_user_recover(&mut self, pid: i32) -> AnyRes<i32> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: UBLK_CMD_END_USER_RECOVERY,
+            flags: CTRL_CMD_HAS_DATA,
+            data: [pid as u64, 0],
+            ..Default::default()
+        };
+
+        ublk_ctrl_cmd(self, &data)
+    }
+
     /// Start ublk device
     ///
     /// # Arguments:
@@ -423,9 +456,13 @@ impl UblkCtrl {
     pub fn start_dev(&mut self, dev: &UblkDev) -> AnyRes<i32> {
         let params = dev.tgt.borrow();
 
-        self.set_params(&params.params)?;
-        self.flush_json()?;
-        self.start(unsafe { libc::getpid() as i32 })?;
+        if self.dev_info.state != UBLK_S_DEV_QUIESCED as u16 {
+            self.set_params(&params.params)?;
+            self.flush_json()?;
+            self.start(unsafe { libc::getpid() as i32 })?;
+        } else {
+            self.end_user_recover(unsafe { libc::getpid() as i32 })?;
+        }
 
         Ok(0)
     }
@@ -482,6 +519,17 @@ impl UblkCtrl {
 
         self.json = json;
     }
+
+    pub fn reload_json(&mut self) -> AnyRes<i32> {
+        let mut file = fs::File::open(self.run_path())?;
+        let mut json_str = String::new();
+
+        file.read_to_string(&mut json_str)?;
+        self.json = serde_json::from_str(&json_str)?;
+
+        Ok(0)
+    }
+
     /// Create queue thread handler(high level)
     ///
     /// # Arguments:
