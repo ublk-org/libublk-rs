@@ -325,6 +325,19 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Remove one device
+    ///
+    ///
+    /// Called when the user wants to remove one device really
+    ///
+    pub fn del_dev(&mut self) -> AnyRes<i32> {
+        self.del()?;
+        if std::path::Path::new(&self.run_path()).exists() {
+            fs::remove_file(self.run_path())?;
+        }
+        Ok(0)
+    }
+
     pub fn get_info(&mut self) -> AnyRes<i32> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_GET_DEV_INFO,
