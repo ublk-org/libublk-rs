@@ -3,6 +3,7 @@ mod tests {
     use anyhow::Result as AnyRes;
     use core::any::Any;
     use libublk::*;
+    use std::env;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -232,5 +233,99 @@ mod tests {
         .join()
         .unwrap();
         ublk_dealloc_buf(buf, size as usize, 4096);
+    }
+
+    fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
+        if let Err(_current_exe) = env::current_exe() {
+            None
+        } else {
+            env::current_exe().ok().map(|mut path| {
+                path.pop();
+                if path.ends_with("deps") {
+                    path.pop();
+                }
+                path
+            })
+        }
+    }
+
+    fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u16, timeout: u32) {
+        let mut count = 0;
+        let unit = 100_u32;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(unit as u64));
+
+            ctrl.get_info().unwrap();
+            if ctrl.dev_info.state == state {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                break;
+            }
+            count += unit;
+            assert!(count < timeout);
+        }
+    }
+
+    /// run examples/ramdisk recovery test
+    #[test]
+    fn test_ublk_ramdisk_recovery() {
+        use std::process::{Command, Stdio};
+
+        let tgt_dir = get_curr_bin_dir().unwrap();
+        let tmpfile = tempfile::NamedTempFile::new().unwrap();
+        let file = std::fs::File::create(tmpfile.path()).unwrap();
+
+        //println!("top dir: path {:?} {:?}", &tgt_dir, &file);
+        let rd_path = tgt_dir.display().to_string() + &"/examples/ramdisk".to_string();
+        let mut cmd = Command::new(&rd_path)
+            .args(["add"])
+            .stdout(Stdio::from(file))
+            .spawn()
+            .expect("fail to add ublk ramdisk");
+        cmd.wait().unwrap();
+
+        //this magic wait makes a difference
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
+
+        let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
+        let tid_regx = regex::Regex::new(r"queue 0 tid: (\d+)").unwrap();
+
+        let mut id = -1_i32;
+        if let Some(c) = id_regx.captures(&buf.as_str()) {
+            id = c.get(1).unwrap().as_str().parse().unwrap();
+        }
+
+        let mut tid = 0;
+        if let Some(c) = tid_regx.captures(&buf.as_str()) {
+            tid = c.get(1).unwrap().as_str().parse().unwrap();
+        }
+
+        let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
+        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_LIVE as u16, 2000);
+
+        //ublk block device should be observed now
+        let dev_path = format!("{}{}", libublk::BDEV_PATH, id);
+        assert!(Path::new(&dev_path).exists() == true);
+
+        //simulate one panic by sending KILL to queue pthread
+        unsafe {
+            libc::kill(tid, libc::SIGKILL);
+        }
+
+        //wait device becomes quiesced
+        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_QUIESCED as u16, 6000);
+
+        let file = std::fs::File::create(tmpfile.path()).unwrap();
+        //recover device
+        let mut cmd = Command::new(&rd_path)
+            .args(["recover", &id.to_string().as_str()])
+            .stdout(Stdio::from(file))
+            .spawn()
+            .expect("fail to recover ramdisk");
+        cmd.wait().unwrap();
+        //let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
+        //println!("{}", buf);
+        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_LIVE as u16, 5000);
+        ctrl.del_dev().unwrap();
     }
 }
