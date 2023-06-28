@@ -570,7 +570,7 @@ impl UblkCtrl {
             let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
             let _tid = Arc::clone(&tid);
             let _fn = f.clone();
-            let _affinity = affinity.clone();
+            let _affinity = affinity;
 
             q_threads.push(std::thread::spawn(move || {
                 let (lock, cvar) = &*_tid;
@@ -663,7 +663,7 @@ impl UblkDev {
             nr_fds: 0,
         };
 
-        let info = ctrl.dev_info.clone();
+        let info = ctrl.dev_info;
         let cdev_path = format!("{}{}", CDEV_PATH, info.dev_id);
         let cdev_file = fs::OpenOptions::new()
             .read(true)
@@ -1183,6 +1183,7 @@ impl UblkQueue<'_> {
 /// Note: This method is one high level API, and handles each queue in
 /// one dedicated thread. If your target won't take this approach, please
 /// don't use this API.
+#[allow(clippy::too_many_arguments)]
 pub fn ublk_tgt_worker<T, Q, W>(
     id: i32,
     nr_queues: u32,

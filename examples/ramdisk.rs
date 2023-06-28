@@ -122,10 +122,10 @@ fn test_add(_r: i32) {
             64,
             512_u32 * 1024,
             recover_flag,
-            if _r > 0 { false } else { true },
+            _r <= 0,
             || {
                 Box::new(RamdiskTgt {
-                    size: size,
+                    size,
                     start: buf_addr,
                 })
             },
