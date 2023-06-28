@@ -456,6 +456,7 @@ impl UblkCtrl {
     pub fn start_dev(&mut self, dev: &UblkDev) -> AnyRes<i32> {
         let params = dev.tgt.borrow();
 
+        self.get_info()?;
         if self.dev_info.state != UBLK_S_DEV_QUIESCED as u16 {
             self.set_params(&params.params)?;
             self.flush_json()?;
