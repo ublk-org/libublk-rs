@@ -166,6 +166,7 @@ fn test_add() {
             64,
             512_u32 * 1024,
             0,
+            true,
             || {
                 Box::new(LoopTgt {
                     back_file: std::fs::OpenOptions::new()

@@ -63,6 +63,7 @@ fn test_add() {
             64,
             512_u32 * 1024,
             0,
+            true,
             || Box::new(NullTgt {}),
             Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
             |dev_id| {

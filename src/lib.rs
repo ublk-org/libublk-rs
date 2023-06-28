@@ -1188,6 +1188,7 @@ pub fn ublk_tgt_worker<T, Q, W>(
     depth: u32,
     io_buf_bytes: u32,
     flags: u64,
+    for_add: bool,
     tgt_fn: T,
     q_fn: Arc<Q>,
     worker_fn: W,
@@ -1197,7 +1198,7 @@ where
     Q: Fn() -> Box<dyn UblkQueueImpl> + Send + Sync + 'static,
     W: Fn(i32) + Send + Sync + 'static,
 {
-    let mut ctrl = UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, true).unwrap();
+    let mut ctrl = UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();
     let ublk_dev = Arc::new(UblkDev::new(tgt_fn(), &mut ctrl).unwrap());
     let depth = ublk_dev.dev_info.queue_depth as u32;
 
