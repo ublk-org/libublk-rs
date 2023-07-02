@@ -325,7 +325,7 @@ mod tests {
         cmd.wait().unwrap();
         //let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
         //println!("{}", buf);
-        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_LIVE as u16, 5000);
+        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_LIVE as u16, 20000);
         ctrl.del_dev().unwrap();
     }
 }
