@@ -111,9 +111,11 @@ fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> AnyRes<i32> {
     ctrl.ring.submit_and_wait(1)?;
 
     let cqe = ctrl.ring.completion().next().expect("cqueue is empty");
-    match cqe.result() {
-        0 => Ok(0),
-        e => Err(anyhow::anyhow!(e)),
+    let res: i32 = cqe.result();
+    if res == 0 || res == -libc::EBUSY {
+        Ok(res)
+    } else {
+        Err(anyhow::anyhow!(res))
     }
 }
 
@@ -424,13 +426,32 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn start_user_recover(&mut self) -> AnyRes<i32> {
+    pub fn __start_user_recover(&mut self) -> AnyRes<i32> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_START_USER_RECOVERY,
             ..Default::default()
         };
 
         ublk_ctrl_cmd(self, &data)
+    }
+
+    pub fn start_user_recover(&mut self) -> AnyRes<i32> {
+        let mut count = 0u32;
+        let unit = 100_u32;
+
+        loop {
+            let res = self.__start_user_recover();
+            if let Ok(r) = res {
+                if r == -libc::EBUSY {
+                    std::thread::sleep(std::time::Duration::from_millis(unit as u64));
+                    count += unit;
+                    if count < 30000 {
+                        continue;
+                    }
+                }
+            }
+            return res;
+        }
     }
 
     pub fn end_user_recover(&mut self, pid: i32) -> AnyRes<i32> {
