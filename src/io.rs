@@ -32,6 +32,10 @@ fn is_target_io(user_data: u64) -> bool {
 
 impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
     #[inline(always)]
+    pub fn set_buf_addr(&mut self, addr: u64) {
+        self.1.set_buf_addr(addr)
+    }
+    #[inline(always)]
     pub fn get_ring(&mut self) -> &mut io_uring::IoUring<io_uring::squeue::Entry> {
         self.0
     }
@@ -324,7 +328,11 @@ const UBLK_IO_FREE: u32 = 1u32 << 2;
 const UBLK_IO_TO_QUEUE: u32 = 1u32 << 3;
 
 struct UblkIO {
-    buf_addr: *mut u8,
+    // for holding the allocated buffer
+    __buf_addr: *mut u8,
+
+    //for sending as io command
+    buf_addr: u64,
     flags: u32,
     result: i32,
 }
@@ -332,7 +340,13 @@ struct UblkIO {
 impl UblkIO {
     #[inline(always)]
     fn get_buf_addr(&self) -> *mut u8 {
-        self.buf_addr
+        self.__buf_addr
+    }
+
+    /// for zoned append command only
+    #[inline(always)]
+    pub fn set_buf_addr(&mut self, addr: u64) {
+        self.buf_addr = addr;
     }
 
     /// Complete this io command
@@ -428,7 +442,7 @@ impl Drop for UblkQueue<'_> {
         for i in 0..depth {
             let io = &self.ios[i as usize];
             super::ublk_dealloc_buf(
-                io.buf_addr,
+                io.__buf_addr,
                 dev.dev_info.max_io_buf_bytes as usize,
                 unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() },
             );
@@ -521,16 +535,21 @@ impl UblkQueue<'_> {
 
             // extra io slot needn't to allocate buffer
             if i < depth {
-                io.buf_addr =
-                    super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
-                        libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
-                    });
+                if (dev.dev_info.flags & (super::sys::UBLK_F_USER_COPY as u64)) == 0 {
+                    io.__buf_addr =
+                        super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
+                            libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+                        });
+                } else {
+                    io.__buf_addr = std::ptr::null_mut();
+                }
                 io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
             } else {
-                io.buf_addr = std::ptr::null_mut();
+                io.__buf_addr = std::ptr::null_mut();
                 io.flags = 0;
             }
             io.result = -1;
+            io.buf_addr = io.__buf_addr as u64;
         }
 
         let mut q = UblkQueue {
