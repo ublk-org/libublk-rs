@@ -785,6 +785,17 @@ union IOCmd {
 
 #[inline(always)]
 #[allow(arithmetic_overflow)]
+pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
+    assert!((offset & !UBLK_IO_BUF_BITS_MASK) == 0);
+
+    UBLKSRV_IO_BUF_OFFSET as u64
+        + ((((q_id as u64) << UBLK_QID_OFF) as u64)
+            | ((tag as u64) << UBLK_TAG_OFF) as u64
+            | offset as u64)
+}
+
+#[inline(always)]
+#[allow(arithmetic_overflow)]
 pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
     assert!((op >> 8) == 0 && (tgt_data >> 16) == 0);
 
