@@ -31,7 +31,7 @@ fn main() {
     const INCLUDE: &str = r#"
 #include <asm/ioctl.h>
 #include <linux/errno.h>
-#include <linux/ublk_cmd.h>
+#include "ublk_cmd.h"
 
 #ifdef UBLK_F_CMD_IOCTL_ENCODE
 #define MARK_FIX_753(req_name) const unsigned long int Fix753_##req_name = req_name;
