@@ -13,14 +13,15 @@ anyhow = {version = "1.0.66", features = ["default"]}
 
 [dependencies]
 libc = "0.2"
-anyhow = {version = "1.0.66", features = ["default"]}
 io-uring = "0.6.0"
 serde = {version = "1.0.99", features = ["derive"]}
 serde_json = "1.0.79"
 bitmaps = "3.2.0"
 log = {version = "0.4", features = ["release_max_level_off"]}
+thiserror = "1.0.43"
 
 [dev-dependencies]
 block-utils = "0.11.0"
 tempfile = "3.6.0"
 regex = "1.8.4"
+anyhow = {version = "1.0.66", features = ["default"]}

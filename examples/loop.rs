@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkQueue, UblkQueueImpl};
+use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
@@ -34,7 +34,7 @@ fn lo_file_size(f: &std::fs::File) -> Result<u64> {
 
 // setup loop target
 impl libublk::UblkTgtImpl for LoopTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value> {
+    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
         trace!("loop: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
 
@@ -82,7 +82,7 @@ impl libublk::UblkTgtImpl for LoopTgt {
     }
 }
 
-fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Result<i32> {
+fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Result<i32, UblkError> {
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
@@ -90,7 +90,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
     let buf_addr = q.get_buf_addr(tag);
 
     if op == libublk::UBLK_IO_OP_WRITE_ZEROES || op == libublk::UBLK_IO_OP_DISCARD {
-        return Err(anyhow::anyhow!("unexpected discard"));
+        return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
     match op {
@@ -124,7 +124,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
                 q.q_ring.submission().push(sqe).expect("submission fail");
             }
         }
-        _ => return Err(anyhow::anyhow!("unexpected op")),
+        _ => return Err(UblkError::OtherError(-libc::EINVAL)),
     }
 
     Ok(1)
@@ -132,7 +132,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
 
 // implement loop IO logic, and it is the main job for writing new ublk target
 impl libublk::UblkQueueImpl for LoopQueue {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32> {
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
 

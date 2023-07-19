@@ -1,6 +1,5 @@
-use anyhow::Result;
 use core::any::Any;
-use libublk::{UblkCtrl, UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::{UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgtImpl};
 use std::sync::Arc;
 
 struct RamdiskTgt {
@@ -12,7 +11,7 @@ struct RamdiskQueue {}
 
 // setup ramdisk target
 impl UblkTgtImpl for RamdiskTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value> {
+    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
         let info = dev.dev_info;
         let dev_size = self.size;
 
@@ -46,7 +45,7 @@ impl UblkTgtImpl for RamdiskTgt {
 
 // implement io logic, and it is the main job for writing new ublk target
 impl UblkQueueImpl for RamdiskQueue {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32> {
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
         let off = (iod.start_sector << 9) as u64;
@@ -71,7 +70,7 @@ impl UblkQueueImpl for RamdiskQueue {
                     bytes as usize,
                 );
             },
-            _ => return Err(anyhow::anyhow!("unexpected op")),
+            _ => return Err(UblkError::OtherError(-libc::EINVAL)),
         }
 
         q.complete_io(tag as u16, bytes as i32);

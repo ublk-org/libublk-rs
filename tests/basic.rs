@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use anyhow::Result as AnyRes;
     use core::any::Any;
     use libublk::*;
     use std::env;
@@ -21,7 +20,7 @@ mod tests {
 
     // setup null target
     impl UblkTgtImpl for NullTgt {
-        fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
+        fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
             let info = dev.dev_info;
             let dev_size = 250_u64 << 30;
 
@@ -56,7 +55,7 @@ mod tests {
 
     // implement io logic, and it is the main job for writing new ublk target
     impl UblkQueueImpl for NullQueue {
-        fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32> {
+        fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
             let iod = q.get_iod(tag);
             let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
@@ -106,7 +105,7 @@ mod tests {
 
     // setup ramdisk target
     impl UblkTgtImpl for RamdiskTgt {
-        fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value> {
+        fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
             let info = dev.dev_info;
             let dev_size = self.size;
 
@@ -141,7 +140,7 @@ mod tests {
 
     // implement io logic, and it is the main job for writing new ublk target
     impl UblkQueueImpl for RamdiskQueue {
-        fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32> {
+        fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
             let _iod = q.get_iod(tag);
             let iod = unsafe { &*_iod };
             let off = (iod.start_sector << 9) as u64;
@@ -167,7 +166,7 @@ mod tests {
                         bytes as usize,
                     );
                 },
-                _ => return Err(anyhow::anyhow!("unexpected op")),
+                _ => return Err(UblkError::OtherError(-libc::EINVAL)),
             }
 
             q.complete_io(tag as u16, bytes as i32);

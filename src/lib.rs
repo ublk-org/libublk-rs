@@ -2,7 +2,6 @@
 #![allow(non_snake_case, non_camel_case_types)]
 include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
 
-use anyhow::Result as AnyRes;
 use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
@@ -13,6 +12,33 @@ use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Condvar, Mutex};
 use std::{env, fs};
+
+#[derive(thiserror::Error, Debug)]
+pub enum UblkError {
+    #[error("failed to read the key file")]
+    UringSubmissionError(#[source] std::io::Error),
+
+    #[error("failed to push SQE to uring")]
+    UringPushError(#[from] squeue::PushError),
+
+    #[error("io_uring IO failure")]
+    UringIOError(i32),
+
+    #[error("json failure")]
+    JsonError(#[from] serde_json::Error),
+
+    #[error("mmap failure")]
+    MmapError(String),
+
+    #[error("queue down failure")]
+    QueueIsDown(String),
+
+    #[error("other IO failure")]
+    OtherIOError(#[source] std::io::Error),
+
+    #[error("other failure")]
+    OtherError(i32),
+}
 
 const CTRL_PATH: &str = "/dev/ublk-control";
 pub const CDEV_PATH: &str = "/dev/ublkc";
@@ -102,20 +128,25 @@ fn ublk_ctrl_prep_cmd(fd: i32, dev_id: u32, data: &UblkCtrlCmdData) -> squeue::E
         .build()
 }
 
-fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> AnyRes<i32> {
+fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
     let sqe = ublk_ctrl_prep_cmd(ctrl.file.as_raw_fd(), ctrl.dev_info.dev_id, data);
 
     unsafe {
-        ctrl.ring.submission().push(&sqe).expect("submission fail");
+        ctrl.ring
+            .submission()
+            .push(&sqe)
+            .map_err(UblkError::UringPushError)?;
     }
-    ctrl.ring.submit_and_wait(1)?;
+    ctrl.ring
+        .submit_and_wait(1)
+        .map_err(UblkError::UringSubmissionError)?;
 
     let cqe = ctrl.ring.completion().next().expect("cqueue is empty");
     let res: i32 = cqe.result();
     if res == 0 || res == -libc::EBUSY {
         Ok(res)
     } else {
-        Err(anyhow::anyhow!(res))
+        Err(UblkError::UringIOError(res))
     }
 }
 
@@ -178,8 +209,10 @@ impl UblkCtrl {
         io_buf_bytes: u32,
         flags: u64,
         for_add: bool,
-    ) -> AnyRes<UblkCtrl> {
-        let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder().build(16)?;
+    ) -> Result<UblkCtrl, UblkError> {
+        let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
+            .build(16)
+            .map_err(UblkError::OtherIOError)?;
         let info = ublksrv_ctrl_dev_info {
             nr_hw_queues: nr_queues as u16,
             queue_depth: depth as u16,
@@ -192,7 +225,8 @@ impl UblkCtrl {
         let fd = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(CTRL_PATH)?;
+            .open(CTRL_PATH)
+            .map_err(UblkError::OtherIOError)?;
 
         let mut dev = UblkCtrl {
             file: fd,
@@ -220,7 +254,7 @@ impl UblkCtrl {
         }
     }
 
-    pub fn get_queue_tid(&self, qid: u32) -> AnyRes<i32> {
+    pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
         let queues = &self.json["queues"];
         let queue = &queues[qid.to_string()];
         let this_queue: Result<queue_affinity_json, _> = serde_json::from_value(queue.clone());
@@ -228,7 +262,7 @@ impl UblkCtrl {
         if let Ok(p) = this_queue {
             Ok(p.tid.try_into().unwrap())
         } else {
-            Err(anyhow::anyhow!("downcast failed"))
+            Err(UblkError::OtherError(-libc::EEXIST))
         }
     }
 
@@ -319,7 +353,7 @@ impl UblkCtrl {
         format!("{}/{:04}.json", UblkCtrl::run_dir(), self.dev_info.dev_id)
     }
 
-    fn add(&mut self) -> AnyRes<i32> {
+    fn add(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_ADD_DEV,
             flags: CTRL_CMD_HAS_BUF,
@@ -331,7 +365,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn del(&mut self) -> AnyRes<i32> {
+    pub fn del(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_DEL_DEV,
             ..Default::default()
@@ -345,15 +379,15 @@ impl UblkCtrl {
     ///
     /// Called when the user wants to remove one device really
     ///
-    pub fn del_dev(&mut self) -> AnyRes<i32> {
+    pub fn del_dev(&mut self) -> Result<i32, UblkError> {
         self.del()?;
         if std::path::Path::new(&self.run_path()).exists() {
-            fs::remove_file(self.run_path())?;
+            fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
         }
         Ok(0)
     }
 
-    pub fn get_info(&mut self) -> AnyRes<i32> {
+    pub fn get_info(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_GET_DEV_INFO,
             flags: CTRL_CMD_HAS_BUF,
@@ -365,7 +399,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn start(&mut self, pid: i32) -> AnyRes<i32> {
+    pub fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_START_DEV,
             flags: CTRL_CMD_HAS_DATA,
@@ -376,7 +410,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn stop(&mut self) -> AnyRes<i32> {
+    pub fn stop(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_STOP_DEV,
             ..Default::default()
@@ -386,7 +420,7 @@ impl UblkCtrl {
     }
 
     /// Can't pass params by reference(&mut), why?
-    pub fn get_params(&mut self, mut params: ublk_params) -> AnyRes<ublk_params> {
+    pub fn get_params(&mut self, mut params: ublk_params) -> Result<ublk_params, UblkError> {
         params.len = core::mem::size_of::<ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_GET_PARAMS,
@@ -400,7 +434,7 @@ impl UblkCtrl {
         Ok(params)
     }
 
-    pub fn set_params(&mut self, params: &ublk_params) -> AnyRes<i32> {
+    pub fn set_params(&mut self, params: &ublk_params) -> Result<i32, UblkError> {
         let mut p = *params;
 
         p.len = core::mem::size_of::<ublk_params>() as u32;
@@ -415,7 +449,11 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> AnyRes<i32> {
+    pub fn get_queue_affinity(
+        &mut self,
+        q: u32,
+        bm: &mut UblkQueueAffinity,
+    ) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_GET_QUEUE_AFFINITY,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA,
@@ -426,7 +464,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn __start_user_recover(&mut self) -> AnyRes<i32> {
+    pub fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_START_USER_RECOVERY,
             ..Default::default()
@@ -435,7 +473,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn start_user_recover(&mut self) -> AnyRes<i32> {
+    pub fn start_user_recover(&mut self) -> Result<i32, UblkError> {
         let mut count = 0u32;
         let unit = 100_u32;
 
@@ -454,7 +492,7 @@ impl UblkCtrl {
         }
     }
 
-    pub fn end_user_recover(&mut self, pid: i32) -> AnyRes<i32> {
+    pub fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: UBLK_CMD_END_USER_RECOVERY,
             flags: CTRL_CMD_HAS_DATA,
@@ -474,7 +512,7 @@ impl UblkCtrl {
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
     ///
-    pub fn start_dev(&mut self, dev: &UblkDev) -> AnyRes<i32> {
+    pub fn start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
         let params = dev.tgt.borrow();
 
         self.get_info()?;
@@ -497,22 +535,24 @@ impl UblkCtrl {
     ///
     /// Remove json export, and send stop command to control device
     ///
-    pub fn stop_dev(&mut self, _dev: &UblkDev) -> AnyRes<i32> {
+    pub fn stop_dev(&mut self, _dev: &UblkDev) -> Result<i32, UblkError> {
         if self.for_add && std::path::Path::new(&self.run_path()).exists() {
-            fs::remove_file(self.run_path())?;
+            fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
         }
         self.stop()
     }
 
-    pub fn flush_json(&mut self) -> AnyRes<i32> {
+    pub fn flush_json(&mut self) -> Result<i32, UblkError> {
         let run_path = self.run_path();
 
         if let Some(parent_dir) = std::path::Path::new(&run_path).parent() {
-            fs::create_dir_all(parent_dir)?;
+            fs::create_dir_all(parent_dir).map_err(UblkError::OtherIOError)?;
         }
-        let mut run_file = fs::File::create(&run_path)?;
+        let mut run_file = fs::File::create(&run_path).map_err(UblkError::OtherIOError)?;
 
-        run_file.write_all(self.json.to_string().as_bytes())?;
+        run_file
+            .write_all(self.json.to_string().as_bytes())
+            .map_err(UblkError::OtherIOError)?;
         Ok(0)
     }
 
@@ -542,12 +582,13 @@ impl UblkCtrl {
         self.json = json;
     }
 
-    pub fn reload_json(&mut self) -> AnyRes<i32> {
-        let mut file = fs::File::open(self.run_path())?;
+    pub fn reload_json(&mut self) -> Result<i32, UblkError> {
+        let mut file = fs::File::open(self.run_path()).map_err(UblkError::OtherIOError)?;
         let mut json_str = String::new();
 
-        file.read_to_string(&mut json_str)?;
-        self.json = serde_json::from_str(&json_str)?;
+        file.read_to_string(&mut json_str)
+            .map_err(UblkError::OtherIOError)?;
+        self.json = serde_json::from_str(&json_str).map_err(UblkError::JsonError)?;
 
         Ok(0)
     }
@@ -674,7 +715,7 @@ impl UblkDev {
     /// ublk device is abstraction for target, and prepare for setting
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
-    pub fn new(ops: Box<dyn UblkTgtImpl>, ctrl: &mut UblkCtrl) -> AnyRes<UblkDev> {
+    pub fn new(ops: Box<dyn UblkTgtImpl>, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError> {
         let tgt = UblkTgt {
             tgt_type: ops.tgt_type().to_string(),
             ..Default::default()
@@ -689,7 +730,8 @@ impl UblkDev {
         let cdev_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(cdev_path)?;
+            .open(cdev_path)
+            .map_err(UblkError::OtherIOError)?;
 
         data.fds[0] = cdev_file.as_raw_fd();
         data.nr_fds = 1;
@@ -709,12 +751,11 @@ impl UblkDev {
     }
 
     //private method for drop
-    fn deinit_cdev(&mut self) -> AnyRes<i32> {
+    fn deinit_cdev(&mut self) {
         let id = self.dev_info.dev_id;
 
         self.ops.deinit_tgt(self);
         info!("dev {} deinitialized", id);
-        Ok(0)
     }
 }
 
@@ -730,12 +771,12 @@ impl UblkDev {
 /// (https://bennett.dev/rust/downcast-trait-object/)
 ///
 #[inline(always)]
-pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> AnyRes<&T> {
+pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> Result<&T, UblkError> {
     let a = dev.ops.as_any();
 
     let tgt: &T = match a.downcast_ref::<T>() {
         Some(b) => b,
-        _ => return Err(anyhow::anyhow!("downcast failed")),
+        _ => return Err(UblkError::OtherError(-libc::ENOENT)),
     };
 
     Ok(tgt)
@@ -743,17 +784,15 @@ pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> AnyRes<&T> {
 
 impl Drop for UblkDev {
     fn drop(&mut self) {
-        if let Err(err) = self.deinit_cdev() {
-            error!("deinit cdev {} failed {}", self.dev_info.dev_id, err);
-        }
+        self.deinit_cdev();
     }
 }
 
 pub trait UblkQueueImpl {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> AnyRes<i32>;
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError>;
     #[inline(always)]
     fn tgt_io_done(&self, _q: &mut UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
-    fn setup_queue(&mut self, _q: &UblkQueue, _dev: &UblkDev) -> AnyRes<i32> {
+    fn setup_queue(&mut self, _q: &UblkQueue, _dev: &UblkDev) -> Result<i32, UblkError> {
         Ok(0)
     }
 }
@@ -763,7 +802,7 @@ pub trait UblkTgtImpl {
     ///
     /// Initialize this target, dev_data is usually built from command line, so
     /// it is produced and consumed by target code.
-    fn init_tgt(&self, dev: &UblkDev) -> AnyRes<serde_json::Value>;
+    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError>;
 
     /// Deinit this target
     ///
@@ -913,18 +952,20 @@ impl UblkQueue<'_> {
         sq_depth: u32,
         cq_depth: u32,
         _ring_flags: u64,
-    ) -> AnyRes<UblkQueue> {
+    ) -> Result<UblkQueue, UblkError> {
         let td = dev.tdata.borrow();
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth)
             .setup_coop_taskrun()
-            .build(sq_depth)?;
+            .build(sq_depth)
+            .map_err(UblkError::OtherIOError)?;
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
 
         ring.submitter()
-            .register_files(&td.fds[0..td.nr_fds as usize])?;
+            .register_files(&td.fds[0..td.nr_fds as usize])
+            .map_err(UblkError::OtherIOError)?;
 
         let off = UBLKSRV_CMD_BUF_OFFSET as i64
             + q_id as i64
@@ -941,7 +982,9 @@ impl UblkQueue<'_> {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(anyhow::anyhow!("io command buf mapping failed"));
+            return Err(UblkError::MmapError(
+                "io cmd buffer mmap failed".to_string(),
+            ));
         }
 
         let mut ios = Vec::<UblkIO>::with_capacity(depth as usize);
@@ -1159,7 +1202,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> AnyRes<i32> {
+    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> Result<i32, UblkError> {
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
@@ -1170,10 +1213,13 @@ impl UblkQueue<'_> {
         );
 
         if self.queue_is_done() && self.q_ring.submission().is_empty() {
-            return Err(anyhow::anyhow!("queue is down"));
+            return Err(UblkError::QueueIsDown("queue is done".to_string()));
         }
 
-        let ret = self.q_ring.submit_and_wait(1)?;
+        let ret = self
+            .q_ring
+            .submit_and_wait(1)
+            .map_err(UblkError::UringSubmissionError)?;
         let reapped = self.reap_events_uring(ops);
 
         info!(
@@ -1226,7 +1272,7 @@ pub fn ublk_tgt_worker<T, Q, W>(
     tgt_fn: T,
     q_fn: Arc<Q>,
     worker_fn: W,
-) -> AnyRes<std::thread::JoinHandle<()>>
+) -> Result<std::thread::JoinHandle<()>, UblkError>
 where
     T: Fn() -> Box<dyn UblkTgtImpl> + Send + Sync,
     Q: Fn() -> Box<dyn UblkQueueImpl> + Send + Sync + 'static,
