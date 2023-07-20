@@ -795,6 +795,8 @@ pub trait UblkQueueImpl {
     fn setup_queue(&mut self, _q: &UblkQueue, _dev: &UblkDev) -> Result<i32, UblkError> {
         Ok(0)
     }
+    #[inline(always)]
+    fn handle_io_background(&self, _q: &UblkQueue, _nr_queued: usize) {}
 }
 
 pub trait UblkTgtImpl {
@@ -1222,6 +1224,10 @@ impl UblkQueue<'_> {
             .map_err(UblkError::UringSubmissionError)?;
         let reapped = self.reap_events_uring(ops);
 
+        {
+            let nr_queued = self.q_ring.submission().len();
+            ops.handle_io_background(self, nr_queued);
+        }
         info!(
             "submit result {}, reapped {} stop {} idle {}",
             ret,
