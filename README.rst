@@ -19,6 +19,8 @@ Related documentations
 
 `ublk doc: <https://github.com/ming1/ubdsrv/blob/master/doc/external_links.rst>`
 
+`ublk introduction: <https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf>`
+
 Examples
 ========
 
