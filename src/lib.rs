@@ -815,9 +815,6 @@ pub trait UblkTgtImpl {
     fn as_any(&self) -> &dyn Any;
 }
 
-#[repr(C, align(512))]
-struct ublk_dio_buf([u8; 512]);
-
 union IOCmd {
     cmd: ublksrv_io_cmd,
     buf: [u8; 16],
