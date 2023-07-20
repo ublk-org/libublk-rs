@@ -30,7 +30,6 @@ impl libublk::UblkTgtImpl for NullTgt {
 
         Ok(serde_json::json!({}))
     }
-    fn deinit_tgt(&self, _dev: &UblkDev) {}
     fn tgt_type(&self) -> &'static str {
         "null"
     }

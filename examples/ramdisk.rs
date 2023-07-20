@@ -34,7 +34,6 @@ impl UblkTgtImpl for RamdiskTgt {
 
         Ok(serde_json::json!({}))
     }
-    fn deinit_tgt(&self, _dev: &UblkDev) {}
     fn tgt_type(&self) -> &'static str {
         "ramdisk"
     }

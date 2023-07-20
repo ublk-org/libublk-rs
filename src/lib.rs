@@ -806,7 +806,9 @@ pub trait UblkTgtImpl {
     /// Deinit this target
     ///
     /// Release target specific resource.
-    fn deinit_tgt(&self, dev: &UblkDev);
+    fn deinit_tgt(&self, dev: &UblkDev) {
+        trace!("{}: deinit_tgt {}", self.tgt_type(), dev.dev_info.dev_id);
+    }
 
     fn tgt_type(&self) -> &'static str;
 
