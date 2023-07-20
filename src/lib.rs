@@ -792,9 +792,6 @@ pub trait UblkQueueImpl {
     fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError>;
     #[inline(always)]
     fn tgt_io_done(&self, _q: &mut UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
-    fn setup_queue(&mut self, _q: &UblkQueue, _dev: &UblkDev) -> Result<i32, UblkError> {
-        Ok(0)
-    }
     #[inline(always)]
     fn handle_io_background(&self, _q: &UblkQueue, _nr_queued: usize) {}
 }
