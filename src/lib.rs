@@ -774,12 +774,10 @@ impl UblkDev {
 pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> Result<&T, UblkError> {
     let a = dev.ops.as_any();
 
-    let tgt: &T = match a.downcast_ref::<T>() {
-        Some(b) => b,
-        _ => return Err(UblkError::OtherError(-libc::ENOENT)),
-    };
-
-    Ok(tgt)
+    match a.downcast_ref::<T>() {
+        Some(b) => Ok(b),
+        _ => Err(UblkError::OtherError(-libc::ENOENT)),
+    }
 }
 
 impl Drop for UblkDev {
