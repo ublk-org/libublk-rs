@@ -834,10 +834,7 @@ pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
 pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
     assert!((op >> 8) == 0 && (tgt_data >> 16) == 0);
 
-    match is_target_io {
-        true => tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | (1_u64 << 63),
-        false => tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64,
-    }
+    tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
 }
 
 #[inline(always)]
