@@ -14,9 +14,9 @@ impl libublk::UblkTgtImpl for NullTgt {
         let mut tgt = dev.tgt.borrow_mut();
 
         tgt.dev_size = dev_size;
-        tgt.params = libublk::ublk_params {
-            types: libublk::UBLK_PARAM_TYPE_BASIC,
-            basic: libublk::ublk_param_basic {
+        tgt.params = libublk::sys::ublk_params {
+            types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
+            basic: libublk::sys::ublk_param_basic {
                 logical_bs_shift: 9,
                 physical_bs_shift: 12,
                 io_opt_shift: 12,

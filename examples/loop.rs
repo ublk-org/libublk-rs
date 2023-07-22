@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::{ublksrv_io_desc, UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
+use libublk::{sys::ublksrv_io_desc, UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
@@ -53,9 +53,9 @@ impl libublk::UblkTgtImpl for LoopTgt {
         tgt.dev_size = lo_file_size(&self.back_file).unwrap();
 
         //todo: figure out correct block size
-        tgt.params = libublk::ublk_params {
-            types: libublk::UBLK_PARAM_TYPE_BASIC,
-            basic: libublk::ublk_param_basic {
+        tgt.params = libublk::sys::ublk_params {
+            types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
+            basic: libublk::sys::ublk_param_basic {
                 logical_bs_shift: 9,
                 physical_bs_shift: 12,
                 io_opt_shift: 12,
@@ -86,12 +86,12 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
     let data = libublk::build_user_data(tag as u16, op, 0, true);
     let buf_addr = q.get_buf_addr(tag);
 
-    if op == libublk::UBLK_IO_OP_WRITE_ZEROES || op == libublk::UBLK_IO_OP_DISCARD {
+    if op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES || op == libublk::sys::UBLK_IO_OP_DISCARD {
         return Err(UblkError::OtherError(-libc::EINVAL));
     }
 
     match op {
-        libublk::UBLK_IO_OP_FLUSH => {
+        libublk::sys::UBLK_IO_OP_FLUSH => {
             let sqe = &opcode::SyncFileRange::new(types::Fixed(1), bytes)
                 .offset(off)
                 .build()
@@ -101,7 +101,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
                 q.q_ring.submission().push(sqe).expect("submission fail");
             }
         }
-        libublk::UBLK_IO_OP_READ => {
+        libublk::sys::UBLK_IO_OP_READ => {
             let sqe = &opcode::Read::new(types::Fixed(1), buf_addr, bytes)
                 .offset(off)
                 .build()
@@ -111,7 +111,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
                 q.q_ring.submission().push(sqe).expect("submission fail");
             }
         }
-        libublk::UBLK_IO_OP_WRITE => {
+        libublk::sys::UBLK_IO_OP_WRITE => {
             let sqe = &opcode::Write::new(types::Fixed(1), buf_addr, bytes)
                 .offset(off)
                 .build()

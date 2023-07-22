@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod tests {
     use core::any::Any;
-    use libublk::*;
+    use libublk::sys;
+    use libublk::{UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgtImpl};
     use std::env;
     use std::path::Path;
     use std::sync::Arc;
@@ -9,7 +10,7 @@ mod tests {
     #[test]
     fn add_ctrl_dev() {
         let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, true).unwrap();
-        let dev_path = format!("{}{}", CDEV_PATH, ctrl.dev_info.dev_id);
+        let dev_path = format!("{}{}", libublk::CDEV_PATH, ctrl.dev_info.dev_id);
 
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(Path::new(&dev_path).exists() == true);
@@ -27,9 +28,9 @@ mod tests {
             let mut tgt = dev.tgt.borrow_mut();
 
             tgt.dev_size = dev_size;
-            tgt.params = ublk_params {
-                types: UBLK_PARAM_TYPE_BASIC,
-                basic: ublk_param_basic {
+            tgt.params = sys::ublk_params {
+                types: sys::UBLK_PARAM_TYPE_BASIC,
+                basic: sys::ublk_param_basic {
                     logical_bs_shift: 9,
                     physical_bs_shift: 12,
                     io_opt_shift: 12,
@@ -66,7 +67,7 @@ mod tests {
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
-        ublk_tgt_worker(
+        libublk::ublk_tgt_worker(
             -1,
             2,
             64,
@@ -77,7 +78,7 @@ mod tests {
             Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
-                let dev_path = format!("{}{}", BDEV_PATH, dev_id);
+                let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -111,9 +112,9 @@ mod tests {
             let mut tgt = dev.tgt.borrow_mut();
 
             tgt.dev_size = dev_size;
-            tgt.params = ublk_params {
-                types: UBLK_PARAM_TYPE_BASIC,
-                basic: ublk_param_basic {
+            tgt.params = sys::ublk_params {
+                types: sys::UBLK_PARAM_TYPE_BASIC,
+                basic: sys::ublk_param_basic {
                     logical_bs_shift: 12,
                     physical_bs_shift: 12,
                     io_opt_shift: 12,
@@ -144,20 +145,20 @@ mod tests {
             let off = (iod.start_sector << 9) as u64;
             let bytes = (iod.nr_sectors << 9) as u32;
             let op = iod.op_flags & 0xff;
-            let tgt = ublk_tgt_data_from_queue::<RamdiskTgt>(q.dev).unwrap();
+            let tgt = libublk::ublk_tgt_data_from_queue::<RamdiskTgt>(q.dev).unwrap();
             let start = tgt.start;
             let buf_addr = q.get_buf_addr(tag);
 
             match op {
-                UBLK_IO_OP_FLUSH => {}
-                UBLK_IO_OP_READ => unsafe {
+                sys::UBLK_IO_OP_FLUSH => {}
+                sys::UBLK_IO_OP_READ => unsafe {
                     libc::memcpy(
                         buf_addr as *mut libc::c_void,
                         (start + off) as *mut libc::c_void,
                         bytes as usize,
                     );
                 },
-                UBLK_IO_OP_WRITE => unsafe {
+                sys::UBLK_IO_OP_WRITE => unsafe {
                     libc::memcpy(
                         (start + off) as *mut libc::c_void,
                         buf_addr as *mut libc::c_void,
@@ -178,10 +179,10 @@ mod tests {
     #[test]
     fn test_ublk_ramdisk() {
         let size = 32_u64 << 20;
-        let buf = ublk_alloc_buf(size as usize, 4096);
+        let buf = libublk::ublk_alloc_buf(size as usize, 4096);
         let buf_addr = buf as u64;
 
-        ublk_tgt_worker(
+        libublk::ublk_tgt_worker(
             -1,
             1,
             64,
@@ -197,7 +198,7 @@ mod tests {
             Arc::new(|| Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>),
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
-                let dev_path = format!("{}{}", BDEV_PATH, dev_id);
+                let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -229,7 +230,7 @@ mod tests {
         .unwrap()
         .join()
         .unwrap();
-        ublk_dealloc_buf(buf, size as usize, 4096);
+        libublk::ublk_dealloc_buf(buf, size as usize, 4096);
     }
 
     fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
@@ -298,7 +299,7 @@ mod tests {
         }
 
         let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
-        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_LIVE as u16, 2000);
+        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
 
         //ublk block device should be observed now
         let dev_path = format!("{}{}", libublk::BDEV_PATH, id);
@@ -310,7 +311,7 @@ mod tests {
         }
 
         //wait device becomes quiesced
-        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_QUIESCED as u16, 6000);
+        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_QUIESCED as u16, 6000);
 
         let file = std::fs::File::create(tmpfile.path()).unwrap();
         //recover device
@@ -322,7 +323,7 @@ mod tests {
         cmd.wait().unwrap();
         //let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
         //println!("{}", buf);
-        ublk_state_wait_until(&mut ctrl, libublk::UBLK_S_DEV_LIVE as u16, 20000);
+        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
         ctrl.del_dev().unwrap();
     }
 }

@@ -1,17 +1,16 @@
-#![allow(dead_code)]
-#![allow(non_snake_case, non_camel_case_types)]
-include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
-
 use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
+use serde::{Deserialize, Serialize};
 use std::alloc::{alloc, dealloc, Layout};
 use std::any::Any;
 use std::cell::RefCell;
+use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Condvar, Mutex};
-use std::{env, fs};
+
+pub mod sys;
 
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
@@ -84,7 +83,7 @@ impl UblkQueueAffinity {
 }
 
 union CtrlCmd {
-    ctrl_cmd: ublksrv_ctrl_cmd,
+    ctrl_cmd: sys::ublksrv_ctrl_cmd,
     buf: [u8; 80],
 }
 
@@ -101,7 +100,7 @@ struct UblkCtrlCmdData {
 }
 
 fn ublk_ctrl_prep_cmd(fd: i32, dev_id: u32, data: &UblkCtrlCmdData) -> squeue::Entry128 {
-    let cmd = ublksrv_ctrl_cmd {
+    let cmd = sys::ublksrv_ctrl_cmd {
         addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
             data.addr
         } else {
@@ -151,7 +150,7 @@ fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> Result<i32, Ubl
 }
 
 #[derive(Debug, Deserialize)]
-struct queue_affinity_json {
+struct QueueAffinityJson {
     affinity: Vec<u32>,
     qid: u32,
     tid: u32,
@@ -168,7 +167,7 @@ struct queue_affinity_json {
 /// 3) exporting device as json file
 pub struct UblkCtrl {
     file: fs::File,
-    pub dev_info: ublksrv_ctrl_dev_info,
+    pub dev_info: sys::ublksrv_ctrl_dev_info,
     pub json: serde_json::Value,
     for_add: bool,
     ring: IoUring<squeue::Entry128>,
@@ -213,7 +212,7 @@ impl UblkCtrl {
         let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
             .build(16)
             .map_err(UblkError::OtherIOError)?;
-        let info = ublksrv_ctrl_dev_info {
+        let info = sys::ublksrv_ctrl_dev_info {
             nr_hw_queues: nr_queues as u16,
             queue_depth: depth as u16,
             max_io_buf_bytes: io_buf_bytes,
@@ -247,9 +246,9 @@ impl UblkCtrl {
 
     fn dev_state_desc(&self) -> String {
         match self.dev_info.state as u32 {
-            UBLK_S_DEV_DEAD => "DEAD".to_string(),
-            UBLK_S_DEV_LIVE => "LIVE".to_string(),
-            UBLK_S_DEV_QUIESCED => "QUIESCED".to_string(),
+            sys::UBLK_S_DEV_DEAD => "DEAD".to_string(),
+            sys::UBLK_S_DEV_LIVE => "LIVE".to_string(),
+            sys::UBLK_S_DEV_QUIESCED => "QUIESCED".to_string(),
             _ => "UNKNOWN".to_string(),
         }
     }
@@ -257,7 +256,7 @@ impl UblkCtrl {
     pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
         let queues = &self.json["queues"];
         let queue = &queues[qid.to_string()];
-        let this_queue: Result<queue_affinity_json, _> = serde_json::from_value(queue.clone());
+        let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
 
         if let Ok(p) = this_queue {
             Ok(p.tid.try_into().unwrap())
@@ -282,12 +281,12 @@ impl UblkCtrl {
 
         for i in 0..self.dev_info.nr_hw_queues {
             let queue = &queues[i.to_string()];
-            let this_queue: Result<queue_affinity_json, _> = serde_json::from_value(queue.clone());
+            let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
 
             if let Ok(p) = this_queue {
                 println!(
                     "\tqueue {} tid: {} affinity({})",
-                    i,
+                    p.qid,
                     p.tid,
                     p.affinity
                         .iter()
@@ -308,7 +307,7 @@ impl UblkCtrl {
         println!("\ttarget_data {}", &json_value["target_data"]);
     }
     pub fn dump(&mut self) {
-        let mut p = ublk_params {
+        let mut p = sys::ublk_params {
             ..Default::default()
         };
 
@@ -355,10 +354,10 @@ impl UblkCtrl {
 
     fn add(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_ADD_DEV,
+            cmd_op: sys::UBLK_CMD_ADD_DEV,
             flags: CTRL_CMD_HAS_BUF,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
-            len: core::mem::size_of::<ublksrv_ctrl_dev_info>() as u32,
+            len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             data: [0, 0],
         };
 
@@ -367,7 +366,7 @@ impl UblkCtrl {
 
     pub fn del(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_DEL_DEV,
+            cmd_op: sys::UBLK_CMD_DEL_DEV,
             ..Default::default()
         };
 
@@ -389,10 +388,10 @@ impl UblkCtrl {
 
     pub fn get_info(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_GET_DEV_INFO,
+            cmd_op: sys::UBLK_CMD_GET_DEV_INFO,
             flags: CTRL_CMD_HAS_BUF,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
-            len: core::mem::size_of::<ublksrv_ctrl_dev_info>() as u32,
+            len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             ..Default::default()
         };
 
@@ -401,7 +400,7 @@ impl UblkCtrl {
 
     pub fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_START_DEV,
+            cmd_op: sys::UBLK_CMD_START_DEV,
             flags: CTRL_CMD_HAS_DATA,
             data: [pid as u64, 0],
             ..Default::default()
@@ -412,7 +411,7 @@ impl UblkCtrl {
 
     pub fn stop(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_STOP_DEV,
+            cmd_op: sys::UBLK_CMD_STOP_DEV,
             ..Default::default()
         };
 
@@ -420,10 +419,13 @@ impl UblkCtrl {
     }
 
     /// Can't pass params by reference(&mut), why?
-    pub fn get_params(&mut self, mut params: ublk_params) -> Result<ublk_params, UblkError> {
-        params.len = core::mem::size_of::<ublk_params>() as u32;
+    pub fn get_params(
+        &mut self,
+        mut params: sys::ublk_params,
+    ) -> Result<sys::ublk_params, UblkError> {
+        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_GET_PARAMS,
+            cmd_op: sys::UBLK_CMD_GET_PARAMS,
             flags: CTRL_CMD_HAS_BUF,
             addr: std::ptr::addr_of!(params) as u64,
             len: params.len,
@@ -434,12 +436,12 @@ impl UblkCtrl {
         Ok(params)
     }
 
-    pub fn set_params(&mut self, params: &ublk_params) -> Result<i32, UblkError> {
+    pub fn set_params(&mut self, params: &sys::ublk_params) -> Result<i32, UblkError> {
         let mut p = *params;
 
-        p.len = core::mem::size_of::<ublk_params>() as u32;
+        p.len = core::mem::size_of::<sys::ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_SET_PARAMS,
+            cmd_op: sys::UBLK_CMD_SET_PARAMS,
             flags: CTRL_CMD_HAS_BUF,
             addr: std::ptr::addr_of!(p) as u64,
             len: p.len,
@@ -455,7 +457,7 @@ impl UblkCtrl {
         bm: &mut UblkQueueAffinity,
     ) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_GET_QUEUE_AFFINITY,
+            cmd_op: sys::UBLK_CMD_GET_QUEUE_AFFINITY,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA,
             addr: bm.addr() as u64,
             data: [q as u64, 0],
@@ -466,7 +468,7 @@ impl UblkCtrl {
 
     pub fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_START_USER_RECOVERY,
+            cmd_op: sys::UBLK_CMD_START_USER_RECOVERY,
             ..Default::default()
         };
 
@@ -494,7 +496,7 @@ impl UblkCtrl {
 
     pub fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: UBLK_CMD_END_USER_RECOVERY,
+            cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
             flags: CTRL_CMD_HAS_DATA,
             data: [pid as u64, 0],
             ..Default::default()
@@ -516,7 +518,7 @@ impl UblkCtrl {
         let params = dev.tgt.borrow();
 
         self.get_info()?;
-        if self.dev_info.state != UBLK_S_DEV_QUIESCED as u16 {
+        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             self.set_params(&params.params)?;
             self.flush_json()?;
             self.start(unsafe { libc::getpid() as i32 })?;
@@ -678,7 +680,7 @@ pub struct UblkTgt {
     pub tgt_type: String,
     pub dev_size: u64,
     //const struct ublk_tgt_ops *ops;
-    pub params: ublk_params,
+    pub params: sys::ublk_params,
 }
 
 pub struct UblkTgtData {
@@ -687,7 +689,7 @@ pub struct UblkTgtData {
 }
 
 pub struct UblkDev {
-    pub dev_info: ublksrv_ctrl_dev_info,
+    pub dev_info: sys::ublksrv_ctrl_dev_info,
 
     // not like C's ops, here ops actually points to one object which
     // implements the trait of UblkTgtImpl
@@ -814,18 +816,18 @@ pub trait UblkTgtImpl {
 }
 
 union IOCmd {
-    cmd: ublksrv_io_cmd,
+    cmd: sys::ublksrv_io_cmd,
     buf: [u8; 16],
 }
 
 #[inline(always)]
 #[allow(arithmetic_overflow)]
 pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
-    assert!((offset & !UBLK_IO_BUF_BITS_MASK) == 0);
+    assert!((offset & !sys::UBLK_IO_BUF_BITS_MASK) == 0);
 
-    UBLKSRV_IO_BUF_OFFSET as u64
-        + ((((q_id as u64) << UBLK_QID_OFF) as u64)
-            | ((tag as u64) << UBLK_TAG_OFF) as u64
+    sys::UBLKSRV_IO_BUF_OFFSET as u64
+        + ((((q_id as u64) << sys::UBLK_QID_OFF) as u64)
+            | ((tag as u64) << sys::UBLK_TAG_OFF) as u64
             | offset as u64)
 }
 
@@ -860,12 +862,6 @@ struct UblkIO {
     buf_addr: *mut u8,
     flags: u32,
     result: i32,
-}
-
-impl UblkIO {
-    fn is_done(&self) -> bool {
-        self.flags & (UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE) != 0
-    }
 }
 
 const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
@@ -920,7 +916,7 @@ impl Drop for UblkQueue<'_> {
 impl UblkQueue<'_> {
     #[inline(always)]
     fn cmd_buf_sz(depth: u32) -> u32 {
-        let size = depth * core::mem::size_of::<ublksrv_io_desc>() as u32;
+        let size = depth * core::mem::size_of::<sys::ublksrv_io_desc>() as u32;
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
 
         round_up(size, page_sz)
@@ -960,10 +956,10 @@ impl UblkQueue<'_> {
             .register_files(&td.fds[0..td.nr_fds as usize])
             .map_err(UblkError::OtherIOError)?;
 
-        let off = UBLKSRV_CMD_BUF_OFFSET as i64
+        let off = sys::UBLKSRV_CMD_BUF_OFFSET as i64
             + q_id as i64
-                * ((UBLK_MAX_QUEUE_DEPTH as usize * core::mem::size_of::<ublksrv_io_desc>())
-                    as i64);
+                * ((sys::UBLK_MAX_QUEUE_DEPTH as usize
+                    * core::mem::size_of::<sys::ublksrv_io_desc>()) as i64);
         let io_cmd_buf = unsafe {
             libc::mmap(
                 std::ptr::null_mut::<libc::c_void>(),
@@ -1020,8 +1016,8 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    pub fn get_iod(&self, idx: u32) -> *const ublksrv_io_desc {
-        (self.io_cmd_buf + idx as u64 * 24) as *const ublksrv_io_desc
+    pub fn get_iod(&self, idx: u32) -> *const sys::ublksrv_io_desc {
+        (self.io_cmd_buf + idx as u64 * 24) as *const sys::ublksrv_io_desc
     }
 
     #[inline(always)]
@@ -1035,15 +1031,15 @@ impl UblkQueue<'_> {
         }
 
         if (io.flags & UBLK_IO_NEED_COMMIT_RQ_COMP) != 0 {
-            cmd_op = UBLK_IO_COMMIT_AND_FETCH_REQ;
+            cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
         } else if (io.flags & UBLK_IO_NEED_FETCH_RQ) != 0 {
-            cmd_op = UBLK_IO_FETCH_REQ;
+            cmd_op = sys::UBLK_IO_FETCH_REQ;
         } else {
             return 0;
         }
 
         let io_cmd = IOCmd {
-            cmd: ublksrv_io_cmd {
+            cmd: sys::ublksrv_io_cmd {
                 tag,
                 addr: io.buf_addr as u64,
                 q_id: self.q_id,
@@ -1156,12 +1152,12 @@ impl UblkQueue<'_> {
 
         self.cmd_inflight -= 1;
 
-        if res == UBLK_IO_RES_ABORT || ((self.q_state & UBLK_QUEUE_STOPPING) != 0) {
+        if res == sys::UBLK_IO_RES_ABORT || ((self.q_state & UBLK_QUEUE_STOPPING) != 0) {
             self.q_state |= UBLK_QUEUE_STOPPING;
             self.ios[tag as usize].flags &= !UBLK_IO_NEED_FETCH_RQ;
         }
 
-        if res == UBLK_IO_RES_OK as i32 {
+        if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
             ops.queue_io(self, tag).unwrap();
         } else {

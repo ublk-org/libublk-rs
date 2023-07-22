@@ -18,9 +18,9 @@ impl UblkTgtImpl for RamdiskTgt {
         let mut tgt = dev.tgt.borrow_mut();
 
         tgt.dev_size = dev_size;
-        tgt.params = libublk::ublk_params {
-            types: libublk::UBLK_PARAM_TYPE_BASIC,
-            basic: libublk::ublk_param_basic {
+        tgt.params = libublk::sys::ublk_params {
+            types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
+            basic: libublk::sys::ublk_param_basic {
                 logical_bs_shift: 12,
                 physical_bs_shift: 12,
                 io_opt_shift: 12,
@@ -55,14 +55,14 @@ impl UblkQueueImpl for RamdiskQueue {
         let buf_addr = q.get_buf_addr(tag);
 
         match op {
-            libublk::UBLK_IO_OP_READ => unsafe {
+            libublk::sys::UBLK_IO_OP_READ => unsafe {
                 libc::memcpy(
                     buf_addr as *mut libc::c_void,
                     (start + off) as *mut libc::c_void,
                     bytes as usize,
                 );
             },
-            libublk::UBLK_IO_OP_WRITE => unsafe {
+            libublk::sys::UBLK_IO_OP_WRITE => unsafe {
                 libc::memcpy(
                     (start + off) as *mut libc::c_void,
                     buf_addr as *mut libc::c_void,
@@ -97,7 +97,7 @@ fn test_add(_r: i32) {
         .unwrap();
     let s = std::env::args().nth(3).unwrap_or_else(|| "32".to_string());
     let mb = s.parse::<u64>().unwrap();
-    let recover_flag = libublk::UBLK_F_USER_RECOVERY as u64;
+    let recover_flag = libublk::sys::UBLK_F_USER_RECOVERY as u64;
 
     //println!("dev_id is {}, recover {}", dev_id, _r);
 
