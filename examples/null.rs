@@ -1,12 +1,13 @@
 use core::any::Any;
-use libublk::{ctrl::UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
+use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::{ctrl::UblkCtrl, UblkError};
 use std::sync::Arc;
 
 pub struct NullTgt {}
 pub struct NullQueue {}
 
 // setup null target
-impl libublk::UblkTgtImpl for NullTgt {
+impl UblkTgtImpl for NullTgt {
     fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
         let info = dev.dev_info;
         let dev_size = 250_u64 << 30;
@@ -40,7 +41,7 @@ impl libublk::UblkTgtImpl for NullTgt {
 }
 
 // implement io logic, and it is the main job for writing new ublk target
-impl libublk::UblkQueueImpl for NullQueue {
+impl libublk::io::UblkQueueImpl for NullQueue {
     fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;

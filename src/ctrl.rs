@@ -1,4 +1,5 @@
-use super::{sys, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgt};
+use super::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgt};
+use super::{sys, UblkError};
 use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};

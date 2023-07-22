@@ -1,7 +1,8 @@
 use anyhow::Result;
 use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::{ctrl::UblkCtrl, sys::ublksrv_io_desc, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
+use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
@@ -33,7 +34,7 @@ fn lo_file_size(f: &std::fs::File) -> Result<u64> {
 }
 
 // setup loop target
-impl libublk::UblkTgtImpl for LoopTgt {
+impl UblkTgtImpl for LoopTgt {
     fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
         trace!("loop: init_tgt {}", dev.dev_info.dev_id);
         let info = dev.dev_info;
@@ -79,11 +80,15 @@ impl libublk::UblkTgtImpl for LoopTgt {
     }
 }
 
-fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Result<i32, UblkError> {
+fn loop_queue_tgt_io(
+    q: &mut UblkQueue,
+    tag: u32,
+    iod: &libublk::sys::ublksrv_io_desc,
+) -> Result<i32, UblkError> {
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
-    let data = libublk::build_user_data(tag as u16, op, 0, true);
+    let data = libublk::io::build_user_data(tag as u16, op, 0, true);
     let buf_addr = q.get_buf_addr(tag);
 
     if op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES || op == libublk::sys::UBLK_IO_OP_DISCARD {
@@ -128,7 +133,7 @@ fn loop_queue_tgt_io(q: &mut UblkQueue, tag: u32, iod: &ublksrv_io_desc) -> Resu
 }
 
 // implement loop IO logic, and it is the main job for writing new ublk target
-impl libublk::UblkQueueImpl for LoopQueue {
+impl UblkQueueImpl for LoopQueue {
     fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
@@ -137,7 +142,7 @@ impl libublk::UblkQueueImpl for LoopQueue {
     }
 
     fn tgt_io_done(&self, q: &mut UblkQueue, tag: u32, res: i32, user_data: u64) {
-        let cqe_tag = libublk::user_data_to_tag(user_data);
+        let cqe_tag = libublk::io::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);
 

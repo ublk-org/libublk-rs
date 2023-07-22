@@ -1,5 +1,6 @@
 use core::any::Any;
-use libublk::{ctrl::UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgt, UblkTgtImpl};
+use libublk::{ctrl::UblkCtrl, UblkError};
 use std::sync::Arc;
 
 struct RamdiskTgt {
@@ -50,7 +51,7 @@ impl UblkQueueImpl for RamdiskQueue {
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
         let op = iod.op_flags & 0xff;
-        let tgt = libublk::ublk_tgt_data_from_queue::<RamdiskTgt>(q.dev).unwrap();
+        let tgt = libublk::io::ublk_tgt_data_from_queue::<RamdiskTgt>(q.dev).unwrap();
         let start = tgt.start;
         let buf_addr = q.get_buf_addr(tag);
 
@@ -81,7 +82,7 @@ fn rd_get_device_size(ctrl: &mut UblkCtrl) -> u64 {
     ctrl.reload_json().unwrap();
 
     let tgt_val = &ctrl.json["target"];
-    let tgt: Result<libublk::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
+    let tgt: Result<UblkTgt, _> = serde_json::from_value(tgt_val.clone());
     if let Ok(p) = tgt {
         p.dev_size
     } else {
