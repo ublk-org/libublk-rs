@@ -1,5 +1,5 @@
 use core::any::Any;
-use libublk::{UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::{ctrl::UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgtImpl};
 use std::sync::Arc;
 
 struct RamdiskTgt {

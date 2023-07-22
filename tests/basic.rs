@@ -2,7 +2,7 @@
 mod tests {
     use core::any::Any;
     use libublk::sys;
-    use libublk::{UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+    use libublk::{ctrl::UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl, UblkTgtImpl};
     use std::env;
     use std::path::Path;
     use std::sync::Arc;

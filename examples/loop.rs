@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::{sys::ublksrv_io_desc, UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
+use libublk::{ctrl::UblkCtrl, sys::ublksrv_io_desc, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;

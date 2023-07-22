@@ -1,5 +1,5 @@
 use core::any::Any;
-use libublk::{UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
+use libublk::{ctrl::UblkCtrl, UblkDev, UblkError, UblkQueue, UblkQueueImpl};
 use std::sync::Arc;
 
 pub struct NullTgt {}
