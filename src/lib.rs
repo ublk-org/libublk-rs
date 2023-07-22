@@ -767,8 +767,8 @@ impl UblkDev {
 /// * `dev`: UblkDev instance
 /// * `T`: The concrete target data type
 ///
-/// Use as_any()/Downcast trick for doing this job, see [downcast_trait_object]
-/// (https://bennett.dev/rust/downcast-trait-object/)
+/// Use as_any()/Downcast trick for doing this job, see `\[`downcast_trait_object`\]`
+/// `<https://bennett.dev/rust/downcast-trait-object/>`
 ///
 #[inline(always)]
 pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> Result<&T, UblkError> {
