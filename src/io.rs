@@ -96,26 +96,25 @@ impl UblkDev {
         self.ops.deinit_tgt(self);
         info!("dev {} deinitialized", id);
     }
-}
 
-///
-/// Return the target concrete object from UblkTgtImpl trait object
-///
-/// # parameters
-///
-/// * `dev`: UblkDev instance
-/// * `T`: The concrete target data type
-///
-/// Use as_any()/Downcast trick for doing this job, see `\[`downcast_trait_object`\]`
-/// `<https://bennett.dev/rust/downcast-trait-object/>`
-///
-#[inline(always)]
-pub fn ublk_tgt_data_from_queue<T: 'static>(dev: &UblkDev) -> Result<&T, UblkError> {
-    let a = dev.ops.as_any();
+    ///
+    /// Return the target concrete object from UblkTgtImpl trait object
+    ///
+    /// # parameters
+    ///
+    /// * `T`: The concrete target data type
+    ///
+    /// Use as_any()/Downcast trick for doing this job, see `\[`downcast_trait_object`\]`
+    /// `<https://bennett.dev/rust/downcast-trait-object/>`
+    ///
+    #[inline(always)]
+    pub fn ublk_tgt_data_from_queue<T: 'static>(&self) -> Result<&T, UblkError> {
+        let a = self.ops.as_any();
 
-    match a.downcast_ref::<T>() {
-        Some(b) => Ok(b),
-        _ => Err(UblkError::OtherError(-libc::ENOENT)),
+        match a.downcast_ref::<T>() {
+            Some(b) => Ok(b),
+            _ => Err(UblkError::OtherError(-libc::ENOENT)),
+        }
     }
 }
 

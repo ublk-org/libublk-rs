@@ -51,7 +51,7 @@ impl UblkQueueImpl for RamdiskQueue {
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
         let op = iod.op_flags & 0xff;
-        let tgt = libublk::io::ublk_tgt_data_from_queue::<RamdiskTgt>(q.dev).unwrap();
+        let tgt = q.dev.ublk_tgt_data_from_queue::<RamdiskTgt>().unwrap();
         let start = tgt.start;
         let buf_addr = q.get_buf_addr(tag);
 
