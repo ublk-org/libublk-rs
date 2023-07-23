@@ -63,14 +63,17 @@ pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
 /// Note: This method is one high level API, and handles each queue in
 /// one dedicated thread. If your target won't take this approach, please
 /// don't use this API.
-pub fn create_queue_handler<F: Fn() -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static>(
+pub fn create_queue_handler<F>(
     ctrl: &mut ctrl::UblkCtrl,
     dev: &Arc<io::UblkDev>,
     sq_depth: u32,
     cq_depth: u32,
     ring_flags: u64,
     f: Arc<F>,
-) -> Vec<std::thread::JoinHandle<()>> {
+) -> Vec<std::thread::JoinHandle<()>>
+where
+    F: Fn() -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
+{
     let mut q_threads = Vec::new();
     let mut q_affi = Vec::new();
     let mut q_tids = Vec::new();
