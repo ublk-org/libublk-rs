@@ -1,4 +1,4 @@
-use super::{ctrl::UblkCtrl, sys, ublk_alloc_buf, ublk_dealloc_buf, UblkError, CDEV_PATH};
+use super::{ctrl::UblkCtrl, sys, UblkError};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
@@ -65,7 +65,7 @@ impl UblkDev {
         };
 
         let info = ctrl.dev_info;
-        let cdev_path = format!("{}{}", CDEV_PATH, info.dev_id);
+        let cdev_path = format!("{}{}", super::CDEV_PATH, info.dev_id);
         let cdev_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -240,7 +240,7 @@ impl Drop for UblkQueue<'_> {
 
         for i in 0..depth {
             let io = &self.ios[i as usize];
-            ublk_dealloc_buf(
+            super::ublk_dealloc_buf(
                 io.buf_addr,
                 dev.dev_info.max_io_buf_bytes as usize,
                 unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() },
@@ -317,7 +317,7 @@ impl UblkQueue<'_> {
             ios.set_len(depth as usize);
         }
         for io in &mut ios {
-            io.buf_addr = ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
+            io.buf_addr = super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
                 libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
             });
             io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
