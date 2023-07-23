@@ -121,13 +121,13 @@ fn test_add(_r: i32) {
             512_u32 * 1024,
             recover_flag,
             _r <= 0,
-            || {
+            |_| {
                 Box::new(RamdiskTgt {
                     size,
                     start: buf_addr,
                 })
             },
-            || Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>,
+            |_| Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
 

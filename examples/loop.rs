@@ -168,7 +168,7 @@ fn test_add() {
             512_u32 * 1024,
             0,
             true,
-            || {
+            |_| {
                 Box::new(LoopTgt {
                     back_file: std::fs::OpenOptions::new()
                         .read(true)
@@ -179,7 +179,7 @@ fn test_add() {
                     back_file_path: back_file.clone(),
                 })
             },
-            || Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>,
+            |_| Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
 

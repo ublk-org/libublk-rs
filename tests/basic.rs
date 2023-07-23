@@ -74,8 +74,8 @@ mod tests {
             512_u32 * 1024,
             0,
             true,
-            || Box::new(NullTgt {}),
-            || Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>,
+            |_| Box::new(NullTgt {}),
+            |_| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
@@ -189,13 +189,13 @@ mod tests {
             512_u32 * 1024,
             0,
             true,
-            || {
+            |_| {
                 Box::new(RamdiskTgt {
                     size: size,
                     start: buf_addr,
                 })
             },
-            || Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>,
+            |_| Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);

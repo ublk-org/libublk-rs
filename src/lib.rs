@@ -72,7 +72,7 @@ pub fn create_queue_handler<F>(
     f: F,
 ) -> Vec<std::thread::JoinHandle<()>>
 where
-    F: Fn() -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
+    F: Fn(i32) -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
 {
     let mut q_threads = Vec::new();
     let mut q_affi = Vec::new();
@@ -106,7 +106,7 @@ where
                     _affinity.addr() as *const libc::cpu_set_t,
                 );
             }
-            let ops: &'static dyn io::UblkQueueImpl = &*Box::leak(_fn());
+            let ops: &'static dyn io::UblkQueueImpl = &*Box::leak(_fn(_q_id as i32));
             io::UblkQueue::new(_q_id, &_dev, sq_depth, cq_depth, ring_flags)
                 .unwrap()
                 .handler(ops);
@@ -161,12 +161,13 @@ pub fn ublk_tgt_worker<T, Q, W>(
     worker_fn: W,
 ) -> Result<std::thread::JoinHandle<()>, UblkError>
 where
-    T: Fn() -> Box<dyn io::UblkTgtImpl> + Send + Sync,
-    Q: Fn() -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
+    T: Fn(i32) -> Box<dyn io::UblkTgtImpl> + Send + Sync,
+    Q: Fn(i32) -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
     W: Fn(i32) + Send + Sync + 'static,
 {
     let mut ctrl = ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();
-    let ublk_dev = Arc::new(io::UblkDev::new(tgt_fn(), &mut ctrl).unwrap());
+    let ublk_dev =
+        Arc::new(io::UblkDev::new(tgt_fn(ctrl.dev_info.dev_id as i32), &mut ctrl).unwrap());
     let depth = ublk_dev.dev_info.queue_depth as u32;
 
     let threads = create_queue_handler(&mut ctrl, &ublk_dev, depth, depth, 0, q_fn);
