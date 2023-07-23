@@ -1,6 +1,6 @@
 use log::error;
 use std::alloc::{alloc, dealloc, Layout};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 pub mod ctrl;
 pub mod io;
@@ -46,6 +46,86 @@ pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
     unsafe { dealloc(ptr as *mut u8, layout) };
 }
 
+/// Create queue thread handler(high level)
+///
+/// # Arguments:
+///
+/// * `ctrl`: UblkCtrl mut reference
+/// * `dev`: UblkDev reference, which is required for creating queue
+/// * `sq_depth`: uring submission queue depth
+/// * `cq_depth`: uring completion queue depth
+/// * `ring_flags`: uring flags
+/// *  `f`: closure for allocating queue trait object, and Arc() is
+/// required since the closure is called for multiple threads
+///
+/// # Return: Vectors for holding each queue thread JoinHandler and tid
+///
+/// Note: This method is one high level API, and handles each queue in
+/// one dedicated thread. If your target won't take this approach, please
+/// don't use this API.
+pub fn create_queue_handler<F: Fn() -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static>(
+    ctrl: &mut ctrl::UblkCtrl,
+    dev: &Arc<io::UblkDev>,
+    sq_depth: u32,
+    cq_depth: u32,
+    ring_flags: u64,
+    f: Arc<F>,
+) -> Vec<std::thread::JoinHandle<()>> {
+    let mut q_threads = Vec::new();
+    let mut q_affi = Vec::new();
+    let mut q_tids = Vec::new();
+    let nr_queues = dev.dev_info.nr_hw_queues;
+    let mut tids = Vec::<Arc<(Mutex<i32>, Condvar)>>::with_capacity(nr_queues as usize);
+
+    for q in 0..nr_queues {
+        let mut affinity = ctrl::UblkQueueAffinity::new();
+        ctrl.get_queue_affinity(q as u32, &mut affinity).unwrap();
+
+        let _dev = Arc::clone(dev);
+        let _q_id = q;
+        let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
+        let _tid = Arc::clone(&tid);
+        let _fn = f.clone();
+        let _affinity = affinity;
+
+        q_threads.push(std::thread::spawn(move || {
+            let (lock, cvar) = &*_tid;
+            unsafe {
+                let mut guard = lock.lock().unwrap();
+                *guard = libc::gettid();
+                cvar.notify_one();
+            }
+            unsafe {
+                libc::pthread_setaffinity_np(
+                    libc::pthread_self(),
+                    _affinity.buf_len(),
+                    _affinity.addr() as *const libc::cpu_set_t,
+                );
+            }
+            let ops: &'static dyn io::UblkQueueImpl = &*Box::leak(_fn());
+            io::UblkQueue::new(_q_id, &_dev, sq_depth, cq_depth, ring_flags)
+                .unwrap()
+                .handler(ops);
+        }));
+        tids.push(tid);
+        q_affi.push(affinity);
+    }
+    for q in 0..nr_queues {
+        let (lock, cvar) = &*tids[q as usize];
+
+        let mut guard = lock.lock().unwrap();
+        while *guard == 0 {
+            guard = cvar.wait(guard).unwrap();
+        }
+        q_tids.push(*guard);
+    }
+
+    //Now we are up, and build & export json
+    ctrl.build_json(dev, q_affi, q_tids);
+
+    q_threads
+}
+
 /// create ublk target device (high level)
 ///
 /// # Arguments:
@@ -85,7 +165,7 @@ where
     let ublk_dev = Arc::new(io::UblkDev::new(tgt_fn(), &mut ctrl).unwrap());
     let depth = ublk_dev.dev_info.queue_depth as u32;
 
-    let threads = ctrl.create_queue_handler(&ublk_dev, depth, depth, 0, q_fn);
+    let threads = create_queue_handler(&mut ctrl, &ublk_dev, depth, depth, 0, q_fn);
 
     ctrl.start_dev(&ublk_dev).unwrap();
 

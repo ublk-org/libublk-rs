@@ -1,4 +1,4 @@
-use super::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgt};
+use super::io::{UblkDev, UblkTgt};
 use super::{sys, UblkError};
 use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
@@ -7,7 +7,6 @@ use serde::Deserialize;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
-use std::sync::{Arc, Condvar, Mutex};
 
 const CTRL_PATH: &str = "/dev/ublk-control";
 
@@ -546,84 +545,5 @@ impl UblkCtrl {
         self.json = serde_json::from_str(&json_str).map_err(UblkError::JsonError)?;
 
         Ok(0)
-    }
-
-    /// Create queue thread handler(high level)
-    ///
-    /// # Arguments:
-    ///
-    /// * `_dev`: UblkDev reference, which is required for creating queue
-    /// * `sq_depth`: uring submission queue depth
-    /// * `cq_depth`: uring completion queue depth
-    /// * `ring_flags`: uring flags
-    /// *  `f`: closure for allocating queue trait object, and Arc() is
-    /// required since the closure is called for multiple threads
-    ///
-    /// # Return: Vectors for holding each queue thread JoinHandler and tid
-    ///
-    /// Note: This method is one high level API, and handles each queue in
-    /// one dedicated thread. If your target won't take this approach, please
-    /// don't use this API.
-    pub fn create_queue_handler<F: Fn() -> Box<dyn UblkQueueImpl> + Send + Sync + 'static>(
-        &mut self,
-        dev: &Arc<UblkDev>,
-        sq_depth: u32,
-        cq_depth: u32,
-        ring_flags: u64,
-        f: Arc<F>,
-    ) -> Vec<std::thread::JoinHandle<()>> {
-        let mut q_threads = Vec::new();
-        let mut q_affi = Vec::new();
-        let mut q_tids = Vec::new();
-        let nr_queues = dev.dev_info.nr_hw_queues;
-        let mut tids = Vec::<Arc<(Mutex<i32>, Condvar)>>::with_capacity(nr_queues as usize);
-
-        for q in 0..nr_queues {
-            let mut affinity = UblkQueueAffinity::new();
-            self.get_queue_affinity(q as u32, &mut affinity).unwrap();
-
-            let _dev = Arc::clone(dev);
-            let _q_id = q;
-            let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
-            let _tid = Arc::clone(&tid);
-            let _fn = f.clone();
-            let _affinity = affinity;
-
-            q_threads.push(std::thread::spawn(move || {
-                let (lock, cvar) = &*_tid;
-                unsafe {
-                    let mut guard = lock.lock().unwrap();
-                    *guard = libc::gettid();
-                    cvar.notify_one();
-                }
-                unsafe {
-                    libc::pthread_setaffinity_np(
-                        libc::pthread_self(),
-                        _affinity.buf_len(),
-                        _affinity.addr() as *const libc::cpu_set_t,
-                    );
-                }
-                let ops: &'static dyn UblkQueueImpl = &*Box::leak(_fn());
-                UblkQueue::new(_q_id, &_dev, sq_depth, cq_depth, ring_flags)
-                    .unwrap()
-                    .handler(ops);
-            }));
-            tids.push(tid);
-            q_affi.push(affinity);
-        }
-        for q in 0..nr_queues {
-            let (lock, cvar) = &*tids[q as usize];
-
-            let mut guard = lock.lock().unwrap();
-            while *guard == 0 {
-                guard = cvar.wait(guard).unwrap();
-            }
-            q_tids.push(*guard);
-        }
-
-        //Now we are up, and build & export json
-        self.build_json(dev, q_affi, q_tids);
-
-        q_threads
     }
 }
