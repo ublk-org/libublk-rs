@@ -6,7 +6,6 @@ mod tests {
     use libublk::{ctrl::UblkCtrl, UblkError};
     use std::env;
     use std::path::Path;
-    use std::sync::Arc;
 
     #[test]
     fn add_ctrl_dev() {
@@ -76,7 +75,7 @@ mod tests {
             0,
             true,
             || Box::new(NullTgt {}),
-            Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
+            || Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
@@ -196,7 +195,7 @@ mod tests {
                     start: buf_addr,
                 })
             },
-            Arc::new(|| Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>),
+            || Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);

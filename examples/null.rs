@@ -1,7 +1,6 @@
 use core::any::Any;
 use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
-use std::sync::Arc;
 
 pub struct NullTgt {}
 pub struct NullQueue {}
@@ -64,7 +63,7 @@ fn test_add() {
             0,
             true,
             || Box::new(NullTgt {}),
-            Arc::new(|| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>),
+            || Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
 

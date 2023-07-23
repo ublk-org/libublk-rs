@@ -1,7 +1,6 @@
 use core::any::Any;
 use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgt, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
-use std::sync::Arc;
 
 struct RamdiskTgt {
     size: u64,
@@ -128,7 +127,7 @@ fn test_add(_r: i32) {
                     start: buf_addr,
                 })
             },
-            Arc::new(|| Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>),
+            || Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
 

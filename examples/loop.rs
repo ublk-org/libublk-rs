@@ -6,7 +6,6 @@ use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 struct LoJson {
@@ -180,7 +179,7 @@ fn test_add() {
                     back_file_path: back_file.clone(),
                 })
             },
-            Arc::new(|| Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>),
+            || Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
 

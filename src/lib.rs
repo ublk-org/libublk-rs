@@ -69,7 +69,7 @@ pub fn create_queue_handler<F>(
     sq_depth: u32,
     cq_depth: u32,
     ring_flags: u64,
-    f: Arc<F>,
+    f: F,
 ) -> Vec<std::thread::JoinHandle<()>>
 where
     F: Fn() -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
@@ -79,6 +79,7 @@ where
     let mut q_tids = Vec::new();
     let nr_queues = dev.dev_info.nr_hw_queues;
     let mut tids = Vec::<Arc<(Mutex<i32>, Condvar)>>::with_capacity(nr_queues as usize);
+    let arc_fn = Arc::new(f);
 
     for q in 0..nr_queues {
         let mut affinity = ctrl::UblkQueueAffinity::new();
@@ -88,7 +89,7 @@ where
         let _q_id = q;
         let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
         let _tid = Arc::clone(&tid);
-        let _fn = f.clone();
+        let _fn = arc_fn.clone();
         let _affinity = affinity;
 
         q_threads.push(std::thread::spawn(move || {
@@ -156,7 +157,7 @@ pub fn ublk_tgt_worker<T, Q, W>(
     flags: u64,
     for_add: bool,
     tgt_fn: T,
-    q_fn: Arc<Q>,
+    q_fn: Q,
     worker_fn: W,
 ) -> Result<std::thread::JoinHandle<()>, UblkError>
 where
