@@ -7,9 +7,83 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
-#[inline(always)]
-fn round_up(val: u32, rnd: u32) -> u32 {
-    (val + rnd - 1) & !(rnd - 1)
+pub trait UblkQueueImpl {
+    /// Handle IO command represented by `tag`
+    ///
+    /// # Arguments:
+    ///
+    /// * `q`: this UblkQueue instance
+    /// * `tag`: io command tag
+    ///
+    /// Called when one io command is retrieved from ublk kernel driver side,
+    /// and target code implements this method for handling io command. After
+    /// io command is done, it needs to complete by calling UblkQueue::complete_io().
+    ///
+    /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
+    /// ublk kernel driver, and is indexed by tag. IO command is readonly for
+    /// ublk userspace.
+    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError>;
+
+    /// target io_uring IO notifier(optional)
+    ///
+    /// # Arguments:
+    /// * `_q`: this UblkQueue instance
+    /// * `_tag`: io command tag
+    /// * `_res`: io uring completion result
+    /// * `_user_data`: io uring completion user data
+    ///
+    /// Called when one target io submitted via io_uring is completed
+    ///
+    /// Note: only used in case that target IO is handled our shared per-queue
+    /// io_uring
+    #[inline(always)]
+    fn tgt_io_done(&self, _q: &mut UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
+
+    /// Method after current io command batch is handled(optional)
+    ///
+    /// # Arguments:
+    /// * `_q`: this UblkQueue instance
+    /// * `_nr_queued`: How many IOs queued to our per-queue io_uring
+    ///
+    /// Called after the current io command batch is handled, often useful
+    /// for handling network IO
+    ///
+    #[inline(always)]
+    fn handle_io_background(&self, _q: &UblkQueue, _nr_queued: usize) {}
+}
+
+pub trait UblkTgtImpl {
+    /// Init target specific stuff
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: this UblkDev instance
+    ///
+    /// Initialize this target, dev_data is usually built from command line, so
+    /// it is produced and consumed by target code. Target code needs to setup
+    /// ublk device parameters for telling kernel driver in this method.
+    ///
+    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError>;
+
+    /// Deinit this target
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: this UblkDev instance
+    ///
+    /// Release target specific resource.
+    fn deinit_tgt(&self, dev: &UblkDev) {
+        trace!("{}: deinit_tgt {}", self.tgt_type(), dev.dev_info.dev_id);
+    }
+
+    /// Return target type name
+    ///
+    fn tgt_type(&self) -> &'static str;
+
+    /// as_any method for downcast from UblkDev instance
+    ///
+    /// For implementing `ublk_tgt_data_from_queue()` of `UblkDev`.
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,33 +198,6 @@ impl Drop for UblkDev {
     }
 }
 
-pub trait UblkQueueImpl {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError>;
-    #[inline(always)]
-    fn tgt_io_done(&self, _q: &mut UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
-    #[inline(always)]
-    fn handle_io_background(&self, _q: &UblkQueue, _nr_queued: usize) {}
-}
-
-pub trait UblkTgtImpl {
-    /// Init this target
-    ///
-    /// Initialize this target, dev_data is usually built from command line, so
-    /// it is produced and consumed by target code.
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError>;
-
-    /// Deinit this target
-    ///
-    /// Release target specific resource.
-    fn deinit_tgt(&self, dev: &UblkDev) {
-        trace!("{}: deinit_tgt {}", self.tgt_type(), dev.dev_info.dev_id);
-    }
-
-    fn tgt_type(&self) -> &'static str;
-
-    fn as_any(&self) -> &dyn Any;
-}
-
 union IOCmd {
     cmd: sys::ublksrv_io_cmd,
     buf: [u8; 16],
@@ -247,6 +294,11 @@ impl Drop for UblkQueue<'_> {
             );
         }
     }
+}
+
+#[inline(always)]
+fn round_up(val: u32, rnd: u32) -> u32 {
+    (val + rnd - 1) & !(rnd - 1)
 }
 
 impl UblkQueue<'_> {
