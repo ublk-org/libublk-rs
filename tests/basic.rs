@@ -297,6 +297,7 @@ mod tests {
         if let Some(c) = tid_regx.captures(&buf.as_str()) {
             tid = c.get(1).unwrap().as_str().parse().unwrap();
         }
+        assert!(tid != 0);
 
         let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
         ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
