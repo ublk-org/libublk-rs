@@ -44,7 +44,7 @@ impl UblkTgtImpl for RamdiskTgt {
 
 // implement io logic, and it is the main job for writing new ublk target
 impl UblkQueueImpl for RamdiskQueue {
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
+    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
         let off = (iod.start_sector << 9) as u64;

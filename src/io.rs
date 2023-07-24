@@ -22,7 +22,7 @@ pub trait UblkQueueImpl {
     /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
     /// ublk kernel driver, and is indexed by tag. IO command is readonly for
     /// ublk userspace.
-    fn queue_io(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError>;
+    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError>;
 
     /// target io_uring IO notifier(optional)
     ///
@@ -607,7 +607,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.queue_io(self, tag).unwrap();
+            ops.handle_io_cmd(self, tag).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
