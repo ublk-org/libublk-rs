@@ -203,6 +203,20 @@ union IOCmd {
     buf: [u8; 16],
 }
 
+/// Build offset for read from or write to per-io-cmd buffer
+///
+/// # Arguments:
+///
+/// * `q_id`: queue id
+/// * `tag`: io command tag
+/// * `offset`: offset to this io-cmd buffer
+///
+/// The built offset is passed to pread() or pwrite() on device of
+/// /dev/ublkcN for reading data from io command buffer, or writing
+/// data to io command buffer.
+///
+/// Available if UBLK_F_USER_COPY is enabled.
+///
 #[inline(always)]
 #[allow(arithmetic_overflow)]
 pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
@@ -214,6 +228,18 @@ pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
             | offset as u64)
 }
 
+/// Build userdata for submitting io via io_uring
+///
+/// # Arguments:
+///
+/// * `tag`: io tag, length is 16bit
+/// * `op`: io operation code, length is 8bit
+/// * `tgt_data`: target specific data, at most 39bit (64 - 16 - 8 - 1)
+/// * `is_target_io`: if this userdata is for handling target io, false if
+///         if it is only for ublk io command
+///
+/// The built userdata is passed to io_uring for parsing io result
+///
 #[inline(always)]
 #[allow(arithmetic_overflow)]
 pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
@@ -222,16 +248,19 @@ pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> 
     tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
 }
 
+/// Check if this userdata is from target IO
 #[inline(always)]
 pub fn is_target_io(user_data: u64) -> bool {
     (user_data & (1_u64 << 63)) != 0
 }
 
+/// Extract tag from userdata
 #[inline(always)]
 pub fn user_data_to_tag(user_data: u64) -> u32 {
     (user_data & 0xffff) as u32
 }
 
+/// Extract operation code from userdata
 #[inline(always)]
 pub fn user_data_to_op(user_data: u64) -> u32 {
     ((user_data >> 16) & 0xff) as u32
@@ -392,6 +421,12 @@ impl UblkQueue<'_> {
         Ok(q)
     }
 
+    /// Return address of io buffer which is allocated for data copy
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io tag, length is 16bit
+    ///
     #[inline(always)]
     pub fn get_buf_addr(&self, tag: u32) -> *mut u8 {
         self.ios[tag as usize].buf_addr
@@ -403,9 +438,18 @@ impl UblkQueue<'_> {
         self.ios[tag as usize].result = res;
     }
 
+    /// Return IO command description info represented by `ublksrv_io_desc`
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io tag
+    ///
+    /// Returned `ublksrv_io_desc` data is readonly, and filled by ublk kernel
+    /// driver
+    ///
     #[inline(always)]
-    pub fn get_iod(&self, idx: u32) -> *const sys::ublksrv_io_desc {
-        (self.io_cmd_buf + idx as u64 * 24) as *const sys::ublksrv_io_desc
+    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
+        (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc
     }
 
     #[inline(always)]
@@ -473,6 +517,11 @@ impl UblkQueue<'_> {
         res
     }
 
+    /// Submit all commands for fetching IO
+    ///
+    /// Only called during queue initialization. After queue is setup,
+    /// COMMIT_AND_FETCH_REQ command is used for both committing io command
+    /// result and fetching new incoming IO
     #[inline(always)]
     pub fn submit_fetch_commands(&mut self) {
         for i in 0..self.q_depth {
@@ -490,6 +539,17 @@ impl UblkQueue<'_> {
         (self.q_state & UBLK_QUEUE_STOPPING) != 0 && self.queue_is_idle()
     }
 
+    /// Complete this io command
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io tag
+    /// * `res`: result of handling this io command
+    ///
+    /// Called from specific target code for completing this io command,
+    /// and ublk driver gets notified and complete IO request on
+    /// /dev/ublkbN
+    ///
     #[inline(always)]
     pub fn complete_io(&mut self, tag: u16, res: i32) {
         self.mark_io_done(tag, res);
@@ -578,6 +638,17 @@ impl UblkQueue<'_> {
         count
     }
 
+    /// Process the incoming IO from io_uring
+    ///
+    /// # Arguments:
+    ///
+    /// * `ops`: UblkQueueImpl trait object
+    ///
+    /// When either io command or target io is coming, we are called for handling
+    /// both.
+    ///
+    /// Note: Return Error in case that queue is down.
+    ///
     #[inline(always)]
     pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> Result<i32, UblkError> {
         info!(
@@ -613,6 +684,14 @@ impl UblkQueue<'_> {
         Ok(reapped as i32)
     }
 
+    /// Queue IO handler(high level interface)
+    ///
+    /// # Arguments:
+    ///
+    /// * `ops`: UblkQueueImpl trait object
+    ///
+    /// Called in queue context. Won't return unless error is observed.
+    ///
     pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
         self.submit_fetch_commands();
         loop {
