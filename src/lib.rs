@@ -1,3 +1,10 @@
+//! # libublk
+//!
+//! A library for building linux ublk block device in userspace, see related
+//! docs in `<https://github.com/ming1/ubdsrv/blob/master/doc/external_links.rst>`
+//! and introduction doc in
+//! `<https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf>`
+
 use log::error;
 use std::alloc::{alloc, dealloc, Layout};
 use std::sync::{Arc, Condvar, Mutex};
