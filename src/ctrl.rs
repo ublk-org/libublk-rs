@@ -10,6 +10,10 @@ use std::os::unix::io::AsRawFd;
 
 const CTRL_PATH: &str = "/dev/ublk-control";
 
+/// Ublk per-queue CPU affinity
+///
+/// Responsible for setting ublk queue pthread's affinity.
+///
 #[derive(Debug, Default, Copy, Clone)]
 pub struct UblkQueueAffinity {
     affinity: Bitmap<1024>,
@@ -108,7 +112,7 @@ struct QueueAffinityJson {
     tid: u32,
 }
 
-/// UBLK controller
+/// ublk control device
 ///
 /// Responsible for:
 ///
@@ -205,6 +209,12 @@ impl UblkCtrl {
         }
     }
 
+    /// Get queue's pthread id from exported json file for this device
+    ///
+    /// # Arguments:
+    ///
+    /// * `qid`: queue id
+    ///
     pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
         let queues = &self.json["queues"];
         let queue = &queues[qid.to_string()];
@@ -258,6 +268,11 @@ impl UblkCtrl {
         }
         println!("\ttarget_data {}", &json_value["target_data"]);
     }
+
+    /// Dump this device info
+    ///
+    /// The 1st part is from UblkCtrl.dev_info, and the 2nd part is
+    /// retrieved from device's exported json file
     pub fn dump(&mut self) {
         let mut p = sys::ublk_params {
             ..Default::default()
@@ -300,6 +315,8 @@ impl UblkCtrl {
         format!("{}/ublk", std::env::temp_dir().display())
     }
 
+    /// Returned path of this device's exported json file
+    ///
     pub fn run_path(&self) -> String {
         format!("{}/{:04}.json", UblkCtrl::run_dir(), self.dev_info.dev_id)
     }
@@ -316,6 +333,8 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Remove this device
+    ///
     pub fn del(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_DEL_DEV,
@@ -325,8 +344,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    /// Remove one device
-    ///
+    /// Remove this device and its exported json file
     ///
     /// Called when the user wants to remove one device really
     ///
@@ -338,6 +356,8 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    /// Retrieving device info from ublk driver
+    ///
     pub fn get_info(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_DEV_INFO,
@@ -350,6 +370,8 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Start this device by sending command to ublk driver
+    ///
     pub fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_START_DEV,
@@ -361,6 +383,8 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Stop this device by sending command to ublk driver
+    ///
     pub fn stop(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_STOP_DEV,
@@ -370,6 +394,9 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Retrieve this device's parameter from ublk driver by
+    /// sending command
+    ///
     /// Can't pass params by reference(&mut), why?
     pub fn get_params(
         &mut self,
@@ -388,6 +415,10 @@ impl UblkCtrl {
         Ok(params)
     }
 
+    /// Send this device's parameter to ublk driver
+    ///
+    /// Note: device parameter has to send to driver before starting
+    /// this device
     pub fn set_params(&mut self, params: &sys::ublk_params) -> Result<i32, UblkError> {
         let mut p = *params;
 
@@ -403,6 +434,8 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Retrieving the specified queue's affinity from ublk driver
+    ///
     pub fn get_queue_affinity(
         &mut self,
         q: u32,
@@ -427,6 +460,8 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
+    /// Start user recover for this device
+    ///
     pub fn start_user_recover(&mut self) -> Result<i32, UblkError> {
         let mut count = 0u32;
         let unit = 100_u32;
@@ -446,6 +481,8 @@ impl UblkCtrl {
         }
     }
 
+    /// End user recover for this device
+    ///
     pub fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
@@ -496,6 +533,7 @@ impl UblkCtrl {
         self.stop()
     }
 
+    /// Flush this device's json info as file
     pub fn flush_json(&mut self) -> Result<i32, UblkError> {
         let run_path = self.run_path();
 
@@ -510,6 +548,15 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    /// Build json info for this device
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: this device's UblkDev instance
+    /// * `affi`: queue affinity vector, in which each item stores the queue's affinity
+    /// * `tids`: queue pthread tid vector, in which each item stores the queue's
+    /// pthread tid
+    ///
     pub fn build_json(&mut self, dev: &UblkDev, affi: Vec<UblkQueueAffinity>, tids: Vec<i32>) {
         let tgt_data = self.json.clone();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -536,6 +583,8 @@ impl UblkCtrl {
         self.json = json;
     }
 
+    /// Reload json info for this device
+    ///
     pub fn reload_json(&mut self) -> Result<i32, UblkError> {
         let mut file = fs::File::open(self.run_path()).map_err(UblkError::OtherIOError)?;
         let mut json_str = String::new();
