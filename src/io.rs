@@ -650,7 +650,11 @@ impl UblkQueue<'_> {
     /// Note: Return Error in case that queue is down.
     ///
     #[inline(always)]
-    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> Result<i32, UblkError> {
+    pub fn process_io(
+        &mut self,
+        ops: &dyn UblkQueueImpl,
+        to_wait: usize,
+    ) -> Result<i32, UblkError> {
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
@@ -666,7 +670,7 @@ impl UblkQueue<'_> {
 
         let ret = self
             .q_ring
-            .submit_and_wait(1)
+            .submit_and_wait(to_wait)
             .map_err(UblkError::UringSubmissionError)?;
         let reapped = self.reap_events_uring(ops);
 
@@ -695,7 +699,7 @@ impl UblkQueue<'_> {
     pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
         self.submit_fetch_commands();
         loop {
-            match self.process_io(ops) {
+            match self.process_io(ops, 1) {
                 Err(_) => break,
                 _ => continue,
             }
