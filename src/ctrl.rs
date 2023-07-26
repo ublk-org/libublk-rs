@@ -45,6 +45,7 @@ union CtrlCmd {
 
 const CTRL_CMD_HAS_DATA: u32 = 1;
 const CTRL_CMD_HAS_BUF: u32 = 2;
+const CTRL_CMD_ASYNC: u32 = 4;
 
 #[derive(Debug, Default, Copy, Clone)]
 struct UblkCtrlCmdData {
@@ -55,7 +56,12 @@ struct UblkCtrlCmdData {
     len: u32,
 }
 
-fn ublk_ctrl_prep_cmd(fd: i32, dev_id: u32, data: &UblkCtrlCmdData) -> squeue::Entry128 {
+fn ublk_ctrl_prep_cmd(
+    ctrl: &mut UblkCtrl,
+    fd: i32,
+    dev_id: u32,
+    data: &UblkCtrlCmdData,
+) -> squeue::Entry128 {
     let cmd = sys::ublksrv_ctrl_cmd {
         addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
             data.addr
@@ -81,10 +87,19 @@ fn ublk_ctrl_prep_cmd(fd: i32, dev_id: u32, data: &UblkCtrlCmdData) -> squeue::E
     opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
         .cmd(unsafe { c_cmd.buf })
         .build()
+        .user_data({
+            ctrl.cmd_token += 1;
+            ctrl.cmd_token as u64
+        })
 }
 
 fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-    let sqe = ublk_ctrl_prep_cmd(ctrl.file.as_raw_fd(), ctrl.dev_info.dev_id, data);
+    let sqe = ublk_ctrl_prep_cmd(ctrl, ctrl.file.as_raw_fd(), ctrl.dev_info.dev_id, data);
+    let to_wait = if data.flags & CTRL_CMD_ASYNC != 0 {
+        0
+    } else {
+        1
+    };
 
     unsafe {
         ctrl.ring
@@ -93,8 +108,12 @@ fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> Result<i32, Ubl
             .map_err(UblkError::UringPushError)?;
     }
     ctrl.ring
-        .submit_and_wait(1)
+        .submit_and_wait(to_wait)
         .map_err(UblkError::UringSubmissionError)?;
+
+    if to_wait == 0 {
+        return Ok(ctrl.cmd_token);
+    }
 
     let cqe = ctrl.ring.completion().next().expect("cqueue is empty");
     let res: i32 = cqe.result();
@@ -126,6 +145,7 @@ pub struct UblkCtrl {
     pub dev_info: sys::ublksrv_ctrl_dev_info,
     pub json: serde_json::Value,
     for_add: bool,
+    cmd_token: i32,
     ring: IoUring<squeue::Entry128>,
 }
 
@@ -189,6 +209,7 @@ impl UblkCtrl {
             json: serde_json::json!({}),
             ring,
             for_add,
+            cmd_token: 0,
         };
 
         //add cdev if the device is for adding device
@@ -331,6 +352,25 @@ impl UblkCtrl {
         };
 
         ublk_ctrl_cmd(self, &data)
+    }
+
+    /// Poll one control command until it is completed
+    ///
+    /// Note: so far, we only support to poll at most one-inflight
+    /// command, and the use case is for supporting to run start_dev
+    /// in queue io handling context
+    pub fn poll_cmd(&mut self, token: i32) -> Result<i32, UblkError> {
+        if self.ring.completion().is_empty() {
+            return Err(UblkError::UringIOError(-libc::EAGAIN));
+        }
+
+        let cqe = self.ring.completion().next().expect("cqueue is empty");
+        let res: i32 = cqe.result();
+        if res == 0 && cqe.user_data() == token as u64 {
+            Ok(res)
+        } else {
+            Err(UblkError::UringIOError(res))
+        }
     }
 
     /// Remove this device
