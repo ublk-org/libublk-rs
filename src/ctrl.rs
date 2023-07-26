@@ -412,10 +412,10 @@ impl UblkCtrl {
 
     /// Start this device by sending command to ublk driver
     ///
-    pub fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
+    pub fn start(&mut self, pid: i32, async_cmd: bool) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_START_DEV,
-            flags: CTRL_CMD_HAS_DATA,
+            flags: CTRL_CMD_HAS_DATA | if async_cmd { CTRL_CMD_ASYNC } else { 0 },
             data: [pid as u64, 0],
             ..Default::default()
         };
@@ -523,10 +523,10 @@ impl UblkCtrl {
 
     /// End user recover for this device
     ///
-    pub fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
+    pub fn end_user_recover(&mut self, pid: i32, async_cmd: bool) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
-            flags: CTRL_CMD_HAS_DATA,
+            flags: CTRL_CMD_HAS_DATA | if async_cmd { CTRL_CMD_ASYNC } else { 0 },
             data: [pid as u64, 0],
             ..Default::default()
         };
@@ -550,12 +550,23 @@ impl UblkCtrl {
         if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             self.set_params(&params.params)?;
             self.flush_json()?;
-            self.start(unsafe { libc::getpid() as i32 })?;
+            self.start(unsafe { libc::getpid() as i32 }, false)
         } else {
-            self.end_user_recover(unsafe { libc::getpid() as i32 })?;
+            self.end_user_recover(unsafe { libc::getpid() as i32 }, false)
         }
+    }
 
-        Ok(0)
+    pub fn start_dev_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        let params = dev.tgt.borrow();
+
+        self.get_info()?;
+        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            self.set_params(&params.params)?;
+            self.flush_json()?;
+            self.start(unsafe { libc::getpid() as i32 }, true)
+        } else {
+            self.end_user_recover(unsafe { libc::getpid() as i32 }, true)
+        }
     }
 
     /// Stop ublk device
