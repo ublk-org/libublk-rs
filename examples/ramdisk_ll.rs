@@ -1,7 +1,7 @@
 use core::any::Any;
 use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 struct RamdiskTgt {
     size: u64,
@@ -79,47 +79,78 @@ impl UblkQueueImpl for RamdiskQueue {
 }
 
 fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
+    let _qid = 0;
     let depth = 128;
     let nr_queues = 1;
-    let mut ctrl = UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap();
-    let ublk_dev = Arc::new(
-        UblkDev::new(
-            Box::new(RamdiskTgt {
-                size,
-                start: buf_addr,
-            }),
-            &mut ctrl,
-        )
-        .unwrap(),
-    );
+    let ctrl_arc = Arc::new(Mutex::new(
+        UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap(),
+    ));
+    let ctrl_clone = Arc::clone(&ctrl_arc);
 
     let mut affinity = libublk::ctrl::UblkQueueAffinity::new();
-    ctrl.get_queue_affinity(0, &mut affinity).unwrap();
+    let ublk_dev = {
+        let mut ctrl = ctrl_clone.lock().unwrap();
+
+        ctrl.get_queue_affinity(0, &mut affinity).unwrap();
+
+        Arc::new(
+            UblkDev::new(
+                Box::new(RamdiskTgt {
+                    size,
+                    start: buf_addr,
+                }),
+                &mut ctrl,
+            )
+            .unwrap(),
+        )
+    };
+
+    unsafe {
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            affinity.buf_len(),
+            affinity.addr() as *const libc::cpu_set_t,
+        );
+    }
+
+    // Still need one temp pthread for starting device
     let _dev = Arc::clone(&ublk_dev);
-    let _qid = 0;
+    let _ctrl = Arc::clone(&ctrl_arc);
 
-    let qh = std::thread::spawn(move || {
-        unsafe {
-            libc::pthread_setaffinity_np(
-                libc::pthread_self(),
-                affinity.buf_len(),
-                affinity.addr() as *const libc::cpu_set_t,
-            );
-        }
-        let ops = RamdiskQueue {};
+    let f_ctrl = async_std::task::spawn(async move {
+        let mut ctrl = _ctrl.lock().unwrap();
+        ctrl.start_dev(&_dev).unwrap();
 
-        UblkQueue::new(_qid, &_dev, depth, depth, 0)
-            .unwrap()
-            .handler(&ops);
+        let dev_id = ctrl.dev_info.dev_id;
+        let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+        assert!(std::path::Path::new(&dev_path).exists() == true);
+
+        ctrl.dump();
     });
 
-    ctrl.start_dev(&ublk_dev).unwrap();
-    ctrl.dump();
+    let _dev1 = Arc::clone(&ublk_dev);
+    let f_queue = async_std::task::spawn_local(async move {
+        let ops = RamdiskQueue {};
+        let mut queue = UblkQueue::new(_qid, &_dev1, depth, depth, 0).unwrap();
 
-    qh.join()
-        .unwrap_or_else(|_| eprintln!("dev-{} join queue thread failed", ublk_dev.dev_info.dev_id));
+        queue.submit_fetch_commands();
+        loop {
+            match queue.process_io(&ops, 1) {
+                Err(_) => break,
+                _ => continue,
+            }
+        }
+    });
 
-    ctrl.stop_dev(&ublk_dev).unwrap();
+    async_std::task::block_on(async {
+        f_ctrl.await;
+        f_queue.await;
+    });
+
+    {
+        let mut ctrl = ctrl_clone.lock().unwrap();
+        ctrl.stop_dev(&ublk_dev).unwrap();
+    }
 }
 
 fn test_add() {
