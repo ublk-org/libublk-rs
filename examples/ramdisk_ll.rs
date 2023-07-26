@@ -78,6 +78,67 @@ impl UblkQueueImpl for RamdiskQueue {
     }
 }
 
+///run this ramdisk ublk daemon completely in single context with
+///async control command, no need Rust async any more
+fn rd_add_dev2(dev_id: i32, buf_addr: u64, size: u64) {
+    let depth = 128;
+    let nr_queues = 1;
+    let mut ctrl = UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap();
+    let ublk_dev = UblkDev::new(
+        Box::new(RamdiskTgt {
+            size,
+            start: buf_addr,
+        }),
+        &mut ctrl,
+    )
+    .unwrap();
+
+    let mut affinity = libublk::ctrl::UblkQueueAffinity::new();
+    ctrl.get_queue_affinity(0, &mut affinity).unwrap();
+    let _qid = 0;
+
+    unsafe {
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            affinity.buf_len(),
+            affinity.addr() as *const libc::cpu_set_t,
+        );
+    }
+
+    let ops = RamdiskQueue {};
+    let mut queue = UblkQueue::new(_qid, &ublk_dev, depth, depth, 0).unwrap();
+    queue.submit_fetch_commands();
+
+    let token = ctrl.start_dev_async(&ublk_dev).unwrap();
+    let mut started = false;
+    loop {
+        if !started {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Ok(res) = ctrl.poll_cmd(token) {
+                started = true;
+                if res == 0 {
+                    ctrl.dump();
+                    continue;
+                } else {
+                    println!("fail to start device");
+                    break;
+                }
+            }
+            match queue.process_io(&ops, 0) {
+                Err(_) => break,
+                _ => continue,
+            }
+        } else {
+            match queue.process_io(&ops, 1) {
+                Err(_) => break,
+                _ => continue,
+            }
+        }
+    }
+
+    ctrl.stop_dev(&ublk_dev).unwrap();
+}
+
 fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
     let _qid = 0;
     let depth = 128;
@@ -153,7 +214,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
     }
 }
 
-fn test_add() {
+fn test_add(no: usize) {
     let dev_id: i32 = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "-1".to_string())
@@ -167,7 +228,11 @@ fn test_add() {
         let size = (mb << 20) as u64;
         let buf = libublk::ublk_alloc_buf(size as usize, 4096);
 
-        rd_add_dev(dev_id, buf as u64, size);
+        if no == 0 {
+            rd_add_dev(dev_id, buf as u64, size);
+        } else {
+            rd_add_dev2(dev_id, buf as u64, size);
+        }
 
         libublk::ublk_dealloc_buf(buf, size as usize, 4096);
     }
@@ -184,7 +249,8 @@ fn test_del() {
 fn main() {
     if let Some(cmd) = std::env::args().nth(1) {
         match cmd.as_str() {
-            "add" => test_add(),
+            "add" => test_add(0),
+            "add2" => test_add(1),
             "del" => test_del(),
             _ => todo!(),
         }
