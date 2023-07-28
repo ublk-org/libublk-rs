@@ -92,9 +92,6 @@ pub struct UblkTgt {
     pub dev_size: u64,
     //const struct ublk_tgt_ops *ops;
     pub params: sys::ublk_params,
-}
-
-pub struct UblkTgtData {
     pub fds: [i32; 32],
     pub nr_fds: i32,
 }
@@ -110,7 +107,6 @@ pub struct UblkDev {
     cdev_file: fs::File,
 
     pub tgt: RefCell<UblkTgt>,
-    pub tdata: RefCell<UblkTgtData>,
 }
 
 unsafe impl Send for UblkDev {}
@@ -129,13 +125,10 @@ impl UblkDev {
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
     pub fn new(ops: Box<dyn UblkTgtImpl>, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError> {
-        let tgt = UblkTgt {
+        let mut tgt = UblkTgt {
             tgt_type: ops.tgt_type().to_string(),
-            ..Default::default()
-        };
-        let mut data = UblkTgtData {
             fds: [0_i32; 32],
-            nr_fds: 0,
+            ..Default::default()
         };
 
         let info = ctrl.dev_info;
@@ -146,15 +139,14 @@ impl UblkDev {
             .open(cdev_path)
             .map_err(UblkError::OtherIOError)?;
 
-        data.fds[0] = cdev_file.as_raw_fd();
-        data.nr_fds = 1;
+        tgt.fds[0] = cdev_file.as_raw_fd();
+        tgt.nr_fds = 1;
 
         let dev = UblkDev {
             ops,
             dev_info: info,
             cdev_file,
             tgt: RefCell::new(tgt),
-            tdata: RefCell::new(data),
         };
 
         ctrl.json = dev.ops.init_tgt(&dev)?;
@@ -359,7 +351,7 @@ impl UblkQueue<'_> {
         cq_depth: u32,
         _ring_flags: u64,
     ) -> Result<UblkQueue, UblkError> {
-        let td = dev.tdata.borrow();
+        let tgt = dev.tgt.borrow();
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth)
             .setup_coop_taskrun()
@@ -370,7 +362,7 @@ impl UblkQueue<'_> {
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
 
         ring.submitter()
-            .register_files(&td.fds[0..td.nr_fds as usize])
+            .register_files(&tgt.fds[0..tgt.nr_fds as usize])
             .map_err(UblkError::OtherIOError)?;
 
         let off = sys::UBLKSRV_CMD_BUF_OFFSET as i64

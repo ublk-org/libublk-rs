@@ -44,12 +44,12 @@ impl UblkTgtImpl for LoopTgt {
             }
         }
 
-        let mut td = dev.tdata.borrow_mut();
-        let nr_fds = td.nr_fds;
-        td.fds[nr_fds as usize] = self.back_file.as_raw_fd();
-        td.nr_fds = nr_fds + 1;
-
         let mut tgt = dev.tgt.borrow_mut();
+        let nr_fds = tgt.nr_fds;
+
+        tgt.fds[nr_fds as usize] = self.back_file.as_raw_fd();
+        tgt.nr_fds = nr_fds + 1;
+
         tgt.dev_size = lo_file_size(&self.back_file).unwrap();
 
         //todo: figure out correct block size
