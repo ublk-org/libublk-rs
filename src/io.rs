@@ -103,6 +103,10 @@ pub struct UblkTgt {
     /// uring CQ depth, default is queue depth
     pub cq_depth: u16,
 
+    /// extra io slots, usually for meta data handling or eventfd,
+    /// default is 0
+    pub extra_ios: u16,
+
     //const struct ublk_tgt_ops *ops;
     pub fds: [i32; 32],
     pub nr_fds: i32,
@@ -399,16 +403,26 @@ impl UblkQueue<'_> {
             ));
         }
 
-        let nr_ios = depth;
+        let nr_ios = depth + tgt.extra_ios as u32;
         let mut ios = Vec::<UblkIO>::with_capacity(nr_ios as usize);
         unsafe {
             ios.set_len(nr_ios as usize);
         }
-        for io in &mut ios {
-            io.buf_addr = super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
-                libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
-            });
-            io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
+
+        for i in 0..nr_ios {
+            let mut io = &mut ios[i as usize];
+
+            // extra io slot needn't to allocate buffer
+            if i < depth {
+                io.buf_addr =
+                    super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
+                        libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+                    });
+                io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
+            } else {
+                io.buf_addr = std::ptr::null_mut();
+                io.flags = 0;
+            }
             io.result = -1;
         }
 
