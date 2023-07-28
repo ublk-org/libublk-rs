@@ -73,9 +73,6 @@ pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
 pub fn create_queue_handler<F>(
     ctrl: &mut ctrl::UblkCtrl,
     dev: &Arc<io::UblkDev>,
-    sq_depth: u32,
-    cq_depth: u32,
-    ring_flags: u64,
     f: F,
 ) -> Vec<std::thread::JoinHandle<()>>
 where
@@ -114,9 +111,7 @@ where
                 );
             }
             let ops: &'static dyn io::UblkQueueImpl = &*Box::leak(_fn(_q_id as i32));
-            io::UblkQueue::new(_q_id, &_dev, sq_depth, cq_depth, ring_flags)
-                .unwrap()
-                .handler(ops);
+            io::UblkQueue::new(_q_id, &_dev).unwrap().handler(ops);
         }));
         tids.push(tid);
         q_affi.push(affinity);
@@ -175,9 +170,7 @@ where
     let mut ctrl = ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();
     let ublk_dev =
         Arc::new(io::UblkDev::new(tgt_fn(ctrl.dev_info.dev_id as i32), &mut ctrl).unwrap());
-    let depth = ublk_dev.dev_info.queue_depth as u32;
-
-    let threads = create_queue_handler(&mut ctrl, &ublk_dev, depth, depth, 0, q_fn);
+    let threads = create_queue_handler(&mut ctrl, &ublk_dev, q_fn);
 
     ctrl.start_dev(&ublk_dev).unwrap();
 

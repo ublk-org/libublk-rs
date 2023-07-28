@@ -88,12 +88,27 @@ pub trait UblkTgtImpl {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UblkTgt {
+    /// target type
     pub tgt_type: String,
+
+    /// target device size, will be the actual size of /dev/ublkbN
     pub dev_size: u64,
+
+    /// target specific io_ring flags, default is 0
+    pub ring_flags: u64,
+
+    /// uring SQ depth, default is queue depth
+    pub sq_depth: u16,
+
+    /// uring CQ depth, default is queue depth
+    pub cq_depth: u16,
+
     //const struct ublk_tgt_ops *ops;
-    pub params: sys::ublk_params,
     pub fds: [i32; 32],
     pub nr_fds: i32,
+
+    /// could become bigger, is it one issue?
+    pub params: sys::ublk_params,
 }
 
 pub struct UblkDev {
@@ -125,13 +140,16 @@ impl UblkDev {
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
     pub fn new(ops: Box<dyn UblkTgtImpl>, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError> {
+        let info = ctrl.dev_info;
         let mut tgt = UblkTgt {
             tgt_type: ops.tgt_type().to_string(),
+            sq_depth: info.queue_depth,
+            cq_depth: info.queue_depth,
             fds: [0_i32; 32],
+            ring_flags: 0,
             ..Default::default()
         };
 
-        let info = ctrl.dev_info;
         let cdev_path = format!("{}{}", super::CDEV_PATH, info.dev_id);
         let cdev_file = fs::OpenOptions::new()
             .read(true)
@@ -337,26 +355,22 @@ impl UblkQueue<'_> {
     ///
     /// * `q_id`: queue id, [0, nr_queues)
     /// * `dev`: ublk device reference
-    /// * `sq_depth`: io_uring sq depth
-    /// * `cq_depth`: io_uring cq depth
-    /// * `_ring_flags`: io uring flags for setup this qeuue's uring
     ///
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
-    pub fn new(
-        q_id: u16,
-        dev: &UblkDev,
-        sq_depth: u32,
-        cq_depth: u32,
-        _ring_flags: u64,
-    ) -> Result<UblkQueue, UblkError> {
+    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue, UblkError> {
         let tgt = dev.tgt.borrow();
+        let sq_depth = tgt.sq_depth;
+        let cq_depth = tgt.cq_depth;
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
-            .setup_cqsize(cq_depth)
+            .setup_cqsize(cq_depth as u32)
             .setup_coop_taskrun()
-            .build(sq_depth)
+            .build(sq_depth as u32)
             .map_err(UblkError::OtherIOError)?;
+
+        //todo: apply io_uring flags from tgt.ring_flags
+
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
@@ -385,9 +399,10 @@ impl UblkQueue<'_> {
             ));
         }
 
-        let mut ios = Vec::<UblkIO>::with_capacity(depth as usize);
+        let nr_ios = depth;
+        let mut ios = Vec::<UblkIO>::with_capacity(nr_ios as usize);
         unsafe {
-            ios.set_len(depth as usize);
+            ios.set_len(nr_ios as usize);
         }
         for io in &mut ios {
             io.buf_addr = super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {

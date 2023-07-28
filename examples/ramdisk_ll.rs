@@ -106,7 +106,7 @@ fn rd_add_dev2(dev_id: i32, buf_addr: u64, size: u64) {
     }
 
     let ops = RamdiskQueue {};
-    let mut queue = UblkQueue::new(_qid, &ublk_dev, depth, depth, 0).unwrap();
+    let mut queue = UblkQueue::new(_qid, &ublk_dev).unwrap();
     queue.submit_fetch_commands();
 
     let token = ctrl.start_dev_async(&ublk_dev).unwrap();
@@ -192,7 +192,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
     let _dev1 = Arc::clone(&ublk_dev);
     let f_queue = async_std::task::spawn_local(async move {
         let ops = RamdiskQueue {};
-        let mut queue = UblkQueue::new(_qid, &_dev1, depth, depth, 0).unwrap();
+        let mut queue = UblkQueue::new(_qid, &_dev1).unwrap();
 
         queue.submit_fetch_commands();
         loop {
