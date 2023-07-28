@@ -586,6 +586,10 @@ impl UblkCtrl {
 
     /// Flush this device's json info as file
     pub fn flush_json(&mut self) -> Result<i32, UblkError> {
+        if self.json == serde_json::json!({}) {
+            return Ok(0);
+        }
+
         let run_path = self.run_path();
 
         if let Some(parent_dir) = std::path::Path::new(&run_path).parent() {
