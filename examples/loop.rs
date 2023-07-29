@@ -117,7 +117,7 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-fn loop_handle_io(q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
+fn loop_handle_io(q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError> {
     let tag = e.get_tag();
 
     // our IO on backing file is done
@@ -144,8 +144,8 @@ fn loop_handle_io(q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, Ubl
 
 // implement loop IO logic, and it is the main job for writing new ublk target
 impl UblkQueueImpl for LoopQueue {
-    fn handle_io(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
-        loop_handle_io(q, e, _flags)
+    fn handle_io(&self, q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError> {
+        loop_handle_io(q, e)
     }
 }
 

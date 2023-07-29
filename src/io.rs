@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
-pub struct UblkCQE<'a>(&'a cqueue::Entry);
+pub struct UblkCQE<'a>(&'a cqueue::Entry, u32);
 
 impl<'a> UblkCQE<'a> {
     #[inline(always)]
@@ -27,6 +27,10 @@ impl<'a> UblkCQE<'a> {
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
         is_target_io(self.0.user_data())
+    }
+    #[inline(always)]
+    pub fn flags(&self) -> u32 {
+        self.1
     }
 }
 
@@ -54,7 +58,7 @@ pub trait UblkQueueImpl {
     /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
     /// ublk kernel driver, and is indexed by tag. IO command is readonly for
     /// ublk userspace.
-    fn handle_io(&self, q: &mut UblkQueue, e: UblkCQE, flags: u32) -> Result<i32, UblkError>;
+    fn handle_io(&self, q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError>;
 }
 
 pub trait UblkTgtImpl {
@@ -607,7 +611,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, e: UblkCQE, flags: u32) {
+    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &UblkCQE) {
         let res = e.result();
 
         if res < 0 && res != -(libc::EAGAIN) {
@@ -621,12 +625,12 @@ impl UblkQueue<'_> {
                 user_data_to_op(data)
             );
         }
-        ops.handle_io(self, e, flags).unwrap();
+        ops.handle_io(self, e).unwrap();
     }
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: UblkCQE, flags: u32) {
+    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &UblkCQE) {
         let data = e.user_data();
         let res = e.result();
         let tag = user_data_to_tag(data);
@@ -645,7 +649,7 @@ impl UblkQueue<'_> {
 
         /* Don't retrieve io in case of target io */
         if is_target_io(data) {
-            self.handle_tgt_cqe(ops, e, flags);
+            self.handle_tgt_cqe(ops, e);
             return;
         }
 
@@ -658,7 +662,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.handle_io(self, e, flags).unwrap();
+            ops.handle_io(self, e).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
@@ -685,9 +689,11 @@ impl UblkQueue<'_> {
         for (idx, cqe) in cqes.iter().enumerate() {
             self.handle_cqe(
                 ops,
-                UblkCQE(&cqe),
-                if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
-                    | if idx + 1 == count { UBLK_IO_F_LAST } else { 0 },
+                &UblkCQE(
+                    &cqe,
+                    if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
+                        | if idx + 1 == count { UBLK_IO_F_LAST } else { 0 },
+                ),
             );
         }
 
