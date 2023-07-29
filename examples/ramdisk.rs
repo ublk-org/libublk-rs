@@ -12,26 +12,7 @@ struct RamdiskQueue {}
 // setup ramdisk target
 impl UblkTgtImpl for RamdiskTgt {
     fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-        let info = dev.dev_info;
-        let dev_size = self.size;
-
-        let mut tgt = dev.tgt.borrow_mut();
-
-        tgt.dev_size = dev_size;
-        tgt.params = libublk::sys::ublk_params {
-            types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
-            basic: libublk::sys::ublk_param_basic {
-                logical_bs_shift: 12,
-                physical_bs_shift: 12,
-                io_opt_shift: 12,
-                io_min_shift: 12,
-                max_sectors: info.max_io_buf_bytes >> 9,
-                dev_sectors: dev_size >> 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
+        dev.set_default_params(self.size);
         Ok(serde_json::json!({}))
     }
     fn tgt_type(&self) -> &'static str {

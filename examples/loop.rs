@@ -36,36 +36,22 @@ fn lo_file_size(f: &std::fs::File) -> Result<u64> {
 impl UblkTgtImpl for LoopTgt {
     fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
         trace!("loop: init_tgt {}", dev.dev_info.dev_id);
-        let info = dev.dev_info;
-
         if self.direct_io != 0 {
             unsafe {
                 libc::fcntl(self.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
             }
         }
 
-        let mut tgt = dev.tgt.borrow_mut();
-        let nr_fds = tgt.nr_fds;
+        let dev_size = {
+            let mut tgt = dev.tgt.borrow_mut();
+            let nr_fds = tgt.nr_fds;
+            tgt.fds[nr_fds as usize] = self.back_file.as_raw_fd();
+            tgt.nr_fds = nr_fds + 1;
 
-        tgt.fds[nr_fds as usize] = self.back_file.as_raw_fd();
-        tgt.nr_fds = nr_fds + 1;
-
-        tgt.dev_size = lo_file_size(&self.back_file).unwrap();
-
-        //todo: figure out correct block size
-        tgt.params = libublk::sys::ublk_params {
-            types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
-            basic: libublk::sys::ublk_param_basic {
-                logical_bs_shift: 9,
-                physical_bs_shift: 12,
-                io_opt_shift: 12,
-                io_min_shift: 9,
-                max_sectors: info.max_io_buf_bytes >> 9,
-                dev_sectors: tgt.dev_size >> 9,
-                ..Default::default()
-            },
-            ..Default::default()
+            tgt.dev_size = lo_file_size(&self.back_file).unwrap();
+            tgt.dev_size
         };
+        dev.set_default_params(dev_size);
 
         Ok(
             serde_json::json!({"loop": LoJson { back_file_path: self.back_file_path.clone(), direct_io: 1 } }),

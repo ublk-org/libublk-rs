@@ -190,6 +190,26 @@ impl UblkDev {
         info!("dev {} deinitialized", id);
     }
 
+    pub fn set_default_params(&self, dev_size: u64) {
+        let info = self.dev_info;
+        let mut tgt = self.tgt.borrow_mut();
+
+        tgt.dev_size = dev_size;
+        tgt.params = super::sys::ublk_params {
+            types: super::sys::UBLK_PARAM_TYPE_BASIC,
+            basic: super::sys::ublk_param_basic {
+                logical_bs_shift: 12,
+                physical_bs_shift: 12,
+                io_opt_shift: 12,
+                io_min_shift: 12,
+                max_sectors: info.max_io_buf_bytes >> 9,
+                dev_sectors: dev_size >> 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+    }
+
     ///
     /// Return the target concrete object from UblkTgtImpl trait object
     ///
