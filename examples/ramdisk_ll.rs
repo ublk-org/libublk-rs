@@ -108,7 +108,6 @@ fn rd_add_dev2(dev_id: i32, buf_addr: u64, size: u64) {
 
     let ops = RamdiskQueue {};
     let mut queue = UblkQueue::new(_qid, &ublk_dev).unwrap();
-    queue.submit_fetch_commands();
 
     let token = ctrl.start_dev_async(&ublk_dev).unwrap();
     let mut started = false;
@@ -195,7 +194,6 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
         let ops = RamdiskQueue {};
         let mut queue = UblkQueue::new(_qid, &_dev1).unwrap();
 
-        queue.submit_fetch_commands();
         loop {
             match queue.process_io(&ops, 1) {
                 Err(_) => break,

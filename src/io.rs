@@ -434,7 +434,7 @@ impl UblkQueue<'_> {
             io.result = -1;
         }
 
-        let q = UblkQueue {
+        let mut q = UblkQueue {
             q_id,
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
@@ -444,6 +444,7 @@ impl UblkQueue<'_> {
             q_ring: ring,
             ios,
         };
+        q.submit_fetch_commands();
 
         trace!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
@@ -552,7 +553,7 @@ impl UblkQueue<'_> {
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
     #[inline(always)]
-    pub fn submit_fetch_commands(&mut self) {
+    fn submit_fetch_commands(&mut self) {
         for i in 0..self.q_depth {
             self.queue_io_cmd(i as u16);
         }
@@ -728,7 +729,6 @@ impl UblkQueue<'_> {
     /// Called in queue context. Won't return unless error is observed.
     ///
     pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
-        self.submit_fetch_commands();
         loop {
             match self.process_io(ops, 1) {
                 Err(_) => break,
