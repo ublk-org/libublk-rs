@@ -31,7 +31,7 @@ impl<'a> UblkCQE<'a> {
 }
 
 pub trait UblkQueueImpl {
-    /// Handle IO command represented by `tag`
+    /// Handle IO represented by `tag`
     ///
     /// # Arguments:
     ///
@@ -39,28 +39,22 @@ pub trait UblkQueueImpl {
     /// * `tag`: io command tag
     ///
     /// Called when one io command is retrieved from ublk kernel driver side,
-    /// and target code implements this method for handling io command. After
-    /// io command is done, it needs to complete by calling UblkQueue::complete_io().
+    /// and target code implements this method for handling io command,
+    /// when e.is_target_io() returns false. After io command is done, it
+    /// needs to complete by calling UblkQueue::complete_io().
+    ///
+    /// Or called when target IO is completed by io_uring, when e.is_target_io()
+    /// returns true.
+    ///
+    /// In short, this method handles both io cmd and target io. IO command comes
+    /// when its CQE is done from ublk driver, and target IO is done when its CQE
+    /// is done from io_uring normal operations(FS, network, ...). Both share
+    /// same IO tag.
     ///
     /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
     /// ublk kernel driver, and is indexed by tag. IO command is readonly for
     /// ublk userspace.
-    fn handle_io_cmd(&self, q: &mut UblkQueue, e: UblkCQE, flags: u32) -> Result<i32, UblkError>;
-
-    /// target io_uring IO notifier(optional)
-    ///
-    /// # Arguments:
-    /// * `_q`: this UblkQueue instance
-    /// * `_tag`: io command tag
-    /// * `_res`: io uring completion result
-    /// * `_user_data`: io uring completion user data
-    ///
-    /// Called when one target io submitted via io_uring is completed
-    ///
-    /// Note: only used in case that target IO is handled our shared per-queue
-    /// io_uring
-    #[inline(always)]
-    fn tgt_io_done(&self, _q: &mut UblkQueue, _e: UblkCQE, _last: u32) {}
+    fn handle_io(&self, q: &mut UblkQueue, e: UblkCQE, flags: u32) -> Result<i32, UblkError>;
 }
 
 pub trait UblkTgtImpl {
@@ -606,7 +600,7 @@ impl UblkQueue<'_> {
                 user_data_to_op(data)
             );
         }
-        ops.tgt_io_done(self, e, flags);
+        ops.handle_io(self, e, flags).unwrap();
     }
 
     #[inline(always)]
@@ -643,7 +637,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.handle_io_cmd(self, e, flags).unwrap();
+            ops.handle_io(self, e, flags).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching

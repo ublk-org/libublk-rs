@@ -158,12 +158,8 @@ fn loop_handle_io(q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, Ubl
 
 // implement loop IO logic, and it is the main job for writing new ublk target
 impl UblkQueueImpl for LoopQueue {
-    fn handle_io_cmd(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
+    fn handle_io(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
         loop_handle_io(q, e, _flags)
-    }
-
-    fn tgt_io_done(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) {
-        loop_handle_io(q, e, _flags).unwrap();
     }
 }
 
