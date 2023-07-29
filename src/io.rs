@@ -38,18 +38,6 @@ pub trait UblkQueueImpl {
     /// io_uring
     #[inline(always)]
     fn tgt_io_done(&self, _q: &mut UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
-
-    /// Method after current io command batch is handled(optional)
-    ///
-    /// # Arguments:
-    /// * `_q`: this UblkQueue instance
-    /// * `_nr_queued`: How many IOs queued to our per-queue io_uring
-    ///
-    /// Called after the current io command batch is handled, often useful
-    /// for handling network IO
-    ///
-    #[inline(always)]
-    fn handle_io_background(&self, _q: &UblkQueue, _nr_queued: usize) {}
 }
 
 pub trait UblkTgtImpl {
@@ -283,6 +271,9 @@ pub fn user_data_to_op(user_data: u64) -> u32 {
 const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
 const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
 const UBLK_IO_FREE: u32 = 1u32 << 2;
+
+pub const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
+pub const UBLK_IO_F_LAST: u32 = 1u32 << 17;
 
 struct UblkIO {
     buf_addr: *mut u8,
@@ -596,7 +587,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &cqueue::Entry) {
+    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &cqueue::Entry, _flags: u32) {
         let data = e.user_data();
         let res = e.result();
         let tag = user_data_to_tag(data);
@@ -652,8 +643,13 @@ impl UblkQueue<'_> {
         let cqes = self.get_cqes();
         let count = cqes.len();
 
-        for cqe in cqes {
-            self.handle_cqe(ops, &cqe);
+        for (idx, cqe) in cqes.iter().enumerate() {
+            self.handle_cqe(
+                ops,
+                &cqe,
+                if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
+                    | if idx + 1 == count { UBLK_IO_F_LAST } else { 0 },
+            );
         }
 
         count
@@ -695,10 +691,6 @@ impl UblkQueue<'_> {
             .map_err(UblkError::UringSubmissionError)?;
         let reapped = self.reap_events_uring(ops);
 
-        {
-            let nr_queued = self.q_ring.submission().len();
-            ops.handle_io_background(self, nr_queued);
-        }
         info!(
             "submit result {}, reapped {} stop {} idle {}",
             ret,
