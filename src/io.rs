@@ -7,6 +7,19 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
+pub struct UblkCQE<'a>(&'a cqueue::Entry);
+
+impl<'a> UblkCQE<'a> {
+    #[inline(always)]
+    pub fn result(&self) -> i32 {
+        self.0.result()
+    }
+    #[inline(always)]
+    pub fn user_data(&self) -> u64 {
+        self.0.user_data()
+    }
+}
+
 pub trait UblkQueueImpl {
     /// Handle IO command represented by `tag`
     ///
@@ -587,7 +600,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &cqueue::Entry, _flags: u32) {
+    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: UblkCQE, _flags: u32) {
         let data = e.user_data();
         let res = e.result();
         let tag = user_data_to_tag(data);
@@ -646,7 +659,7 @@ impl UblkQueue<'_> {
         for (idx, cqe) in cqes.iter().enumerate() {
             self.handle_cqe(
                 ops,
-                &cqe,
+                UblkCQE(&cqe),
                 if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
                     | if idx + 1 == count { UBLK_IO_F_LAST } else { 0 },
             );
