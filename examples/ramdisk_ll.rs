@@ -94,20 +94,8 @@ fn rd_add_dev2(dev_id: i32, buf_addr: u64, size: u64) {
     )
     .unwrap();
 
-    let mut affinity = libublk::ctrl::UblkQueueAffinity::new();
-    ctrl.get_queue_affinity(0, &mut affinity).unwrap();
-    let _qid = 0;
-
-    unsafe {
-        libc::pthread_setaffinity_np(
-            libc::pthread_self(),
-            affinity.buf_len(),
-            affinity.addr() as *const libc::cpu_set_t,
-        );
-    }
-
     let ops = RamdiskQueue {};
-    let mut queue = UblkQueue::new(_qid, &ublk_dev).unwrap();
+    let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
 
     ctrl.start_dev(&ublk_dev, Some(&mut queue), Some(&ops))
         .unwrap();
@@ -130,11 +118,8 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
     ));
     let ctrl_clone = Arc::clone(&ctrl_arc);
 
-    let mut affinity = libublk::ctrl::UblkQueueAffinity::new();
     let ublk_dev = {
         let mut ctrl = ctrl_clone.lock().unwrap();
-
-        ctrl.get_queue_affinity(0, &mut affinity).unwrap();
 
         Arc::new(
             UblkDev::new(
@@ -147,14 +132,6 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
             .unwrap(),
         )
     };
-
-    unsafe {
-        libc::pthread_setaffinity_np(
-            libc::pthread_self(),
-            affinity.buf_len(),
-            affinity.addr() as *const libc::cpu_set_t,
-        );
-    }
 
     // Still need one temp pthread for starting device
     let _dev = Arc::clone(&ublk_dev);
@@ -230,8 +207,8 @@ fn test_del() {
 fn main() {
     if let Some(cmd) = std::env::args().nth(1) {
         match cmd.as_str() {
-            "add" => test_add(0),
-            "add2" => test_add(1),
+            "add" => test_add(1),
+            "add2" => test_add(0),
             "del" => test_del(),
             _ => todo!(),
         }
