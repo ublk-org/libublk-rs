@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
@@ -133,14 +133,18 @@ fn loop_queue_tgt_io(
 
 // implement loop IO logic, and it is the main job for writing new ublk target
 impl UblkQueueImpl for LoopQueue {
-    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
+    fn handle_io_cmd(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
+        let tag = e.get_tag();
         let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
 
         loop_queue_tgt_io(q, tag, iod)
     }
 
-    fn tgt_io_done(&self, q: &mut UblkQueue, tag: u32, res: i32, user_data: u64) {
+    fn tgt_io_done(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) {
+        let user_data = e.user_data();
+        let res = e.result();
+        let tag = e.get_tag();
         let cqe_tag = libublk::io::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);

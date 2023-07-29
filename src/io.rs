@@ -18,6 +18,11 @@ impl<'a> UblkCQE<'a> {
     pub fn user_data(&self) -> u64 {
         self.0.user_data()
     }
+
+    #[inline(always)]
+    pub fn get_tag(&self) -> u32 {
+        user_data_to_tag(self.0.user_data())
+    }
 }
 
 pub trait UblkQueueImpl {
@@ -35,7 +40,7 @@ pub trait UblkQueueImpl {
     /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
     /// ublk kernel driver, and is indexed by tag. IO command is readonly for
     /// ublk userspace.
-    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError>;
+    fn handle_io_cmd(&self, q: &mut UblkQueue, e: UblkCQE, flags: u32) -> Result<i32, UblkError>;
 
     /// target io_uring IO notifier(optional)
     ///
@@ -50,7 +55,7 @@ pub trait UblkQueueImpl {
     /// Note: only used in case that target IO is handled our shared per-queue
     /// io_uring
     #[inline(always)]
-    fn tgt_io_done(&self, _q: &mut UblkQueue, _tag: u32, _res: i32, _user_data: u64) {}
+    fn tgt_io_done(&self, _q: &mut UblkQueue, _e: UblkCQE, _last: u32) {}
 }
 
 pub trait UblkTgtImpl {
@@ -582,10 +587,11 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, res: i32, data: u64) {
-        let tag = user_data_to_tag(data);
+    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, e: UblkCQE, flags: u32) {
+        let res = e.result();
 
         if res < 0 && res != -(libc::EAGAIN) {
+            let data = e.user_data();
             error!(
                 "{}: failed tgt io: res {} qid {} tag {}, cmd_op {}\n",
                 "handle_tgt_cqe",
@@ -595,12 +601,12 @@ impl UblkQueue<'_> {
                 user_data_to_op(data)
             );
         }
-        ops.tgt_io_done(self, tag, res, data);
+        ops.tgt_io_done(self, e, flags);
     }
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: UblkCQE, _flags: u32) {
+    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: UblkCQE, flags: u32) {
         let data = e.user_data();
         let res = e.result();
         let tag = user_data_to_tag(data);
@@ -619,7 +625,7 @@ impl UblkQueue<'_> {
 
         /* Don't retrieve io in case of target io */
         if is_target_io(data) {
-            self.handle_tgt_cqe(ops, res, data);
+            self.handle_tgt_cqe(ops, e, flags);
             return;
         }
 
@@ -632,7 +638,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.handle_io_cmd(self, tag).unwrap();
+            ops.handle_io_cmd(self, e, flags).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching

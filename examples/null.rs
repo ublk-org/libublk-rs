@@ -1,5 +1,5 @@
 use core::any::Any;
-use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
 pub struct NullTgt {}
@@ -41,7 +41,8 @@ impl UblkTgtImpl for NullTgt {
 
 // implement io logic, and it is the main job for writing new ublk target
 impl libublk::io::UblkQueueImpl for NullQueue {
-    fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
+    fn handle_io_cmd(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
+        let tag = e.get_tag();
         let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 

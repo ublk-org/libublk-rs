@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use core::any::Any;
-    use libublk::io::{UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+    use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
     use libublk::sys;
     use libublk::{ctrl::UblkCtrl, UblkError};
     use std::env;
@@ -55,7 +55,13 @@ mod tests {
 
     // implement io logic, and it is the main job for writing new ublk target
     impl UblkQueueImpl for NullQueue {
-        fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
+        fn handle_io_cmd(
+            &self,
+            q: &mut UblkQueue,
+            e: UblkCQE,
+            _flags: u32,
+        ) -> Result<i32, UblkError> {
+            let tag = e.get_tag();
             let iod = q.get_iod(tag);
             let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
@@ -139,7 +145,13 @@ mod tests {
 
     // implement io logic, and it is the main job for writing new ublk target
     impl UblkQueueImpl for RamdiskQueue {
-        fn handle_io_cmd(&self, q: &mut UblkQueue, tag: u32) -> Result<i32, UblkError> {
+        fn handle_io_cmd(
+            &self,
+            q: &mut UblkQueue,
+            e: UblkCQE,
+            _flags: u32,
+        ) -> Result<i32, UblkError> {
+            let tag = e.get_tag();
             let _iod = q.get_iod(tag);
             let iod = unsafe { &*_iod };
             let off = (iod.start_sector << 9) as u64;
