@@ -109,33 +109,15 @@ fn rd_add_dev2(dev_id: i32, buf_addr: u64, size: u64) {
     let ops = RamdiskQueue {};
     let mut queue = UblkQueue::new(_qid, &ublk_dev).unwrap();
 
-    let token = ctrl.start_dev_async(&ublk_dev).unwrap();
-    let mut started = false;
+    ctrl.start_dev(&ublk_dev, Some(&mut queue), Some(&ops))
+        .unwrap();
+    ctrl.dump();
     loop {
-        if !started {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            if let Ok(res) = ctrl.poll_cmd(token) {
-                started = true;
-                if res == 0 {
-                    ctrl.dump();
-                    continue;
-                } else {
-                    println!("fail to start device");
-                    break;
-                }
-            }
-            match queue.process_io(&ops, 0) {
-                Err(_) => break,
-                _ => continue,
-            }
-        } else {
-            match queue.process_io(&ops, 1) {
-                Err(_) => break,
-                _ => continue,
-            }
+        match queue.process_io(&ops, 1) {
+            Err(_) => break,
+            _ => continue,
         }
     }
-
     ctrl.stop_dev(&ublk_dev).unwrap();
 }
 
@@ -180,7 +162,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
 
     let f_ctrl = async_std::task::spawn(async move {
         let mut ctrl = _ctrl.lock().unwrap();
-        ctrl.start_dev(&_dev).unwrap();
+        ctrl.start_dev(&_dev, None, None).unwrap();
 
         let dev_id = ctrl.dev_info.dev_id;
         let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);

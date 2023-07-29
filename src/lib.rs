@@ -152,7 +152,7 @@ where
         Arc::new(io::UblkDev::new(tgt_fn(ctrl.dev_info.dev_id as i32), &mut ctrl).unwrap());
     let threads = create_queue_handler(&mut ctrl, &ublk_dev, q_fn);
 
-    ctrl.start_dev(&ublk_dev).unwrap();
+    ctrl.start_dev(&ublk_dev, None, None).unwrap();
 
     let dev_id = ublk_dev.dev_info.dev_id as i32;
     let worker_qh = std::thread::spawn(move || {

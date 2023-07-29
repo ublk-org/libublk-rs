@@ -590,35 +590,63 @@ impl UblkCtrl {
     ///
     /// # Arguments:
     ///
-    /// * `_dev`: ublk device
+    /// * `dev`: ublk device
+    /// * `queue`: ublk queue, if both `queue` and `ops`  isn't none, we
+    ///     start device in queue daemon context
+    /// * `ops`: ublk queue trait
     ///
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
     ///
-    pub fn start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+    pub fn start_dev(
+        &mut self,
+        dev: &UblkDev,
+        queue: Option<&mut super::io::UblkQueue>,
+        ops: Option<&dyn super::io::UblkQueueImpl>,
+    ) -> Result<i32, UblkError> {
         let params = dev.tgt.borrow();
+        let async_cmd = !(queue.is_none() || ops.is_none());
 
         self.get_info()?;
-        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
+            return Ok(0);
+        }
+
+        let token = if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             self.set_params(&params.params)?;
             self.flush_json()?;
-            self.start(unsafe { libc::getpid() as i32 }, false)
+            self.start(unsafe { libc::getpid() as i32 }, async_cmd)?
         } else {
-            self.end_user_recover(unsafe { libc::getpid() as i32 }, false)
-        }
-    }
+            self.end_user_recover(unsafe { libc::getpid() as i32 }, async_cmd)?
+        };
 
-    pub fn start_dev_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        let params = dev.tgt.borrow();
-
-        self.get_info()?;
-        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
-            self.set_params(&params.params)?;
-            self.flush_json()?;
-            self.start(unsafe { libc::getpid() as i32 }, true)
-        } else {
-            self.end_user_recover(unsafe { libc::getpid() as i32 }, true)
+        if !async_cmd {
+            return Ok(0);
         }
+
+        if let Some(q) = queue {
+            if let Some(f) = ops {
+                let mut started = false;
+
+                while !started {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    if let Ok(res) = self.poll_cmd(token) {
+                        started = true;
+                        if res == 0 {
+                            continue;
+                        } else {
+                            return Err(UblkError::UringIOError(res));
+                        }
+                    }
+                    match q.process_io(f, 0) {
+                        Err(r) => return Err(r),
+                        _ => continue,
+                    }
+                }
+            }
+        }
+
+        Ok(0)
     }
 
     /// Stop ublk device
