@@ -146,6 +146,8 @@ pub struct UblkCtrl {
     pub json: serde_json::Value,
     for_add: bool,
     cmd_token: i32,
+    queue_tids: Vec<i32>,
+    nr_queues_configured: u16,
     ring: IoUring<squeue::Entry128>,
 }
 
@@ -210,6 +212,14 @@ impl UblkCtrl {
             ring,
             for_add,
             cmd_token: 0,
+            queue_tids: {
+                let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
+                unsafe {
+                    tids.set_len(nr_queues as usize);
+                }
+                tids
+            },
+            nr_queues_configured: 0,
         };
 
         //add cdev if the device is for adding device
@@ -246,6 +256,48 @@ impl UblkCtrl {
         } else {
             Err(UblkError::OtherError(-libc::EEXIST))
         }
+    }
+
+    fn store_queue_tid(&mut self, qid: u16, tid: i32) {
+        self.queue_tids[qid as usize] = tid;
+    }
+
+    /// Configure queue affinity and record queue tid
+    ///
+    /// # Arguments:
+    ///
+    /// * `qid`: queue id
+    /// * `tid`: tid of the queue's pthread context
+    /// * `pthread_id`: pthread handle for setting affinity
+    ///
+    /// Note: this method has to be called in queue daemon context
+    pub fn configure_queue(
+        &mut self,
+        dev: &UblkDev,
+        qid: u16,
+        tid: i32,
+        pthread_id: libc::pthread_t,
+    ) {
+        let mut affinity = self::UblkQueueAffinity::new();
+        self.get_queue_affinity(qid as u32, &mut affinity).unwrap();
+        self.store_queue_tid(qid, tid);
+
+        unsafe {
+            libc::pthread_setaffinity_np(
+                pthread_id,
+                affinity.buf_len(),
+                affinity.addr() as *const libc::cpu_set_t,
+            );
+        }
+        self.nr_queues_configured += 1;
+
+        if self.nr_queues_configured == self.dev_info.nr_hw_queues {
+            self.build_json(dev);
+        }
+    }
+
+    pub fn queues_configured(&self) -> bool {
+        self.nr_queues_configured == self.dev_info.nr_hw_queues
     }
 
     pub fn dump_from_json(&self) {
@@ -612,17 +664,20 @@ impl UblkCtrl {
     /// * `tids`: queue pthread tid vector, in which each item stores the queue's
     /// pthread tid
     ///
-    pub fn build_json(&mut self, dev: &UblkDev, affi: Vec<UblkQueueAffinity>, tids: Vec<i32>) {
+    fn build_json(&mut self, dev: &UblkDev) {
         let tgt_data = self.json.clone();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
+            let mut affinity = self::UblkQueueAffinity::new();
+            self.get_queue_affinity(qid as u32, &mut affinity).unwrap();
+
             map.insert(
                 format!("{}", qid),
                 serde_json::json!({
                     "qid": qid,
-                    "tid": tids[qid as usize],
-                    "affinity": affi[qid as usize].to_bits_vec(),
+                    "tid": self.queue_tids[qid as usize],
+                    "affinity": affinity.to_bits_vec(),
                 }),
             );
         }

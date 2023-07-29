@@ -7,7 +7,7 @@
 
 use log::error;
 use std::alloc::{alloc, dealloc, Layout};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 pub mod ctrl;
 pub mod io;
@@ -78,56 +78,36 @@ pub fn create_queue_handler<F>(
 where
     F: Fn(i32) -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
 {
+    use std::sync::mpsc;
+    use std::sync::mpsc::{Receiver, Sender};
+
     let mut q_threads = Vec::new();
-    let mut q_affi = Vec::new();
-    let mut q_tids = Vec::new();
     let nr_queues = dev.dev_info.nr_hw_queues;
-    let mut tids = Vec::<Arc<(Mutex<i32>, Condvar)>>::with_capacity(nr_queues as usize);
     let arc_fn = Arc::new(f);
 
-    for q in 0..nr_queues {
-        let mut affinity = ctrl::UblkQueueAffinity::new();
-        ctrl.get_queue_affinity(q as u32, &mut affinity).unwrap();
+    let (tx, rx): (
+        Sender<(u16, i32, libc::pthread_t)>,
+        Receiver<(u16, i32, libc::pthread_t)>,
+    ) = mpsc::channel();
 
+    for q in 0..nr_queues {
         let _dev = Arc::clone(dev);
-        let _q_id = q;
-        let tid = Arc::new((Mutex::new(0_i32), Condvar::new()));
-        let _tid = Arc::clone(&tid);
         let _fn = arc_fn.clone();
-        let _affinity = affinity;
+        let _tx = tx.clone();
 
         q_threads.push(std::thread::spawn(move || {
-            let (lock, cvar) = &*_tid;
             unsafe {
-                let mut guard = lock.lock().unwrap();
-                *guard = libc::gettid();
-                cvar.notify_one();
+                _tx.send((q, libc::gettid(), libc::pthread_self())).unwrap();
             }
-            unsafe {
-                libc::pthread_setaffinity_np(
-                    libc::pthread_self(),
-                    _affinity.buf_len(),
-                    _affinity.addr() as *const libc::cpu_set_t,
-                );
-            }
-            let ops: &'static dyn io::UblkQueueImpl = &*Box::leak(_fn(_q_id as i32));
-            io::UblkQueue::new(_q_id, &_dev).unwrap().handler(ops);
+            let ops: &'static dyn io::UblkQueueImpl = &*Box::leak(_fn(q as i32));
+            io::UblkQueue::new(q, &_dev).unwrap().handler(ops);
         }));
-        tids.push(tid);
-        q_affi.push(affinity);
-    }
-    for q in 0..nr_queues {
-        let (lock, cvar) = &*tids[q as usize];
-
-        let mut guard = lock.lock().unwrap();
-        while *guard == 0 {
-            guard = cvar.wait(guard).unwrap();
-        }
-        q_tids.push(*guard);
     }
 
-    //Now we are up, and build & export json
-    ctrl.build_json(dev, q_affi, q_tids);
+    for _q in 0..nr_queues {
+        let (qid, tid, pthread_id) = rx.recv().unwrap();
+        ctrl.configure_queue(&dev, qid, tid, pthread_id);
+    }
 
     q_threads
 }
