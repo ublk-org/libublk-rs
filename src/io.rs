@@ -23,6 +23,11 @@ impl<'a> UblkCQE<'a> {
     pub fn get_tag(&self) -> u32 {
         user_data_to_tag(self.0.user_data())
     }
+
+    #[inline(always)]
+    pub fn is_tgt_io(&self) -> bool {
+        is_target_io(self.0.user_data())
+    }
 }
 
 pub trait UblkQueueImpl {

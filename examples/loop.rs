@@ -131,32 +131,39 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-// implement loop IO logic, and it is the main job for writing new ublk target
-impl UblkQueueImpl for LoopQueue {
-    fn handle_io_cmd(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
-        let tag = e.get_tag();
-        let _iod = q.get_iod(tag);
-        let iod = unsafe { &*_iod };
+fn loop_handle_io(q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
+    let tag = e.get_tag();
 
-        loop_queue_tgt_io(q, tag, iod)
-    }
-
-    fn tgt_io_done(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) {
+    // our IO on backing file is done
+    if e.is_tgt_io() {
         let user_data = e.user_data();
         let res = e.result();
-        let tag = e.get_tag();
         let cqe_tag = libublk::io::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
             q.complete_io(tag as u16, res);
-        } else {
-            let _iod = q.get_iod(tag);
-            let iod = unsafe { &*_iod };
 
-            loop_queue_tgt_io(q, tag, iod).unwrap();
+            return Ok(0);
         }
+    }
+
+    // either start to handle or retry
+    let _iod = q.get_iod(tag);
+    let iod = unsafe { &*_iod };
+
+    loop_queue_tgt_io(q, tag, iod)
+}
+
+// implement loop IO logic, and it is the main job for writing new ublk target
+impl UblkQueueImpl for LoopQueue {
+    fn handle_io_cmd(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) -> Result<i32, UblkError> {
+        loop_handle_io(q, e, _flags)
+    }
+
+    fn tgt_io_done(&self, q: &mut UblkQueue, e: UblkCQE, _flags: u32) {
+        loop_handle_io(q, e, _flags).unwrap();
     }
 }
 
