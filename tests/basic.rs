@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use core::any::Any;
-    use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
+    use libublk::io::{
+        UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl,
+    };
     use libublk::sys;
     use libublk::{ctrl::UblkCtrl, UblkError};
     use std::env;
@@ -152,6 +154,66 @@ mod tests {
         }
     }
 
+    fn __test_ublk_ramdisk(dev_id: i32) {
+        let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+        let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        //ublk block device should be observed now
+        assert!(Path::new(&dev_path).exists() == true);
+
+        //ublk exported json file should be observed
+        assert!(Path::new(&ctrl.run_path()).exists() == true);
+
+        //format as ext4 and mount over the created ublk-ramdisk
+        {
+            let ext4_options = block_utils::Filesystem::Ext4 {
+                inode_size: 512,
+                stride: Some(2),
+                stripe_width: None,
+                reserved_blocks_percentage: 10,
+            };
+            block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
+
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
+
+            block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
+            block_utils::unmount_device(tmp_dir.path()).unwrap();
+        }
+        ctrl.del().unwrap();
+    }
+
+    fn rd_add_dev(
+        dev_id: i32,
+        buf_addr: u64,
+        size: u64,
+        fn_ptr: fn(i32),
+    ) -> std::thread::JoinHandle<()> {
+        let depth = 128;
+        let nr_queues = 1;
+        let mut ctrl = UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap();
+        let ublk_dev = UblkDev::new(Box::new(RamdiskTgt { size }), &mut ctrl).unwrap();
+
+        let ops = RamdiskQueue { start: buf_addr };
+        let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
+        ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
+            libc::pthread_self()
+        });
+
+        ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &ops)
+            .unwrap();
+
+        let dev_id = ctrl.dev_info.dev_id as i32;
+        let qh = std::thread::spawn(move || fn_ptr(dev_id));
+
+        queue.handler(&ops);
+        ctrl.stop_dev(&ublk_dev).unwrap();
+
+        qh
+    }
+
     /// make one ublk-ramdisk and test:
     /// - if /dev/ublkbN can be created successfully
     /// - if yes, then test format/mount/umount over this ublk-ramdisk
@@ -161,50 +223,11 @@ mod tests {
         let buf = libublk::ublk_alloc_buf(size as usize, 4096);
         let buf_addr = buf as u64;
 
-        libublk::ublk_tgt_worker(
-            -1,
-            1,
-            64,
-            512_u32 * 1024,
-            0,
-            true,
-            move |_| Box::new(RamdiskTgt { size: size }),
-            move |_| Box::new(RamdiskQueue { start: buf_addr }) as Box<dyn UblkQueueImpl>,
-            |dev_id| {
-                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
-                let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+        let qh = rd_add_dev(-1, buf_addr, size, __test_ublk_ramdisk);
 
-                std::thread::sleep(std::time::Duration::from_millis(500));
-
-                //ublk block device should be observed now
-                assert!(Path::new(&dev_path).exists() == true);
-
-                //ublk exported json file should be observed
-                assert!(Path::new(&ctrl.run_path()).exists() == true);
-
-                //format as ext4 and mount over the created ublk-ramdisk
-                {
-                    let ext4_options = block_utils::Filesystem::Ext4 {
-                        inode_size: 512,
-                        stride: Some(2),
-                        stripe_width: None,
-                        reserved_blocks_percentage: 10,
-                    };
-                    block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
-
-                    let tmp_dir = tempfile::TempDir::new().unwrap();
-                    let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
-
-                    block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
-                    block_utils::unmount_device(tmp_dir.path()).unwrap();
-                }
-                ctrl.del().unwrap();
-            },
-        )
-        .unwrap()
-        .join()
-        .unwrap();
         libublk::ublk_dealloc_buf(buf, size as usize, 4096);
+
+        qh.join().unwrap();
     }
 
     fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
