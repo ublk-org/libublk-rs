@@ -29,6 +29,7 @@ impl UblkTgtImpl for RamdiskTgt {
 impl UblkQueueImpl for RamdiskQueue {
     fn handle_io(
         &self,
+        _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
         ctx: &UblkQueueCtx,
         io: &mut UblkIO,
         e: &UblkCQE,

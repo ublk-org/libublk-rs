@@ -25,6 +25,7 @@ impl UblkTgtImpl for NullTgt {
 impl libublk::io::UblkQueueImpl for NullQueue {
     fn handle_io(
         &self,
+        _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
         ctx: &UblkQueueCtx,
         io: &mut UblkIO,
         e: &UblkCQE,

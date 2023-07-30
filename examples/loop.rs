@@ -66,6 +66,7 @@ impl UblkTgtImpl for LoopTgt {
 }
 
 fn loop_queue_tgt_io(
+    r: &mut io_uring::IoUring<squeue::Entry>,
     io: &mut UblkIO,
     tag: u32,
     iod: &libublk::sys::ublksrv_io_desc,
@@ -82,28 +83,34 @@ fn loop_queue_tgt_io(
 
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => {
-            let sqe = opcode::SyncFileRange::new(types::Fixed(1), bytes)
+            let sqe = &opcode::SyncFileRange::new(types::Fixed(1), bytes)
                 .offset(off)
                 .build()
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
-            io.push(sqe);
+            unsafe {
+                r.submission().push(sqe).expect("submission fail");
+            }
         }
         libublk::sys::UBLK_IO_OP_READ => {
-            let sqe = opcode::Read::new(types::Fixed(1), buf_addr, bytes)
+            let sqe = &opcode::Read::new(types::Fixed(1), buf_addr, bytes)
                 .offset(off)
                 .build()
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
-            io.push(sqe);
+            unsafe {
+                r.submission().push(sqe).expect("submission fail");
+            }
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
-            let sqe = opcode::Write::new(types::Fixed(1), buf_addr, bytes)
+            let sqe = &opcode::Write::new(types::Fixed(1), buf_addr, bytes)
                 .offset(off)
                 .build()
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
-            io.push(sqe);
+            unsafe {
+                r.submission().push(sqe).expect("submission fail");
+            }
         }
         _ => return Err(UblkError::OtherError(-libc::EINVAL)),
     }
@@ -111,7 +118,12 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-fn loop_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIO, e: &UblkCQE) -> Result<i32, UblkError> {
+fn loop_handle_io(
+    r: &mut io_uring::IoUring<squeue::Entry>,
+    ctx: &UblkQueueCtx,
+    io: &mut UblkIO,
+    e: &UblkCQE,
+) -> Result<i32, UblkError> {
     let tag = e.get_tag();
 
     // our IO on backing file is done
@@ -133,18 +145,19 @@ fn loop_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIO, e: &UblkCQE) -> Result<i3
     let _iod = ctx.get_iod(tag);
     let iod = unsafe { &*_iod };
 
-    loop_queue_tgt_io(io, tag, iod)
+    loop_queue_tgt_io(r, io, tag, iod)
 }
 
 // implement loop IO logic, and it is the main job for writing new ublk target
 impl UblkQueueImpl for LoopQueue {
     fn handle_io(
         &self,
+        ring: &mut io_uring::IoUring<squeue::Entry>,
         ctx: &UblkQueueCtx,
         io: &mut UblkIO,
         e: &UblkCQE,
     ) -> Result<i32, UblkError> {
-        loop_handle_io(ctx, io, e)
+        loop_handle_io(ring, ctx, io, e)
     }
 }
 

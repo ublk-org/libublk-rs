@@ -40,6 +40,7 @@ mod tests {
     impl UblkQueueImpl for NullQueue {
         fn handle_io(
             &self,
+            _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
             ctx: &UblkQueueCtx,
             io: &mut UblkIO,
             e: &UblkCQE,
@@ -113,6 +114,7 @@ mod tests {
     impl UblkQueueImpl for RamdiskQueue {
         fn handle_io(
             &self,
+            _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
             ctx: &UblkQueueCtx,
             io: &mut UblkIO,
             e: &UblkCQE,

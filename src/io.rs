@@ -62,6 +62,7 @@ pub trait UblkQueueImpl {
     /// ublk userspace.
     fn handle_io(
         &self,
+        ring: &mut IoUring<squeue::Entry>,
         qctx: &UblkQueueCtx,
         io: &mut UblkIO,
         e: &UblkCQE,
@@ -325,7 +326,6 @@ pub const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
 pub const UBLK_IO_F_LAST: u32 = 1u32 << 17;
 
 pub struct UblkIO {
-    pub sqes: Vec<squeue::Entry>,
     buf_addr: *mut u8,
     flags: u32,
     result: i32,
@@ -351,11 +351,6 @@ impl UblkIO {
     pub fn complete(&mut self, res: i32) {
         self.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE | UBLK_IO_TO_QUEUE;
         self.result = res;
-    }
-
-    #[inline(always)]
-    pub fn push(&mut self, sqe: squeue::Entry) {
-        self.sqes.push(sqe)
     }
 }
 
@@ -537,7 +532,6 @@ impl UblkQueue<'_> {
                 io.flags = 0;
             }
             io.result = -1;
-            io.sqes = Vec::new();
         }
 
         let mut q = UblkQueue {
@@ -714,7 +708,7 @@ impl UblkQueue<'_> {
                     user_data_to_op(data)
                 );
             }
-            ops.handle_io(&qctx, &mut self.ios[tag as usize], e)
+            ops.handle_io(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)
                 .unwrap();
             return;
         }
@@ -728,7 +722,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.handle_io(&qctx, &mut self.ios[tag as usize], e)
+            ops.handle_io(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)
                 .unwrap();
         } else {
             /*
@@ -766,15 +760,6 @@ impl UblkQueue<'_> {
         if self.ios[tag].flags & UBLK_IO_TO_QUEUE != 0 {
             self.ios[tag].flags &= !UBLK_IO_TO_QUEUE;
             self.queue_io_cmd(tag.try_into().unwrap());
-        }
-
-        if !self.ios[tag].sqes.is_empty() {
-            for s in &self.ios[tag].sqes {
-                unsafe {
-                    self.q_ring.submission().push(&s).expect("submission fail");
-                }
-            }
-            self.ios[tag].sqes.clear();
         }
 
         self.cqes_idx += 1;
