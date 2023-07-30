@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use core::any::Any;
-    use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
+    use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
     use libublk::sys;
     use libublk::{ctrl::UblkCtrl, UblkError};
     use std::env;
@@ -40,15 +40,15 @@ mod tests {
     impl UblkQueueImpl for NullQueue {
         fn handle_io(
             &self,
-            q: &mut UblkQueue,
             ctx: &UblkQueueCtx,
+            io: &mut UblkIO,
             e: &UblkCQE,
         ) -> Result<i32, UblkError> {
             let tag = e.get_tag();
             let iod = ctx.get_iod(tag);
             let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            q.complete_io(tag as u16, bytes);
+            io.complete(bytes);
             Ok(0)
         }
     }
@@ -113,8 +113,8 @@ mod tests {
     impl UblkQueueImpl for RamdiskQueue {
         fn handle_io(
             &self,
-            q: &mut UblkQueue,
             ctx: &UblkQueueCtx,
+            io: &mut UblkIO,
             e: &UblkCQE,
         ) -> Result<i32, UblkError> {
             let tag = e.get_tag();
@@ -124,7 +124,7 @@ mod tests {
             let bytes = (iod.nr_sectors << 9) as u32;
             let op = iod.op_flags & 0xff;
             let start = self.start;
-            let buf_addr = q.get_buf_addr(tag);
+            let buf_addr = io.get_buf_addr();
 
             match op {
                 sys::UBLK_IO_OP_FLUSH => {}
@@ -145,7 +145,7 @@ mod tests {
                 _ => return Err(UblkError::OtherError(-libc::EINVAL)),
             }
 
-            q.complete_io(tag as u16, bytes as i32);
+            io.complete(bytes as i32);
             Ok(0)
         }
     }

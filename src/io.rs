@@ -39,8 +39,10 @@ pub trait UblkQueueImpl {
     ///
     /// # Arguments:
     ///
-    /// * `q`: this UblkQueue instance
-    /// * `tag`: io command tag
+    /// * `qctx`: this queue's context info for retrieving iod and so on
+    /// * `io`: IO slot, which represents the io command from ublk driver
+    /// * `e`: the arrived io_uring cqe, which may represent IO command,
+    ///    or any target io_uring IO issued for handling this io command
     ///
     /// Called when one io command is retrieved from ublk kernel driver side,
     /// and target code implements this method for handling io command,
@@ -60,8 +62,8 @@ pub trait UblkQueueImpl {
     /// ublk userspace.
     fn handle_io(
         &self,
-        q: &mut UblkQueue,
         qctx: &UblkQueueCtx,
+        io: &mut UblkIO,
         e: &UblkCQE,
     ) -> Result<i32, UblkError>;
 }
@@ -317,14 +319,44 @@ pub fn user_data_to_op(user_data: u64) -> u32 {
 const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
 const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
 const UBLK_IO_FREE: u32 = 1u32 << 2;
+const UBLK_IO_TO_QUEUE: u32 = 1u32 << 3;
 
 pub const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
 pub const UBLK_IO_F_LAST: u32 = 1u32 << 17;
 
-struct UblkIO {
+pub struct UblkIO {
+    pub sqes: Vec<squeue::Entry>,
     buf_addr: *mut u8,
     flags: u32,
     result: i32,
+}
+
+impl UblkIO {
+    #[inline(always)]
+    pub fn get_buf_addr(&self) -> *mut u8 {
+        self.buf_addr
+    }
+
+    /// Complete this io command
+    ///
+    /// # Arguments:
+    ///
+    /// * `res`: result of handling this io command
+    ///
+    /// Called from specific target code for completing this io command,
+    /// so ublk driver gets notified and complete IO request on
+    /// /dev/ublkbN
+    ///
+    #[inline(always)]
+    pub fn complete(&mut self, res: i32) {
+        self.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE | UBLK_IO_TO_QUEUE;
+        self.result = res;
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, sqe: squeue::Entry) {
+        self.sqes.push(sqe)
+    }
 }
 
 /// UblkQueue Context info
@@ -332,13 +364,14 @@ struct UblkIO {
 ///
 /// Can only hold read-only info for UblkQueue, so it is safe to
 /// mark it as Copy
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct UblkQueueCtx {
     pub depth: u16,
     pub q_id: u16,
 
     /// io command buffer start address of this queue
     buf_addr: u64,
+    //dev: &'a UblkDev,
 }
 
 impl UblkQueueCtx {
@@ -429,6 +462,7 @@ impl UblkQueue<'_> {
             buf_addr: self.io_cmd_buf,
             depth: self.q_depth.try_into().unwrap(),
             q_id: self.q_id,
+            //dev: self.dev,
         }
     }
 
@@ -503,6 +537,7 @@ impl UblkQueue<'_> {
                 io.flags = 0;
             }
             io.result = -1;
+            io.sqes = Vec::new();
         }
 
         let mut q = UblkQueue {
@@ -646,24 +681,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, qctx: &UblkQueueCtx, e: &UblkCQE) {
-        let res = e.result();
-
-        if res < 0 && res != -(libc::EAGAIN) {
-            let data = e.user_data();
-            error!(
-                "{}: failed tgt io: res {} qid {} tag {}, cmd_op {}\n",
-                "handle_tgt_cqe",
-                res,
-                self.q_id,
-                user_data_to_tag(data),
-                user_data_to_op(data)
-            );
-        }
-        ops.handle_io(self, qctx, e).unwrap();
-    }
-
-    #[inline(always)]
     #[allow(unused_assignments)]
     fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &UblkCQE) {
         let data = e.user_data();
@@ -683,9 +700,22 @@ impl UblkQueue<'_> {
             self.q_state,
         );
 
-        /* Don't retrieve io in case of target io */
         if is_target_io(data) {
-            self.handle_tgt_cqe(ops, &qctx, e);
+            let res = e.result();
+
+            if res < 0 && res != -(libc::EAGAIN) {
+                let data = e.user_data();
+                error!(
+                    "{}: failed tgt io: res {} qid {} tag {}, cmd_op {}\n",
+                    "handle_tgt_cqe",
+                    res,
+                    self.q_id,
+                    user_data_to_tag(data),
+                    user_data_to_op(data)
+                );
+            }
+            ops.handle_io(&qctx, &mut self.ios[tag as usize], e)
+                .unwrap();
             return;
         }
 
@@ -698,7 +728,8 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.handle_io(self, &qctx, e).unwrap();
+            ops.handle_io(&qctx, &mut self.ios[tag as usize], e)
+                .unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
@@ -720,18 +751,31 @@ impl UblkQueue<'_> {
         }
 
         let cqe = self.q_ring.completion().next().unwrap();
-        self.handle_cqe(
-            ops,
-            &UblkCQE(
-                &cqe,
-                &if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
-                    | if idx + 1 == self.cqes_cnt {
-                        UBLK_IO_F_LAST
-                    } else {
-                        0
-                    },
-            ),
+        let ublk_cqe = UblkCQE(
+            &cqe,
+            &if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
+                | if idx + 1 == self.cqes_cnt {
+                    UBLK_IO_F_LAST
+                } else {
+                    0
+                },
         );
+        self.handle_cqe(ops, &ublk_cqe);
+
+        let tag = ublk_cqe.get_tag() as usize;
+        if self.ios[tag].flags & UBLK_IO_TO_QUEUE != 0 {
+            self.ios[tag].flags &= !UBLK_IO_TO_QUEUE;
+            self.queue_io_cmd(tag.try_into().unwrap());
+        }
+
+        if !self.ios[tag].sqes.is_empty() {
+            for s in &self.ios[tag].sqes {
+                unsafe {
+                    self.q_ring.submission().push(&s).expect("submission fail");
+                }
+            }
+            self.ios[tag].sqes.clear();
+        }
 
         self.cqes_idx += 1;
 

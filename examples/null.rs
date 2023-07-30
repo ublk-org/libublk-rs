@@ -1,5 +1,5 @@
 use core::any::Any;
-use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
 pub struct NullTgt {}
@@ -25,15 +25,15 @@ impl UblkTgtImpl for NullTgt {
 impl libublk::io::UblkQueueImpl for NullQueue {
     fn handle_io(
         &self,
-        q: &mut UblkQueue,
         ctx: &UblkQueueCtx,
+        io: &mut UblkIO,
         e: &UblkCQE,
     ) -> Result<i32, UblkError> {
         let tag = e.get_tag();
         let iod = ctx.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        q.complete_io(tag as u16, bytes);
+        io.complete(bytes);
         Ok(0)
     }
 }

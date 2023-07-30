@@ -1,5 +1,5 @@
 use core::any::Any;
-use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use std::sync::{Arc, Mutex};
 
@@ -29,8 +29,8 @@ impl UblkTgtImpl for RamdiskTgt {
 impl UblkQueueImpl for RamdiskQueue {
     fn handle_io(
         &self,
-        q: &mut UblkQueue,
         ctx: &UblkQueueCtx,
+        io: &mut UblkIO,
         e: &UblkCQE,
     ) -> Result<i32, UblkError> {
         let tag = e.get_tag();
@@ -40,7 +40,7 @@ impl UblkQueueImpl for RamdiskQueue {
         let bytes = (iod.nr_sectors << 9) as u32;
         let op = iod.op_flags & 0xff;
         let start = self.start;
-        let buf_addr = q.get_buf_addr(tag);
+        let buf_addr = io.get_buf_addr();
 
         match op {
             libublk::sys::UBLK_IO_OP_READ => unsafe {
@@ -60,7 +60,7 @@ impl UblkQueueImpl for RamdiskQueue {
             _ => return Err(UblkError::OtherError(-libc::EINVAL)),
         }
 
-        q.complete_io(tag as u16, bytes as i32);
+        io.complete(bytes as i32);
         Ok(0)
     }
 }
