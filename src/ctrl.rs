@@ -586,26 +586,8 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    /// Start ublk device
-    ///
-    /// # Arguments:
-    ///
-    /// * `dev`: ublk device
-    /// * `queue`: ublk queue, if both `queue` and `ops`  isn't none, we
-    ///     start device in queue daemon context
-    /// * `ops`: ublk queue trait
-    ///
-    /// Send parameter to driver, and flush json to storage, finally
-    /// send START command
-    ///
-    pub fn start_dev(
-        &mut self,
-        dev: &UblkDev,
-        queue: Option<&mut super::io::UblkQueue>,
-        ops: Option<&dyn super::io::UblkQueueImpl>,
-    ) -> Result<i32, UblkError> {
+    fn __start_dev(&mut self, dev: &UblkDev, async_cmd: bool) -> Result<i32, UblkError> {
         let params = dev.tgt.borrow();
-        let async_cmd = !(queue.is_none() || ops.is_none());
 
         self.get_info()?;
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
@@ -620,33 +602,64 @@ impl UblkCtrl {
             self.end_user_recover(unsafe { libc::getpid() as i32 }, async_cmd)?
         };
 
-        if !async_cmd {
-            return Ok(0);
-        }
+        Ok(token)
+    }
 
-        if let Some(q) = queue {
-            if let Some(f) = ops {
-                let mut started = false;
+    /// Start ublk device
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: ublk device
+    ///
+    /// Send parameter to driver, and flush json to storage, finally
+    /// send START command
+    ///
+    pub fn start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        self.__start_dev(dev, false)
+    }
 
-                q.set_poll(true);
-                while !started {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    if let Ok(res) = self.poll_cmd(token) {
-                        started = true;
-                        if res == 0 {
-                            continue;
-                        } else {
-                            return Err(UblkError::UringIOError(res));
-                        }
-                    }
-                    match q.process_io(f) {
-                        Err(r) => return Err(r),
-                        _ => continue,
-                    }
+    /// Start ublk device from queue daemon context
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: ublk device
+    /// * `queue`: ublk queue, if both `queue` and `ops`  isn't none, we
+    ///     start device in queue daemon context
+    /// * `ops`: ublk queue trait
+    ///
+    /// Send parameter to driver, and flush json to storage, finally
+    /// send START command
+    ///
+    /// When ublk driver handles START_DEV, ublk IO starts to come from
+    /// this kernel code path, such as, reading partition table, so we
+    /// have make io handler working before sending START_DEV to kernel
+    ///
+    pub fn start_dev_in_queue(
+        &mut self,
+        dev: &UblkDev,
+        q: &mut super::io::UblkQueue,
+        ops: &dyn super::io::UblkQueueImpl,
+    ) -> Result<i32, UblkError> {
+        let mut started = false;
+        let token = self.__start_dev(dev, true)?;
+
+        q.set_poll(true);
+        while !started {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Ok(res) = self.poll_cmd(token) {
+                started = true;
+                if res == 0 {
+                    continue;
+                } else {
+                    return Err(UblkError::UringIOError(res));
                 }
-                q.set_poll(false);
+            }
+            match q.process_io(ops) {
+                Err(r) => return Err(r),
+                _ => continue,
             }
         }
+        q.set_poll(false);
 
         Ok(0)
     }

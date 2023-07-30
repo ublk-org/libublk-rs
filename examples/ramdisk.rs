@@ -87,7 +87,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         libc::pthread_self()
     });
 
-    ctrl.start_dev(&ublk_dev, Some(&mut queue), Some(&ops))
+    ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &ops)
         .unwrap();
     ctrl.dump();
     queue.handler(&ops);
