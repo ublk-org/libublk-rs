@@ -13,6 +13,13 @@ pub mod ctrl;
 pub mod io;
 pub mod sys;
 
+type QueueFn = fn(
+    &mut io_uring::IoUring<io_uring::squeue::Entry>,
+    &io::UblkQueueCtx,
+    &mut io::UblkIO,
+    &io::UblkCQE,
+) -> Result<i32, UblkError>;
+
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
     #[error("failed to read the key file")]
@@ -70,37 +77,42 @@ pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
 /// Note: This method is one high level API, and handles each queue in
 /// one dedicated thread. If your target won't take this approach, please
 /// don't use this API.
-pub fn create_queue_handler<F>(
+pub fn create_queue_handler(
     ctrl: &mut ctrl::UblkCtrl,
     dev: &Arc<io::UblkDev>,
-    f: F,
-) -> Vec<std::thread::JoinHandle<()>>
-where
-    F: Fn(i32) -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
-{
+    q_fn: QueueFn,
+) -> Vec<std::thread::JoinHandle<()>> {
     use std::sync::mpsc;
     use std::sync::mpsc::{Receiver, Sender};
 
     let mut q_threads = Vec::new();
     let nr_queues = dev.dev_info.nr_hw_queues;
-    let arc_fn = Arc::new(f);
 
     let (tx, rx): (
         Sender<(u16, i32, libc::pthread_t)>,
         Receiver<(u16, i32, libc::pthread_t)>,
     ) = mpsc::channel();
 
+    let queue_closure = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+                              ctx: &io::UblkQueueCtx,
+                              io: &mut io::UblkIO,
+                              e: &io::UblkCQE| {
+        let r = q_fn(r, ctx, io, e);
+
+        r
+    };
+
     for q in 0..nr_queues {
         let _dev = Arc::clone(dev);
-        let _fn = arc_fn.clone();
         let _tx = tx.clone();
 
         q_threads.push(std::thread::spawn(move || {
             unsafe {
                 _tx.send((q, libc::gettid(), libc::pthread_self())).unwrap();
             }
-            let ops: &'static dyn io::UblkQueueImpl = &*Box::leak(_fn(q as i32));
-            io::UblkQueue::new(q, &_dev).unwrap().handler(ops);
+            let mut queue = io::UblkQueue::new(q, &_dev).unwrap();
+
+            queue.handler(queue_closure);
         }));
     }
 
@@ -131,7 +143,7 @@ where
 /// one dedicated thread. If your target won't take this approach, please
 /// don't use this API.
 #[allow(clippy::too_many_arguments)]
-pub fn ublk_tgt_worker<T, Q, W>(
+pub fn ublk_tgt_worker<T, W>(
     id: i32,
     nr_queues: u32,
     depth: u32,
@@ -139,12 +151,11 @@ pub fn ublk_tgt_worker<T, Q, W>(
     flags: u64,
     for_add: bool,
     tgt_fn: T,
-    q_fn: Q,
+    q_fn: QueueFn,
     worker_fn: W,
 ) -> Result<std::thread::JoinHandle<()>, UblkError>
 where
     T: Fn(i32) -> Box<dyn io::UblkTgtImpl> + Send + Sync,
-    Q: Fn(i32) -> Box<dyn io::UblkQueueImpl> + Send + Sync + 'static,
     W: Fn(i32) + Send + Sync + 'static,
 {
     let mut ctrl = ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();

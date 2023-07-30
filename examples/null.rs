@@ -1,9 +1,7 @@
-use core::any::Any;
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
 pub struct NullTgt {}
-pub struct NullQueue {}
 
 // setup null target
 impl UblkTgtImpl for NullTgt {
@@ -15,28 +13,20 @@ impl UblkTgtImpl for NullTgt {
     fn tgt_type(&self) -> &'static str {
         "null"
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
-// implement io logic, and it is the main job for writing new ublk target
-impl libublk::io::UblkQueueImpl for NullQueue {
-    fn handle_io(
-        &self,
-        _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-        ctx: &UblkQueueCtx,
-        io: &mut UblkIO,
-        e: &UblkCQE,
-    ) -> Result<i32, UblkError> {
-        let tag = e.get_tag();
-        let iod = ctx.get_iod(tag);
-        let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+fn handle_io(
+    _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+    ctx: &UblkQueueCtx,
+    io: &mut UblkIO,
+    e: &UblkCQE,
+) -> Result<i32, UblkError> {
+    let tag = e.get_tag();
+    let iod = ctx.get_iod(tag);
+    let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        io.complete(bytes);
-        Ok(0)
-    }
+    io.complete(bytes);
+    Ok(0)
 }
 
 fn test_add() {
@@ -52,7 +42,7 @@ fn test_add() {
             0,
             true,
             |_| Box::new(NullTgt {}),
-            |_| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>,
+            handle_io,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
 

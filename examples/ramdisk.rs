@@ -1,13 +1,8 @@
-use core::any::Any;
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
 struct RamdiskTgt {
     size: u64,
-}
-
-struct RamdiskQueue {
-    start: u64,
 }
 
 // setup ramdisk target
@@ -19,50 +14,43 @@ impl UblkTgtImpl for RamdiskTgt {
     fn tgt_type(&self) -> &'static str {
         "ramdisk"
     }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
-// implement io logic, and it is the main job for writing new ublk target
-impl UblkQueueImpl for RamdiskQueue {
-    fn handle_io(
-        &self,
-        _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-        ctx: &UblkQueueCtx,
-        io: &mut UblkIO,
-        e: &UblkCQE,
-    ) -> Result<i32, UblkError> {
-        let tag = e.get_tag();
-        let _iod = ctx.get_iod(tag);
-        let iod = unsafe { &*_iod };
-        let off = (iod.start_sector << 9) as u64;
-        let bytes = (iod.nr_sectors << 9) as u32;
-        let op = iod.op_flags & 0xff;
-        let start = self.start;
-        let buf_addr = io.get_buf_addr();
+fn handle_io(
+    _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+    ctx: &UblkQueueCtx,
+    io: &mut UblkIO,
+    e: &UblkCQE,
+    start: u64,
+) -> Result<i32, UblkError> {
+    let tag = e.get_tag();
+    let _iod = ctx.get_iod(tag);
+    let iod = unsafe { &*_iod };
+    let off = (iod.start_sector << 9) as u64;
+    let bytes = (iod.nr_sectors << 9) as u32;
+    let op = iod.op_flags & 0xff;
+    let buf_addr = io.get_buf_addr();
 
-        match op {
-            libublk::sys::UBLK_IO_OP_READ => unsafe {
-                libc::memcpy(
-                    buf_addr as *mut libc::c_void,
-                    (start + off) as *mut libc::c_void,
-                    bytes as usize,
-                );
-            },
-            libublk::sys::UBLK_IO_OP_WRITE => unsafe {
-                libc::memcpy(
-                    (start + off) as *mut libc::c_void,
-                    buf_addr as *mut libc::c_void,
-                    bytes as usize,
-                );
-            },
-            _ => return Err(UblkError::OtherError(-libc::EINVAL)),
-        }
-
-        io.complete(bytes as i32);
-        Ok(0)
+    match op {
+        libublk::sys::UBLK_IO_OP_READ => unsafe {
+            libc::memcpy(
+                buf_addr as *mut libc::c_void,
+                (start + off) as *mut libc::c_void,
+                bytes as usize,
+            );
+        },
+        libublk::sys::UBLK_IO_OP_WRITE => unsafe {
+            libc::memcpy(
+                (start + off) as *mut libc::c_void,
+                buf_addr as *mut libc::c_void,
+                bytes as usize,
+            );
+        },
+        _ => return Err(UblkError::OtherError(-libc::EINVAL)),
     }
+
+    io.complete(bytes as i32);
+    Ok(0)
 }
 
 ///run this ramdisk ublk daemon completely in single context with
@@ -81,16 +69,18 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     .unwrap();
     let ublk_dev = UblkDev::new(Box::new(RamdiskTgt { size }), &mut ctrl).unwrap();
 
-    let ops = RamdiskQueue { start: buf_addr };
+    let qc = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+                   ctx: &UblkQueueCtx,
+                   io: &mut UblkIO,
+                   e: &UblkCQE| { handle_io(r, ctx, io, e, buf_addr) };
     let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
     ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
         libc::pthread_self()
     });
 
-    ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &ops)
-        .unwrap();
+    ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
     ctrl.dump();
-    queue.handler(&ops);
+    queue.handler(&qc);
     ctrl.stop_dev(&ublk_dev).unwrap();
 }
 

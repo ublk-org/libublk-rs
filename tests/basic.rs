@@ -1,9 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use core::any::Any;
-    use libublk::io::{
-        UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl,
-    };
+    use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkTgtImpl};
     use libublk::sys;
     use libublk::{ctrl::UblkCtrl, UblkError};
     use std::env;
@@ -19,7 +16,6 @@ mod tests {
     }
 
     struct NullTgt {}
-    struct NullQueue {}
 
     // setup null target
     impl UblkTgtImpl for NullTgt {
@@ -32,28 +28,20 @@ mod tests {
         fn tgt_type(&self) -> &'static str {
             "null"
         }
-        #[inline(always)]
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
-    // implement io logic, and it is the main job for writing new ublk target
-    impl UblkQueueImpl for NullQueue {
-        fn handle_io(
-            &self,
-            _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-            ctx: &UblkQueueCtx,
-            io: &mut UblkIO,
-            e: &UblkCQE,
-        ) -> Result<i32, UblkError> {
-            let tag = e.get_tag();
-            let iod = ctx.get_iod(tag);
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+    fn null_handle_io(
+        _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+        ctx: &UblkQueueCtx,
+        io: &mut UblkIO,
+        e: &UblkCQE,
+    ) -> Result<i32, UblkError> {
+        let tag = e.get_tag();
+        let iod = ctx.get_iod(tag);
+        let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            io.complete(bytes);
-            Ok(0)
-        }
+        io.complete(bytes);
+        Ok(0)
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -67,7 +55,7 @@ mod tests {
             0,
             true,
             |_| Box::new(NullTgt {}),
-            |_| Box::new(NullQueue {}) as Box<dyn UblkQueueImpl>,
+            null_handle_io,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
@@ -92,10 +80,6 @@ mod tests {
         size: u64,
     }
 
-    struct RamdiskQueue {
-        start: u64,
-    }
-
     // setup ramdisk target
     impl UblkTgtImpl for RamdiskTgt {
         fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
@@ -106,52 +90,44 @@ mod tests {
         fn tgt_type(&self) -> &'static str {
             "ramdisk"
         }
-        #[inline(always)]
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
-    // implement io logic, and it is the main job for writing new ublk target
-    impl UblkQueueImpl for RamdiskQueue {
-        fn handle_io(
-            &self,
-            _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-            ctx: &UblkQueueCtx,
-            io: &mut UblkIO,
-            e: &UblkCQE,
-        ) -> Result<i32, UblkError> {
-            let tag = e.get_tag();
-            let _iod = ctx.get_iod(tag);
-            let iod = unsafe { &*_iod };
-            let off = (iod.start_sector << 9) as u64;
-            let bytes = (iod.nr_sectors << 9) as u32;
-            let op = iod.op_flags & 0xff;
-            let start = self.start;
-            let buf_addr = io.get_buf_addr();
+    fn rd_handle_io(
+        _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+        ctx: &UblkQueueCtx,
+        io: &mut UblkIO,
+        e: &UblkCQE,
+        start: u64,
+    ) -> Result<i32, UblkError> {
+        let tag = e.get_tag();
+        let _iod = ctx.get_iod(tag);
+        let iod = unsafe { &*_iod };
+        let off = (iod.start_sector << 9) as u64;
+        let bytes = (iod.nr_sectors << 9) as u32;
+        let op = iod.op_flags & 0xff;
+        let buf_addr = io.get_buf_addr();
 
-            match op {
-                sys::UBLK_IO_OP_FLUSH => {}
-                sys::UBLK_IO_OP_READ => unsafe {
-                    libc::memcpy(
-                        buf_addr as *mut libc::c_void,
-                        (start + off) as *mut libc::c_void,
-                        bytes as usize,
-                    );
-                },
-                sys::UBLK_IO_OP_WRITE => unsafe {
-                    libc::memcpy(
-                        (start + off) as *mut libc::c_void,
-                        buf_addr as *mut libc::c_void,
-                        bytes as usize,
-                    );
-                },
-                _ => return Err(UblkError::OtherError(-libc::EINVAL)),
-            }
-
-            io.complete(bytes as i32);
-            Ok(0)
+        match op {
+            sys::UBLK_IO_OP_FLUSH => {}
+            sys::UBLK_IO_OP_READ => unsafe {
+                libc::memcpy(
+                    buf_addr as *mut libc::c_void,
+                    (start + off) as *mut libc::c_void,
+                    bytes as usize,
+                );
+            },
+            sys::UBLK_IO_OP_WRITE => unsafe {
+                libc::memcpy(
+                    (start + off) as *mut libc::c_void,
+                    buf_addr as *mut libc::c_void,
+                    bytes as usize,
+                );
+            },
+            _ => return Err(UblkError::OtherError(-libc::EINVAL)),
         }
+
+        io.complete(bytes as i32);
+        Ok(0)
     }
 
     fn __test_ublk_ramdisk(dev_id: i32) {
@@ -196,19 +172,21 @@ mod tests {
         let mut ctrl = UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap();
         let ublk_dev = UblkDev::new(Box::new(RamdiskTgt { size }), &mut ctrl).unwrap();
 
-        let ops = RamdiskQueue { start: buf_addr };
+        let qc = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+                       ctx: &UblkQueueCtx,
+                       io: &mut UblkIO,
+                       e: &UblkCQE| { rd_handle_io(r, ctx, io, e, buf_addr) };
         let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
         ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
             libc::pthread_self()
         });
 
-        ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &ops)
-            .unwrap();
+        ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
 
         let dev_id = ctrl.dev_info.dev_id as i32;
         let qh = std::thread::spawn(move || fn_ptr(dev_id));
 
-        queue.handler(&ops);
+        queue.handler(&qc);
         ctrl.stop_dev(&ublk_dev).unwrap();
 
         qh

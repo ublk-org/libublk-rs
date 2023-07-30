@@ -634,12 +634,20 @@ impl UblkCtrl {
     /// this kernel code path, such as, reading partition table, so we
     /// have make io handler working before sending START_DEV to kernel
     ///
-    pub fn start_dev_in_queue(
+    pub fn start_dev_in_queue<F>(
         &mut self,
         dev: &UblkDev,
         q: &mut super::io::UblkQueue,
-        ops: &dyn super::io::UblkQueueImpl,
-    ) -> Result<i32, UblkError> {
+        ops: &F,
+    ) -> Result<i32, UblkError>
+    where
+        F: Fn(
+            &mut io_uring::IoUring<io_uring::squeue::Entry>,
+            &super::io::UblkQueueCtx,
+            &mut super::io::UblkIO,
+            &super::io::UblkCQE,
+        ) -> Result<i32, UblkError>,
+    {
         let mut started = false;
         let token = self.__start_dev(dev, true)?;
 

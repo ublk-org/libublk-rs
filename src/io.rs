@@ -2,7 +2,6 @@ use super::{ctrl::UblkCtrl, sys, UblkError};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
-use std::any::Any;
 use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::AsRawFd;
@@ -34,41 +33,6 @@ impl<'a> UblkCQE<'a> {
     }
 }
 
-pub trait UblkQueueImpl {
-    /// Handle IO represented by `tag`
-    ///
-    /// # Arguments:
-    ///
-    /// * `qctx`: this queue's context info for retrieving iod and so on
-    /// * `io`: IO slot, which represents the io command from ublk driver
-    /// * `e`: the arrived io_uring cqe, which may represent IO command,
-    ///    or any target io_uring IO issued for handling this io command
-    ///
-    /// Called when one io command is retrieved from ublk kernel driver side,
-    /// and target code implements this method for handling io command,
-    /// when e.is_target_io() returns false. After io command is done, it
-    /// needs to complete by calling UblkQueue::complete_io().
-    ///
-    /// Or called when target IO is completed by io_uring, when e.is_target_io()
-    /// returns true.
-    ///
-    /// In short, this method handles both io cmd and target io. IO command comes
-    /// when its CQE is done from ublk driver, and target IO is done when its CQE
-    /// is done from io_uring normal operations(FS, network, ...). Both share
-    /// same IO tag.
-    ///
-    /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
-    /// ublk kernel driver, and is indexed by tag. IO command is readonly for
-    /// ublk userspace.
-    fn handle_io(
-        &self,
-        ring: &mut IoUring<squeue::Entry>,
-        qctx: &UblkQueueCtx,
-        io: &mut UblkIO,
-        e: &UblkCQE,
-    ) -> Result<i32, UblkError>;
-}
-
 pub trait UblkTgtImpl {
     /// Init target specific stuff
     ///
@@ -96,11 +60,6 @@ pub trait UblkTgtImpl {
     /// Return target type name
     ///
     fn tgt_type(&self) -> &'static str;
-
-    /// as_any method for downcast from UblkDev instance
-    ///
-    /// For implementing `ublk_tgt_data_from_queue()` of `UblkDev`.
-    fn as_any(&self) -> &dyn Any;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -220,26 +179,6 @@ impl UblkDev {
             },
             ..Default::default()
         };
-    }
-
-    ///
-    /// Return the target concrete object from UblkTgtImpl trait object
-    ///
-    /// # parameters
-    ///
-    /// * `T`: The concrete target data type
-    ///
-    /// Use as_any()/Downcast trick for doing this job, see `\[`downcast_trait_object`\]`
-    /// `<https://bennett.dev/rust/downcast-trait-object/>`
-    ///
-    #[inline(always)]
-    pub fn ublk_tgt_data_from_queue<T: 'static>(&self) -> Result<&T, UblkError> {
-        let a = self.ops.as_any();
-
-        match a.downcast_ref::<T>() {
-            Some(b) => Ok(b),
-            _ => Err(UblkError::OtherError(-libc::ENOENT)),
-        }
     }
 }
 
@@ -689,7 +628,15 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &UblkCQE) {
+    fn handle_cqe<F>(&mut self, ops: F, e: &UblkCQE)
+    where
+        F: Fn(
+            &mut io_uring::IoUring<io_uring::squeue::Entry>,
+            &UblkQueueCtx,
+            &mut UblkIO,
+            &UblkCQE,
+        ) -> Result<i32, UblkError>,
+    {
         let data = e.user_data();
         let res = e.result();
         let tag = user_data_to_tag(data);
@@ -721,8 +668,7 @@ impl UblkQueue<'_> {
                     user_data_to_op(data)
                 );
             }
-            ops.handle_io(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)
-                .unwrap();
+            ops(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e).unwrap();
             return;
         }
 
@@ -735,8 +681,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.handle_io(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)
-                .unwrap();
+            ops(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
@@ -751,7 +696,15 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn reap_one_event(&mut self, ops: &dyn UblkQueueImpl) -> usize {
+    fn reap_one_event<F>(&mut self, ops: F) -> usize
+    where
+        F: Fn(
+            &mut io_uring::IoUring<io_uring::squeue::Entry>,
+            &UblkQueueCtx,
+            &mut UblkIO,
+            &UblkCQE,
+        ) -> Result<i32, UblkError>,
+    {
         let idx = self.cqes_idx;
         if idx >= self.cqes_cnt {
             return 0;
@@ -799,8 +752,40 @@ impl UblkQueue<'_> {
     ///
     /// Note: Return Error in case that queue is down.
     ///
+    /// # Arguments of io handling closure:
+    ///
+    /// * `qctx`: this queue's context info for retrieving iod and so on
+    /// * `io`: IO slot, which represents the io command from ublk driver
+    /// * `e`: the arrived io_uring cqe, which may represent IO command,
+    ///    or any target io_uring IO issued for handling this io command
+    ///
+    /// Called when one io command is retrieved from ublk kernel driver side,
+    /// and target code implements this method for handling io command,
+    /// when e.is_target_io() returns false. After io command is done, it
+    /// needs to complete by calling UblkQueue::complete_io().
+    ///
+    /// Or called when target IO is completed by io_uring, when e.is_target_io()
+    /// returns true.
+    ///
+    /// In short, this method handles both io cmd and target io. IO command comes
+    /// when its CQE is done from ublk driver, and target IO is done when its CQE
+    /// is done from io_uring normal operations(FS, network, ...). Both share
+    /// same IO tag.
+    ///
+    /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
+    /// ublk kernel driver, and is indexed by tag. IO command is readonly for
+    /// ublk userspace.
+
     #[inline(always)]
-    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> Result<i32, UblkError> {
+    pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
+    where
+        F: Fn(
+            &mut io_uring::IoUring<io_uring::squeue::Entry>,
+            &UblkQueueCtx,
+            &mut UblkIO,
+            &UblkCQE,
+        ) -> Result<i32, UblkError>,
+    {
         let to_wait = if self.get_poll() { 0 } else { 1 };
 
         info!(
@@ -840,13 +825,21 @@ impl UblkQueue<'_> {
     ///
     /// # Arguments:
     ///
-    /// * `ops`: UblkQueueImpl trait object
+    /// * `ops`: IO handling closure
     ///
     /// Called in queue context. Won't return unless error is observed.
     ///
-    pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
+    pub fn handler<F>(&mut self, ops: F)
+    where
+        F: Fn(
+            &mut io_uring::IoUring<io_uring::squeue::Entry>,
+            &UblkQueueCtx,
+            &mut UblkIO,
+            &UblkCQE,
+        ) -> Result<i32, UblkError>,
+    {
         loop {
-            match self.process_io(ops) {
+            match self.process_io(&ops) {
                 Err(_) => break,
                 _ => continue,
             }

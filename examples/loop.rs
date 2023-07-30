@@ -1,7 +1,6 @@
 use anyhow::Result;
-use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
@@ -18,7 +17,6 @@ struct LoopTgt {
     back_file: std::fs::File,
     direct_io: i32,
 }
-struct LoopQueue {}
 
 fn lo_file_size(f: &std::fs::File) -> Result<u64> {
     if let Ok(meta) = f.metadata() {
@@ -59,9 +57,6 @@ impl UblkTgtImpl for LoopTgt {
     }
     fn tgt_type(&self) -> &'static str {
         "loop"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 
@@ -148,19 +143,6 @@ fn loop_handle_io(
     loop_queue_tgt_io(r, io, tag, iod)
 }
 
-// implement loop IO logic, and it is the main job for writing new ublk target
-impl UblkQueueImpl for LoopQueue {
-    fn handle_io(
-        &self,
-        ring: &mut io_uring::IoUring<squeue::Entry>,
-        ctx: &UblkQueueCtx,
-        io: &mut UblkIO,
-        e: &UblkCQE,
-    ) -> Result<i32, UblkError> {
-        loop_handle_io(ring, ctx, io, e)
-    }
-}
-
 fn test_add() {
     let back_file = std::env::args().nth(2).unwrap();
     let _pid = unsafe { libc::fork() };
@@ -184,7 +166,7 @@ fn test_add() {
                     back_file_path: back_file.clone(),
                 })
             },
-            |_| Box::new(LoopQueue {}) as Box<dyn UblkQueueImpl>,
+            loop_handle_io,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
 
