@@ -1,7 +1,7 @@
 use anyhow::Result;
 use core::any::Any;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueImpl, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkQueue, UblkQueueCtx, UblkQueueImpl, UblkTgtImpl};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
@@ -117,7 +117,7 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-fn loop_handle_io(q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError> {
+fn loop_handle_io(q: &mut UblkQueue, ctx: &UblkQueueCtx, e: &UblkCQE) -> Result<i32, UblkError> {
     let tag = e.get_tag();
 
     // our IO on backing file is done
@@ -136,7 +136,7 @@ fn loop_handle_io(q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError> {
     }
 
     // either start to handle or retry
-    let _iod = q.get_iod(tag);
+    let _iod = ctx.get_iod(tag);
     let iod = unsafe { &*_iod };
 
     loop_queue_tgt_io(q, tag, iod)
@@ -144,8 +144,13 @@ fn loop_handle_io(q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError> {
 
 // implement loop IO logic, and it is the main job for writing new ublk target
 impl UblkQueueImpl for LoopQueue {
-    fn handle_io(&self, q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError> {
-        loop_handle_io(q, e)
+    fn handle_io(
+        &self,
+        q: &mut UblkQueue,
+        ctx: &UblkQueueCtx,
+        e: &UblkCQE,
+    ) -> Result<i32, UblkError> {
+        loop_handle_io(q, ctx, e)
     }
 }
 

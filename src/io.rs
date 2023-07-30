@@ -58,7 +58,12 @@ pub trait UblkQueueImpl {
     /// Note: io command is stored to shared mmap area(`UblkQueue`.`io_cmd_buf`) by
     /// ublk kernel driver, and is indexed by tag. IO command is readonly for
     /// ublk userspace.
-    fn handle_io(&self, q: &mut UblkQueue, e: &UblkCQE) -> Result<i32, UblkError>;
+    fn handle_io(
+        &self,
+        q: &mut UblkQueue,
+        qctx: &UblkQueueCtx,
+        e: &UblkCQE,
+    ) -> Result<i32, UblkError>;
 }
 
 pub trait UblkTgtImpl {
@@ -322,6 +327,37 @@ struct UblkIO {
     result: i32,
 }
 
+/// UblkQueue Context info
+///
+///
+/// Can only hold read-only info for UblkQueue, so it is safe to
+/// mark it as Copy
+#[derive(Debug, Default, Copy, Clone)]
+pub struct UblkQueueCtx {
+    pub depth: u16,
+    pub q_id: u16,
+
+    /// io command buffer start address of this queue
+    buf_addr: u64,
+}
+
+impl UblkQueueCtx {
+    /// Return IO command description info represented by `ublksrv_io_desc`
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io tag
+    ///
+    /// Returned `ublksrv_io_desc` data is readonly, and filled by ublk kernel
+    /// driver
+    ///
+    #[inline(always)]
+    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
+        assert!(tag < self.depth as u32);
+        (self.buf_addr + tag as u64 * 24) as *const sys::ublksrv_io_desc
+    }
+}
+
 const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
 const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
 
@@ -385,6 +421,15 @@ impl UblkQueue<'_> {
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
 
         round_up(size, page_sz)
+    }
+
+    #[inline(always)]
+    fn make_queue_ctx(&self) -> UblkQueueCtx {
+        UblkQueueCtx {
+            buf_addr: self.io_cmd_buf,
+            depth: self.q_depth.try_into().unwrap(),
+            q_id: self.q_id,
+        }
     }
 
     /// New one ublk queue
@@ -496,20 +541,6 @@ impl UblkQueue<'_> {
         self.ios[tag as usize].result = res;
     }
 
-    /// Return IO command description info represented by `ublksrv_io_desc`
-    ///
-    /// # Arguments:
-    ///
-    /// * `tag`: io tag
-    ///
-    /// Returned `ublksrv_io_desc` data is readonly, and filled by ublk kernel
-    /// driver
-    ///
-    #[inline(always)]
-    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
-        (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc
-    }
-
     #[inline(always)]
     #[allow(unused_assignments)]
     fn __queue_io_cmd(&mut self, tag: u16) -> i32 {
@@ -615,7 +646,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, e: &UblkCQE) {
+    fn handle_tgt_cqe(&mut self, ops: &dyn UblkQueueImpl, qctx: &UblkQueueCtx, e: &UblkCQE) {
         let res = e.result();
 
         if res < 0 && res != -(libc::EAGAIN) {
@@ -629,7 +660,7 @@ impl UblkQueue<'_> {
                 user_data_to_op(data)
             );
         }
-        ops.handle_io(self, e).unwrap();
+        ops.handle_io(self, qctx, e).unwrap();
     }
 
     #[inline(always)]
@@ -639,6 +670,7 @@ impl UblkQueue<'_> {
         let res = e.result();
         let tag = user_data_to_tag(data);
         let cmd_op = user_data_to_op(data);
+        let qctx = self.make_queue_ctx();
 
         trace!(
             "{}: res {} (qid {} tag {} cmd_op {} target {}) state {}",
@@ -653,7 +685,7 @@ impl UblkQueue<'_> {
 
         /* Don't retrieve io in case of target io */
         if is_target_io(data) {
-            self.handle_tgt_cqe(ops, e);
+            self.handle_tgt_cqe(ops, &qctx, e);
             return;
         }
 
@@ -666,7 +698,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops.handle_io(self, e).unwrap();
+            ops.handle_io(self, &qctx, e).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
