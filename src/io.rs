@@ -388,6 +388,7 @@ impl UblkQueueCtx {
 
 const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
 const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
+const UBLK_QUEUE_POLL: u32 = 1_u32 << 2;
 
 /// UBLK queue abstraction
 ///
@@ -551,6 +552,18 @@ impl UblkQueue<'_> {
         trace!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
         Ok(q)
+    }
+
+    pub fn set_poll(&mut self, val: bool) {
+        if val {
+            self.q_state |= UBLK_QUEUE_POLL;
+        } else {
+            self.q_state &= !UBLK_QUEUE_POLL;
+        }
+    }
+
+    pub fn get_poll(&mut self) -> bool {
+        self.q_state & UBLK_QUEUE_POLL != 0
     }
 
     /// Return address of io buffer which is allocated for data copy
@@ -787,11 +800,9 @@ impl UblkQueue<'_> {
     /// Note: Return Error in case that queue is down.
     ///
     #[inline(always)]
-    pub fn process_io(
-        &mut self,
-        ops: &dyn UblkQueueImpl,
-        to_wait: usize,
-    ) -> Result<i32, UblkError> {
+    pub fn process_io(&mut self, ops: &dyn UblkQueueImpl) -> Result<i32, UblkError> {
+        let to_wait = if self.get_poll() { 0 } else { 1 };
+
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
@@ -835,7 +846,7 @@ impl UblkQueue<'_> {
     ///
     pub fn handler(&mut self, ops: &dyn UblkQueueImpl) {
         loop {
-            match self.process_io(ops, 1) {
+            match self.process_io(ops) {
                 Err(_) => break,
                 _ => continue,
             }

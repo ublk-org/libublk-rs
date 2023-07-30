@@ -628,6 +628,7 @@ impl UblkCtrl {
             if let Some(f) = ops {
                 let mut started = false;
 
+                q.set_poll(true);
                 while !started {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     if let Ok(res) = self.poll_cmd(token) {
@@ -638,11 +639,12 @@ impl UblkCtrl {
                             return Err(UblkError::UringIOError(res));
                         }
                     }
-                    match q.process_io(f, 0) {
+                    match q.process_io(f) {
                         Err(r) => return Err(r),
                         _ => continue,
                     }
                 }
+                q.set_poll(false);
             }
         }
 
