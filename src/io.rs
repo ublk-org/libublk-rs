@@ -339,6 +339,8 @@ pub struct UblkQueue<'a> {
     pub dev: &'a UblkDev,
     cmd_inflight: u32,
     q_state: u32,
+    cqes_idx: usize,
+    cqes_cnt: usize,
     ios: Vec<UblkIO>,
     pub q_ring: IoUring<squeue::Entry>,
 }
@@ -467,6 +469,8 @@ impl UblkQueue<'_> {
             q_state: 0,
             q_ring: ring,
             ios,
+            cqes_idx: 0,
+            cqes_cnt: 0,
         };
         q.submit_fetch_commands();
 
@@ -677,27 +681,37 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn get_cqes(&mut self) -> Vec<cqueue::Entry> {
-        self.q_ring.completion().map(Into::into).collect()
+    fn reap_one_event(&mut self, ops: &dyn UblkQueueImpl) -> usize {
+        let idx = self.cqes_idx;
+        if idx >= self.cqes_cnt {
+            return 0;
+        }
+
+        let cqe = self.q_ring.completion().next().unwrap();
+        self.handle_cqe(
+            ops,
+            &UblkCQE(
+                &cqe,
+                &if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
+                    | if idx + 1 == self.cqes_cnt {
+                        UBLK_IO_F_LAST
+                    } else {
+                        0
+                    },
+            ),
+        );
+
+        self.cqes_idx += 1;
+
+        1
     }
 
     #[inline(always)]
-    fn reap_events_uring(&mut self, ops: &dyn UblkQueueImpl) -> usize {
-        let cqes = self.get_cqes();
-        let count = cqes.len();
+    fn prep_reap_events(&mut self) -> usize {
+        self.cqes_cnt = self.q_ring.completion().len();
+        self.cqes_idx = 0;
 
-        for (idx, cqe) in cqes.iter().enumerate() {
-            self.handle_cqe(
-                ops,
-                &UblkCQE(
-                    &cqe,
-                    if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
-                        | if idx + 1 == count { UBLK_IO_F_LAST } else { 0 },
-                ),
-            );
-        }
-
-        count
+        self.cqes_cnt
     }
 
     /// Process the incoming IO from io_uring
@@ -726,6 +740,10 @@ impl UblkQueue<'_> {
             (self.q_state & UBLK_QUEUE_STOPPING)
         );
 
+        if self.reap_one_event(ops) > 0 {
+            return Ok(0);
+        }
+
         if self.queue_is_done() && self.q_ring.submission().is_empty() {
             return Err(UblkError::QueueIsDown("queue is done".to_string()));
         }
@@ -734,7 +752,7 @@ impl UblkQueue<'_> {
             .q_ring
             .submit_and_wait(to_wait)
             .map_err(UblkError::UringSubmissionError)?;
-        let reapped = self.reap_events_uring(ops);
+        let reapped = self.prep_reap_events();
 
         info!(
             "submit result {}, reapped {} stop {} idle {}",
