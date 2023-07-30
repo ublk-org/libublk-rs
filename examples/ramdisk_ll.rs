@@ -77,6 +77,9 @@ fn rd_add_dev2(dev_id: i32, buf_addr: u64, size: u64) {
 
     let ops = RamdiskQueue {};
     let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
+    ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
+        libc::pthread_self()
+    });
 
     ctrl.start_dev(&ublk_dev, Some(&mut queue), Some(&ops))
         .unwrap();
