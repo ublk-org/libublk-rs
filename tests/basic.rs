@@ -87,10 +87,11 @@ mod tests {
 
     struct RamdiskTgt {
         size: u64,
-        start: u64,
     }
 
-    struct RamdiskQueue {}
+    struct RamdiskQueue {
+        start: u64,
+    }
 
     // setup ramdisk target
     impl UblkTgtImpl for RamdiskTgt {
@@ -122,8 +123,7 @@ mod tests {
             let off = (iod.start_sector << 9) as u64;
             let bytes = (iod.nr_sectors << 9) as u32;
             let op = iod.op_flags & 0xff;
-            let tgt = q.dev.ublk_tgt_data_from_queue::<RamdiskTgt>().unwrap();
-            let start = tgt.start;
+            let start = self.start;
             let buf_addr = q.get_buf_addr(tag);
 
             match op {
@@ -166,13 +166,8 @@ mod tests {
             512_u32 * 1024,
             0,
             true,
-            |_| {
-                Box::new(RamdiskTgt {
-                    size: size,
-                    start: buf_addr,
-                })
-            },
-            |_| Box::new(RamdiskQueue {}) as Box<dyn UblkQueueImpl>,
+            move |_| Box::new(RamdiskTgt { size: size }),
+            move |_| Box::new(RamdiskQueue { start: buf_addr }) as Box<dyn UblkQueueImpl>,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);

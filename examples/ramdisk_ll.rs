@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 
 struct RamdiskTgt {
     size: u64,
-    start: u64,
 }
 
-struct RamdiskQueue {}
+struct RamdiskQueue {
+    start: u64,
+}
 
 // setup ramdisk target
 impl UblkTgtImpl for RamdiskTgt {
@@ -38,8 +39,7 @@ impl UblkQueueImpl for RamdiskQueue {
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
         let op = iod.op_flags & 0xff;
-        let tgt = q.dev.ublk_tgt_data_from_queue::<RamdiskTgt>().unwrap();
-        let start = tgt.start;
+        let start = self.start;
         let buf_addr = q.get_buf_addr(tag);
 
         match op {
@@ -71,16 +71,9 @@ fn rd_add_dev2(dev_id: i32, buf_addr: u64, size: u64) {
     let depth = 128;
     let nr_queues = 1;
     let mut ctrl = UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap();
-    let ublk_dev = UblkDev::new(
-        Box::new(RamdiskTgt {
-            size,
-            start: buf_addr,
-        }),
-        &mut ctrl,
-    )
-    .unwrap();
+    let ublk_dev = UblkDev::new(Box::new(RamdiskTgt { size }), &mut ctrl).unwrap();
 
-    let ops = RamdiskQueue {};
+    let ops = RamdiskQueue { start: buf_addr };
     let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
     ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
         libc::pthread_self()
@@ -110,16 +103,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
     let ublk_dev = {
         let mut ctrl = ctrl_clone.lock().unwrap();
 
-        Arc::new(
-            UblkDev::new(
-                Box::new(RamdiskTgt {
-                    size,
-                    start: buf_addr,
-                }),
-                &mut ctrl,
-            )
-            .unwrap(),
-        )
+        Arc::new(UblkDev::new(Box::new(RamdiskTgt { size }), &mut ctrl).unwrap())
     };
 
     // Still need one temp pthread for starting device
@@ -139,7 +123,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64) {
 
     let _dev1 = Arc::clone(&ublk_dev);
     let f_queue = async_std::task::spawn_local(async move {
-        let ops = RamdiskQueue {};
+        let ops = RamdiskQueue { start: buf_addr };
         let mut queue = UblkQueue::new(_qid, &_dev1).unwrap();
 
         loop {
