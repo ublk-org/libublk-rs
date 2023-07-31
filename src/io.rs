@@ -427,7 +427,6 @@ impl UblkQueue<'_> {
             buf_addr: self.io_cmd_buf,
             depth: self.q_depth.try_into().unwrap(),
             q_id: self.q_id,
-            //dev: self.dev,
         }
     }
 
@@ -536,23 +535,6 @@ impl UblkQueue<'_> {
         self.q_state & UBLK_QUEUE_POLL != 0
     }
 
-    /// Return address of io buffer which is allocated for data copy
-    ///
-    /// # Arguments:
-    ///
-    /// * `tag`: io tag, length is 16bit
-    ///
-    #[inline(always)]
-    pub fn get_buf_addr(&self, tag: u32) -> *mut u8 {
-        self.ios[tag as usize].buf_addr
-    }
-
-    #[inline(always)]
-    fn mark_io_done(&mut self, tag: u16, res: i32) {
-        self.ios[tag as usize].flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
-        self.ios[tag as usize].result = res;
-    }
-
     #[inline(always)]
     #[allow(unused_assignments)]
     fn __queue_io_cmd(&mut self, tag: u16) -> i32 {
@@ -623,7 +605,6 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
-    #[inline(always)]
     fn submit_fetch_commands(&mut self) {
         for i in 0..self.q_depth {
             self.queue_io_cmd(i as u16);
@@ -638,23 +619,6 @@ impl UblkQueue<'_> {
     #[inline(always)]
     fn queue_is_done(&self) -> bool {
         (self.q_state & UBLK_QUEUE_STOPPING) != 0 && self.queue_is_idle()
-    }
-
-    /// Complete this io command
-    ///
-    /// # Arguments:
-    ///
-    /// * `tag`: io tag
-    /// * `res`: result of handling this io command
-    ///
-    /// Called from specific target code for completing this io command,
-    /// and ublk driver gets notified and complete IO request on
-    /// /dev/ublkbN
-    ///
-    #[inline(always)]
-    pub fn complete_io(&mut self, tag: u16, res: i32) {
-        self.mark_io_done(tag, res);
-        self.queue_io_cmd(tag as u16);
     }
 
     #[inline(always)]
@@ -795,7 +759,7 @@ impl UblkQueue<'_> {
     /// Called when one io command is retrieved from ublk kernel driver side,
     /// and target code implements this method for handling io command,
     /// when e.is_target_io() returns false. After io command is done, it
-    /// needs to complete by calling UblkQueue::complete_io().
+    /// needs to complete by calling UblkIOCtx::complete_io().
     ///
     /// Or called when target IO is completed by io_uring, when e.is_target_io()
     /// returns true.
@@ -809,7 +773,6 @@ impl UblkQueue<'_> {
     /// ublk kernel driver, and is indexed by tag. IO command is readonly for
     /// ublk userspace.
 
-    #[inline(always)]
     pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
     where
         F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
@@ -857,6 +820,7 @@ impl UblkQueue<'_> {
     ///
     /// Called in queue context. Won't return unless error is observed.
     ///
+    #[inline(always)]
     pub fn handler<F>(&mut self, mut ops: F)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
