@@ -6,7 +6,14 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
-pub struct UblkCQE<'a>(&'a cqueue::Entry, u32);
+pub type UblkIOCtx<'a, 'b, 'c, 'd> = (
+    &'a mut io_uring::IoUring<io_uring::squeue::Entry>,
+    &'b UblkQueueCtx,
+    &'c mut UblkIO,
+    &'d UblkCQE<'d>,
+);
+
+pub struct UblkCQE<'d>(&'d cqueue::Entry, u32);
 
 impl<'a> UblkCQE<'a> {
     #[inline(always)]
@@ -628,12 +635,7 @@ impl UblkQueue<'_> {
     #[allow(unused_assignments)]
     fn handle_cqe<F>(&mut self, mut ops: F, e: &UblkCQE)
     where
-        F: FnMut(
-            &mut io_uring::IoUring<io_uring::squeue::Entry>,
-            &UblkQueueCtx,
-            &mut UblkIO,
-            &UblkCQE,
-        ) -> Result<i32, UblkError>,
+        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
     {
         let data = e.user_data();
         let res = e.result();
@@ -666,7 +668,7 @@ impl UblkQueue<'_> {
                     user_data_to_op(data)
                 );
             }
-            ops(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e).unwrap();
+            ops((&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)).unwrap();
             return;
         }
 
@@ -679,7 +681,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops(&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e).unwrap();
+            ops((&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)).unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
@@ -696,12 +698,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     fn reap_one_event<F>(&mut self, ops: F) -> usize
     where
-        F: FnMut(
-            &mut io_uring::IoUring<io_uring::squeue::Entry>,
-            &UblkQueueCtx,
-            &mut UblkIO,
-            &UblkCQE,
-        ) -> Result<i32, UblkError>,
+        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
     {
         let idx = self.cqes_idx;
         if idx >= self.cqes_cnt {
@@ -777,12 +774,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
     where
-        F: FnMut(
-            &mut io_uring::IoUring<io_uring::squeue::Entry>,
-            &UblkQueueCtx,
-            &mut UblkIO,
-            &UblkCQE,
-        ) -> Result<i32, UblkError>,
+        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
     {
         let to_wait = if self.get_poll() { 0 } else { 1 };
 
@@ -829,12 +821,7 @@ impl UblkQueue<'_> {
     ///
     pub fn handler<F>(&mut self, mut ops: F)
     where
-        F: FnMut(
-            &mut io_uring::IoUring<io_uring::squeue::Entry>,
-            &UblkQueueCtx,
-            &mut UblkIO,
-            &UblkCQE,
-        ) -> Result<i32, UblkError>,
+        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
     {
         loop {
             match self.process_io(&mut ops) {

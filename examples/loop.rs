@@ -1,6 +1,6 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx};
+use libublk::io::{UblkDev, UblkIO, UblkIOCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
@@ -108,34 +108,29 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-fn loop_handle_io(
-    r: &mut io_uring::IoUring<squeue::Entry>,
-    ctx: &UblkQueueCtx,
-    io: &mut UblkIO,
-    e: &UblkCQE,
-) -> Result<i32, UblkError> {
-    let tag = e.get_tag();
+fn loop_handle_io(i: UblkIOCtx) -> Result<i32, UblkError> {
+    let tag = i.3.get_tag();
 
     // our IO on backing file is done
-    if e.is_tgt_io() {
-        let user_data = e.user_data();
-        let res = e.result();
+    if i.3.is_tgt_io() {
+        let user_data = i.3.user_data();
+        let res = i.3.result();
         let cqe_tag = libublk::io::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
-            io.complete(res);
+            i.2.complete(res);
 
             return Ok(0);
         }
     }
 
     // either start to handle or retry
-    let _iod = ctx.get_iod(tag);
+    let _iod = i.1.get_iod(tag);
     let iod = unsafe { &*_iod };
 
-    loop_queue_tgt_io(r, io, tag, iod)
+    loop_queue_tgt_io(i.0, i.2, tag, iod)
 }
 
 fn test_add() {

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx};
+    use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkIOCtx, UblkQueue, UblkQueueCtx};
     use libublk::sys;
     use libublk::{ctrl::UblkCtrl, UblkError};
     use std::env;
@@ -15,17 +15,12 @@ mod tests {
         assert!(Path::new(&dev_path).exists() == true);
     }
 
-    fn null_handle_io(
-        _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-        ctx: &UblkQueueCtx,
-        io: &mut UblkIO,
-        e: &UblkCQE,
-    ) -> Result<i32, UblkError> {
-        let tag = e.get_tag();
-        let iod = ctx.get_iod(tag);
+    fn null_handle_io(io: UblkIOCtx) -> Result<i32, UblkError> {
+        let tag = io.3.get_tag();
+        let iod = io.1.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        io.complete(bytes);
+        io.2.complete(bytes);
         Ok(0)
     }
 
@@ -153,10 +148,7 @@ mod tests {
         )
         .unwrap();
 
-        let qc = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-                       ctx: &UblkQueueCtx,
-                       io: &mut UblkIO,
-                       e: &UblkCQE| { rd_handle_io(r, ctx, io, e, buf_addr) };
+        let qc = move |i: UblkIOCtx| rd_handle_io(i.0, i.1, i.2, i.3, buf_addr);
         let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
         ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
             libc::pthread_self()
@@ -205,17 +197,15 @@ mod tests {
         let mut q_vec = Vec::<i32>::new();
 
         // FuMut closure for handling our io_uring IO
-        let mut qc = move |_r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-                           ctx: &UblkQueueCtx,
-                           io: &mut UblkIO,
-                           e: &UblkCQE| {
-            q_vec.push(e.get_tag() as i32);
+        let mut qc = move |i: UblkIOCtx| {
+            let tag = i.3.get_tag();
+            q_vec.push(tag as i32);
             if q_vec.len() >= 64 {
                 q_vec.clear();
             }
 
-            let iod = ctx.get_iod(e.get_tag());
-            io.complete(unsafe { (*iod).nr_sectors << 9 } as i32);
+            let iod = i.1.get_iod(tag);
+            i.2.complete(unsafe { (*iod).nr_sectors << 9 } as i32);
             Ok(0)
         };
         let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();

@@ -1,17 +1,12 @@
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx};
+use libublk::io::{UblkDev, UblkIOCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
-fn handle_io(
-    _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-    ctx: &UblkQueueCtx,
-    io: &mut UblkIO,
-    e: &UblkCQE,
-) -> Result<i32, UblkError> {
-    let tag = e.get_tag();
-    let iod = ctx.get_iod(tag);
+fn handle_io(io: UblkIOCtx) -> Result<i32, UblkError> {
+    let tag = io.3.get_tag();
+    let iod = io.1.get_iod(tag);
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-    io.complete(bytes);
+    io.2.complete(bytes);
     Ok(0)
 }
 

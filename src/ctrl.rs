@@ -641,12 +641,7 @@ impl UblkCtrl {
         mut ops: F,
     ) -> Result<i32, UblkError>
     where
-        F: FnMut(
-            &mut io_uring::IoUring<io_uring::squeue::Entry>,
-            &super::io::UblkQueueCtx,
-            &mut super::io::UblkIO,
-            &super::io::UblkCQE,
-        ) -> Result<i32, UblkError>,
+        F: FnMut(super::io::UblkIOCtx) -> Result<i32, UblkError>,
     {
         let mut started = false;
         let token = self.__start_dev(dev, true)?;

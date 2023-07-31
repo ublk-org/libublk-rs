@@ -1,4 +1,4 @@
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkIOCtx, UblkQueue, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
 fn handle_io(
@@ -62,10 +62,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     )
     .unwrap();
 
-    let qc = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-                   ctx: &UblkQueueCtx,
-                   io: &mut UblkIO,
-                   e: &UblkCQE| { handle_io(r, ctx, io, e, buf_addr) };
+    let qc = move |i: UblkIOCtx| handle_io(i.0, i.1, i.2, i.3, buf_addr);
     let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
     ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
         libc::pthread_self()
