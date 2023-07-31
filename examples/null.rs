@@ -1,19 +1,5 @@
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
-
-pub struct NullTgt {}
-
-// setup null target
-impl UblkTgtImpl for NullTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-        let dev_size = 250_u64 << 30;
-        dev.set_default_params(dev_size);
-        Ok(serde_json::json!({}))
-    }
-    fn tgt_type(&self) -> &'static str {
-        "null"
-    }
-}
 
 fn handle_io(
     _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
@@ -35,17 +21,20 @@ fn test_add() {
     let _pid = unsafe { libc::fork() };
     if _pid == 0 {
         libublk::ublk_tgt_worker(
+            "null".to_string(),
             dev_id,
             2,
             64,
             512_u32 * 1024,
             0,
             true,
-            |_| Box::new(NullTgt {}),
+            |dev: &mut UblkDev| {
+                dev.set_default_params(250_u64 << 30);
+                Ok(serde_json::json!({}))
+            },
             handle_io,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
-
                 ctrl.dump();
             },
         )

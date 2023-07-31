@@ -94,10 +94,6 @@ pub struct UblkTgt {
 pub struct UblkDev {
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
-    // not like C's ops, here ops actually points to one object which
-    // implements the trait of UblkTgtImpl
-    ops: Box<dyn UblkTgtImpl>,
-
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
 
@@ -119,10 +115,13 @@ impl UblkDev {
     /// ublk device is abstraction for target, and prepare for setting
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
-    pub fn new(ops: Box<dyn UblkTgtImpl>, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError> {
+    pub fn new<F>(tgt_name: String, ops: F, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError>
+    where
+        F: FnOnce(&mut UblkDev) -> Result<serde_json::Value, UblkError>,
+    {
         let info = ctrl.dev_info;
         let mut tgt = UblkTgt {
-            tgt_type: ops.tgt_type().to_string(),
+            tgt_type: tgt_name,
             sq_depth: info.queue_depth,
             cq_depth: info.queue_depth,
             fds: [0_i32; 32],
@@ -140,14 +139,13 @@ impl UblkDev {
         tgt.fds[0] = cdev_file.as_raw_fd();
         tgt.nr_fds = 1;
 
-        let dev = UblkDev {
-            ops,
+        let mut dev = UblkDev {
             dev_info: info,
             cdev_file,
             tgt: RefCell::new(tgt),
         };
 
-        ctrl.json = dev.ops.init_tgt(&dev)?;
+        ctrl.json = ops(&mut dev)?;
         info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
@@ -157,7 +155,6 @@ impl UblkDev {
     fn deinit_cdev(&mut self) {
         let id = self.dev_info.dev_id;
 
-        self.ops.deinit_tgt(self);
         info!("dev {} deinitialized", id);
     }
 
@@ -415,6 +412,7 @@ impl UblkQueue<'_> {
         let tgt = dev.tgt.borrow();
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
+
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth as u32)
             .setup_coop_taskrun()

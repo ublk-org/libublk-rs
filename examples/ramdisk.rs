@@ -1,20 +1,5 @@
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
-
-struct RamdiskTgt {
-    size: u64,
-}
-
-// setup ramdisk target
-impl UblkTgtImpl for RamdiskTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-        dev.set_default_params(self.size);
-        Ok(serde_json::json!({}))
-    }
-    fn tgt_type(&self) -> &'static str {
-        "ramdisk"
-    }
-}
 
 fn handle_io(
     _r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
@@ -67,7 +52,15 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         for_add,
     )
     .unwrap();
-    let ublk_dev = UblkDev::new(Box::new(RamdiskTgt { size }), &mut ctrl).unwrap();
+    let ublk_dev = UblkDev::new(
+        "ramdisk".to_string(),
+        |dev: &mut UblkDev| {
+            dev.set_default_params(size);
+            Ok(serde_json::json!({}))
+        },
+        &mut ctrl,
+    )
+    .unwrap();
 
     let qc = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
                    ctx: &UblkQueueCtx,

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx, UblkTgtImpl};
+    use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueue, UblkQueueCtx};
     use libublk::sys;
     use libublk::{ctrl::UblkCtrl, UblkError};
     use std::env;
@@ -13,21 +13,6 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(Path::new(&dev_path).exists() == true);
-    }
-
-    struct NullTgt {}
-
-    // setup null target
-    impl UblkTgtImpl for NullTgt {
-        fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-            let dev_size = 250_u64 << 30;
-
-            dev.set_default_params(dev_size);
-            Ok(serde_json::json!({}))
-        }
-        fn tgt_type(&self) -> &'static str {
-            "null"
-        }
     }
 
     fn null_handle_io(
@@ -48,13 +33,17 @@ mod tests {
     #[test]
     fn test_ublk_null() {
         libublk::ublk_tgt_worker(
+            "null".to_string(),
             -1,
             2,
             64,
             512_u32 * 1024,
             0,
             true,
-            |_| Box::new(NullTgt {}),
+            |dev: &mut UblkDev| {
+                dev.set_default_params(250_u64 << 30);
+                Ok(serde_json::json!({}))
+            },
             null_handle_io,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
@@ -74,22 +63,6 @@ mod tests {
         .unwrap()
         .join()
         .unwrap();
-    }
-
-    struct RamdiskTgt {
-        size: u64,
-    }
-
-    // setup ramdisk target
-    impl UblkTgtImpl for RamdiskTgt {
-        fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-            dev.set_default_params(self.size);
-
-            Ok(serde_json::json!({}))
-        }
-        fn tgt_type(&self) -> &'static str {
-            "ramdisk"
-        }
     }
 
     fn rd_handle_io(
@@ -170,7 +143,15 @@ mod tests {
         let depth = 128;
         let nr_queues = 1;
         let mut ctrl = UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap();
-        let ublk_dev = UblkDev::new(Box::new(RamdiskTgt { size }), &mut ctrl).unwrap();
+        let ublk_dev = UblkDev::new(
+            "ramdisk".to_string(),
+            |dev: &mut UblkDev| {
+                dev.set_default_params(size);
+                Ok(serde_json::json!({}))
+            },
+            &mut ctrl,
+        )
+        .unwrap();
 
         let qc = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
                        ctx: &UblkQueueCtx,

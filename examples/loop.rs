@@ -1,6 +1,6 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx, UblkTgtImpl};
+use libublk::io::{UblkCQE, UblkDev, UblkIO, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
@@ -31,33 +31,28 @@ fn lo_file_size(f: &std::fs::File) -> Result<u64> {
 }
 
 // setup loop target
-impl UblkTgtImpl for LoopTgt {
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
-        trace!("loop: init_tgt {}", dev.dev_info.dev_id);
-        if self.direct_io != 0 {
-            unsafe {
-                libc::fcntl(self.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
-            }
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, UblkError> {
+    trace!("loop: init_tgt {}", dev.dev_info.dev_id);
+    if lo.direct_io != 0 {
+        unsafe {
+            libc::fcntl(lo.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
         }
-
-        let dev_size = {
-            let mut tgt = dev.tgt.borrow_mut();
-            let nr_fds = tgt.nr_fds;
-            tgt.fds[nr_fds as usize] = self.back_file.as_raw_fd();
-            tgt.nr_fds = nr_fds + 1;
-
-            tgt.dev_size = lo_file_size(&self.back_file).unwrap();
-            tgt.dev_size
-        };
-        dev.set_default_params(dev_size);
-
-        Ok(
-            serde_json::json!({"loop": LoJson { back_file_path: self.back_file_path.clone(), direct_io: 1 } }),
-        )
     }
-    fn tgt_type(&self) -> &'static str {
-        "loop"
-    }
+
+    let dev_size = {
+        let mut tgt = dev.tgt.borrow_mut();
+        let nr_fds = tgt.nr_fds;
+        tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
+        tgt.nr_fds = nr_fds + 1;
+
+        tgt.dev_size = lo_file_size(&lo.back_file).unwrap();
+        tgt.dev_size
+    };
+    dev.set_default_params(dev_size);
+
+    Ok(
+        serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: 1 } }),
+    )
 }
 
 fn loop_queue_tgt_io(
@@ -148,24 +143,25 @@ fn test_add() {
     let _pid = unsafe { libc::fork() };
 
     if _pid == 0 {
+        // LooTgt has to live in the whole device lifetime
+        let lo = LoopTgt {
+            back_file: std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&back_file)
+                .unwrap(),
+            direct_io: 1,
+            back_file_path: back_file.clone(),
+        };
         libublk::ublk_tgt_worker(
+            "loop".to_string(),
             -1,
             1,
             64,
             512_u32 * 1024,
             0,
             true,
-            |_| {
-                Box::new(LoopTgt {
-                    back_file: std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&back_file)
-                        .unwrap(),
-                    direct_io: 1,
-                    back_file_path: back_file.clone(),
-                })
-            },
+            |dev: &mut UblkDev| lo_init_tgt(dev, &lo),
             loop_handle_io,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();

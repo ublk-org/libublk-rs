@@ -144,6 +144,7 @@ pub fn create_queue_handler(
 /// don't use this API.
 #[allow(clippy::too_many_arguments)]
 pub fn ublk_tgt_worker<T, W>(
+    name: String,
     id: i32,
     nr_queues: u32,
     depth: u32,
@@ -155,12 +156,11 @@ pub fn ublk_tgt_worker<T, W>(
     worker_fn: W,
 ) -> Result<std::thread::JoinHandle<()>, UblkError>
 where
-    T: Fn(i32) -> Box<dyn io::UblkTgtImpl> + Send + Sync,
+    T: FnOnce(&mut io::UblkDev) -> Result<serde_json::Value, UblkError>,
     W: Fn(i32) + Send + Sync + 'static,
 {
     let mut ctrl = ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();
-    let ublk_dev =
-        Arc::new(io::UblkDev::new(tgt_fn(ctrl.dev_info.dev_id as i32), &mut ctrl).unwrap());
+    let ublk_dev = Arc::new(io::UblkDev::new(name, tgt_fn, &mut ctrl).unwrap());
     let threads = create_queue_handler(&mut ctrl, &ublk_dev, q_fn);
 
     ctrl.start_dev(&ublk_dev).unwrap();
