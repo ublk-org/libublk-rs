@@ -811,9 +811,10 @@ impl UblkQueue<'_> {
     /// * `ops`: IO handling closure
     ///
     /// Called in queue context. Won't return unless error is observed.
+    /// Handle any incoming cqe until queue is down.
     ///
     #[inline(always)]
-    pub fn handler<F>(&mut self, mut ops: F)
+    pub fn handle_io<F>(&mut self, mut ops: F)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
     {

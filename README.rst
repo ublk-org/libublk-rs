@@ -112,14 +112,14 @@ write to captured variables.
               //IO handling closure(FnMut), we are driven by io_uring CQE, and
               //this closure is called for every incoming CQE(io command or
               //target io completion)
-              let queue_handler = move |io: &mut UblkIOCtx| {
+              let io_handler = move |io: &mut UblkIOCtx| {
                   let iod = ctx.get_iod(io.get_tag());
                   let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
                   io.complete_io(bytes);
                   Ok(0)
               };
-              queue.handler(queue_handler);
+              queue.handle_io(io_handler);
           }));
       }
       ctrl.start_dev(&ublk_dev).unwrap();

@@ -153,7 +153,7 @@ mod tests {
         let dev_id = ctrl.dev_info.dev_id as i32;
         let qh = std::thread::spawn(move || fn_ptr(dev_id));
 
-        queue.handler(&qc);
+        queue.handle_io(&qc);
         ctrl.stop_dev(&ublk_dev).unwrap();
 
         qh
@@ -215,7 +215,7 @@ mod tests {
             ctrl.del().unwrap();
         });
 
-        queue.handler(&mut qc);
+        queue.handle_io(&mut qc);
         ctrl.stop_dev(&ublk_dev).unwrap();
 
         qh
