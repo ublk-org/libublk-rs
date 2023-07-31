@@ -7,7 +7,7 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn add_ctrl_dev() {
+    fn test_add_ctrl_dev() {
         let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, true).unwrap();
         let dev_path = format!("{}{}", libublk::CDEV_PATH, ctrl.dev_info.dev_id);
 
@@ -187,6 +187,58 @@ mod tests {
         libublk::ublk_dealloc_buf(buf, size as usize, 4096);
 
         qh.join().unwrap();
+    }
+
+    fn __test_fn_mut_io_closure() -> std::thread::JoinHandle<()> {
+        let mut ctrl = UblkCtrl::new(-1, 1, 64, 512 << 10, 0, true).unwrap();
+        let ublk_dev = UblkDev::new(
+            "FnMutClosure".to_string(),
+            |dev: &mut UblkDev| {
+                dev.set_default_params(32_u64 << 20);
+                Ok(serde_json::json!({}))
+            },
+            &mut ctrl,
+        )
+        .unwrap();
+
+        // modify this vector in io handling closure
+        let mut q_vec = Vec::<i32>::new();
+
+        // FuMut closure for handling our io_uring IO
+        let mut qc = move |_r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+                           ctx: &UblkQueueCtx,
+                           io: &mut UblkIO,
+                           e: &UblkCQE| {
+            q_vec.push(e.get_tag() as i32);
+            if q_vec.len() >= 64 {
+                q_vec.clear();
+            }
+
+            let iod = ctx.get_iod(e.get_tag());
+            io.complete(unsafe { (*iod).nr_sectors << 9 } as i32);
+            Ok(0)
+        };
+        let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
+
+        ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &mut qc)
+            .unwrap();
+
+        let dev_id = ctrl.dev_info.dev_id as i32;
+        let qh = std::thread::spawn(move || {
+            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            ctrl.del().unwrap();
+        });
+
+        queue.handler(&mut qc);
+        ctrl.stop_dev(&ublk_dev).unwrap();
+
+        qh
+    }
+
+    /// make FnMut closure for IO handling
+    #[test]
+    fn test_fn_mut_io_closure() {
+        __test_fn_mut_io_closure().join().unwrap();
     }
 
     fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
