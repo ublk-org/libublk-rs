@@ -804,17 +804,17 @@ impl UblkQueue<'_> {
         Ok(reapped as i32)
     }
 
-    /// Queue IO handler(high level interface)
+    /// Wait and handle incoming IO
     ///
     /// # Arguments:
     ///
     /// * `ops`: IO handling closure
     ///
-    /// Called in queue context. Won't return unless error is observed.
-    /// Handle any incoming cqe until queue is down.
+    /// Called in queue context. won't return unless error is observed.
+    /// Wait and handle any incoming cqe until queue is down.
     ///
     #[inline(always)]
-    pub fn handle_io<F>(&mut self, mut ops: F)
+    pub fn wait_and_handle_io<F>(&mut self, mut ops: F)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
     {

@@ -100,7 +100,7 @@ pub fn create_queue_handler(
             let ctx = queue.make_queue_ctx();
             let queue_closure = move |io_ctx: &mut io::UblkIOCtx| q_fn(&ctx, io_ctx);
 
-            queue.handle_io(queue_closure);
+            queue.wait_and_handle_io(queue_closure);
         }));
     }
 

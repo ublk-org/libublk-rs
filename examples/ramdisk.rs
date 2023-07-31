@@ -72,7 +72,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
     ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
     ctrl.dump();
-    queue.handle_io(&qc);
+    queue.wait_and_handle_io(&qc);
     ctrl.stop_dev(&ublk_dev).unwrap();
 }
 

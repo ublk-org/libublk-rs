@@ -119,7 +119,7 @@ write to captured variables.
                   io.complete_io(bytes);
                   Ok(0)
               };
-              queue.handle_io(io_handler);
+              queue.wait_and_handle_io(io_handler);
           }));
       }
       ctrl.start_dev(&ublk_dev).unwrap();
