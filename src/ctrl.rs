@@ -10,6 +10,8 @@ use std::os::unix::io::AsRawFd;
 
 const CTRL_PATH: &str = "/dev/ublk-control";
 
+const MAX_BUF_SZ: u32 = 32_u32 << 20;
+
 /// Ublk per-queue CPU affinity
 ///
 /// Responsible for setting ublk queue pthread's affinity.
@@ -187,6 +189,22 @@ impl UblkCtrl {
         flags: u64,
         for_add: bool,
     ) -> Result<UblkCtrl, UblkError> {
+        if id < 0 && id != -1 {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
+        if nr_queues > sys::UBLK_MAX_NR_QUEUES {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
+        if depth > sys::UBLK_MAX_QUEUE_DEPTH {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
+        if io_buf_bytes > MAX_BUF_SZ {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
         let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
             .build(16)
             .map_err(UblkError::OtherIOError)?;
