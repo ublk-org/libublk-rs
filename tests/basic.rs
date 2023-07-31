@@ -137,6 +137,7 @@ mod tests {
                 Ok(serde_json::json!({}))
             },
             &mut ctrl,
+            0,
         )
         .unwrap();
 
@@ -182,6 +183,7 @@ mod tests {
                 Ok(serde_json::json!({}))
             },
             &mut ctrl,
+            0,
         )
         .unwrap();
 

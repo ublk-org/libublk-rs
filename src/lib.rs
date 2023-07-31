@@ -148,7 +148,7 @@ where
     W: Fn(i32) + Send + Sync + 'static,
 {
     let mut ctrl = ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();
-    let ublk_dev = Arc::new(io::UblkDev::new(name, tgt_fn, &mut ctrl).unwrap());
+    let ublk_dev = Arc::new(io::UblkDev::new(name, tgt_fn, &mut ctrl, 0).unwrap());
     let threads = create_queue_handler(&mut ctrl, &ublk_dev, q_fn);
 
     ctrl.start_dev(&ublk_dev).unwrap();

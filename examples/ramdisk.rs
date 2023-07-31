@@ -52,6 +52,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
             Ok(serde_json::json!({}))
         },
         &mut ctrl,
+        0,
     )
     .unwrap();
 

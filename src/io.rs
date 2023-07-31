@@ -189,6 +189,9 @@ pub struct UblkTgt {
 pub struct UblkDev {
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
+    /// reserved for supporting new features
+    pub flags: u32,
+
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
 
@@ -210,7 +213,12 @@ impl UblkDev {
     /// ublk device is abstraction for target, and prepare for setting
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
-    pub fn new<F>(tgt_name: String, ops: F, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError>
+    pub fn new<F>(
+        tgt_name: String,
+        ops: F,
+        ctrl: &mut UblkCtrl,
+        flags: u32,
+    ) -> Result<UblkDev, UblkError>
     where
         F: FnOnce(&mut UblkDev) -> Result<serde_json::Value, UblkError>,
     {
@@ -223,6 +231,10 @@ impl UblkDev {
             ring_flags: 0,
             ..Default::default()
         };
+
+        if flags != 0 {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
 
         let cdev_path = format!("{}{}", super::CDEV_PATH, info.dev_id);
         let cdev_file = fs::OpenOptions::new()
@@ -238,6 +250,7 @@ impl UblkDev {
             dev_info: info,
             cdev_file,
             tgt,
+            flags,
         };
 
         ctrl.json = ops(&mut dev)?;
