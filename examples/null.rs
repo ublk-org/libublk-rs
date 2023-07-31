@@ -1,8 +1,8 @@
-use libublk::io::{UblkDev, UblkIOCtx};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
-fn handle_io(io: &mut UblkIOCtx) -> Result<i32, UblkError> {
-    let iod = io.get_iod();
+fn handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx) -> Result<i32, UblkError> {
+    let iod = ctx.get_iod(io.get_tag());
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
     io.complete_io(bytes);

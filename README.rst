@@ -101,27 +101,27 @@ write to captured variables.
       };
       let ublk_dev =
           std::sync::Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl, 0).unwrap());
-
       let mut threads = Vec::new();
+
       for q in 0..nr_queues {
           let dev = Arc::clone(&ublk_dev);
-
-          //IO handling closure(FnMut), we are driven by io_uring CQE, and
-          //this closure is called for every incoming CQE(io command or
-          //target io completion)
-          let queue_handler = move |io: &mut UblkIOCtx| {
-              let iod = io.get_iod();
-              let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
-
-              io.complete_io(bytes);
-              Ok(0)
-          };
           threads.push(std::thread::spawn(move || {
               let mut queue = UblkQueue::new(q as u16, &dev).unwrap();
+              let ctx = queue.make_queue_ctx();
+
+              //IO handling closure(FnMut), we are driven by io_uring CQE, and
+              //this closure is called for every incoming CQE(io command or
+              //target io completion)
+              let queue_handler = move |io: &mut UblkIOCtx| {
+                  let iod = ctx.get_iod(io.get_tag());
+                  let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+                  io.complete_io(bytes);
+                  Ok(0)
+              };
               queue.handler(queue_handler);
           }));
       }
-
       ctrl.start_dev(&ublk_dev).unwrap();
       ctrl.dump();
       for qh in threads {

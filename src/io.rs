@@ -5,10 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
-pub struct UblkIOCtx<'a, 'b, 'c, 'd>(
+pub struct UblkIOCtx<'a, 'b, 'd>(
     &'a mut io_uring::IoUring<io_uring::squeue::Entry>,
-    &'b UblkQueueCtx,
-    &'c mut UblkIO,
+    &'b mut UblkIO,
     &'d UblkCQE<'d>,
 );
 
@@ -18,58 +17,44 @@ fn is_target_io(user_data: u64) -> bool {
     (user_data & (1_u64 << 63)) != 0
 }
 
-impl<'a, 'b, 'c, 'd> UblkIOCtx<'a, 'b, 'c, 'd> {
+impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
     #[inline(always)]
     pub fn get_ring(&mut self) -> &mut io_uring::IoUring<io_uring::squeue::Entry> {
         self.0
     }
-    #[inline(always)]
-    pub fn get_iod(&self) -> *const sys::ublksrv_io_desc {
-        self.1.get_iod(self.get_tag())
-    }
 
     #[inline(always)]
     pub fn result(&self) -> i32 {
-        self.3.result()
+        self.2.result()
     }
 
     #[inline(always)]
     pub fn get_tag(&self) -> u32 {
-        self.3.get_tag()
+        self.2.get_tag()
     }
 
     #[inline(always)]
     pub fn user_data(&self) -> u64 {
-        self.3.user_data()
+        self.2.user_data()
     }
 
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
-        self.3.is_tgt_io()
+        self.2.is_tgt_io()
     }
 
     #[inline(always)]
     pub fn flags(&self) -> u32 {
-        self.3.flags()
+        self.2.flags()
     }
     #[inline(always)]
     pub fn io_buf_addr(&self) -> *mut u8 {
-        self.2.get_buf_addr()
+        self.1.get_buf_addr()
     }
 
     #[inline(always)]
     pub fn complete_io(&mut self, res: i32) {
-        self.2.complete(res);
-    }
-
-    #[inline(always)]
-    pub fn get_qid(&self) -> u16 {
-        self.1.q_id
-    }
-
-    #[inline(always)]
-    pub fn get_queue_depth(&self) -> u16 {
-        self.1.depth
+        self.1.complete(res);
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -340,13 +325,12 @@ impl UblkIO {
 /// Can only hold read-only info for UblkQueue, so it is safe to
 /// mark it as Copy
 #[derive(Copy, Clone)]
-struct UblkQueueCtx {
-    depth: u16,
-    q_id: u16,
+pub struct UblkQueueCtx {
+    pub depth: u16,
+    pub q_id: u16,
 
     /// io command buffer start address of this queue
     buf_addr: u64,
-    //dev: &'a UblkDev,
 }
 
 impl UblkQueueCtx {
@@ -360,7 +344,7 @@ impl UblkQueueCtx {
     /// driver
     ///
     #[inline(always)]
-    fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
+    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
         assert!(tag < self.depth as u32);
         (self.buf_addr + tag as u64 * 24) as *const sys::ublksrv_io_desc
     }
@@ -433,7 +417,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn make_queue_ctx(&self) -> UblkQueueCtx {
+    pub fn make_queue_ctx(&self) -> UblkQueueCtx {
         UblkQueueCtx {
             buf_addr: self.io_cmd_buf,
             depth: self.q_depth.try_into().unwrap(),
@@ -642,7 +626,6 @@ impl UblkQueue<'_> {
         let res = e.result();
         let tag = UblkIOCtx::user_data_to_tag(data);
         let cmd_op = UblkIOCtx::user_data_to_op(data);
-        let qctx = self.make_queue_ctx();
 
         trace!(
             "{}: res {} (qid {} tag {} cmd_op {} target {}) state {}",
@@ -671,7 +654,6 @@ impl UblkQueue<'_> {
             }
             ops(&mut UblkIOCtx(
                 &mut self.q_ring,
-                &qctx,
                 &mut self.ios[tag as usize],
                 e,
             ))
@@ -690,7 +672,6 @@ impl UblkQueue<'_> {
             assert!(tag < self.q_depth);
             ops(&mut UblkIOCtx(
                 &mut self.q_ring,
-                &qctx,
                 &mut self.ios[tag as usize],
                 e,
             ))

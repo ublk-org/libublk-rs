@@ -1,9 +1,11 @@
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
-fn handle_io(io: &mut UblkIOCtx, start: u64) -> Result<i32, UblkError> {
-    let _iod = io.get_iod();
-    let iod = unsafe { &*_iod };
+fn handle_io(
+    io: &mut UblkIOCtx,
+    iod: &libublk::sys::ublksrv_io_desc,
+    start: u64,
+) -> Result<i32, UblkError> {
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
@@ -56,8 +58,14 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     )
     .unwrap();
 
-    let qc = move |i: &mut UblkIOCtx| handle_io(i, buf_addr);
     let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
+    let ctx = queue.make_queue_ctx();
+    let qc = move |i: &mut UblkIOCtx| {
+        let _iod = ctx.get_iod(i.get_tag());
+        let iod = unsafe { &*_iod };
+
+        handle_io(i, iod, buf_addr)
+    };
     ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
         libc::pthread_self()
     });

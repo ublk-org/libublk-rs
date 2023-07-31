@@ -1,6 +1,6 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkDev, UblkIOCtx};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
@@ -108,7 +108,7 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-fn loop_handle_io(i: &mut UblkIOCtx) -> Result<i32, UblkError> {
+fn loop_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<i32, UblkError> {
     let tag = i.get_tag();
 
     // our IO on backing file is done
@@ -127,7 +127,7 @@ fn loop_handle_io(i: &mut UblkIOCtx) -> Result<i32, UblkError> {
     }
 
     // either start to handle or retry
-    let _iod = i.get_iod();
+    let _iod = ctx.get_iod(tag);
     let iod = unsafe { &*_iod };
 
     loop_queue_tgt_io(i, tag, iod)
