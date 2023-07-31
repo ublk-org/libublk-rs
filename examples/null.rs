@@ -1,12 +1,11 @@
 use libublk::io::{UblkDev, UblkIOCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 
-fn handle_io(io: UblkIOCtx) -> Result<i32, UblkError> {
-    let tag = io.3.get_tag();
-    let iod = io.1.get_iod(tag);
+fn handle_io(io: &mut UblkIOCtx) -> Result<i32, UblkError> {
+    let iod = io.get_iod();
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-    io.2.complete(bytes);
+    io.complete_io(bytes);
     Ok(0)
 }
 

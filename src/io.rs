@@ -6,12 +6,57 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
-pub type UblkIOCtx<'a, 'b, 'c, 'd> = (
+pub struct UblkIOCtx<'a, 'b, 'c, 'd>(
     &'a mut io_uring::IoUring<io_uring::squeue::Entry>,
     &'b UblkQueueCtx,
     &'c mut UblkIO,
     &'d UblkCQE<'d>,
 );
+
+impl<'a, 'b, 'c, 'd> UblkIOCtx<'a, 'b, 'c, 'd> {
+    #[inline(always)]
+    pub fn get_ring(&mut self) -> &mut io_uring::IoUring<io_uring::squeue::Entry> {
+        self.0
+    }
+    #[inline(always)]
+    pub fn get_iod(&self) -> *const sys::ublksrv_io_desc {
+        self.1.get_iod(self.get_tag())
+    }
+
+    #[inline(always)]
+    pub fn result(&self) -> i32 {
+        self.3.result()
+    }
+
+    #[inline(always)]
+    pub fn get_tag(&self) -> u32 {
+        self.3.get_tag()
+    }
+
+    #[inline(always)]
+    pub fn user_data(&self) -> u64 {
+        self.3.user_data()
+    }
+
+    #[inline(always)]
+    pub fn is_tgt_io(&self) -> bool {
+        self.3.is_tgt_io()
+    }
+
+    #[inline(always)]
+    pub fn flags(&self) -> u32 {
+        self.3.flags()
+    }
+    #[inline(always)]
+    pub fn io_buf_addr(&self) -> *mut u8 {
+        self.2.get_buf_addr()
+    }
+
+    #[inline(always)]
+    pub fn complete_io(&mut self, res: i32) {
+        self.2.complete(res);
+    }
+}
 
 pub struct UblkCQE<'d>(&'d cqueue::Entry, u32);
 
@@ -635,7 +680,7 @@ impl UblkQueue<'_> {
     #[allow(unused_assignments)]
     fn handle_cqe<F>(&mut self, mut ops: F, e: &UblkCQE)
     where
-        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
     {
         let data = e.user_data();
         let res = e.result();
@@ -668,7 +713,13 @@ impl UblkQueue<'_> {
                     user_data_to_op(data)
                 );
             }
-            ops((&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)).unwrap();
+            ops(&mut UblkIOCtx(
+                &mut self.q_ring,
+                &qctx,
+                &mut self.ios[tag as usize],
+                e,
+            ))
+            .unwrap();
             return;
         }
 
@@ -681,7 +732,13 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops((&mut self.q_ring, &qctx, &mut self.ios[tag as usize], e)).unwrap();
+            ops(&mut UblkIOCtx(
+                &mut self.q_ring,
+                &qctx,
+                &mut self.ios[tag as usize],
+                e,
+            ))
+            .unwrap();
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching
@@ -698,7 +755,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     fn reap_one_event<F>(&mut self, ops: F) -> usize
     where
-        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
     {
         let idx = self.cqes_idx;
         if idx >= self.cqes_cnt {
@@ -774,7 +831,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
     where
-        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
     {
         let to_wait = if self.get_poll() { 0 } else { 1 };
 
@@ -821,7 +878,7 @@ impl UblkQueue<'_> {
     ///
     pub fn handler<F>(&mut self, mut ops: F)
     where
-        F: FnMut(UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
     {
         loop {
             match self.process_io(&mut ops) {

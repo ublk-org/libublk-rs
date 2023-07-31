@@ -1,6 +1,6 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkDev, UblkIO, UblkIOCtx};
+use libublk::io::{UblkDev, UblkIOCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use log::trace;
 use serde::Serialize;
@@ -56,8 +56,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
 }
 
 fn loop_queue_tgt_io(
-    r: &mut io_uring::IoUring<squeue::Entry>,
-    io: &mut UblkIO,
+    io: &mut UblkIOCtx,
     tag: u32,
     iod: &libublk::sys::ublksrv_io_desc,
 ) -> Result<i32, UblkError> {
@@ -65,7 +64,8 @@ fn loop_queue_tgt_io(
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
     let data = libublk::io::build_user_data(tag as u16, op, 0, true);
-    let buf_addr = io.get_buf_addr();
+    let buf_addr = io.io_buf_addr();
+    let r = io.get_ring();
 
     if op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES || op == libublk::sys::UBLK_IO_OP_DISCARD {
         return Err(UblkError::OtherError(-libc::EINVAL));
@@ -108,29 +108,29 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-fn loop_handle_io(i: UblkIOCtx) -> Result<i32, UblkError> {
-    let tag = i.3.get_tag();
+fn loop_handle_io(i: &mut UblkIOCtx) -> Result<i32, UblkError> {
+    let tag = i.get_tag();
 
     // our IO on backing file is done
-    if i.3.is_tgt_io() {
-        let user_data = i.3.user_data();
-        let res = i.3.result();
+    if i.is_tgt_io() {
+        let user_data = i.user_data();
+        let res = i.result();
         let cqe_tag = libublk::io::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
-            i.2.complete(res);
+            i.complete_io(res);
 
             return Ok(0);
         }
     }
 
     // either start to handle or retry
-    let _iod = i.1.get_iod(tag);
+    let _iod = i.get_iod();
     let iod = unsafe { &*_iod };
 
-    loop_queue_tgt_io(i.0, i.2, tag, iod)
+    loop_queue_tgt_io(i, tag, iod)
 }
 
 fn test_add() {

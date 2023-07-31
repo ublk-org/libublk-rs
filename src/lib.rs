@@ -13,7 +13,7 @@ pub mod ctrl;
 pub mod io;
 pub mod sys;
 
-type QueueFn = fn(io::UblkIOCtx) -> Result<i32, UblkError>;
+type QueueFn = fn(&mut io::UblkIOCtx) -> Result<i32, UblkError>;
 
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
@@ -92,7 +92,7 @@ pub fn create_queue_handler(
         let _dev = Arc::clone(dev);
         let _tx = tx.clone();
 
-        let queue_closure = move |io_ctx: io::UblkIOCtx| q_fn(io_ctx);
+        let queue_closure = move |io_ctx: &mut io::UblkIOCtx| q_fn(io_ctx);
 
         q_threads.push(std::thread::spawn(move || {
             unsafe {
