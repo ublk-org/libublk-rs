@@ -260,7 +260,7 @@ impl UblkDev {
         self.tgt.params = super::sys::ublk_params {
             types: super::sys::UBLK_PARAM_TYPE_BASIC,
             basic: super::sys::ublk_param_basic {
-                logical_bs_shift: 12,
+                logical_bs_shift: 9,
                 physical_bs_shift: 12,
                 io_opt_shift: 12,
                 io_min_shift: 12,
