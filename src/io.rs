@@ -13,6 +13,12 @@ pub struct UblkIOCtx<'a, 'b, 'c, 'd>(
     &'d UblkCQE<'d>,
 );
 
+/// Check if this userdata is from target IO
+#[inline(always)]
+fn is_target_io(user_data: u64) -> bool {
+    (user_data & (1_u64 << 63)) != 0
+}
+
 impl<'a, 'b, 'c, 'd> UblkIOCtx<'a, 'b, 'c, 'd> {
     #[inline(always)]
     pub fn get_ring(&mut self) -> &mut io_uring::IoUring<io_uring::squeue::Entry> {
@@ -66,6 +72,63 @@ impl<'a, 'b, 'c, 'd> UblkIOCtx<'a, 'b, 'c, 'd> {
     pub fn get_queue_depth(&self) -> u16 {
         self.1.depth
     }
+
+    /// Build offset for read from or write to per-io-cmd buffer
+    ///
+    /// # Arguments:
+    ///
+    /// * `q_id`: queue id
+    /// * `tag`: io command tag
+    /// * `offset`: offset to this io-cmd buffer
+    ///
+    /// The built offset is passed to pread() or pwrite() on device of
+    /// /dev/ublkcN for reading data from io command buffer, or writing
+    /// data to io command buffer.
+    ///
+    /// Available if UBLK_F_USER_COPY is enabled.
+    ///
+    #[inline(always)]
+    #[allow(arithmetic_overflow)]
+    pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
+        assert!((offset & !sys::UBLK_IO_BUF_BITS_MASK) == 0);
+
+        sys::UBLKSRV_IO_BUF_OFFSET as u64
+            + ((((q_id as u64) << sys::UBLK_QID_OFF) as u64)
+                | ((tag as u64) << sys::UBLK_TAG_OFF) as u64
+                | offset as u64)
+    }
+
+    /// Build userdata for submitting io via io_uring
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io tag, length is 16bit
+    /// * `op`: io operation code, length is 8bit
+    /// * `tgt_data`: target specific data, at most 39bit (64 - 16 - 8 - 1)
+    /// * `is_target_io`: if this userdata is for handling target io, false if
+    ///         if it is only for ublk io command
+    ///
+    /// The built userdata is passed to io_uring for parsing io result
+    ///
+    #[inline(always)]
+    #[allow(arithmetic_overflow)]
+    pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
+        assert!((op >> 8) == 0 && (tgt_data >> 16) == 0);
+
+        tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
+    }
+
+    /// Extract tag from userdata
+    #[inline(always)]
+    pub fn user_data_to_tag(user_data: u64) -> u32 {
+        (user_data & 0xffff) as u32
+    }
+
+    /// Extract operation code from userdata
+    #[inline(always)]
+    pub fn user_data_to_op(user_data: u64) -> u32 {
+        ((user_data >> 16) & 0xff) as u32
+    }
 }
 
 struct UblkCQE<'d>(&'d cqueue::Entry, u32);
@@ -82,7 +145,7 @@ impl<'a> UblkCQE<'a> {
 
     #[inline(always)]
     fn get_tag(&self) -> u32 {
-        user_data_to_tag(self.0.user_data())
+        UblkIOCtx::user_data_to_tag(self.0.user_data())
     }
 
     #[inline(always)]
@@ -221,69 +284,6 @@ impl Drop for UblkDev {
 union IOCmd {
     cmd: sys::ublksrv_io_cmd,
     buf: [u8; 16],
-}
-
-/// Build offset for read from or write to per-io-cmd buffer
-///
-/// # Arguments:
-///
-/// * `q_id`: queue id
-/// * `tag`: io command tag
-/// * `offset`: offset to this io-cmd buffer
-///
-/// The built offset is passed to pread() or pwrite() on device of
-/// /dev/ublkcN for reading data from io command buffer, or writing
-/// data to io command buffer.
-///
-/// Available if UBLK_F_USER_COPY is enabled.
-///
-#[inline(always)]
-#[allow(arithmetic_overflow)]
-pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
-    assert!((offset & !sys::UBLK_IO_BUF_BITS_MASK) == 0);
-
-    sys::UBLKSRV_IO_BUF_OFFSET as u64
-        + ((((q_id as u64) << sys::UBLK_QID_OFF) as u64)
-            | ((tag as u64) << sys::UBLK_TAG_OFF) as u64
-            | offset as u64)
-}
-
-/// Build userdata for submitting io via io_uring
-///
-/// # Arguments:
-///
-/// * `tag`: io tag, length is 16bit
-/// * `op`: io operation code, length is 8bit
-/// * `tgt_data`: target specific data, at most 39bit (64 - 16 - 8 - 1)
-/// * `is_target_io`: if this userdata is for handling target io, false if
-///         if it is only for ublk io command
-///
-/// The built userdata is passed to io_uring for parsing io result
-///
-#[inline(always)]
-#[allow(arithmetic_overflow)]
-pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
-    assert!((op >> 8) == 0 && (tgt_data >> 16) == 0);
-
-    tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
-}
-
-/// Check if this userdata is from target IO
-#[inline(always)]
-pub fn is_target_io(user_data: u64) -> bool {
-    (user_data & (1_u64 << 63)) != 0
-}
-
-/// Extract tag from userdata
-#[inline(always)]
-pub fn user_data_to_tag(user_data: u64) -> u32 {
-    (user_data & 0xffff) as u32
-}
-
-/// Extract operation code from userdata
-#[inline(always)]
-pub fn user_data_to_op(user_data: u64) -> u32 {
-    ((user_data >> 16) & 0xff) as u32
 }
 
 const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
@@ -579,7 +579,7 @@ impl UblkQueue<'_> {
                 result: io.result,
             },
         };
-        let data = build_user_data(tag, cmd_op, 0, false);
+        let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
 
         let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
             .cmd(unsafe { io_cmd.buf })
@@ -665,8 +665,8 @@ impl UblkQueue<'_> {
     {
         let data = e.user_data();
         let res = e.result();
-        let tag = user_data_to_tag(data);
-        let cmd_op = user_data_to_op(data);
+        let tag = UblkIOCtx::user_data_to_tag(data);
+        let cmd_op = UblkIOCtx::user_data_to_op(data);
         let qctx = self.make_queue_ctx();
 
         trace!(
@@ -690,8 +690,8 @@ impl UblkQueue<'_> {
                     "handle_tgt_cqe",
                     res,
                     self.q_id,
-                    user_data_to_tag(data),
-                    user_data_to_op(data)
+                    UblkIOCtx::user_data_to_tag(data),
+                    UblkIOCtx::user_data_to_op(data)
                 );
             }
             ops(&mut UblkIOCtx(

@@ -63,7 +63,7 @@ fn loop_queue_tgt_io(
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
-    let data = libublk::io::build_user_data(tag as u16, op, 0, true);
+    let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
     let buf_addr = io.io_buf_addr();
     let r = io.get_ring();
 
@@ -115,7 +115,7 @@ fn loop_handle_io(i: &mut UblkIOCtx) -> Result<i32, UblkError> {
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
-        let cqe_tag = libublk::io::user_data_to_tag(user_data);
+        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
 
         assert!(cqe_tag == tag);
 
