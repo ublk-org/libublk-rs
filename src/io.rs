@@ -56,62 +56,43 @@ impl<'a, 'b, 'c, 'd> UblkIOCtx<'a, 'b, 'c, 'd> {
     pub fn complete_io(&mut self, res: i32) {
         self.2.complete(res);
     }
+
+    #[inline(always)]
+    pub fn get_qid(&self) -> u16 {
+        self.1.q_id
+    }
+
+    #[inline(always)]
+    pub fn get_queue_depth(&self) -> u16 {
+        self.1.depth
+    }
 }
 
-pub struct UblkCQE<'d>(&'d cqueue::Entry, u32);
+struct UblkCQE<'d>(&'d cqueue::Entry, u32);
 
 impl<'a> UblkCQE<'a> {
     #[inline(always)]
-    pub fn result(&self) -> i32 {
+    fn result(&self) -> i32 {
         self.0.result()
     }
     #[inline(always)]
-    pub fn user_data(&self) -> u64 {
+    fn user_data(&self) -> u64 {
         self.0.user_data()
     }
 
     #[inline(always)]
-    pub fn get_tag(&self) -> u32 {
+    fn get_tag(&self) -> u32 {
         user_data_to_tag(self.0.user_data())
     }
 
     #[inline(always)]
-    pub fn is_tgt_io(&self) -> bool {
+    fn is_tgt_io(&self) -> bool {
         is_target_io(self.0.user_data())
     }
     #[inline(always)]
-    pub fn flags(&self) -> u32 {
+    fn flags(&self) -> u32 {
         self.1
     }
-}
-
-pub trait UblkTgtImpl {
-    /// Init target specific stuff
-    ///
-    /// # Arguments:
-    ///
-    /// * `dev`: this UblkDev instance
-    ///
-    /// Initialize this target, dev_data is usually built from command line, so
-    /// it is produced and consumed by target code. Target code needs to setup
-    /// ublk device parameters for telling kernel driver in this method.
-    ///
-    fn init_tgt(&self, dev: &UblkDev) -> Result<serde_json::Value, UblkError>;
-
-    /// Deinit this target
-    ///
-    /// # Arguments:
-    ///
-    /// * `dev`: this UblkDev instance
-    ///
-    /// Release target specific resource.
-    fn deinit_tgt(&self, dev: &UblkDev) {
-        trace!("{}: deinit_tgt {}", self.tgt_type(), dev.dev_info.dev_id);
-    }
-
-    /// Return target type name
-    ///
-    fn tgt_type(&self) -> &'static str;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -313,7 +294,7 @@ const UBLK_IO_TO_QUEUE: u32 = 1u32 << 3;
 pub const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
 pub const UBLK_IO_F_LAST: u32 = 1u32 << 17;
 
-pub struct UblkIO {
+struct UblkIO {
     buf_addr: *mut u8,
     flags: u32,
     result: i32,
@@ -321,7 +302,7 @@ pub struct UblkIO {
 
 impl UblkIO {
     #[inline(always)]
-    pub fn get_buf_addr(&self) -> *mut u8 {
+    fn get_buf_addr(&self) -> *mut u8 {
         self.buf_addr
     }
 
@@ -336,7 +317,7 @@ impl UblkIO {
     /// /dev/ublkbN
     ///
     #[inline(always)]
-    pub fn complete(&mut self, res: i32) {
+    fn complete(&mut self, res: i32) {
         self.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE | UBLK_IO_TO_QUEUE;
         self.result = res;
     }
@@ -348,9 +329,9 @@ impl UblkIO {
 /// Can only hold read-only info for UblkQueue, so it is safe to
 /// mark it as Copy
 #[derive(Copy, Clone)]
-pub struct UblkQueueCtx {
-    pub depth: u16,
-    pub q_id: u16,
+struct UblkQueueCtx {
+    depth: u16,
+    q_id: u16,
 
     /// io command buffer start address of this queue
     buf_addr: u64,
@@ -368,7 +349,7 @@ impl UblkQueueCtx {
     /// driver
     ///
     #[inline(always)]
-    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
+    fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
         assert!(tag < self.depth as u32);
         (self.buf_addr + tag as u64 * 24) as *const sys::ublksrv_io_desc
     }
