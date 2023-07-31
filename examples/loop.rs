@@ -40,7 +40,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     }
 
     let dev_size = {
-        let mut tgt = dev.tgt.borrow_mut();
+        let tgt = &mut dev.tgt;
         let nr_fds = tgt.nr_fds;
         tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
         tgt.nr_fds = nr_fds + 1;

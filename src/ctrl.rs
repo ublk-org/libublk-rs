@@ -587,15 +587,13 @@ impl UblkCtrl {
     }
 
     fn __start_dev(&mut self, dev: &UblkDev, async_cmd: bool) -> Result<i32, UblkError> {
-        let params = dev.tgt.borrow();
-
         self.get_info()?;
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
             return Ok(0);
         }
 
         let token = if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
-            self.set_params(&params.params)?;
+            self.set_params(&dev.tgt.params)?;
             self.flush_json()?;
             self.start(unsafe { libc::getpid() as i32 }, async_cmd)?
         } else {

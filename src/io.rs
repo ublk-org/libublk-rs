@@ -2,7 +2,6 @@ use super::{ctrl::UblkCtrl, sys, UblkError};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
@@ -193,7 +192,7 @@ pub struct UblkDev {
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
 
-    pub tgt: RefCell<UblkTgt>,
+    pub tgt: UblkTgt,
 }
 
 unsafe impl Send for UblkDev {}
@@ -238,7 +237,7 @@ impl UblkDev {
         let mut dev = UblkDev {
             dev_info: info,
             cdev_file,
-            tgt: RefCell::new(tgt),
+            tgt,
         };
 
         ctrl.json = ops(&mut dev)?;
@@ -254,12 +253,11 @@ impl UblkDev {
         info!("dev {} deinitialized", id);
     }
 
-    pub fn set_default_params(&self, dev_size: u64) {
+    pub fn set_default_params(&mut self, dev_size: u64) {
         let info = self.dev_info;
-        let mut tgt = self.tgt.borrow_mut();
 
-        tgt.dev_size = dev_size;
-        tgt.params = super::sys::ublk_params {
+        self.tgt.dev_size = dev_size;
+        self.tgt.params = super::sys::ublk_params {
             types: super::sys::UBLK_PARAM_TYPE_BASIC,
             basic: super::sys::ublk_param_basic {
                 logical_bs_shift: 12,
@@ -441,7 +439,7 @@ impl UblkQueue<'_> {
     ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
     pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue, UblkError> {
-        let tgt = dev.tgt.borrow();
+        let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
 
