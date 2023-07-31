@@ -626,9 +626,9 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe<F>(&mut self, ops: F, e: &UblkCQE)
+    fn handle_cqe<F>(&mut self, mut ops: F, e: &UblkCQE)
     where
-        F: Fn(
+        F: FnMut(
             &mut io_uring::IoUring<io_uring::squeue::Entry>,
             &UblkQueueCtx,
             &mut UblkIO,
@@ -696,7 +696,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     fn reap_one_event<F>(&mut self, ops: F) -> usize
     where
-        F: Fn(
+        F: FnMut(
             &mut io_uring::IoUring<io_uring::squeue::Entry>,
             &UblkQueueCtx,
             &mut UblkIO,
@@ -777,7 +777,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
     where
-        F: Fn(
+        F: FnMut(
             &mut io_uring::IoUring<io_uring::squeue::Entry>,
             &UblkQueueCtx,
             &mut UblkIO,
@@ -827,9 +827,9 @@ impl UblkQueue<'_> {
     ///
     /// Called in queue context. Won't return unless error is observed.
     ///
-    pub fn handler<F>(&mut self, ops: F)
+    pub fn handler<F>(&mut self, mut ops: F)
     where
-        F: Fn(
+        F: FnMut(
             &mut io_uring::IoUring<io_uring::squeue::Entry>,
             &UblkQueueCtx,
             &mut UblkIO,
@@ -837,7 +837,7 @@ impl UblkQueue<'_> {
         ) -> Result<i32, UblkError>,
     {
         loop {
-            match self.process_io(&ops) {
+            match self.process_io(&mut ops) {
                 Err(_) => break,
                 _ => continue,
             }

@@ -638,10 +638,10 @@ impl UblkCtrl {
         &mut self,
         dev: &UblkDev,
         q: &mut super::io::UblkQueue,
-        ops: &F,
+        mut ops: F,
     ) -> Result<i32, UblkError>
     where
-        F: Fn(
+        F: FnMut(
             &mut io_uring::IoUring<io_uring::squeue::Entry>,
             &super::io::UblkQueueCtx,
             &mut super::io::UblkIO,
@@ -662,7 +662,7 @@ impl UblkCtrl {
                     return Err(UblkError::UringIOError(res));
                 }
             }
-            match q.process_io(ops) {
+            match q.process_io(&mut ops) {
                 Err(r) => return Err(r),
                 _ => continue,
             }

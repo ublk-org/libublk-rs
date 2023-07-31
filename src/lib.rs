@@ -93,18 +93,18 @@ pub fn create_queue_handler(
         Receiver<(u16, i32, libc::pthread_t)>,
     ) = mpsc::channel();
 
-    let queue_closure = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
-                              ctx: &io::UblkQueueCtx,
-                              io: &mut io::UblkIO,
-                              e: &io::UblkCQE| {
-        let r = q_fn(r, ctx, io, e);
-
-        r
-    };
-
     for q in 0..nr_queues {
         let _dev = Arc::clone(dev);
         let _tx = tx.clone();
+
+        let queue_closure = move |r: &mut io_uring::IoUring<io_uring::squeue::Entry>,
+                                  ctx: &io::UblkQueueCtx,
+                                  io: &mut io::UblkIO,
+                                  e: &io::UblkCQE| {
+            let r = q_fn(r, ctx, io, e);
+
+            r
+        };
 
         q_threads.push(std::thread::spawn(move || {
             unsafe {
