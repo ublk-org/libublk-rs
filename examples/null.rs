@@ -2,14 +2,21 @@ use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
 use libublk::{ctrl::UblkCtrl, UblkError};
 use std::sync::Arc;
 
-fn null_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx) -> Result<i32, UblkError> {
+fn null_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, park: bool) -> Result<i32, UblkError> {
     let iod = ctx.get_iod(io.get_tag());
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-    io.complete_io(bytes);
-    Ok(0)
+    if !park {
+        io.complete_io(bytes);
+        Ok(0)
+    } else {
+        io.add_to_comp_batch(io.get_tag() as u16, bytes);
+        Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
+    }
 }
 fn test_add(dev_id: i32) {
+    let s = std::env::args().nth(3).unwrap_or_else(|| "0".to_string());
+    let park = s.parse::<i32>().unwrap();
     let nr_queues = 2; //two queues
                        //io depth: 64, max buf size: 512KB
     let mut ctrl = UblkCtrl::new(dev_id, nr_queues, 64, 512 << 10, 0, true).unwrap();
@@ -19,9 +26,22 @@ fn test_add(dev_id: i32) {
         dev.set_default_params(250_u64 << 30);
         Ok(serde_json::json!({}))
     };
-    let ublk_dev =
-        std::sync::Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl, 0).unwrap());
+    let ublk_dev = std::sync::Arc::new(
+        UblkDev::new(
+            "null".to_string(),
+            tgt_init,
+            &mut ctrl,
+            if park != 0 {
+                libublk::io::UBLK_DEV_F_COMP_BATCH
+            } else {
+                0
+            },
+        )
+        .unwrap(),
+    );
     let mut threads = Vec::new();
+
+    println!("park completed IO {}", park);
 
     for q in 0..nr_queues {
         let dev = Arc::clone(&ublk_dev);
@@ -32,7 +52,7 @@ fn test_add(dev_id: i32) {
             //IO handling closure(FnMut), we are driven by io_uring CQE, and
             //this closure is called for every incoming CQE(io command or
             //target io completion)
-            let io_handler = move |io: &mut UblkIOCtx| null_handle_io(&ctx, io);
+            let io_handler = move |io: &mut UblkIOCtx| null_handle_io(&ctx, io, park != 0);
             queue.wait_and_handle_io(io_handler);
         }));
     }
