@@ -5,10 +5,10 @@ libublk of Rust
 Introduction
 ============
 
-Rust library for help to build any ublk[1] target device, which talks with
-linux ``ublk driver`` [#ublk_driver]_ for exposing standard linux block device,
+Rust library for building ublk[1] target device, which talks with linux
+``ublk driver`` [#ublk_driver]_ for exposing standard linux block device,
 meantime help target code to implement its own IO logic, which is totally
-done in userspace target code.
+done in userspace.
 
 So Rust's advantage can be taken for building userspace block device.
 
@@ -18,13 +18,13 @@ Linux kernel 6.0 starts to support ublk covered by config option CONFIG_BLK_DEV_
 Related documentations
 ======================
 
-`ublk doc <https://github.com/ming1/ubdsrv/blob/master/doc/external_links.rst>`_
+`ublk doc links <https://github.com/ming1/ubdsrv/blob/master/doc/external_links.rst>`_
 
 `ublk introduction <https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf>`_
 
 
-Build blocks
-============
+Building blocks
+===============
 
 UblkCtrl
 --------
@@ -45,26 +45,27 @@ UblkQueue
 
 UblkQueue is the core part of the whole stack, which communicates with
 ublk driver via ``io_uring cmd`` [#io_uirng_cmd]_. When any io command for
-representing one block IO originating from /dev/ublkbN comes, one uring_cmd
-CQE is received. Basically the whole stack is driven by io_uring CQE
-(uring_cmd or plain io_uring IO submitted from target code). Here target
-means the specific ublk device implementation, such as ublk-loop, ublk-zoned,
-ublk-nbd, ublk-qcow2, ...
+representing one block IO request originating from /dev/ublkbN comes, one
+uring_cmd CQE is received in ublk userspace side. Basically the whole stack
+is driven by io_uring CQE(uring_cmd or plain io_uring IO submitted from
+target code). Here target means the specific ublk device implementation,
+such as ublk-loop, ublk-zoned, ublk-nbd, ublk-qcow2, ...
 
 UblkIOCtx
 ---------
 
 When any io_uring CQE is received, libublk lets the target code handle it by
-IO handling closure. This CQE may represents one io command from /dev/ublkbN,
-or one plain io_uring IO which is submitted from target code, still in the
-same io handling closure.
+IO handling closure. This CQE may represents IO command from /dev/ublkbN,
+or plain io_uring IO submitted from ublk target code, still in the same IO
+handling closure.
 
-If target won't use io_uring to handle IO, eventfd is sent from the real
-handler context to wakeup queue context for driving the machinery. eventfd &
-native IO offloading will be added soon.
+If target won't use io_uring to handle IO, eventfd needs to be sent from the
+real handler context to wakeup ublk queue/io_uring context for driving the
+machinery. Eventfd gets minimized support with UBLK_DEV_F_COMP_BATCH, and
+native & generic IO offloading will be added soon.
 
-UblkIOCtx provides enough information for target code to handle this CQE and
-implementing target IO handling logic.
+UblkIOCtx & UblkQueueCtx provide enough information for target code to handle
+this CQE and implement target IO handling logic.
 
 Quick Start
 ===========
@@ -74,14 +75,14 @@ libublk 0.1.0, and each queue depth is 64, and each IO's max buffer size
 is 512KB.
 
 The closure `tgt_init` provides interface to set all kinds of parameters
-for this ublk-null.
+for this target.
 
-The closure `queue_handler` provides interface to handle incoming CQE
-and implement target io logic.
+The closure `io_handler` provides interface to handle incoming CQE/
+IO cmmand and implement target IO logic.
 
 Closure interface is flexible since it can capture environment(outside of
-closure) variables, and IO handling closure is FnMut which allows to
-write to captured variables.
+closure) variables, and IO handling closure is defined as FnMut which allows
+to write to captured variables.
 
 .. code-block:: rust
 
@@ -136,34 +137,36 @@ Target IO handling
 Target IO handling needs target code to implement the IO handling
 closure.
 
-If IO is super fast to complete, such as ramdisk, this io can be handled
+If IO is super fast to complete, such as ramdisk, this request can be handled
 directly in the closure, and call `io.complete_io(result)` to complete
-this IO command from ublk driver. Another example is null target(null.rs).
+the IO command originated from ublk driver. Another example is null
+target(null.rs).
 
 Most of times, IO is slow, so it needs to be handled asynchronously. The
 preferred way is to submit target IO by io_uring in IO handling closure by
 using the same IO slot(represented by `tag`). After this target IO is
-completed, one io_uring CQE will be received, and the same io closure is
+completed, one io_uring CQE will be received, and the same IO closure is
 called for handling this target IO, which can be checked by
-`UblkIOCtx::is_tgt_io()` method. Finally if this target IO completion
+`UblkIOCtx::is_tgt_io()` method. Finally if the coming target IO completion
 means the original IO command is done, `io.complete_io(result)` is called
-for moving on, otherwise the IO handling closure can continue to submit
-IO for driving its IO logic.
+for moving on, otherwise the IO handling closure can continue to submit IO
+or whatever for driving its IO logic.
 
-Not all target IO logics can be done by io_uring, such as some IO handling
-needs extra computation, which often require offload IO to another
-context. However, when target IO is done, `io.complete_io(result)` has to
-be called in the queue context. One approach is to use eventfd to wakeup &
-notify this completion. Here, eventfd can be thought as one kind of target
-IO. Inside IO closure, eventfd needs to be queued by io_uring opcode::PollAdd.
-Once target IO handling is done, write(eventfd) can wakeup/notify the queue,
-then IO closure can get chance to handle all completed IOs. Unfortunately,
-each IO command(originated from ublk driver) can only use its own `UblkIOCtx`
+Not all target IO logics can be done by io_uring, such as some handling
+needs extra computation, which often require to offload IO in another
+context. However, when target IO is done in remote offload context,
+`io.complete_io(result)` has to be called in the queue/io_uring context.
+One approach is to use eventfd to wakeup & notify ublk queue/io_uring.
+Here, eventfd can be thought as one special target IO. Inside IO closure,
+eventfd is queued by io_uring opcode::PollAdd. Once target IO handling is
+done, write(eventfd) can wakeup/notify ublk queue & io_uring, then IO
+closure can get chance to handle all completed IOs. Unfortunately, each
+IO command(originated from ublk driver) can only use its own `UblkIOCtx`
 to complete itself. But one eventfd is often reused for the whole queue, so
 normally multiple IOs are completed when handling single eventfd CQE.
 Here IO completion batch feature is provided, and target code can call
 `io.add_to_comp_batch()` for each completed IO(tag, result) in io closure.
-Then, all these IOs will be completed automatically.
+Then, all these added IOs will be completed automatically.
 
 Examples
 ========
