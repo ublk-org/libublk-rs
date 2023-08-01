@@ -115,6 +115,9 @@ impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
     }
 }
 
+pub const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
+pub const UBLK_IO_F_LAST: u32 = 1u32 << 17;
+
 struct UblkCQE<'d>(&'d cqueue::Entry, u32);
 
 impl<'a> UblkCQE<'a> {
@@ -286,9 +289,6 @@ const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
 const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
 const UBLK_IO_FREE: u32 = 1u32 << 2;
 const UBLK_IO_TO_QUEUE: u32 = 1u32 << 3;
-
-pub const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
-pub const UBLK_IO_F_LAST: u32 = 1u32 << 17;
 
 struct UblkIO {
     buf_addr: *mut u8,
