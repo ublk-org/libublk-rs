@@ -5,10 +5,23 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::io::AsRawFd;
 
+/// Return value of IO handling closure.
+///
+/// If `UBLK_IO_S_COMP_BATCH` is returned from the closure, we need
+/// to check if there is any completed IOs in `UblkIOCtx.3`, and
+/// if yes, complete them all.
+///
+/// The typical use case is that IO offloading from another context,
+/// then target code sends eventfd to wakeup our queue(io_uring).
+/// After any IO is completed, it is added to `UblkIOCtx.3` by
+/// `UblkIOCtx::add_to_comp_batch()` for later completion.
+pub const UBLK_IO_S_COMP_BATCH: i32 = 1;
+
 pub struct UblkIOCtx<'a, 'b, 'd>(
     &'a mut io_uring::IoUring<io_uring::squeue::Entry>,
     &'b mut UblkIO,
     &'d UblkCQE<'d>,
+    Option<Vec<(u16, i32)>>,
 );
 
 /// Check if this userdata is from target IO
@@ -55,6 +68,23 @@ impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
     #[inline(always)]
     pub fn complete_io(&mut self, res: i32) {
         self.1.complete(res);
+    }
+
+    /// Add completed IOs represented by (tag, res) to batch list, so that
+    /// we can complete them after returning from io handling closure, which
+    /// must return `UBLK_IO_S_COMP_BATCH`, so that we know that there are
+    /// IOs in batch list.
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io tag
+    /// * `res`: IO handling result
+    ///
+    #[inline(always)]
+    pub fn add_to_comp_batch(&mut self, tag: u16, res: i32) {
+        if let Some(v) = self.3.as_mut() {
+            v.push((tag, res));
+        }
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -174,6 +204,9 @@ pub struct UblkTgt {
     pub params: sys::ublk_params,
 }
 
+pub const UBLK_DEV_F_COMP_BATCH: u32 = 1u32 << 0;
+const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH;
+
 pub struct UblkDev {
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
@@ -220,7 +253,7 @@ impl UblkDev {
             ..Default::default()
         };
 
-        if flags != 0 {
+        if (flags & !UBLK_DEV_F_ALL) != 0 {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
@@ -361,6 +394,7 @@ const UBLK_QUEUE_POLL: u32 = 1_u32 << 2;
 /// So far, each queue is handled by one single io_uring.
 ///
 pub struct UblkQueue<'a> {
+    flags: u32,
     pub q_id: u16,
     pub q_depth: u32,
     io_cmd_buf: u64,
@@ -500,6 +534,7 @@ impl UblkQueue<'_> {
         }
 
         let mut q = UblkQueue {
+            flags: dev.flags,
             q_id,
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
@@ -516,6 +551,10 @@ impl UblkQueue<'_> {
         trace!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
         Ok(q)
+    }
+
+    fn support_comp_batch(&self) -> bool {
+        self.flags & UBLK_DEV_F_COMP_BATCH != 0
     }
 
     pub fn set_poll(&mut self, val: bool) {
@@ -617,8 +656,30 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    fn call_io_closure<F>(&mut self, mut ops: F, tag: u32, e: &UblkCQE)
+    where
+        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
+    {
+        let comp_batch = self.support_comp_batch();
+        let mut ctx = UblkIOCtx(
+            &mut self.q_ring,
+            &mut self.ios[tag as usize],
+            e,
+            if comp_batch { Some(Vec::new()) } else { None },
+        );
+        let res = ops(&mut ctx).unwrap();
+        if res == UBLK_IO_S_COMP_BATCH {
+            if let Some(ios) = ctx.3.as_mut() {
+                for item in ios {
+                    self.ios[item.0 as usize].complete(item.1);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe<F>(&mut self, mut ops: F, e: &UblkCQE)
+    fn handle_cqe<F>(&mut self, ops: F, e: &UblkCQE)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
     {
@@ -652,12 +713,7 @@ impl UblkQueue<'_> {
                     UblkIOCtx::user_data_to_op(data)
                 );
             }
-            ops(&mut UblkIOCtx(
-                &mut self.q_ring,
-                &mut self.ios[tag as usize],
-                e,
-            ))
-            .unwrap();
+            self.call_io_closure(ops, tag, e);
             return;
         }
 
@@ -670,12 +726,7 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops(&mut UblkIOCtx(
-                &mut self.q_ring,
-                &mut self.ios[tag as usize],
-                e,
-            ))
-            .unwrap();
+            self.call_io_closure(ops, tag, e);
         } else {
             /*
              * COMMIT_REQ will be completed immediately since no fetching

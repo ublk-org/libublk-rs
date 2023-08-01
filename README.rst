@@ -94,7 +94,7 @@ write to captured variables.
                          //io depth: 64, max buf size: 512KB
       let mut ctrl = UblkCtrl::new(-1, nr_queues, 64, 512 << 10, 0, true).unwrap();
 
-      //target specific initialization is done in this closure
+      //target specific initialization by tgt_init closure
       let tgt_init = |dev: &mut UblkDev| {
           dev.set_default_params(250_u64 << 30);
           Ok(serde_json::json!({}))
@@ -109,9 +109,9 @@ write to captured variables.
               let mut queue = UblkQueue::new(q as u16, &dev).unwrap();
               let ctx = queue.make_queue_ctx();
 
-              //IO handling closure(FnMut), we are driven by io_uring CQE, and
-              //this closure is called for every incoming CQE(io command or
-              //target io completion)
+              //IO handling closure(FnMut), we are driven by io_uring
+              //CQE, and this closure is called for every incoming CQE
+              //(IO command or target io completion)
               let io_handler = move |io: &mut UblkIOCtx| {
                   let iod = ctx.get_iod(io.get_tag());
                   let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
@@ -129,6 +129,41 @@ write to captured variables.
       }
       ctrl.stop_dev(&ublk_dev).unwrap();
   }
+
+Target IO handling
+==================
+
+Target IO handling needs target code to implement the IO handling
+closure.
+
+If IO is super fast to complete, such as ramdisk, this io can be handled
+directly in the closure, and call `io.complete_io(result)` to complete
+this IO command from ublk driver. Another example is null target(null.rs).
+
+Most of times, IO is slow, so it needs to be handled asynchronously. The
+preferred way is to submit target IO by io_uring in IO handling closure by
+using the same IO slot(represented by `tag`). After this target IO is
+completed, one io_uring CQE will be received, and the same io closure is
+called for handling this target IO, which can be checked by
+`UblkIOCtx::is_tgt_io()` method. Finally if this target IO completion
+means the original IO command is done, `io.complete_io(result)` is called
+for moving on, otherwise the IO handling closure can continue to submit
+IO for driving its IO logic.
+
+Not all target IO logics can be done by io_uring, such as some IO handling
+needs extra computation, which often require offload IO to another
+context. However, when target IO is done, `io.complete_io(result)` has to
+be called in the queue context. One approach is to use eventfd to wakeup &
+notify this completion. Here, eventfd can be thought as one kind of target
+IO. Inside IO closure, eventfd needs to be queued by io_uring opcode::PollAdd.
+Once target IO handling is done, write(eventfd) can wakeup/notify the queue,
+then IO closure can get chance to handle all completed IOs. Unfortunately,
+each IO command(originated from ublk driver) can only use its own `UblkIOCtx`
+to complete itself. But one eventfd is often reused for the whole queue, so
+normally multiple IOs are completed when handling single eventfd CQE.
+Here IO completion batch feature is provided, and target code can call
+`io.add_to_comp_batch()` for each completed IO(tag, result) in io closure.
+Then, all these IOs will be completed automatically.
 
 Examples
 ========
