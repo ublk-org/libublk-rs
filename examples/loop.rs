@@ -156,6 +156,7 @@ fn test_add() {
             512_u32 * 1024,
             0,
             true,
+            0,
             |dev: &mut UblkDev| lo_init_tgt(dev, &lo),
             loop_handle_io,
             |dev_id| {

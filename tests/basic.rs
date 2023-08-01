@@ -34,6 +34,7 @@ mod tests {
             512_u32 * 1024,
             0,
             true,
+            0,
             |dev: &mut UblkDev| {
                 dev.set_default_params(250_u64 << 30);
                 Ok(serde_json::json!({}))

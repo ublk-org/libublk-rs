@@ -147,6 +147,7 @@ pub fn ublk_tgt_worker<T, W>(
     io_buf_bytes: u32,
     flags: u64,
     for_add: bool,
+    dev_flags: u32,
     tgt_fn: T,
     q_fn: QueueFn,
     worker_fn: W,
@@ -156,7 +157,7 @@ where
     W: Fn(i32) + Send + Sync + 'static,
 {
     let mut ctrl = ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();
-    let ublk_dev = Arc::new(io::UblkDev::new(name, tgt_fn, &mut ctrl, 0).unwrap());
+    let ublk_dev = Arc::new(io::UblkDev::new(name, tgt_fn, &mut ctrl, dev_flags).unwrap());
     let threads = create_queue_handler(&mut ctrl, &ublk_dev, q_fn);
 
     ctrl.start_dev(&ublk_dev).unwrap();
