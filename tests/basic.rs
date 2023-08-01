@@ -144,9 +144,7 @@ mod tests {
         let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
         let ctx = queue.make_queue_ctx();
         let qc = move |i: &mut UblkIOCtx| rd_handle_io(&ctx, i, buf_addr);
-        ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
-            libc::pthread_self()
-        });
+        ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() });
 
         ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
 

@@ -83,19 +83,27 @@ pub fn create_queue_handler(
     let mut q_threads = Vec::new();
     let nr_queues = dev.dev_info.nr_hw_queues;
 
-    let (tx, rx): (
-        Sender<(u16, i32, libc::pthread_t)>,
-        Receiver<(u16, i32, libc::pthread_t)>,
-    ) = mpsc::channel();
+    let (tx, rx): (Sender<(u16, i32)>, Receiver<(u16, i32)>) = mpsc::channel();
 
     for q in 0..nr_queues {
         let _dev = Arc::clone(dev);
         let _tx = tx.clone();
 
+        let mut affinity = ctrl::UblkQueueAffinity::new();
+        ctrl.get_queue_affinity(q as u32, &mut affinity).unwrap();
+
         q_threads.push(std::thread::spawn(move || {
+            //setup pthread affinity first, so that any allocation may
+            //be affine to cpu/memory
             unsafe {
-                _tx.send((q, libc::gettid(), libc::pthread_self())).unwrap();
+                libc::pthread_setaffinity_np(
+                    libc::pthread_self(),
+                    affinity.buf_len(),
+                    affinity.addr() as *const libc::cpu_set_t,
+                );
             }
+            _tx.send((q, unsafe { libc::gettid() })).unwrap();
+
             let mut queue = io::UblkQueue::new(q, &_dev).unwrap();
             let ctx = queue.make_queue_ctx();
             let queue_closure = move |io_ctx: &mut io::UblkIOCtx| q_fn(&ctx, io_ctx);
@@ -105,8 +113,8 @@ pub fn create_queue_handler(
     }
 
     for _q in 0..nr_queues {
-        let (qid, tid, pthread_id) = rx.recv().unwrap();
-        ctrl.configure_queue(&dev, qid, tid, pthread_id);
+        let (qid, tid) = rx.recv().unwrap();
+        ctrl.configure_queue(&dev, qid, tid);
     }
 
     q_threads

@@ -66,9 +66,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
         handle_io(i, iod, buf_addr)
     };
-    ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() }, unsafe {
-        libc::pthread_self()
-    });
+    ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() });
 
     ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
     ctrl.dump();

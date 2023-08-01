@@ -289,24 +289,9 @@ impl UblkCtrl {
     /// * `pthread_id`: pthread handle for setting affinity
     ///
     /// Note: this method has to be called in queue daemon context
-    pub fn configure_queue(
-        &mut self,
-        dev: &UblkDev,
-        qid: u16,
-        tid: i32,
-        pthread_id: libc::pthread_t,
-    ) {
-        let mut affinity = self::UblkQueueAffinity::new();
-        self.get_queue_affinity(qid as u32, &mut affinity).unwrap();
+    pub fn configure_queue(&mut self, dev: &UblkDev, qid: u16, tid: i32) {
         self.store_queue_tid(qid, tid);
 
-        unsafe {
-            libc::pthread_setaffinity_np(
-                pthread_id,
-                affinity.buf_len(),
-                affinity.addr() as *const libc::cpu_set_t,
-            );
-        }
         self.nr_queues_configured += 1;
 
         if self.nr_queues_configured == self.dev_info.nr_hw_queues {
