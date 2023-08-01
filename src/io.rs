@@ -753,7 +753,7 @@ impl UblkQueue<'_> {
         let cqe = self.q_ring.completion().next().unwrap();
         let ublk_cqe = UblkCQE(
             &cqe,
-            &if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
+            if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
                 | if idx + 1 == self.cqes_cnt {
                     UBLK_IO_F_LAST
                 } else {

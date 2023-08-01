@@ -78,12 +78,11 @@ pub fn create_queue_handler(
     q_fn: QueueFn,
 ) -> Vec<std::thread::JoinHandle<()>> {
     use std::sync::mpsc;
-    use std::sync::mpsc::{Receiver, Sender};
 
     let mut q_threads = Vec::new();
     let nr_queues = dev.dev_info.nr_hw_queues;
 
-    let (tx, rx): (Sender<(u16, i32)>, Receiver<(u16, i32)>) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
 
     for q in 0..nr_queues {
         let _dev = Arc::clone(dev);
@@ -114,7 +113,7 @@ pub fn create_queue_handler(
 
     for _q in 0..nr_queues {
         let (qid, tid) = rx.recv().unwrap();
-        ctrl.configure_queue(&dev, qid, tid);
+        ctrl.configure_queue(dev, qid, tid);
     }
 
     q_threads

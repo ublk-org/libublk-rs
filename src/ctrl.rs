@@ -181,6 +181,7 @@ impl UblkCtrl {
     /// ublk control device is for sending command to driver, and maintain
     /// device exported json file, dump, or any misc management task.
     ///
+    #[allow(clippy::uninit_vec)]
     pub fn new(
         id: i32,
         nr_queues: u32,
