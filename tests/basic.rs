@@ -23,9 +23,18 @@ mod tests {
         Ok(0)
     }
 
-    /// make one ublk-null and test if /dev/ublkbN can be created successfully
-    #[test]
-    fn test_ublk_null() {
+    fn null_handle_io_batch(ctx: &UblkQueueCtx, io: &mut UblkIOCtx) -> Result<i32, UblkError> {
+        let iod = ctx.get_iod(io.get_tag());
+        let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+        io.add_to_comp_batch(io.get_tag() as u16, bytes);
+        Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
+    }
+
+    fn __test_ublk_null(
+        dev_flags: u32,
+        f: fn(&UblkQueueCtx, &mut UblkIOCtx) -> Result<i32, UblkError>,
+    ) {
         libublk::ublk_tgt_worker(
             "null".to_string(),
             -1,
@@ -34,12 +43,12 @@ mod tests {
             512_u32 * 1024,
             0,
             true,
-            0,
+            dev_flags,
             |dev: &mut UblkDev| {
                 dev.set_default_params(250_u64 << 30);
                 Ok(serde_json::json!({}))
             },
-            null_handle_io,
+            f,
             |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
@@ -58,6 +67,18 @@ mod tests {
         .unwrap()
         .join()
         .unwrap();
+    }
+
+    /// make one ublk-null and test if /dev/ublkbN can be created successfully
+    #[test]
+    fn test_ublk_null() {
+        __test_ublk_null(0, null_handle_io);
+    }
+
+    /// make one ublk-null and test if /dev/ublkbN can be created successfully
+    #[test]
+    fn test_ublk_null_comp_batch() {
+        __test_ublk_null(libublk::io::UBLK_DEV_F_COMP_BATCH, null_handle_io_batch);
     }
 
     fn rd_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, start: u64) -> Result<i32, UblkError> {
