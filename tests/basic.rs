@@ -296,7 +296,7 @@ mod tests {
         cmd.wait().unwrap();
 
         //this magic wait makes a difference
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
 
         let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
