@@ -634,6 +634,14 @@ impl UblkQueue<'_> {
         res
     }
 
+    #[inline(always)]
+    fn check_and_queue_io_cmd(&mut self, tag: u16) {
+        if self.ios[tag as usize].flags & UBLK_IO_TO_QUEUE != 0 {
+            self.ios[tag as usize].flags &= !UBLK_IO_TO_QUEUE;
+            self.queue_io_cmd(tag);
+        }
+    }
+
     /// Submit all commands for fetching IO
     ///
     /// Only called during queue initialization. After queue is setup,
@@ -671,7 +679,9 @@ impl UblkQueue<'_> {
         if res == UBLK_IO_S_COMP_BATCH {
             if let Some(ios) = ctx.3.as_mut() {
                 for item in ios {
-                    self.ios[item.0 as usize].complete(item.1);
+                    let tag = item.0;
+                    self.ios[tag as usize].complete(item.1);
+                    self.check_and_queue_io_cmd(tag);
                 }
             }
         }
@@ -762,11 +772,8 @@ impl UblkQueue<'_> {
         );
         self.handle_cqe(ops, &ublk_cqe);
 
-        let tag = ublk_cqe.get_tag() as usize;
-        if self.ios[tag].flags & UBLK_IO_TO_QUEUE != 0 {
-            self.ios[tag].flags &= !UBLK_IO_TO_QUEUE;
-            self.queue_io_cmd(tag.try_into().unwrap());
-        }
+        let tag = ublk_cqe.get_tag();
+        self.check_and_queue_io_cmd(tag as u16);
 
         self.cqes_idx += 1;
 
