@@ -46,12 +46,18 @@ pub const CDEV_PATH: &str = "/dev/ublkc";
 pub const BDEV_PATH: &str = "/dev/ublkb";
 
 pub fn ublk_alloc_buf(size: usize, align: usize) -> *mut u8 {
-    let layout = Layout::from_size_align(size, align).unwrap();
+    let layout = match Layout::from_size_align(size, align) {
+        Ok(r) => r,
+        Err(_) => return std::ptr::null_mut() as *mut u8,
+    };
     unsafe { alloc(layout) as *mut u8 }
 }
 
 pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
-    let layout = Layout::from_size_align(size, align).unwrap();
+    let layout = match Layout::from_size_align(size, align) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
     unsafe { dealloc(ptr as *mut u8, layout) };
 }
 
@@ -61,17 +67,12 @@ pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
 ///
 /// * `ctrl`: UblkCtrl mut reference
 /// * `dev`: UblkDev reference, which is required for creating queue
-/// * `sq_depth`: uring submission queue depth
-/// * `cq_depth`: uring completion queue depth
-/// * `ring_flags`: uring flags
-/// *  `f`: closure for allocating queue trait object, and Arc() is
-/// required since the closure is called for multiple threads
+/// *  `q_fn`: callback for handling io command
 ///
 /// # Return: Vectors for holding each queue thread JoinHandler and tid
 ///
-/// Note: This method is one high level API, and handles each queue in
-/// one dedicated thread. If your target won't take this approach, please
-/// don't use this API.
+/// Note: This API is supposed to be used for test code only, and we don't
+/// suggest to use it in production project.
 pub fn create_queue_handler(
     ctrl: &mut ctrl::UblkCtrl,
     dev: &Arc<io::UblkDev>,
@@ -133,15 +134,16 @@ pub fn create_queue_handler(
 /// * `depth`: each hw queue's depth
 /// * `io_buf_bytes`: max buf size for each IO
 /// * `flags`: flags for setting ublk device
+/// * `for_add`: for adding device or not
+/// * `dev_flags`: flags for constructing UblkDev instance
 /// * `tgt_fn`: closure for allocating Target Trait object
 /// * `q_fn`: closure for allocating Target Queue Trait object
 /// * `worker_fn`: closure for running workerload
 ///
 /// # Return: JoinHandle of thread for running workload
 ///
-/// Note: This method is one high level API, and handles each queue in
-/// one dedicated thread. If your target won't take this approach, please
-/// don't use this API.
+/// Note: This API is supposed to be used for test code only, and we don't
+/// suggest to use it in production project.
 #[allow(clippy::too_many_arguments)]
 pub fn ublk_tgt_worker<T, W>(
     name: String,
