@@ -313,11 +313,6 @@ impl Drop for UblkDev {
     }
 }
 
-union IOCmd {
-    cmd: sys::ublksrv_io_cmd,
-    buf: [u8; 16],
-}
-
 const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
 const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
 const UBLK_IO_FREE: u32 = 1u32 << 2;
@@ -587,18 +582,16 @@ impl UblkQueue<'_> {
             return 0;
         }
 
-        let io_cmd = IOCmd {
-            cmd: sys::ublksrv_io_cmd {
-                tag,
-                addr: io.buf_addr as u64,
-                q_id: self.q_id,
-                result: io.result,
-            },
+        let io_cmd = sys::ublksrv_io_cmd {
+            tag,
+            addr: io.buf_addr as u64,
+            q_id: self.q_id,
+            result: io.result,
         };
         let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
 
         let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
-            .cmd(unsafe { io_cmd.buf })
+            .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(data);
 
