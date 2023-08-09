@@ -425,7 +425,7 @@ impl Drop for UblkQueue<'_> {
             super::ublk_dealloc_buf(
                 io.buf_addr,
                 dev.dev_info.max_io_buf_bytes as usize,
-                unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() },
+                unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize },
             );
         }
     }
@@ -449,7 +449,7 @@ impl UblkQueue<'_> {
     pub fn make_queue_ctx(&self) -> UblkQueueCtx {
         UblkQueueCtx {
             buf_addr: self.io_cmd_buf,
-            depth: self.q_depth.try_into().unwrap(),
+            depth: self.q_depth as u16,
             q_id: self.q_id,
         }
     }
@@ -518,7 +518,7 @@ impl UblkQueue<'_> {
             if i < depth {
                 io.buf_addr =
                     super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
-                        libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+                        libc::sysconf(libc::_SC_PAGESIZE) as usize
                     });
                 io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
             } else {
@@ -668,13 +668,15 @@ impl UblkQueue<'_> {
             e,
             if comp_batch { Some(Vec::new()) } else { None },
         );
-        let res = ops(&mut ctx).unwrap();
-        if res == UBLK_IO_S_COMP_BATCH {
-            if let Some(ios) = ctx.3.as_mut() {
-                for item in ios {
-                    let tag = item.0;
-                    self.ios[tag as usize].complete(item.1);
-                    self.check_and_queue_io_cmd(tag);
+
+        if let Ok(res) = ops(&mut ctx) {
+            if res == UBLK_IO_S_COMP_BATCH {
+                if let Some(ios) = ctx.3.as_mut() {
+                    for item in ios {
+                        let tag = item.0;
+                        self.ios[tag as usize].complete(item.1);
+                        self.check_and_queue_io_cmd(tag);
+                    }
                 }
             }
         }
@@ -753,7 +755,11 @@ impl UblkQueue<'_> {
             return 0;
         }
 
-        let cqe = self.q_ring.completion().next().unwrap();
+        let cqe = match self.q_ring.completion().next() {
+            None => return 0,
+            Some(r) => r,
+        };
+
         let ublk_cqe = UblkCQE(
             &cqe,
             if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
