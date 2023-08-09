@@ -40,6 +40,7 @@ impl UblkQueueAffinity {
     }
 }
 
+#[repr(C)]
 union CtrlCmd {
     ctrl_cmd: sys::ublksrv_ctrl_cmd,
     buf: [u8; 80],
