@@ -113,7 +113,12 @@ pub fn create_queue_handler(
 
     for _q in 0..nr_queues {
         let (qid, tid) = rx.recv().unwrap();
-        ctrl.configure_queue(dev, qid, tid);
+        if let Err(_) = ctrl.configure_queue(dev, qid, tid) {
+            println!(
+                "create_queue_handler: configure queue failed for {}-{}",
+                dev.dev_info.dev_id, qid
+            );
+        }
     }
 
     q_threads

@@ -272,7 +272,7 @@ impl UblkCtrl {
         let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
 
         if let Ok(p) = this_queue {
-            Ok(p.tid.try_into().unwrap())
+            Ok(p.tid as i32)
         } else {
             Err(UblkError::OtherError(-libc::EEXIST))
         }
@@ -291,14 +291,16 @@ impl UblkCtrl {
     /// * `pthread_id`: pthread handle for setting affinity
     ///
     /// Note: this method has to be called in queue daemon context
-    pub fn configure_queue(&mut self, dev: &UblkDev, qid: u16, tid: i32) {
+    pub fn configure_queue(&mut self, dev: &UblkDev, qid: u16, tid: i32) -> Result<i32, UblkError> {
         self.store_queue_tid(qid, tid);
 
         self.nr_queues_configured += 1;
 
         if self.nr_queues_configured == self.dev_info.nr_hw_queues {
-            self.build_json(dev);
+            self.build_json(dev)?;
         }
+
+        Ok(0)
     }
 
     pub fn queues_configured(&self) -> bool {
@@ -713,13 +715,13 @@ impl UblkCtrl {
     /// * `tids`: queue pthread tid vector, in which each item stores the queue's
     /// pthread tid
     ///
-    fn build_json(&mut self, dev: &UblkDev) {
+    fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
         let tgt_data = self.json.clone();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
             let mut affinity = self::UblkQueueAffinity::new();
-            self.get_queue_affinity(qid as u32, &mut affinity).unwrap();
+            self.get_queue_affinity(qid as u32, &mut affinity)?;
 
             map.insert(
                 format!("{}", qid),
@@ -740,6 +742,7 @@ impl UblkCtrl {
         json["queues"] = serde_json::Value::Object(map);
 
         self.json = json;
+        Ok(0)
     }
 
     /// Reload json info for this device
