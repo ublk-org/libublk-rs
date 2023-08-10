@@ -398,14 +398,13 @@ fn handle_mgmt(tgt: &ZonedTgt, _ctx: &UblkQueueCtx, _io: &UblkIOCtx, iod: &ublks
         }
     }
 
-    let ret;
-    match iod.op_flags & 0xff {
-        UBLK_IO_OP_ZONE_RESET => ret = tgt.zone_reset(iod.start_sector),
-        UBLK_IO_OP_ZONE_OPEN => ret = tgt.zone_open(iod.start_sector),
-        UBLK_IO_OP_ZONE_CLOSE => ret = tgt.zone_close(iod.start_sector),
-        UBLK_IO_OP_ZONE_FINISH => ret = tgt.zone_finish(iod.start_sector),
-        _ => ret = -libc::EINVAL,
-    }
+    let ret = match iod.op_flags & 0xff {
+        UBLK_IO_OP_ZONE_RESET => tgt.zone_reset(iod.start_sector),
+        UBLK_IO_OP_ZONE_OPEN => tgt.zone_open(iod.start_sector),
+        UBLK_IO_OP_ZONE_CLOSE => tgt.zone_close(iod.start_sector),
+        UBLK_IO_OP_ZONE_FINISH => tgt.zone_finish(iod.start_sector),
+        _ => -libc::EINVAL,
+    };
 
     ret
 }
