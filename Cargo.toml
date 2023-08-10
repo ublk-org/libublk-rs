@@ -10,6 +10,9 @@ license = "MIT OR Apache-2.0"
 keywords = ["ublk", "io_uring", "userspace", "block", "storage"]
 publish = false
 
+[badges]
+maintenance = { status = "actively-developed" }
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
