@@ -33,10 +33,6 @@ for this target.
 The closure io_handler provides interface to handle every incoming CQE
 and implement target IO logic.
 
-Closure interface is flexible since it can capture environment(outside of
-closure) variables, and IO handling closure is defined as FnMut which allows
-to write to captured variables.
-
 .. code-block:: rust
 
   use libublk::ctrl::UblkCtrl;
@@ -48,13 +44,14 @@ to write to captured variables.
                          //io depth: 64, max buf size: 512KB
       let mut ctrl = UblkCtrl::new(-1, nr_queues, 64, 512 << 10, 0, true).unwrap();
 
-      //target specific initialization by tgt_init closure
+      // target specific initialization by tgt_init closure, which is flexible
+      // for customizing target with captured environment
       let tgt_init = |dev: &mut UblkDev| {
           dev.set_default_params(250_u64 << 30);
           Ok(serde_json::json!({}))
       };
       let ublk_dev =
-          std::sync::Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl, 0).unwrap());
+          Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl, 0).unwrap());
       let mut threads = Vec::new();
 
       for q in 0..nr_queues {
@@ -116,6 +113,11 @@ License
 
 This project is licensed under either of Apache License, Version 2.0 or
 MIT license at your option.
+
+Contribution
+============
+
+Any kinds of contributions are welcome!
 
 References
 ==========
