@@ -136,11 +136,12 @@ struct QueueAffinityJson {
 
 /// ublk control device
 ///
-/// Responsible for:
+/// Responsible for controlling ublk device:
 ///
 /// 1) adding and removing ublk char device(/dev/ublkcN)
 ///
-/// 2) send all kinds of control commands
+/// 2) send all kinds of control commands(recover, list, set/get parameter,
+/// get queue affinity, ...)
 ///
 /// 3) exporting device as json file
 pub struct UblkCtrl {
