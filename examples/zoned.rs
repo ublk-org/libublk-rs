@@ -10,6 +10,7 @@ use libublk::sys::{BLK_ZONE_TYPE_CONVENTIONAL, BLK_ZONE_TYPE_SEQWRITE_REQ};
 use libublk::sys::{
     UBLK_IO_OP_READ, UBLK_IO_OP_REPORT_ZONES, UBLK_IO_OP_WRITE, UBLK_IO_OP_ZONE_APPEND,
     UBLK_IO_OP_ZONE_CLOSE, UBLK_IO_OP_ZONE_FINISH, UBLK_IO_OP_ZONE_OPEN, UBLK_IO_OP_ZONE_RESET,
+    UBLK_IO_OP_ZONE_RESET_ALL,
 };
 use libublk::{
     ctrl::UblkCtrl, io::UblkDev, io::UblkIOCtx, io::UblkQueue, io::UblkQueueCtx, UblkError,
@@ -215,7 +216,7 @@ impl ZonedTgt {
         }
 
         match data.zones[zno].cond {
-            BLK_ZONE_COND_EMPTY => return 0,
+            BLK_ZONE_COND_EMPTY | BLK_ZONE_COND_READONLY | BLK_ZONE_COND_OFFLINE => return 0,
             BLK_ZONE_COND_IMP_OPEN => data.nr_zones_imp_open -= 1,
             BLK_ZONE_COND_EXP_OPEN => data.nr_zones_exp_open -= 1,
             BLK_ZONE_COND_CLOSED => data.nr_zones_closed -= 1,
@@ -388,6 +389,15 @@ fn handle_report_zones(
 }
 
 fn handle_mgmt(tgt: &ZonedTgt, _ctx: &UblkQueueCtx, _io: &UblkIOCtx, iod: &ublksrv_io_desc) -> i32 {
+    if (iod.op_flags & 0xff) == UBLK_IO_OP_ZONE_RESET_ALL {
+        let mut off = 0;
+        while off < tgt.size {
+            tgt.zone_reset(off >> 9);
+            off += tgt.zone_size;
+        }
+        return 0;
+    }
+
     {
         let zno = tgt.get_zone_no(iod.start_sector);
         let data = tgt.data.read().unwrap();
@@ -605,6 +615,7 @@ fn zoned_handle_io(
             bytes = handle_report_zones(tgt, ctx, io, iod) as i32;
         }
         UBLK_IO_OP_ZONE_RESET
+        | UBLK_IO_OP_ZONE_RESET_ALL
         | UBLK_IO_OP_ZONE_OPEN
         | UBLK_IO_OP_ZONE_CLOSE
         | UBLK_IO_OP_ZONE_FINISH => bytes = handle_mgmt(tgt, ctx, io, iod),
