@@ -3,7 +3,7 @@
 [![license](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/ming1/libublk-rs/blob/master/LICENSE-MIT)
 [![license](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/ming1/libublk-rs/blob/master/LICENSE-APACHE)
 
-Rust library for building ublk\[1\] target device, which talks with
+Rust library for building linux ublk target device, which talks with
 linux `ublk driver`[^1] for exposing standard linux block device,
 meantime all target IO logic can be moved to userspace.
 
@@ -90,6 +90,13 @@ You can run the test of the library with the following command.
 # cargo test
 ```
 
+## Performance
+
+When running fio `t/io_uring /dev/ublkb0`[^2], IOPS is basically same with
+running same test over ublk device created by blktests `miniublk`[^3], which
+is written by pure C. And the ublk device is null, which has 2 queues, each
+queue's depth is 64.
+
 ## Examples
 
 ### null
@@ -124,3 +131,5 @@ Any kinds of contributions are welcome!
 ## References
 
 [^1]: <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/block/ublk_drv.c?h=v6.0>
+[^2]: <https://github.com/axboe/fio/blob/master/t/io_uring.c>
+[^3]: <https://github.com/osandov/blktests/blob/master/src/miniublk.c>
