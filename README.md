@@ -24,12 +24,6 @@ Follows one totally working 2-queue ublk-null target which is built over
 libublk 0.1, and each queue depth is 64, and each IO\'s max buffer size
 is 512KB.
 
-The closure tgt_init provides interface to set all kinds of parameters
-for this target.
-
-The closure io_handler provides interface to handle every incoming CQE
-and implement target IO logic.
-
 To use `libublk` crate, first add this to your `Cargo.toml`:
 
 ```toml
