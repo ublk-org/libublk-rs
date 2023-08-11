@@ -454,8 +454,8 @@ const UBLK_QUEUE_POLL: u32 = 1_u32 << 2;
 ///
 pub struct UblkQueue<'a> {
     flags: u32,
-    pub q_id: u16,
-    pub q_depth: u32,
+    q_id: u16,
+    q_depth: u32,
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
     pub dev: &'a UblkDev,
@@ -464,7 +464,7 @@ pub struct UblkQueue<'a> {
     cqes_idx: usize,
     cqes_cnt: usize,
     ios: Vec<UblkIO>,
-    pub q_ring: IoUring<squeue::Entry>,
+    q_ring: IoUring<squeue::Entry>,
 }
 
 impl Drop for UblkQueue<'_> {

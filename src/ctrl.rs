@@ -551,7 +551,7 @@ impl UblkCtrl {
         ublk_ctrl_cmd(self, &data)
     }
 
-    pub fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
+    fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_START_USER_RECOVERY,
             ..Default::default()
