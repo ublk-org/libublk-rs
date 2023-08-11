@@ -129,6 +129,7 @@ pub fn create_queue_handler(
 ///
 /// # Arguments:
 ///
+/// * `name`: target type name, such as loop, null, nbd,...
 /// * `id`: device id, or let driver allocate one if -1 is passed
 /// * `nr_queues`: how many hw queues allocated for this device
 /// * `depth`: each hw queue's depth
