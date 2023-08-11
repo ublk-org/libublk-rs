@@ -47,40 +47,75 @@ fn is_target_io(user_data: u64) -> bool {
 }
 
 impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
+    /// Return io_uring instance which is shared in queue wide.
+    ///
+    /// Target IO often needs to handle IO command by io_uring further,
+    /// so io_uring instance has to be exposed.
     #[inline(always)]
     pub fn get_ring(&mut self) -> &mut io_uring::IoUring<io_uring::squeue::Entry> {
         self.0
     }
 
+    /// Return CQE's request of this IO, and used for handling target IO by
+    /// io_uring. When the target IO is completed, its CQE is coming and we
+    /// parse the IO result with result().
     #[inline(always)]
     pub fn result(&self) -> i32 {
         self.2.result()
     }
 
+    /// Get this IO's tag.
+    ///
+    /// tag is one core concept in libublk.
+    ///
+    /// Each IO command has its unique tag, which is in [0, depth), and the tag
+    /// is originated from ublk driver actually.
+    ///
+    /// When target IO uses io_uring for handling IO, this tag should be inherited
+    /// by passing `tag` via `Self::build_user_data()`
     #[inline(always)]
     pub fn get_tag(&self) -> u32 {
         self.2.get_tag()
     }
 
+    /// Get this CQE's userdata
+    ///
     #[inline(always)]
     pub fn user_data(&self) -> u64 {
         self.2.user_data()
     }
 
+    /// Return false if it is one IO command from ublk driver, otherwise
+    /// it is one target IO submitted from IO closure
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
         self.2.is_tgt_io()
     }
 
+    /// if this IO represented by CQE is the last one in current batch
     #[inline(always)]
-    pub fn flags(&self) -> u32 {
-        self.2.flags()
+    pub fn is_last_cqe(&self) -> bool {
+        (self.2.flags() & UBLK_IO_F_LAST) != 0
     }
+
+    /// if this IO represented by CQE is the first one in current batch
+    #[inline(always)]
+    pub fn is_first_cqe(&self) -> bool {
+        (self.2.flags() & UBLK_IO_F_FIRST) != 0
+    }
+
+    /// Return pre-allocated io buffer for this tag.
+    ///
+    /// Don't use it in case of UBLK_F_USER_COPY, which needs target code
+    /// to manage io buffer.
     #[inline(always)]
     pub fn io_buf_addr(&self) -> *mut u8 {
         self.1.get_buf_addr()
     }
 
+    /// Called when this IO command is handled, and tell libublk & ublk driver
+    /// to commit result and re-queue this IO command for future IO from ublk
+    /// driver.
     #[inline(always)]
     pub fn complete_io(&mut self, res: i32) {
         self.1.complete(res);
@@ -161,8 +196,8 @@ impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
     }
 }
 
-pub const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
-pub const UBLK_IO_F_LAST: u32 = 1u32 << 17;
+const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
+const UBLK_IO_F_LAST: u32 = 1u32 << 17;
 
 struct UblkCQE<'d>(&'d cqueue::Entry, u32);
 
