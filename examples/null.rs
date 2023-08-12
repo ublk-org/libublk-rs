@@ -9,7 +9,7 @@ fn null_add(dev_id: i32, comp_batch: bool) {
     };
     println!("IO complete batch {}", comp_batch);
     let sess = libublk::UblkSessionBuilder::default()
-        .name("null".to_string())
+        .name("null")
         .depth(64_u32)
         .nr_queues(2_u32)
         .id(dev_id)

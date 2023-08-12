@@ -92,7 +92,7 @@ use libublk::{ctrl::UblkCtrl, UblkError};
 
 fn main() {
     let sess = libublk::UblkSessionBuilder::default()
-        .name("null".to_string())
+        .name("null")
         .depth(64_u32)
         .nr_queues(2_u32)
         .build()

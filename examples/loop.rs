@@ -150,7 +150,7 @@ fn test_add() {
         };
         let wh = {
             let sess = libublk::UblkSessionBuilder::default()
-                .name("loop".to_string())
+                .name("loop")
                 .build()
                 .unwrap();
 

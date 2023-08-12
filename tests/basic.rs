@@ -8,7 +8,7 @@ mod tests {
 
     fn __test_ublk_session() -> std::thread::JoinHandle<()> {
         let sess = UblkSessionBuilder::default()
-            .name("null".to_string())
+            .name("null")
             .depth(16_u32)
             .nr_queues(2_u32)
             .build()
@@ -67,7 +67,7 @@ mod tests {
 
     fn __test_ublk_null(dev_flags: u32) {
         let sess = UblkSessionBuilder::default()
-            .name("null".to_string())
+            .name("null")
             .depth(64_u32)
             .nr_queues(2_u32)
             .dev_flags(dev_flags)
