@@ -32,7 +32,8 @@ libublk = "0.1"
 ```
 
 Next we can start using `libublk` crate.
-The following is quick introduction for adding ublk-null block device.
+The following is quick introduction for adding ublk-null block device, which
+is against low level APIs.
 
 ``` rust
 use libublk::ctrl::UblkCtrl;
@@ -79,6 +80,42 @@ fn main() {
         qh.join().unwrap();
     }
     ctrl.stop_dev(&ublk_dev).unwrap();
+}
+```
+
+The following ublk-null block device is built over high level
+APIs, which doesn't support IO closure of FnMut.
+
+``` rust
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
+use libublk::{ctrl::UblkCtrl, UblkError};
+
+fn main() {
+    let sess = libublk::UblkSessionBuilder::default()
+        .name("null".to_string())
+        .depth(64_u32)
+        .nr_queues(2_u32)
+        .build()
+        .unwrap();
+    let tgt_init = |dev: &mut UblkDev| {
+        dev.set_default_params(250_u64 << 30);
+        Ok(serde_json::json!({}))
+    };
+    let wh = {
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
+            let iod = ctx.get_iod(io.get_tag());
+            io.complete_io(unsafe { (*iod).nr_sectors << 9 } as i32);
+            Ok(0)
+        };
+
+        sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            d_ctrl.dump();
+        })
+        .unwrap()
+    };
+    wh.join().unwrap();
 }
 ```
 
