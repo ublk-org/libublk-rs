@@ -134,8 +134,10 @@ pub fn create_queue_handler(
 /// * `nr_queues`: how many hw queues allocated for this device
 /// * `depth`: each hw queue's depth
 /// * `io_buf_bytes`: max buf size for each IO
-/// * `flags`: flags for setting ublk device
-/// * `for_add`: for adding device or not
+/// * `ctrl_flags`: flags for adding ublk device, which is passed to
+///     ublk driver via `sys::ublksrv_ctrl_dev_info.flags`
+/// * `for_add`: for adding device or not, false is often for recovering
+///     ublk device
 /// * `dev_flags`: flags for constructing UblkDev instance
 /// * `tgt_fn`: closure for allocating Target Trait object
 /// * `q_fn`: closure for allocating Target Queue Trait object
@@ -152,7 +154,7 @@ pub fn ublk_tgt_worker<T, W>(
     nr_queues: u32,
     depth: u32,
     io_buf_bytes: u32,
-    flags: u64,
+    ctrl_flags: u64,
     for_add: bool,
     dev_flags: u32,
     tgt_fn: T,
@@ -163,7 +165,8 @@ where
     T: FnOnce(&mut io::UblkDev) -> Result<serde_json::Value, UblkError>,
     W: Fn(i32) + Send + Sync + 'static,
 {
-    let mut ctrl = ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, flags, for_add).unwrap();
+    let mut ctrl =
+        ctrl::UblkCtrl::new(id, nr_queues, depth, io_buf_bytes, ctrl_flags, for_add).unwrap();
     let ublk_dev = Arc::new(io::UblkDev::new(name, tgt_fn, &mut ctrl, dev_flags).unwrap());
     let threads = create_queue_handler(&mut ctrl, &ublk_dev, q_fn);
 
