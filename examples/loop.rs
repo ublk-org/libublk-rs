@@ -108,7 +108,7 @@ fn loop_queue_tgt_io(
     Ok(1)
 }
 
-fn loop_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<i32, UblkError> {
+fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<i32, UblkError> {
     let tag = i.get_tag();
 
     // our IO on backing file is done
@@ -148,26 +148,26 @@ fn test_add() {
             direct_io: 1,
             back_file_path: back_file.clone(),
         };
-        libublk::ublk_tgt_worker(
-            "loop".to_string(),
-            -1,
-            1,
-            64,
-            512_u32 * 1024,
-            0,
-            true,
-            0,
-            |dev: &mut UblkDev| lo_init_tgt(dev, &lo),
-            loop_handle_io,
-            |dev_id| {
-                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+        let wh = {
+            let sess = libublk::UblkSessionBuilder::default()
+                .name("loop".to_string())
+                .build()
+                .unwrap();
 
-                ctrl.dump();
-            },
-        )
-        .unwrap()
-        .join()
-        .unwrap();
+            let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
+            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+            let lo_handle_io =
+                move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
+                    _lo_handle_io(ctx, io)
+                };
+
+            sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
+                let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+                d_ctrl.dump();
+            })
+            .unwrap()
+        };
+        wh.join().unwrap();
     }
 }
 
