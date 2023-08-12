@@ -8,7 +8,7 @@ readme = "README.md"
 repository = "https://github.com/ming1/libublk-rs"
 license = "MIT OR Apache-2.0"
 keywords = ["ublk", "io_uring", "userspace", "block", "storage"]
-publish = false
+publish = true
 
 [badges]
 maintenance = { status = "actively-developed" }
