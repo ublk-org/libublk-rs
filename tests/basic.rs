@@ -1,10 +1,44 @@
 #[cfg(test)]
 mod tests {
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
-    use libublk::sys;
     use libublk::{ctrl::UblkCtrl, UblkError};
+    use libublk::{sys, UblkSessionBuilder};
     use std::env;
     use std::path::Path;
+
+    fn __test_ublk_session() -> std::thread::JoinHandle<()> {
+        let sess = UblkSessionBuilder::default()
+            .name("null".to_string())
+            .depth(16_u32)
+            .nr_queues(2_u32)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(serde_json::json!({}))
+        };
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
+            let iod = ctx.get_iod(io.get_tag());
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+            io.complete_io(bytes);
+            Ok(0)
+        };
+
+        sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            d_ctrl.del().unwrap();
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_ublk_session() {
+        let wh = __test_ublk_session();
+        wh.join().unwrap();
+    }
 
     #[test]
     fn test_add_ctrl_dev() {
