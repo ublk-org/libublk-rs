@@ -1,0 +1,85 @@
+name: Libublk Test
+
+on:
+  workflow_dispatch:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  #build one Fedora image and run libublk-rs test
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: "install: mkosi + dependencies"
+      shell: bash
+      run: |
+        sudo apt update -o Acquire::Retries=3
+        sudo apt install -y dnf rpm systemd-container qemu-system-x86 ovmf e2fsprogs btrfs-progs
+        rustup update stable && rustup default stable
+        wget https://github.com/systemd/mkosi/archive/refs/tags/v14.tar.gz
+        tar zxf v14.tar.gz
+        cd mkosi-14
+        sed -i '/gpgurl\ = \urllib.parse.urljoin/c \    gpgurl\ =\ \"https://fedoraproject.org/fedora.gpg\"' ./mkosi/__init__.py
+        python3 -m pip install --user ./
+
+    # Required for ssh'ing into VM
+    - name: "setup: environment"
+      run: |
+        sudo systemctl enable --now systemd-networkd
+
+    - name: "cache: os packages"
+      uses: actions/cache@v3
+      with:
+        path: ~/mkosi.cache
+        key: fedora-cache-v1
+
+    - name: "acquire: libublk"
+      uses: actions/checkout@v3
+
+    - name: "build: fedora image"
+      working-directory: ci
+      run: |
+        [ -d ~/mkosi.cache ] && ln -s mkosi.cache ~/mkosi.cache
+        sudo $(which mkosi) build
+        if [ ! -d ~/mkosi.cache ]; then cp -fr ./mkosi.cache ~/; fi
+
+    - name: "start: boot fedora in qemu"
+      working-directory: ci
+      run: |
+        RUNNER_TRACKING_ID="" && sudo $(which mkosi) qemu -serial none -monitor none -display none -device virtio-net-pci,netdev=network0 -netdev user,id=network0,hostfwd=tcp:127.0.0.1:5555-:22 | tee ${{ github.workspace }}/qemu.log &
+
+    - name: "connect: check ssh connection"
+      shell: bash
+      timeout-minutes: 10
+      working-directory: ci
+      run: |
+        until mkosi ssh uname -a; do
+          echo "Retrying..."
+          sleep 0.25
+        done
+
+    - name: "test: run libublk test"
+      working-directory: ci
+      run: |
+        #sudo iptables --flush
+        #sudo lscpu
+        #sudo free -h
+        #mkosi ssh lscpu
+        #mkosi ssh free -h
+        #mkosi ssh ifconfig -a
+        mkosi ssh ls -l /usr/share/libublk-rs/target/debug/deps/libublk*
+        mkosi ssh ls -l /usr/share/libublk-rs/target/debug/deps/basic*
+        mkosi ssh ls -l /usr/share/libublk-rs/target/debug/
+        mkosi ssh /usr/share/libublk-rs/target/debug/test-libublk --nocapture
+        mkosi ssh /usr/share/libublk-rs/target/debug/test-basic --nocapture
+
+    - name: "cleanup"
+      if: always()
+      continue-on-error: true
+      run: |
+        cat ${{ github.workspace }}/qemu.log
+        sudo pkill -f qemu
