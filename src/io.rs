@@ -576,7 +576,7 @@ impl UblkQueue<'_> {
         }
 
         for i in 0..nr_ios {
-            let mut io = &mut ios[i as usize];
+            let io = &mut ios[i as usize];
 
             // extra io slot needn't to allocate buffer
             if i < depth {
