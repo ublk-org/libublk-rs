@@ -297,14 +297,25 @@ impl UblkCtrl {
         }
     }
 
+    /// Get target from exported json file for this device
+    ///
+    pub fn get_target_from_json(&self) -> Result<super::io::UblkTgt, UblkError> {
+        let tgt_val = &self.json["target"];
+        let tgt: Result<super::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
+        if let Ok(p) = tgt {
+            Ok(p)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
     /// Get target type from exported json file for this device
     ///
     pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
-        let tgt_type = &self.json["target"]["tgt_type"];
-
-        match tgt_type.as_str() {
-            Some(r) => Ok(r.to_string()),
-            _ => Err(UblkError::OtherError(-libc::EINVAL)),
+        if let Ok(tgt) = self.get_target_from_json() {
+            Ok(tgt.tgt_type)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
         }
     }
 
