@@ -96,7 +96,6 @@ mod tests {
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
 
-                ctrl.reload_json().unwrap();
                 assert!(ctrl.get_target_flags_from_json().unwrap() == dev_flags);
 
                 //ublk block device should be observed now

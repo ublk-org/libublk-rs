@@ -76,8 +76,6 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 }
 
 fn rd_get_device_size(ctrl: &mut UblkCtrl) -> u64 {
-    ctrl.reload_json().unwrap();
-
     let tgt_val = &ctrl.json["target"];
     let tgt: Result<libublk::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
     if let Ok(p) = tgt {
