@@ -279,6 +279,19 @@ impl UblkCtrl {
         }
     }
 
+    /// Get target flags from exported json file for this device
+    ///
+    pub fn get_target_flags_from_json(&self) -> Result<u32, UblkError> {
+        let __tgt_flags = &self.json["target_flags"];
+        let tgt_flags: Result<u32, _> = serde_json::from_value(__tgt_flags.clone());
+
+        if let Ok(flags) = tgt_flags {
+            Ok(flags)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
     fn store_queue_tid(&mut self, qid: u16, tid: i32) {
         self.queue_tids[qid as usize] = tid;
     }
@@ -737,6 +750,7 @@ impl UblkCtrl {
         let mut json = serde_json::json!({
                     "dev_info": dev.dev_info,
                     "target": dev.tgt,
+                    "target_flags": dev.flags,
         });
 
         json["target_data"] = tgt_data;

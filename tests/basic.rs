@@ -90,11 +90,14 @@ mod tests {
                     }
                 };
 
-            sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+            sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
                 let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
+
+                ctrl.reload_json().unwrap();
+                assert!(ctrl.get_target_flags_from_json().unwrap() == dev_flags);
 
                 //ublk block device should be observed now
                 assert!(Path::new(&dev_path).exists() == true);
