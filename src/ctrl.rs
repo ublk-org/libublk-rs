@@ -297,6 +297,17 @@ impl UblkCtrl {
         }
     }
 
+    /// Get target type from exported json file for this device
+    ///
+    pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
+        let tgt_type = &self.json["target"]["tgt_type"];
+
+        match tgt_type.as_str() {
+            Some(r) => Ok(r.to_string()),
+            _ => Err(UblkError::OtherError(-libc::EINVAL)),
+        }
+    }
+
     fn store_queue_tid(&mut self, qid: u16, tid: i32) {
         self.queue_tids[qid as usize] = tid;
     }
