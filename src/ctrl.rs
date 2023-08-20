@@ -251,6 +251,7 @@ impl UblkCtrl {
             if res.is_err() {
                 eprintln!("device reload json failed");
             }
+            dev.get_info()?;
         }
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
