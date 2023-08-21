@@ -646,6 +646,7 @@ impl UblkCtrl {
             self.flush_json()?;
             self.start(unsafe { libc::getpid() as i32 }, async_cmd)?
         } else {
+            self.flush_json()?;
             self.end_user_recover(unsafe { libc::getpid() as i32 }, async_cmd)?
         };
 
