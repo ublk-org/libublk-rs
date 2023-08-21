@@ -399,6 +399,7 @@ impl UblkIO {
     }
 
     /// for zoned append command only
+    /// zoned support is started from linux kernel v6.6
     #[inline(always)]
     fn set_buf_addr(&mut self, addr: u64) {
         self.buf_addr = addr;
