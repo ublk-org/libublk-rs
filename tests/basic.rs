@@ -269,6 +269,9 @@ mod tests {
             Ok(0)
         };
 
+        ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })
+            .unwrap();
+
         ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &mut qc)
             .unwrap();
 
