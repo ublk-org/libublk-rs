@@ -192,6 +192,11 @@ impl UblkCtrl {
         flags: u64,
         for_add: bool,
     ) -> Result<UblkCtrl, UblkError> {
+        if !std::path::Path::new(CTRL_PATH).exists() {
+            eprintln!("Please run `modprobe ublk_drv` first");
+            return Err(UblkError::OtherError(-libc::ENOENT));
+        }
+
         if id < 0 && id != -1 {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
