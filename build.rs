@@ -35,7 +35,7 @@ fn main() {
 #include "ublk_cmd.h"
 
 #ifdef UBLK_F_CMD_IOCTL_ENCODE
-#define MARK_FIX_753(req_name) const unsigned long int Fix753_##req_name = req_name;
+#define MARK_FIX_753(req_name) const unsigned int Fix753_##req_name = req_name;
 #else
 #define MARK_FIX_753(req_name)
 #endif
