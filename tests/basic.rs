@@ -6,6 +6,16 @@ mod tests {
     use std::env;
     use std::path::Path;
 
+    #[test]
+    fn test_ublk_get_features() {
+        let mut ctrl = UblkCtrl::new(-1, 0, 0, 0, 0, false).unwrap();
+
+        match ctrl.get_features() {
+            Ok(f) => eprintln!("features is {:04x}", f),
+            Err(_) => eprintln!("not support GET_FEATURES, require linux v6.5"),
+        }
+    }
+
     fn __test_ublk_session() -> std::thread::JoinHandle<()> {
         let sess = UblkSessionBuilder::default()
             .name("null")

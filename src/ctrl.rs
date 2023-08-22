@@ -502,6 +502,24 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    /// Retrieving supported UBLK FEATURES from ublk driver
+    ///
+    /// Supported since linux kernel v6.5
+    pub fn get_features(&mut self) -> Result<u64, UblkError> {
+        let features = 0_u64;
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_U_CMD_GET_FEATURES,
+            flags: CTRL_CMD_HAS_BUF,
+            addr: std::ptr::addr_of!(features) as u64,
+            len: core::mem::size_of::<u64>() as u32,
+            ..Default::default()
+        };
+
+        ublk_ctrl_cmd(self, &data)?;
+
+        Ok(features)
+    }
+
     /// Retrieving device info from ublk driver
     ///
     pub fn get_info(&mut self) -> Result<i32, UblkError> {
