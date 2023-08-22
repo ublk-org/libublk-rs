@@ -251,7 +251,7 @@ impl UblkCtrl {
         //add cdev if the device is for adding device
         if dev.for_add {
             dev.add()?;
-        } else {
+        } else if id >= 0 {
             let res = dev.reload_json();
             if res.is_err() {
                 eprintln!("device reload json failed");
