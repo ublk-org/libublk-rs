@@ -13,6 +13,9 @@ pub mod ctrl;
 pub mod io;
 pub mod sys;
 
+pub const UBLK_DEV_F_COMP_BATCH: u32 = 1u32 << 0;
+const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH;
+
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
     #[error("failed to read the key file")]

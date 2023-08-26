@@ -3,7 +3,7 @@ use libublk::{ctrl::UblkCtrl, UblkError};
 
 fn null_add(dev_id: i32, comp_batch: bool) {
     let dflags = if comp_batch {
-        libublk::io::UBLK_DEV_F_COMP_BATCH
+        libublk::UBLK_DEV_F_COMP_BATCH
     } else {
         0
     };

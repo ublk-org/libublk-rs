@@ -93,7 +93,7 @@ mod tests {
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
             let handle_io =
                 move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
-                    if dev_flags & libublk::io::UBLK_DEV_F_COMP_BATCH != 0 {
+                    if dev_flags & libublk::UBLK_DEV_F_COMP_BATCH != 0 {
                         null_handle_io_batch(ctx, io)
                     } else {
                         null_handle_io(ctx, io)
@@ -130,7 +130,7 @@ mod tests {
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null_comp_batch() {
-        __test_ublk_null(libublk::io::UBLK_DEV_F_COMP_BATCH);
+        __test_ublk_null(libublk::UBLK_DEV_F_COMP_BATCH);
     }
 
     fn rd_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, start: u64) -> Result<i32, UblkError> {

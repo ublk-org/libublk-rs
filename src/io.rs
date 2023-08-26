@@ -27,8 +27,8 @@ pub const UBLK_IO_S_COMP_BATCH: i32 = 1;
 /// If target won't use io_uring to handle IO, eventfd needs to be sent from
 /// the real handler context to wakeup ublk queue/io_uring context for
 /// driving the machinery. Eventfd gets minimized support with
-/// UBLK_DEV_F_COMP_BATCH, and native & generic IO offloading will be added
-/// soon.
+/// `libublk::UBLK_DEV_F_COMP_BATCH`, and native & generic IO offloading will
+/// be added soon.
 ///
 /// UblkIOCtx & UblkQueueCtx provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
@@ -261,9 +261,6 @@ pub struct UblkTgt {
     pub params: sys::ublk_params,
 }
 
-pub const UBLK_DEV_F_COMP_BATCH: u32 = 1u32 << 0;
-const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH;
-
 /// For supporting ublk device IO path, and one thin layer of device
 /// abstract in handling IO level. Ublk device supports multiple queue(MQ),
 /// and each queue has its IO depth.
@@ -317,7 +314,7 @@ impl UblkDev {
             ..Default::default()
         };
 
-        if (flags & !UBLK_DEV_F_ALL) != 0 {
+        if (flags & !super::UBLK_DEV_F_ALL) != 0 {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
@@ -635,7 +632,7 @@ impl UblkQueue<'_> {
     }
 
     fn support_comp_batch(&self) -> bool {
-        self.flags & UBLK_DEV_F_COMP_BATCH != 0
+        self.flags & super::UBLK_DEV_F_COMP_BATCH != 0
     }
 
     pub fn set_poll(&mut self, val: bool) {

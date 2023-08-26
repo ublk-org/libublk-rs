@@ -32,7 +32,7 @@ fn test_add(dev_id: i32) {
             tgt_init,
             &mut ctrl,
             if park != 0 {
-                libublk::io::UBLK_DEV_F_COMP_BATCH
+                libublk::UBLK_DEV_F_COMP_BATCH
             } else {
                 0
             },
