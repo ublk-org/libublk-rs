@@ -19,26 +19,23 @@ fn test_add(dev_id: i32) {
     let park = s.parse::<i32>().unwrap();
     let nr_queues = 2; //two queues
                        //io depth: 64, max buf size: 512KB
-    let mut ctrl = UblkCtrl::new(dev_id, nr_queues, 64, 512 << 10, 0, true).unwrap();
+    let mut ctrl = UblkCtrl::new(
+        dev_id,
+        nr_queues,
+        64,
+        512 << 10,
+        0,
+        libublk::UBLK_DEV_F_ADD_DEV,
+    )
+    .unwrap();
 
     //target specific initialization is done in this closure
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(250_u64 << 30);
         Ok(serde_json::json!({}))
     };
-    let ublk_dev = std::sync::Arc::new(
-        UblkDev::new(
-            "null".to_string(),
-            tgt_init,
-            &mut ctrl,
-            if park != 0 {
-                libublk::UBLK_DEV_F_COMP_BATCH
-            } else {
-                0
-            },
-        )
-        .unwrap(),
-    );
+    let ublk_dev =
+        std::sync::Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl).unwrap());
     let mut threads = Vec::new();
 
     println!("park completed IO {}", park);
@@ -67,7 +64,7 @@ fn test_add(dev_id: i32) {
 fn test_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, false).unwrap();
+    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, 0).unwrap();
 
     ctrl.del().unwrap();
 }

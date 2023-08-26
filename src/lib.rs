@@ -13,8 +13,14 @@ pub mod ctrl;
 pub mod io;
 pub mod sys;
 
+/// feature: support IO batch completion from single IO tag, typical
+/// usecase is to complete IOs from eventfd CQE handler
 pub const UBLK_DEV_F_COMP_BATCH: u32 = 1u32 << 0;
-const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH;
+
+/// tell UblkCtrl that we are adding one new device
+pub const UBLK_DEV_F_ADD_DEV: u32 = 1u32 << 1;
+
+const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV;
 
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
@@ -104,11 +110,6 @@ pub struct UblkSession {
     #[builder(default = "0")]
     ctrl_flags: u64,
 
-    /// true is for adding new device, false is for recovering old one,
-    /// need UBLK_F_USER_RECOVERY to be set in `ctrl_flags`
-    #[builder(default = "true")]
-    for_add: bool,
-
     /// libublk feature flags: UBLK_DEV_F_*
     #[builder(default = "0")]
     dev_flags: u32,
@@ -130,15 +131,10 @@ impl UblkSession {
             self.depth,
             self.io_buf_bytes,
             self.ctrl_flags,
-            self.for_add,
+            self.dev_flags,
         )?;
 
-        let dev = Arc::new(io::UblkDev::new(
-            self.name.clone(),
-            tgt_fn,
-            &mut ctrl,
-            self.dev_flags,
-        )?);
+        let dev = Arc::new(io::UblkDev::new(self.name.clone(), tgt_fn, &mut ctrl)?);
 
         Ok((ctrl, dev))
     }

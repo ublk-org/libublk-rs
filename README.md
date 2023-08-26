@@ -36,14 +36,14 @@ The following is quick introduction for adding ublk-null block device, which
 is against low level APIs.
 
 ``` rust
-use libublk::ctrl::UblkCtrl;
+use libublk::{ctrl::UblkCtrl, UBLK_DEV_F_ADD_DEV};
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use std::sync::Arc;
 
 fn main() {
     let nr_queues = 2; //two queues
                        //io depth: 64, max buf size: 512KB
-    let mut ctrl = UblkCtrl::new(-1, nr_queues, 64, 512 << 10, 0, true).unwrap();
+    let mut ctrl = UblkCtrl::new(-1, nr_queues, 64, 512 << 10, 0, UBLK_DEV_F_ADD_DEV).unwrap();
 
     // target specific initialization by tgt_init closure, which is flexible
     // for customizing target with captured environment
@@ -52,7 +52,7 @@ fn main() {
         Ok(serde_json::json!({}))
     };
     let ublk_dev =
-        Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl, 0).unwrap());
+        Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl).unwrap());
     let mut threads = Vec::new();
 
     for q in 0..nr_queues {
@@ -95,6 +95,7 @@ fn main() {
         .name("null")
         .depth(64_u32)
         .nr_queues(2_u32)
+        .dev_flags(UBLK_DEV_F_ADD_DEV)
         .build()
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| {

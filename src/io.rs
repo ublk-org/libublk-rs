@@ -295,12 +295,7 @@ impl UblkDev {
     /// ublk device is abstraction for target, and prepare for setting
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
-    pub fn new<F>(
-        tgt_name: String,
-        ops: F,
-        ctrl: &mut UblkCtrl,
-        flags: u32,
-    ) -> Result<UblkDev, UblkError>
+    pub fn new<F>(tgt_name: String, ops: F, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError>
     where
         F: FnOnce(&mut UblkDev) -> Result<serde_json::Value, UblkError>,
     {
@@ -313,10 +308,6 @@ impl UblkDev {
             ring_flags: 0,
             ..Default::default()
         };
-
-        if (flags & !super::UBLK_DEV_F_ALL) != 0 {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
 
         let cdev_path = format!("{}{}", super::CDEV_PATH, info.dev_id);
         let cdev_file = fs::OpenOptions::new()
@@ -332,7 +323,7 @@ impl UblkDev {
             dev_info: info,
             cdev_file,
             tgt,
-            flags,
+            flags: ctrl.get_dev_flags(),
         };
 
         ctrl.json = ops(&mut dev)?;

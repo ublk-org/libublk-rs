@@ -148,7 +148,9 @@ pub struct UblkCtrl {
     file: fs::File,
     pub dev_info: sys::ublksrv_ctrl_dev_info,
     pub json: serde_json::Value,
-    for_add: bool,
+
+    /// global flags, shared with UblkDev and UblkQueue
+    dev_flags: u32,
     cmd_token: i32,
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
@@ -159,7 +161,7 @@ impl Drop for UblkCtrl {
     fn drop(&mut self) {
         let id = self.dev_info.dev_id;
         trace!("ctrl: device {} dropped", id);
-        if self.for_add {
+        if self.for_add_dev() {
             if let Err(r) = self.del() {
                 //Maybe deleted from other utilities, so no warn or error:w
                 trace!("Delete char device {} failed {}", self.dev_info.dev_id, r);
@@ -179,6 +181,8 @@ impl UblkCtrl {
     /// * `io_buf_bytes`: max buf size for each IO
     /// * `flags`: flags for setting ublk device
     /// * `for_add`: is for adding new device
+    /// * `dev_flags`: global flags as userspace side feature, will be
+    ///     shared with UblkDev and UblkQueue
     ///
     /// ublk control device is for sending command to driver, and maintain
     /// device exported json file, dump, or any misc management task.
@@ -190,11 +194,15 @@ impl UblkCtrl {
         depth: u32,
         io_buf_bytes: u32,
         flags: u64,
-        for_add: bool,
+        dev_flags: u32,
     ) -> Result<UblkCtrl, UblkError> {
         if !std::path::Path::new(CTRL_PATH).exists() {
             eprintln!("Please run `modprobe ublk_drv` first");
             return Err(UblkError::OtherError(-libc::ENOENT));
+        }
+
+        if (dev_flags & !super::UBLK_DEV_F_ALL) != 0 {
+            return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
         if id < 0 && id != -1 {
@@ -236,7 +244,6 @@ impl UblkCtrl {
             dev_info: info,
             json: serde_json::json!({}),
             ring,
-            for_add,
             cmd_token: 0,
             queue_tids: {
                 let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
@@ -246,10 +253,11 @@ impl UblkCtrl {
                 tids
             },
             nr_queues_configured: 0,
+            dev_flags,
         };
 
         //add cdev if the device is for adding device
-        if dev.for_add {
+        if dev.for_add_dev() {
             dev.add()?;
         } else if id >= 0 {
             let res = dev.reload_json();
@@ -261,6 +269,14 @@ impl UblkCtrl {
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    fn for_add_dev(&self) -> bool {
+        (self.dev_flags & super::UBLK_DEV_F_ADD_DEV) != 0
+    }
+
+    pub fn get_dev_flags(&self) -> u32 {
+        self.dev_flags
     }
 
     fn dev_state_desc(&self) -> String {
@@ -747,7 +763,7 @@ impl UblkCtrl {
     /// Remove json export, and send stop command to control device
     ///
     pub fn stop_dev(&mut self, _dev: &UblkDev) -> Result<i32, UblkError> {
-        if self.for_add && std::path::Path::new(&self.run_path()).exists() {
+        if self.for_add_dev() && std::path::Path::new(&self.run_path()).exists() {
             fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
         }
         self.stop()

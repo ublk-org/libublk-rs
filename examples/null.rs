@@ -13,7 +13,7 @@ fn null_add(dev_id: i32, comp_batch: bool) {
         .depth(64_u32)
         .nr_queues(2_u32)
         .id(dev_id)
-        .dev_flags(dflags)
+        .dev_flags(dflags | libublk::UBLK_DEV_F_ADD_DEV)
         .build()
         .unwrap();
 
@@ -49,7 +49,7 @@ fn null_add(dev_id: i32, comp_batch: bool) {
                 handle_io
             },
             |dev_id| {
-                let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+                let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
                 d_ctrl.dump();
             },
         )
@@ -61,7 +61,7 @@ fn null_add(dev_id: i32, comp_batch: bool) {
 fn null_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, false).unwrap();
+    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, 0).unwrap();
 
     ctrl.del_dev().unwrap();
 }

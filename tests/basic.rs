@@ -8,7 +8,7 @@ mod tests {
 
     #[test]
     fn test_ublk_get_features() {
-        let mut ctrl = UblkCtrl::new(-1, 0, 0, 0, 0, false).unwrap();
+        let mut ctrl = UblkCtrl::new(-1, 0, 0, 0, 0, 0).unwrap();
 
         match ctrl.get_features() {
             Ok(f) => eprintln!("features is {:04x}", f),
@@ -21,6 +21,7 @@ mod tests {
             .name("null")
             .depth(16_u32)
             .nr_queues(2_u32)
+            .dev_flags(libublk::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
@@ -38,7 +39,7 @@ mod tests {
         };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
-            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
             d_ctrl.del().unwrap();
         })
         .unwrap()
@@ -52,7 +53,8 @@ mod tests {
 
     #[test]
     fn test_add_ctrl_dev() {
-        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, true).unwrap();
+        let ctrl =
+            UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, libublk::UBLK_DEV_F_ADD_DEV).unwrap();
         let dev_path = format!("{}{}", libublk::CDEV_PATH, ctrl.dev_info.dev_id);
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -101,7 +103,7 @@ mod tests {
                 };
 
             sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
-                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -124,13 +126,13 @@ mod tests {
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
-        __test_ublk_null(0);
+        __test_ublk_null(libublk::UBLK_DEV_F_ADD_DEV);
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null_comp_batch() {
-        __test_ublk_null(libublk::UBLK_DEV_F_COMP_BATCH);
+        __test_ublk_null(libublk::UBLK_DEV_F_ADD_DEV | libublk::UBLK_DEV_F_COMP_BATCH);
     }
 
     fn rd_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, start: u64) -> Result<i32, UblkError> {
@@ -165,7 +167,7 @@ mod tests {
     }
 
     fn __test_ublk_ramdisk(dev_id: i32) {
-        let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+        let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
         let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -203,7 +205,15 @@ mod tests {
     ) -> std::thread::JoinHandle<()> {
         let depth = 128;
         let nr_queues = 1;
-        let mut ctrl = UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, true).unwrap();
+        let mut ctrl = UblkCtrl::new(
+            dev_id,
+            nr_queues,
+            depth,
+            512 << 10,
+            0,
+            libublk::UBLK_DEV_F_ADD_DEV,
+        )
+        .unwrap();
         let ublk_dev = UblkDev::new(
             "ramdisk".to_string(),
             |dev: &mut UblkDev| {
@@ -211,7 +221,6 @@ mod tests {
                 Ok(serde_json::json!({}))
             },
             &mut ctrl,
-            0,
         )
         .unwrap();
 
@@ -249,7 +258,7 @@ mod tests {
     }
 
     fn __test_fn_mut_io_closure() -> std::thread::JoinHandle<()> {
-        let mut ctrl = UblkCtrl::new(-1, 1, 64, 512 << 10, 0, true).unwrap();
+        let mut ctrl = UblkCtrl::new(-1, 1, 64, 512 << 10, 0, libublk::UBLK_DEV_F_ADD_DEV).unwrap();
         let ublk_dev = UblkDev::new(
             "FnMutClosure".to_string(),
             |dev: &mut UblkDev| {
@@ -257,7 +266,6 @@ mod tests {
                 Ok(serde_json::json!({}))
             },
             &mut ctrl,
-            0,
         )
         .unwrap();
 
@@ -287,7 +295,7 @@ mod tests {
 
         let dev_id = ctrl.dev_info.dev_id as i32;
         let qh = std::thread::spawn(move || {
-            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
             ctrl.del().unwrap();
         });
 
@@ -369,7 +377,7 @@ mod tests {
         }
         assert!(tid != 0);
 
-        let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, false).unwrap();
+        let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, 0).unwrap();
         ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
 
         //ublk block device should be observed now
