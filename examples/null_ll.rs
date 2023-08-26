@@ -64,7 +64,7 @@ fn test_add(dev_id: i32) {
 fn test_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, 0).unwrap();
+    let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
 
     ctrl.del().unwrap();
 }

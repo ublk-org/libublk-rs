@@ -111,7 +111,7 @@ fn main() {
         };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
-            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, false).unwrap();
+            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
         })
         .unwrap()

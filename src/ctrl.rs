@@ -271,6 +271,13 @@ impl UblkCtrl {
         Ok(dev)
     }
 
+    /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
+    /// and it can't be done for adding device
+    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
+        assert!((dev_flags & super::UBLK_DEV_F_ADD_DEV) == 0);
+        Self::new(id, 0, 0, 0, 0, dev_flags)
+    }
+
     fn for_add_dev(&self) -> bool {
         (self.dev_flags & super::UBLK_DEV_F_ADD_DEV) != 0
     }

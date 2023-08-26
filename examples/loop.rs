@@ -163,7 +163,7 @@ fn test_add() {
                 };
 
             sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
-                let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
             })
             .unwrap()
@@ -175,7 +175,7 @@ fn test_add() {
 fn test_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, 0).unwrap();
+    let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
 
     ctrl.del().unwrap();
 }

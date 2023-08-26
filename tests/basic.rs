@@ -8,7 +8,7 @@ mod tests {
 
     #[test]
     fn test_ublk_get_features() {
-        let mut ctrl = UblkCtrl::new(-1, 0, 0, 0, 0, 0).unwrap();
+        let mut ctrl = UblkCtrl::new_simple(-1, 0).unwrap();
 
         match ctrl.get_features() {
             Ok(f) => eprintln!("features is {:04x}", f),
@@ -39,7 +39,7 @@ mod tests {
         };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
-            let mut d_ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
+            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.del().unwrap();
         })
         .unwrap()
@@ -103,7 +103,7 @@ mod tests {
                 };
 
             sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
-                let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
+                let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -167,7 +167,7 @@ mod tests {
     }
 
     fn __test_ublk_ramdisk(dev_id: i32) {
-        let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
+        let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
         let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -295,7 +295,7 @@ mod tests {
 
         let dev_id = ctrl.dev_info.dev_id as i32;
         let qh = std::thread::spawn(move || {
-            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
+            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             ctrl.del().unwrap();
         });
 
@@ -377,7 +377,7 @@ mod tests {
         }
         assert!(tid != 0);
 
-        let mut ctrl = UblkCtrl::new(id, 0, 0, 0, 0, 0).unwrap();
+        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
         ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
 
         //ublk block device should be observed now

@@ -101,7 +101,7 @@ fn test_add(recover: usize) {
 
         if recover > 0 {
             assert!(dev_id >= 0);
-            let mut ctrl = UblkCtrl::new(dev_id, 0, 0, 0, 0, 0).unwrap();
+            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             size = rd_get_device_size(&mut ctrl);
 
             ctrl.start_user_recover().unwrap();
@@ -117,7 +117,7 @@ fn test_add(recover: usize) {
 fn test_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new(dev_id as i32, 0, 0, 0, 0, 0).unwrap();
+    let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
 
     ctrl.del().unwrap();
 }
