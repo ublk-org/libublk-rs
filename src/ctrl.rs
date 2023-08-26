@@ -217,7 +217,8 @@ impl UblkCtrl {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
-        if io_buf_bytes > MAX_BUF_SZ {
+        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        if io_buf_bytes > MAX_BUF_SZ || io_buf_bytes & (page_sz - 1) != 0 {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
