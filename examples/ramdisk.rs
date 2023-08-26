@@ -47,7 +47,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         if for_add {
             libublk::UBLK_DEV_F_ADD_DEV
         } else {
-            0
+            libublk::UBLK_DEV_F_RECOVER_DEV
         },
     )
     .unwrap();

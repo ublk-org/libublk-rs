@@ -282,6 +282,10 @@ impl UblkCtrl {
         (self.dev_flags & super::UBLK_DEV_F_ADD_DEV) != 0
     }
 
+    fn for_recover_dev(&self) -> bool {
+        (self.dev_flags & super::UBLK_DEV_F_RECOVER_DEV) != 0
+    }
+
     pub fn get_dev_flags(&self) -> u32 {
         self.dev_flags
     }
@@ -691,9 +695,11 @@ impl UblkCtrl {
             self.set_params(&dev.tgt.params)?;
             self.flush_json()?;
             self.start(unsafe { libc::getpid() as i32 }, async_cmd)?
-        } else {
+        } else if self.for_recover_dev() {
             self.flush_json()?;
             self.end_user_recover(unsafe { libc::getpid() as i32 }, async_cmd)?
+        } else {
+            panic!();
         };
 
         Ok(token)
@@ -779,6 +785,12 @@ impl UblkCtrl {
     /// Flush this device's json info as file
     pub fn flush_json(&mut self) -> Result<i32, UblkError> {
         if self.json == serde_json::json!({}) {
+            return Ok(0);
+        }
+
+        // flushing json should only be done in case of adding new device
+        // or recovering old device
+        if !self.for_add_dev() && !self.for_recover_dev() {
             return Ok(0);
         }
 
