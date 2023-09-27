@@ -10,6 +10,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::sync::Arc;
 
 pub mod ctrl;
+pub mod exe;
 pub mod io;
 pub mod sys;
 
