@@ -329,10 +329,6 @@ impl Drop for UblkDev {
     }
 }
 
-const UBLK_IO_NEED_FETCH_RQ: u16 = 1_u16 << 0;
-const UBLK_IO_NEED_COMMIT_RQ_COMP: u16 = 1_u16 << 1;
-const UBLK_IO_FREE: u16 = 1u16 << 2;
-
 struct UblkIO {
     // for holding the allocated buffer
     __buf_addr: *mut u8,
@@ -582,23 +578,10 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn __queue_io_cmd(&mut self, tag: u16, flags: u16, res: i32) -> i32 {
-        let mut cmd_op = 0_u32;
+    fn __queue_io_cmd(&mut self, tag: u16, cmd_op:u32, res: i32) -> i32 {
         let io = &self.ios[tag as usize];
 
         if (self.q_state & UBLK_QUEUE_STOPPING) != 0 {
-            return 0;
-        }
-
-        if (flags & UBLK_IO_FREE) == 0 {
-            return 0;
-        }
-
-        if (flags & UBLK_IO_NEED_COMMIT_RQ_COMP) != 0 {
-            cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
-        } else if (flags & UBLK_IO_NEED_FETCH_RQ) != 0 {
-            cmd_op = sys::UBLK_IO_FETCH_REQ;
-        } else {
             return 0;
         }
 
@@ -635,8 +618,8 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn queue_io_cmd(&mut self, tag: u16, flags: u16, io_cmd_result: i32) -> i32 {
-        let res = self.__queue_io_cmd(tag, flags, io_cmd_result);
+    fn queue_io_cmd(&mut self, tag: u16, op: u32, io_cmd_result: i32) -> i32 {
+        let res = self.__queue_io_cmd(tag, op, io_cmd_result);
 
         if res > 0 {
             self.cmd_inflight += 1;
@@ -647,8 +630,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn commit_and_queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) {
-        let flags = UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
-        self.queue_io_cmd(tag, flags, io_cmd_result);
+        self.queue_io_cmd(tag, sys::UBLK_IO_COMMIT_AND_FETCH_REQ, io_cmd_result);
     }
 
     /// Submit all commands for fetching IO
@@ -658,8 +640,7 @@ impl UblkQueue<'_> {
     /// result and fetching new incoming IO
     fn submit_fetch_commands(&mut self) {
         for i in 0..self.q_depth {
-            let flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
-            self.queue_io_cmd(i as u16, flags, -1);
+            self.queue_io_cmd(i as u16, sys::UBLK_IO_FETCH_REQ, -1);
         }
     }
 
