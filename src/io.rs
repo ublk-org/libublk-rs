@@ -646,7 +646,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn check_and_queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) {
+    fn commit_and_queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) {
         let flags = UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
         self.queue_io_cmd(tag, flags, io_cmd_result);
     }
@@ -680,7 +680,7 @@ impl UblkQueue<'_> {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
             | Err(UblkError::UringIOError(res)) => {
-                self.check_and_queue_io_cmd(tag as u16, res);
+                self.commit_and_queue_io_cmd(tag as u16, res);
             }
             Err(UblkError::IoQueued(_)) => {}
             Ok(UblkIORes::FatRes(fat)) => match fat {
@@ -688,7 +688,7 @@ impl UblkQueue<'_> {
                     assert!(self.support_comp_batch());
                     for item in ios {
                         let tag = item.0;
-                        self.check_and_queue_io_cmd(tag, item.1);
+                        self.commit_and_queue_io_cmd(tag, item.1);
                     }
                 }
             },
@@ -703,7 +703,7 @@ impl UblkQueue<'_> {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
             | Err(UblkError::UringIOError(res)) => {
-                self.check_and_queue_io_cmd(tag as u16, res);
+                self.commit_and_queue_io_cmd(tag as u16, res);
             }
             Err(UblkError::IoQueued(_)) => {}
             _ => {}
