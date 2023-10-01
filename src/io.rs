@@ -329,9 +329,9 @@ impl Drop for UblkDev {
     }
 }
 
-const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
-const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
-const UBLK_IO_FREE: u32 = 1u32 << 2;
+const UBLK_IO_NEED_FETCH_RQ: u16 = 1_u16 << 0;
+const UBLK_IO_NEED_COMMIT_RQ_COMP: u16 = 1_u16 << 1;
+const UBLK_IO_FREE: u16 = 1u16 << 2;
 
 struct UblkIO {
     // for holding the allocated buffer
@@ -339,7 +339,6 @@ struct UblkIO {
 
     //for sending as io command
     buf_addr: u64,
-    flags: u32,
 }
 
 impl UblkIO {
@@ -353,21 +352,6 @@ impl UblkIO {
     #[inline(always)]
     fn set_buf_addr(&mut self, addr: u64) {
         self.buf_addr = addr;
-    }
-
-    /// Complete this io command
-    ///
-    /// # Arguments:
-    ///
-    /// * `res`: result of handling this io command
-    ///
-    /// Called from specific target code for completing this io command,
-    /// so ublk driver gets notified and complete IO request on
-    /// /dev/ublkbN
-    ///
-    #[inline(always)]
-    fn complete(&mut self) {
-        self.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
     }
 }
 
@@ -553,10 +537,8 @@ impl UblkQueue<'_> {
                 } else {
                     io.__buf_addr = std::ptr::null_mut();
                 }
-                io.flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
             } else {
                 io.__buf_addr = std::ptr::null_mut();
-                io.flags = 0;
             }
             io.buf_addr = io.__buf_addr as u64;
         }
@@ -600,17 +582,21 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn __queue_io_cmd(&mut self, tag: u16, res: i32) -> i32 {
+    fn __queue_io_cmd(&mut self, tag: u16, flags: u16, res: i32) -> i32 {
         let mut cmd_op = 0_u32;
         let io = &self.ios[tag as usize];
 
-        if (io.flags & UBLK_IO_FREE) == 0 {
+        if (self.q_state & UBLK_QUEUE_STOPPING) != 0 {
             return 0;
         }
 
-        if (io.flags & UBLK_IO_NEED_COMMIT_RQ_COMP) != 0 {
+        if (flags & UBLK_IO_FREE) == 0 {
+            return 0;
+        }
+
+        if (flags & UBLK_IO_NEED_COMMIT_RQ_COMP) != 0 {
             cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
-        } else if (io.flags & UBLK_IO_NEED_FETCH_RQ) != 0 {
+        } else if (flags & UBLK_IO_NEED_FETCH_RQ) != 0 {
             cmd_op = sys::UBLK_IO_FETCH_REQ;
         } else {
             return 0;
@@ -637,12 +623,11 @@ impl UblkQueue<'_> {
         }
 
         trace!(
-            "{}: (qid {} tag {} cmd_op {}) iof {} stopping {}",
+            "{}: (qid {} tag {} cmd_op {}) stopping {}",
             "queue_io_cmd",
             self.q_id,
             tag,
             cmd_op,
-            io.flags,
             (self.q_state & UBLK_QUEUE_STOPPING) != 0
         );
 
@@ -650,12 +635,11 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) -> i32 {
-        let res = self.__queue_io_cmd(tag, io_cmd_result);
+    fn queue_io_cmd(&mut self, tag: u16, flags: u16, io_cmd_result: i32) -> i32 {
+        let res = self.__queue_io_cmd(tag, flags, io_cmd_result);
 
         if res > 0 {
             self.cmd_inflight += 1;
-            self.ios[tag as usize].flags = 0;
         }
 
         res
@@ -663,7 +647,8 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn check_and_queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) {
-        self.queue_io_cmd(tag, io_cmd_result);
+        let flags = UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
+        self.queue_io_cmd(tag, flags, io_cmd_result);
     }
 
     /// Submit all commands for fetching IO
@@ -673,7 +658,8 @@ impl UblkQueue<'_> {
     /// result and fetching new incoming IO
     fn submit_fetch_commands(&mut self) {
         for i in 0..self.q_depth {
-            self.queue_io_cmd(i as u16, -1);
+            let flags = UBLK_IO_NEED_FETCH_RQ | UBLK_IO_FREE;
+            self.queue_io_cmd(i as u16, flags, -1);
         }
     }
 
@@ -694,7 +680,6 @@ impl UblkQueue<'_> {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
             | Err(UblkError::UringIOError(res)) => {
-                self.ios[tag as usize].complete();
                 self.check_and_queue_io_cmd(tag as u16, res);
             }
             Err(UblkError::IoQueued(_)) => {}
@@ -703,7 +688,6 @@ impl UblkQueue<'_> {
                     assert!(self.support_comp_batch());
                     for item in ios {
                         let tag = item.0;
-                        self.ios[tag as usize].complete();
                         self.check_and_queue_io_cmd(tag, item.1);
                     }
                 }
@@ -719,7 +703,6 @@ impl UblkQueue<'_> {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
             | Err(UblkError::UringIOError(res)) => {
-                self.ios[tag as usize].complete();
                 self.check_and_queue_io_cmd(tag as u16, res);
             }
             Err(UblkError::IoQueued(_)) => {}
@@ -783,23 +766,10 @@ impl UblkQueue<'_> {
         if res == sys::UBLK_IO_RES_ABORT {
             self.q_state |= UBLK_QUEUE_STOPPING;
         }
-        if (self.q_state & UBLK_QUEUE_STOPPING) != 0 {
-            self.ios[tag as usize].flags &= !UBLK_IO_NEED_FETCH_RQ;
-        }
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
             self.call_io_closure(ops, tag, e);
-        } else {
-            /*
-             * COMMIT_REQ will be completed immediately since no fetching
-             * piggyback is required.
-             *
-             * Marking IO_FREE only, then this io won't be issued since
-             * we only issue io with (UBLKSRV_IO_FREE | UBLKSRV_NEED_*)
-             *
-             * */
-            self.ios[tag as usize].flags = UBLK_IO_FREE;
         }
     }
 
