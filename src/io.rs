@@ -780,8 +780,10 @@ impl UblkQueue<'_> {
 
         self.cmd_inflight -= 1;
 
-        if res == sys::UBLK_IO_RES_ABORT || ((self.q_state & UBLK_QUEUE_STOPPING) != 0) {
+        if res == sys::UBLK_IO_RES_ABORT {
             self.q_state |= UBLK_QUEUE_STOPPING;
+        }
+        if (self.q_state & UBLK_QUEUE_STOPPING) != 0 {
             self.ios[tag as usize].flags &= !UBLK_IO_NEED_FETCH_RQ;
         }
 
