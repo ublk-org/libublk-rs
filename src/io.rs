@@ -332,7 +332,6 @@ impl Drop for UblkDev {
 const UBLK_IO_NEED_FETCH_RQ: u32 = 1_u32 << 0;
 const UBLK_IO_NEED_COMMIT_RQ_COMP: u32 = 1_u32 << 1;
 const UBLK_IO_FREE: u32 = 1u32 << 2;
-const UBLK_IO_TO_QUEUE: u32 = 1u32 << 3;
 
 struct UblkIO {
     // for holding the allocated buffer
@@ -368,7 +367,7 @@ impl UblkIO {
     ///
     #[inline(always)]
     fn complete(&mut self) {
-        self.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE | UBLK_IO_TO_QUEUE;
+        self.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE;
     }
 }
 
@@ -664,10 +663,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn check_and_queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) {
-        if self.ios[tag as usize].flags & UBLK_IO_TO_QUEUE != 0 {
-            self.ios[tag as usize].flags &= !UBLK_IO_TO_QUEUE;
-            self.queue_io_cmd(tag, io_cmd_result);
-        }
+        self.queue_io_cmd(tag, io_cmd_result);
     }
 
     /// Submit all commands for fetching IO
