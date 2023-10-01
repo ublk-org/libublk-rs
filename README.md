@@ -68,8 +68,7 @@ fn main() {
                 let iod = ctx.get_iod(io.get_tag());
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                io.complete_io(bytes);
-                Ok(0)
+                Ok(UblkIORes::Result(bytes))
             };
             queue.wait_and_handle_io(io_handler);
         }));
@@ -106,8 +105,7 @@ fn main() {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
             let iod = ctx.get_iod(io.get_tag());
-            io.complete_io(unsafe { (*iod).nr_sectors << 9 } as i32);
-            Ok(0)
+            Ok(UblkIORes::Result((unsafe { (*iod).nr_sectors << 9 } as i32)))
         };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {

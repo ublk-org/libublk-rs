@@ -15,8 +15,7 @@ fn null_handle_io(
 
     assert!(!park);
 
-    io.complete_io(bytes);
-    Ok(UblkIORes::Result(0))
+    Ok(UblkIORes::Result(bytes))
 }
 
 #[cfg(feature = "fat_complete")]
@@ -29,8 +28,7 @@ fn null_handle_io(
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
     if !park {
-        io.complete_io(bytes);
-        Ok(UblkIORes::Result(0))
+        Ok(UblkIORes::Result(bytes))
     } else {
         Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
             io.get_tag() as u16,

@@ -43,8 +43,7 @@ fn null_add(dev_id: i32, comp_batch: bool) {
                 let iod = ctx.get_iod(io.get_tag());
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                io.complete_io(bytes);
-                Ok(UblkIORes::Result(0))
+                Ok(UblkIORes::Result(bytes))
             };
         #[cfg(not(feature = "fat_complete"))]
         let handle_io_batch = handle_io;

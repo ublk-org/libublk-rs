@@ -37,8 +37,7 @@ mod tests {
                 let iod = ctx.get_iod(io.get_tag());
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                io.complete_io(bytes);
-                Ok(UblkIORes::Result(0))
+                Ok(UblkIORes::Result(bytes))
             };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
@@ -68,8 +67,7 @@ mod tests {
         let iod = ctx.get_iod(io.get_tag());
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        io.complete_io(bytes);
-        Ok(UblkIORes::Result(0))
+        Ok(UblkIORes::Result(bytes))
     }
 
     #[cfg(feature = "fat_complete")]
@@ -177,8 +175,7 @@ mod tests {
             _ => return Err(UblkError::OtherError(-libc::EINVAL)),
         }
 
-        io.complete_io(bytes as i32);
-        Ok(UblkIORes::Result(0))
+        Ok(UblkIORes::Result(bytes as i32))
     }
 
     fn __test_ublk_ramdisk(dev_id: i32) {
@@ -298,8 +295,8 @@ mod tests {
             }
 
             let iod = ctx.get_iod(tag);
-            i.complete_io(unsafe { (*iod).nr_sectors << 9 } as i32);
-            Ok(UblkIORes::Result(0))
+
+            Ok(UblkIORes::Result(unsafe { (*iod).nr_sectors << 9 } as i32))
         };
 
         ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })

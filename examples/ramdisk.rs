@@ -7,7 +7,7 @@ fn handle_io(
     start: u64,
 ) -> Result<UblkIORes, UblkError> {
     let off = (iod.start_sector << 9) as u64;
-    let bytes = (iod.nr_sectors << 9) as u32;
+    let bytes = (iod.nr_sectors << 9) as i32;
     let op = iod.op_flags & 0xff;
     let buf_addr = io.io_buf_addr();
 
@@ -29,8 +29,7 @@ fn handle_io(
         _ => return Err(UblkError::OtherError(-libc::EINVAL)),
     }
 
-    io.complete_io(bytes as i32);
-    Ok(UblkIORes::Result(0))
+    Ok(UblkIORes::Result(bytes))
 }
 
 ///run this ramdisk ublk daemon completely in single context with

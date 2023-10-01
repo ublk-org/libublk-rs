@@ -105,7 +105,7 @@ fn loop_queue_tgt_io(
         _ => return Err(UblkError::OtherError(-libc::EINVAL)),
     }
 
-    Ok(UblkIORes::Result(1))
+    Err(UblkError::IoQueued(0))
 }
 
 fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<UblkIORes, UblkError> {
@@ -120,9 +120,7 @@ fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<UblkIORes, Ubl
         assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
-            i.complete_io(res);
-
-            return Ok(UblkIORes::Result(0));
+            return Ok(UblkIORes::Result(res));
         }
     }
 

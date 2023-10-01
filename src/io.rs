@@ -108,14 +108,6 @@ impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
         self.1.get_buf_addr()
     }
 
-    /// Called when this IO command is handled, and tell libublk & ublk driver
-    /// to commit result and re-queue this IO command for future IO from ublk
-    /// driver.
-    #[inline(always)]
-    pub fn complete_io(&mut self, res: i32) {
-        self.1.complete(res);
-    }
-
     /// Build offset for read from or write to per-io-cmd buffer
     ///
     /// # Arguments:
@@ -704,8 +696,14 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[cfg(feature = "fat_complete")]
-    fn complete_ios(&mut self, res: Result<UblkIORes, UblkError>) {
+    fn complete_ios(&mut self, tag: usize, res: Result<UblkIORes, UblkError>) {
         match res {
+            Ok(UblkIORes::Result(res))
+            | Err(UblkError::OtherError(res))
+            | Err(UblkError::UringIOError(res)) => {
+                self.ios[tag as usize].complete(res);
+            }
+            Err(UblkError::IoQueued(_)) => {}
             Ok(UblkIORes::FatRes(fat)) => match fat {
                 UblkFatRes::BatchRes(ios) => {
                     assert!(self.support_comp_batch());
@@ -722,7 +720,15 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[cfg(not(feature = "fat_complete"))]
-    fn complete_ios(&mut self, _res: Result<UblkIORes, UblkError>) {}
+    fn complete_ios(&mut self, tag: usize, res: Result<UblkIORes, UblkError>) {
+        match res {
+            Ok(UblkIORes::Result(res))
+            | Err(UblkError::OtherError(res))
+            | Err(UblkError::UringIOError(res)) => self.ios[tag as usize].complete(res),
+            Err(UblkError::IoQueued(_)) => {}
+            _ => {}
+        };
+    }
 
     #[inline(always)]
     fn call_io_closure<F>(&mut self, mut ops: F, tag: u32, e: &UblkCQE)
@@ -732,7 +738,7 @@ impl UblkQueue<'_> {
         let mut ctx = UblkIOCtx(&mut self.q_ring, &mut self.ios[tag as usize], e);
 
         let res = ops(&mut ctx);
-        self.complete_ios(res);
+        self.complete_ios(tag as usize, res);
     }
 
     #[inline(always)]
@@ -856,7 +862,7 @@ impl UblkQueue<'_> {
     /// closure.
     ///
     /// If IO is super fast to complete, such as ramdisk, this request can
-    /// be handled directly in the closure, and call `io.complete_io(result)`
+    /// be handled directly in the closure, and return `Ok(UblkIORes::Result)`
     /// to complete the IO command originated from ublk driver. Another
     /// example is null target(null.rs).
     ///
@@ -867,14 +873,14 @@ impl UblkQueue<'_> {
     /// same IO closure is called for handling this target IO, which can be
     /// checked by `UblkIOCtx::is_tgt_io()` method. Finally if the coming
     /// target IO completion means the original IO command is done,
-    /// `io.complete_io(result)` is called for moving on, otherwise the IO
-    /// handling closure can continue to submit IO or whatever for driving
-    /// its IO logic.
+    /// `Ok(UblkIORes::Result)` is returned for moving on, otherwise UblkError::IoQueued(_)
+    /// can be returned and the IO handling closure can continue to submit IO
+    /// or whatever for driving its IO logic.
     ///
     /// Not all target IO logics can be done by io_uring, such as some
     /// handling needs extra computation, which often require to offload IO
     /// in another context. However, when target IO is done in remote offload
-    /// context, `io.complete_io(result)` has to be called in the queue/
+    /// context, `Ok(UblkIORes::Result)` has to be returned from the queue/
     /// io_uring context. One approach is to use eventfd to wakeup & notify
     /// ublk queue/io_uring. Here, eventfd can be thought as one special target
     /// IO. Inside IO closure, eventfd is queued by io_uring opcode::PollAdd.

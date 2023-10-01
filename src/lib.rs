@@ -59,6 +59,9 @@ pub enum UblkError {
     #[error("other IO failure")]
     OtherIOError(#[source] std::io::Error),
 
+    #[error("IO Queued")]
+    IoQueued(i32),
+
     #[error("other failure")]
     OtherError(i32),
 }
