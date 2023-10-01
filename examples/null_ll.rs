@@ -1,7 +1,25 @@
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
+#[cfg(feature = "fat_complete")]
+use libublk::UblkFatRes;
 use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 use std::sync::Arc;
 
+#[cfg(not(feature = "fat_complete"))]
+fn null_handle_io(
+    ctx: &UblkQueueCtx,
+    io: &mut UblkIOCtx,
+    park: bool,
+) -> Result<UblkIORes, UblkError> {
+    let iod = ctx.get_iod(io.get_tag());
+    let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+    assert!(!park);
+
+    io.complete_io(bytes);
+    Ok(UblkIORes::Result(0))
+}
+
+#[cfg(feature = "fat_complete")]
 fn null_handle_io(
     ctx: &UblkQueueCtx,
     io: &mut UblkIOCtx,
@@ -14,10 +32,13 @@ fn null_handle_io(
         io.complete_io(bytes);
         Ok(UblkIORes::Result(0))
     } else {
-        io.add_to_comp_batch(io.get_tag() as u16, bytes);
-        Ok(UblkIORes::Result(libublk::io::UBLK_IO_S_COMP_BATCH))
+        Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
+            io.get_tag() as u16,
+            bytes,
+        )])))
     }
 }
+
 fn test_add(dev_id: i32) {
     let s = std::env::args().nth(3).unwrap_or_else(|| "0".to_string());
     let park = s.parse::<i32>().unwrap();

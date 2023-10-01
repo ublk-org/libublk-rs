@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
+    #[cfg(feature = "fat_complete")]
+    use libublk::UblkFatRes;
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
@@ -70,6 +72,7 @@ mod tests {
         Ok(UblkIORes::Result(0))
     }
 
+    #[cfg(feature = "fat_complete")]
     fn null_handle_io_batch(
         ctx: &UblkQueueCtx,
         io: &mut UblkIOCtx,
@@ -77,8 +80,10 @@ mod tests {
         let iod = ctx.get_iod(io.get_tag());
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        io.add_to_comp_batch(io.get_tag() as u16, bytes);
-        Ok(UblkIORes::Result(libublk::io::UBLK_IO_S_COMP_BATCH))
+        Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
+            io.get_tag() as u16,
+            bytes,
+        )])))
     }
 
     fn __test_ublk_null(
@@ -132,6 +137,7 @@ mod tests {
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
+    #[cfg(feature = "fat_complete")]
     #[test]
     fn test_ublk_null_comp_batch() {
         __test_ublk_null(
@@ -413,5 +419,18 @@ mod tests {
         //println!("{}", buf);
         ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
         ctrl.del_dev().unwrap();
+    }
+
+    #[cfg(not(feature = "fat_complete"))]
+    #[test]
+    fn test_feature_fat_complete() {
+        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
+        assert!(sz == 16);
+    }
+    #[cfg(feature = "fat_complete")]
+    #[test]
+    fn test_feature_fat_complete() {
+        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
+        assert!(sz == 32);
     }
 }

@@ -1,4 +1,6 @@
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
+#[cfg(feature = "fat_complete")]
+use libublk::UblkFatRes;
 use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 
 fn null_add(dev_id: i32, comp_batch: bool) {
@@ -24,14 +26,18 @@ fn null_add(dev_id: i32, comp_batch: bool) {
 
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        #[cfg(feature = "fat_complete")]
         let handle_io_batch =
             move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
                 let iod = ctx.get_iod(io.get_tag());
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                io.add_to_comp_batch(io.get_tag() as u16, bytes);
-                Ok(UblkIORes::Result(libublk::io::UBLK_IO_S_COMP_BATCH))
+                Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
+                    io.get_tag() as u16,
+                    bytes,
+                )])))
             };
+
         let handle_io =
             move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
                 let iod = ctx.get_iod(io.get_tag());
@@ -40,6 +46,8 @@ fn null_add(dev_id: i32, comp_batch: bool) {
                 io.complete_io(bytes);
                 Ok(UblkIORes::Result(0))
             };
+        #[cfg(not(feature = "fat_complete"))]
+        let handle_io_batch = handle_io;
 
         sess.run(
             &mut ctrl,

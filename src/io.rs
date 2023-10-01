@@ -1,21 +1,11 @@
+#[cfg(feature = "fat_complete")]
+use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::io::AsRawFd;
-
-/// Return value of IO handling closure.
-///
-/// If `UBLK_IO_S_COMP_BATCH` is returned from the closure, we need
-/// to check if there is any completed IOs in `UblkIOCtx.3`, and
-/// if yes, complete them all.
-///
-/// The typical use case is that IO offloading from another context,
-/// then target code sends eventfd to wakeup our queue(io_uring).
-/// After any IO is completed, it is added to `UblkIOCtx.3` by
-/// `UblkIOCtx::add_to_comp_batch()` for later completion.
-pub const UBLK_IO_S_COMP_BATCH: i32 = 1;
 
 /// UblkIOCtx
 ///
@@ -129,8 +119,8 @@ impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
 
     /// Add completed IOs represented by (tag, res) to batch list, so that
     /// we can complete them after returning from io handling closure, which
-    /// must return `UBLK_IO_S_COMP_BATCH`, so that we know that there are
-    /// IOs in batch list.
+    /// must return `Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(batch))`, so
+    /// that we know that there are IOs in batch list.
     ///
     /// # Arguments:
     ///
@@ -729,6 +719,28 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    #[cfg(feature = "fat_complete")]
+    fn complete_ios(&mut self, res: Result<UblkIORes, UblkError>) {
+        match res {
+            Ok(UblkIORes::FatRes(fat)) => match fat {
+                UblkFatRes::BatchRes(ios) => {
+                    assert!(self.support_comp_batch());
+                    for item in ios {
+                        let tag = item.0;
+                        self.ios[tag as usize].complete(item.1);
+                        self.check_and_queue_io_cmd(tag);
+                    }
+                }
+            },
+            _ => {}
+        };
+    }
+
+    #[inline(always)]
+    #[cfg(not(feature = "fat_complete"))]
+    fn complete_ios(&mut self, _res: Result<UblkIORes, UblkError>) {}
+
+    #[inline(always)]
     fn call_io_closure<F>(&mut self, mut ops: F, tag: u32, e: &UblkCQE)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
@@ -741,22 +753,8 @@ impl UblkQueue<'_> {
             if comp_batch { Some(Vec::new()) } else { None },
         );
 
-        match ops(&mut ctx) {
-            Ok(res) => match res {
-                UblkIORes::Result(io_res) => {
-                    if io_res == UBLK_IO_S_COMP_BATCH {
-                        if let Some(ios) = ctx.3.as_mut() {
-                            for item in ios {
-                                let tag = item.0;
-                                self.ios[tag as usize].complete(item.1);
-                                self.check_and_queue_io_cmd(tag);
-                            }
-                        }
-                    }
-                }
-            },
-            _ => {}
-        }
+        let res = ops(&mut ctx);
+        self.complete_ios(res);
     }
 
     #[inline(always)]
