@@ -341,7 +341,6 @@ struct UblkIO {
     //for sending as io command
     buf_addr: u64,
     flags: u32,
-    result: i32,
 }
 
 impl UblkIO {
@@ -368,9 +367,8 @@ impl UblkIO {
     /// /dev/ublkbN
     ///
     #[inline(always)]
-    fn complete(&mut self, res: i32) {
+    fn complete(&mut self) {
         self.flags |= UBLK_IO_NEED_COMMIT_RQ_COMP | UBLK_IO_FREE | UBLK_IO_TO_QUEUE;
-        self.result = res;
     }
 }
 
@@ -561,7 +559,6 @@ impl UblkQueue<'_> {
                 io.__buf_addr = std::ptr::null_mut();
                 io.flags = 0;
             }
-            io.result = -1;
             io.buf_addr = io.__buf_addr as u64;
         }
 
@@ -604,7 +601,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn __queue_io_cmd(&mut self, tag: u16) -> i32 {
+    fn __queue_io_cmd(&mut self, tag: u16, res: i32) -> i32 {
         let mut cmd_op = 0_u32;
         let io = &self.ios[tag as usize];
 
@@ -624,7 +621,7 @@ impl UblkQueue<'_> {
             tag,
             addr: io.buf_addr as u64,
             q_id: self.q_id,
-            result: io.result,
+            result: res,
         };
         let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
 
@@ -654,8 +651,8 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn queue_io_cmd(&mut self, tag: u16) -> i32 {
-        let res = self.__queue_io_cmd(tag);
+    fn queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) -> i32 {
+        let res = self.__queue_io_cmd(tag, io_cmd_result);
 
         if res > 0 {
             self.cmd_inflight += 1;
@@ -666,10 +663,10 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn check_and_queue_io_cmd(&mut self, tag: u16) {
+    fn check_and_queue_io_cmd(&mut self, tag: u16, io_cmd_result: i32) {
         if self.ios[tag as usize].flags & UBLK_IO_TO_QUEUE != 0 {
             self.ios[tag as usize].flags &= !UBLK_IO_TO_QUEUE;
-            self.queue_io_cmd(tag);
+            self.queue_io_cmd(tag, io_cmd_result);
         }
     }
 
@@ -680,7 +677,7 @@ impl UblkQueue<'_> {
     /// result and fetching new incoming IO
     fn submit_fetch_commands(&mut self) {
         for i in 0..self.q_depth {
-            self.queue_io_cmd(i as u16);
+            self.queue_io_cmd(i as u16, -1);
         }
     }
 
@@ -701,7 +698,8 @@ impl UblkQueue<'_> {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
             | Err(UblkError::UringIOError(res)) => {
-                self.ios[tag as usize].complete(res);
+                self.ios[tag as usize].complete();
+                self.check_and_queue_io_cmd(tag as u16, res);
             }
             Err(UblkError::IoQueued(_)) => {}
             Ok(UblkIORes::FatRes(fat)) => match fat {
@@ -709,8 +707,8 @@ impl UblkQueue<'_> {
                     assert!(self.support_comp_batch());
                     for item in ios {
                         let tag = item.0;
-                        self.ios[tag as usize].complete(item.1);
-                        self.check_and_queue_io_cmd(tag);
+                        self.ios[tag as usize].complete();
+                        self.check_and_queue_io_cmd(tag, item.1);
                     }
                 }
             },
@@ -724,7 +722,10 @@ impl UblkQueue<'_> {
         match res {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
-            | Err(UblkError::UringIOError(res)) => self.ios[tag as usize].complete(res),
+            | Err(UblkError::UringIOError(res)) => {
+                self.ios[tag as usize].complete();
+                self.check_and_queue_io_cmd(tag as u16, res);
+            }
             Err(UblkError::IoQueued(_)) => {}
             _ => {}
         };
@@ -829,9 +830,6 @@ impl UblkQueue<'_> {
                 },
         );
         self.handle_cqe(ops, &ublk_cqe);
-
-        let tag = ublk_cqe.get_tag();
-        self.check_and_queue_io_cmd(tag as u16);
 
         self.cqes_idx += 1;
 
