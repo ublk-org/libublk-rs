@@ -77,7 +77,10 @@ mod tests {
         Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
     }
 
-    fn __test_ublk_null(dev_flags: u32) {
+    fn __test_ublk_null(
+        dev_flags: u32,
+        handler: fn(&UblkQueueCtx, &mut UblkIOCtx) -> Result<i32, UblkError>,
+    ) {
         let sess = UblkSessionBuilder::default()
             .name("null")
             .depth(64_u32)
@@ -93,14 +96,9 @@ mod tests {
 
         let wh = {
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let handle_io =
-                move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
-                    if dev_flags & libublk::UBLK_DEV_F_COMP_BATCH != 0 {
-                        null_handle_io_batch(ctx, io)
-                    } else {
-                        null_handle_io(ctx, io)
-                    }
-                };
+            let handle_io = move |ctx: &UblkQueueCtx,
+                                  io: &mut UblkIOCtx|
+                  -> Result<i32, UblkError> { handler(ctx, io) };
 
             sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
                 let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
@@ -126,13 +124,16 @@ mod tests {
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
-        __test_ublk_null(libublk::UBLK_DEV_F_ADD_DEV);
+        __test_ublk_null(libublk::UBLK_DEV_F_ADD_DEV, null_handle_io);
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null_comp_batch() {
-        __test_ublk_null(libublk::UBLK_DEV_F_ADD_DEV | libublk::UBLK_DEV_F_COMP_BATCH);
+        __test_ublk_null(
+            libublk::UBLK_DEV_F_ADD_DEV | libublk::UBLK_DEV_F_COMP_BATCH,
+            null_handle_io_batch,
+        );
     }
 
     fn rd_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, start: u64) -> Result<i32, UblkError> {
