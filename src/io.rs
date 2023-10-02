@@ -569,9 +569,7 @@ impl UblkQueue<'_> {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::MmapError(
-                "io cmd buffer mmap failed".to_string(),
-            ));
+            return Err(UblkError::MmapError(unsafe {*libc::__errno_location()}));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
@@ -928,7 +926,7 @@ impl UblkQueue<'_> {
         }
 
         if self.queue_is_done() && self.q_ring.submission().is_empty() {
-            return Err(UblkError::QueueIsDown("queue is done".to_string()));
+            return Err(UblkError::QueueIsDown(-libc::ENODEV));
         }
 
         let ret = self
