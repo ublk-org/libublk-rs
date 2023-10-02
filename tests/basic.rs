@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
-    use libublk::{ctrl::UblkCtrl, UblkError};
+    use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
     use std::path::Path;
@@ -30,13 +30,14 @@ mod tests {
             Ok(serde_json::json!({}))
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
-            let iod = ctx.get_iod(io.get_tag());
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        let handle_io =
+            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
+                let iod = ctx.get_iod(io.get_tag());
+                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            io.complete_io(bytes);
-            Ok(0)
-        };
+                io.complete_io(bytes);
+                Ok(UblkIORes::Result(0))
+            };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
@@ -61,25 +62,28 @@ mod tests {
         assert!(Path::new(&dev_path).exists() == true);
     }
 
-    fn null_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx) -> Result<i32, UblkError> {
+    fn null_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx) -> Result<UblkIORes, UblkError> {
         let iod = ctx.get_iod(io.get_tag());
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
         io.complete_io(bytes);
-        Ok(0)
+        Ok(UblkIORes::Result(0))
     }
 
-    fn null_handle_io_batch(ctx: &UblkQueueCtx, io: &mut UblkIOCtx) -> Result<i32, UblkError> {
+    fn null_handle_io_batch(
+        ctx: &UblkQueueCtx,
+        io: &mut UblkIOCtx,
+    ) -> Result<UblkIORes, UblkError> {
         let iod = ctx.get_iod(io.get_tag());
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
         io.add_to_comp_batch(io.get_tag() as u16, bytes);
-        Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
+        Ok(UblkIORes::Result(libublk::io::UBLK_IO_S_COMP_BATCH))
     }
 
     fn __test_ublk_null(
         dev_flags: u32,
-        handler: fn(&UblkQueueCtx, &mut UblkIOCtx) -> Result<i32, UblkError>,
+        handler: fn(&UblkQueueCtx, &mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     ) {
         let sess = UblkSessionBuilder::default()
             .name("null")
@@ -98,7 +102,7 @@ mod tests {
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
             let handle_io = move |ctx: &UblkQueueCtx,
                                   io: &mut UblkIOCtx|
-                  -> Result<i32, UblkError> { handler(ctx, io) };
+                  -> Result<UblkIORes, UblkError> { handler(ctx, io) };
 
             sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
                 let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
@@ -136,7 +140,11 @@ mod tests {
         );
     }
 
-    fn rd_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, start: u64) -> Result<i32, UblkError> {
+    fn rd_handle_io(
+        ctx: &UblkQueueCtx,
+        io: &mut UblkIOCtx,
+        start: u64,
+    ) -> Result<UblkIORes, UblkError> {
         let _iod = ctx.get_iod(io.get_tag());
         let iod = unsafe { &*_iod };
         let off = (iod.start_sector << 9) as u64;
@@ -164,7 +172,7 @@ mod tests {
         }
 
         io.complete_io(bytes as i32);
-        Ok(0)
+        Ok(UblkIORes::Result(0))
     }
 
     fn __test_ublk_ramdisk(dev_id: i32) {
@@ -285,7 +293,7 @@ mod tests {
 
             let iod = ctx.get_iod(tag);
             i.complete_io(unsafe { (*iod).nr_sectors << 9 } as i32);
-            Ok(0)
+            Ok(UblkIORes::Result(0))
         };
 
         ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })

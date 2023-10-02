@@ -1,5 +1,5 @@
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 
 fn null_add(dev_id: i32, comp_batch: bool) {
     let dflags = if comp_batch {
@@ -25,20 +25,21 @@ fn null_add(dev_id: i32, comp_batch: bool) {
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let handle_io_batch =
-            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
+            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
                 let iod = ctx.get_iod(io.get_tag());
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
                 io.add_to_comp_batch(io.get_tag() as u16, bytes);
-                Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
+                Ok(UblkIORes::Result(libublk::io::UBLK_IO_S_COMP_BATCH))
             };
-        let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
-            let iod = ctx.get_iod(io.get_tag());
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        let handle_io =
+            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
+                let iod = ctx.get_iod(io.get_tag());
+                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            io.complete_io(bytes);
-            Ok(0)
-        };
+                io.complete_io(bytes);
+                Ok(UblkIORes::Result(0))
+            };
 
         sess.run(
             &mut ctrl,

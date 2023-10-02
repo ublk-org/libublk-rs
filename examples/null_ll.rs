@@ -1,17 +1,21 @@
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 use std::sync::Arc;
 
-fn null_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx, park: bool) -> Result<i32, UblkError> {
+fn null_handle_io(
+    ctx: &UblkQueueCtx,
+    io: &mut UblkIOCtx,
+    park: bool,
+) -> Result<UblkIORes, UblkError> {
     let iod = ctx.get_iod(io.get_tag());
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
     if !park {
         io.complete_io(bytes);
-        Ok(0)
+        Ok(UblkIORes::Result(0))
     } else {
         io.add_to_comp_batch(io.get_tag() as u16, bytes);
-        Ok(libublk::io::UBLK_IO_S_COMP_BATCH)
+        Ok(UblkIORes::Result(libublk::io::UBLK_IO_S_COMP_BATCH))
     }
 }
 fn test_add(dev_id: i32) {

@@ -25,6 +25,10 @@ pub const UBLK_DEV_F_RECOVER_DEV: u32 = 1u32 << 2;
 
 const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV;
 
+pub enum UblkIORes {
+    Result(i32),
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
     #[error("failed to read the key file")]
@@ -149,7 +153,7 @@ impl UblkSession {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: Fn(&io::UblkQueueCtx, &mut io::UblkIOCtx) -> Result<i32, UblkError>
+        Q: Fn(&io::UblkQueueCtx, &mut io::UblkIOCtx) -> Result<UblkIORes, UblkError>
             + Send
             + Sync
             + Clone
@@ -219,7 +223,7 @@ impl UblkSession {
         worker_fn: W,
     ) -> Result<std::thread::JoinHandle<()>, UblkError>
     where
-        Q: Fn(&io::UblkQueueCtx, &mut io::UblkIOCtx) -> Result<i32, UblkError>
+        Q: Fn(&io::UblkQueueCtx, &mut io::UblkIOCtx) -> Result<UblkIORes, UblkError>
             + Send
             + Sync
             + Clone

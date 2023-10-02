@@ -1,11 +1,11 @@
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 
 fn handle_io(
     io: &mut UblkIOCtx,
     iod: &libublk::sys::ublksrv_io_desc,
     start: u64,
-) -> Result<i32, UblkError> {
+) -> Result<UblkIORes, UblkError> {
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
@@ -30,7 +30,7 @@ fn handle_io(
     }
 
     io.complete_io(bytes as i32);
-    Ok(0)
+    Ok(UblkIORes::Result(0))
 }
 
 ///run this ramdisk ublk daemon completely in single context with

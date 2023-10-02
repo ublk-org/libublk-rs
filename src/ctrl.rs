@@ -1,5 +1,5 @@
 use super::io::{UblkDev, UblkTgt};
-use super::{sys, UblkError};
+use super::{sys, UblkError, UblkIORes};
 use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
@@ -742,7 +742,7 @@ impl UblkCtrl {
         mut ops: F,
     ) -> Result<i32, UblkError>
     where
-        F: FnMut(&mut super::io::UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut super::io::UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         let mut started = false;
         let token = self.__start_dev(dev, true)?;

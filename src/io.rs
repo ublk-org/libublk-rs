@@ -1,4 +1,4 @@
-use super::{ctrl::UblkCtrl, sys, UblkError};
+use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
@@ -569,7 +569,7 @@ impl UblkQueue<'_> {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::MmapError(unsafe {*libc::__errno_location()}));
+            return Err(UblkError::MmapError(unsafe { *libc::__errno_location() }));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
@@ -731,7 +731,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     fn call_io_closure<F>(&mut self, mut ops: F, tag: u32, e: &UblkCQE)
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         let comp_batch = self.support_comp_batch();
         let mut ctx = UblkIOCtx(
@@ -741,16 +741,21 @@ impl UblkQueue<'_> {
             if comp_batch { Some(Vec::new()) } else { None },
         );
 
-        if let Ok(res) = ops(&mut ctx) {
-            if res == UBLK_IO_S_COMP_BATCH {
-                if let Some(ios) = ctx.3.as_mut() {
-                    for item in ios {
-                        let tag = item.0;
-                        self.ios[tag as usize].complete(item.1);
-                        self.check_and_queue_io_cmd(tag);
+        match ops(&mut ctx) {
+            Ok(res) => match res {
+                UblkIORes::Result(io_res) => {
+                    if io_res == UBLK_IO_S_COMP_BATCH {
+                        if let Some(ios) = ctx.3.as_mut() {
+                            for item in ios {
+                                let tag = item.0;
+                                self.ios[tag as usize].complete(item.1);
+                                self.check_and_queue_io_cmd(tag);
+                            }
+                        }
                     }
                 }
-            }
+            },
+            _ => {}
         }
     }
 
@@ -758,7 +763,7 @@ impl UblkQueue<'_> {
     #[allow(unused_assignments)]
     fn handle_cqe<F>(&mut self, ops: F, e: &UblkCQE)
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         let data = e.user_data();
         let res = e.result();
@@ -820,7 +825,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     fn reap_one_event<F>(&mut self, ops: F) -> usize
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         let idx = self.cqes_idx;
         if idx >= self.cqes_cnt {
@@ -908,7 +913,7 @@ impl UblkQueue<'_> {
     /// be completed automatically.
     pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         let to_wait = if self.get_poll() { 0 } else { 1 };
 
@@ -957,7 +962,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     pub fn wait_and_handle_io<F>(&mut self, mut ops: F)
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<i32, UblkError>,
+        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         loop {
             match self.process_io(&mut ops) {
