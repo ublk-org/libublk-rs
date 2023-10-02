@@ -23,9 +23,9 @@ use std::os::unix::io::AsRawFd;
 /// UblkIOCtx & UblkQueueCtx provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
 ///
-pub struct UblkIOCtx<'a, 'b, 'd>(
+pub struct UblkIOCtx<'a, 'd>(
     &'a mut io_uring::IoUring<io_uring::squeue::Entry>,
-    &'b mut UblkIO,
+    *mut u8,
     &'d UblkCQE<'d>,
 );
 
@@ -35,13 +35,7 @@ fn is_target_io(user_data: u64) -> bool {
     (user_data & (1_u64 << 63)) != 0
 }
 
-impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
-    /// Set LBA for UBLK_IO_ZONE_APPEND
-    #[inline(always)]
-    pub fn set_zone_append_lab(&mut self, lba: u64) {
-        self.1.set_buf_addr(lba)
-    }
-
+impl<'a, 'd> UblkIOCtx<'a, 'd> {
     /// Return io_uring instance which is shared in queue wide.
     ///
     /// Target IO often needs to handle IO command by io_uring further,
@@ -105,7 +99,7 @@ impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
     /// to manage io buffer.
     #[inline(always)]
     pub fn io_buf_addr(&self) -> *mut u8 {
-        self.1.get_buf_addr()
+        self.1
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -329,28 +323,6 @@ impl Drop for UblkDev {
     }
 }
 
-struct UblkIO {
-    // for holding the allocated buffer
-    __buf_addr: *mut u8,
-
-    //for sending as io command
-    buf_addr: u64,
-}
-
-impl UblkIO {
-    #[inline(always)]
-    fn get_buf_addr(&self) -> *mut u8 {
-        self.__buf_addr
-    }
-
-    /// for zoned append command only
-    /// zoned support is started from linux kernel v6.6
-    #[inline(always)]
-    fn set_buf_addr(&mut self, addr: u64) {
-        self.buf_addr = addr;
-    }
-}
-
 /// UblkQueue Context info
 ///
 ///
@@ -410,7 +382,7 @@ pub struct UblkQueue<'a> {
     q_state: u32,
     cqes_idx: usize,
     cqes_cnt: usize,
-    ios: Vec<UblkIO>,
+    bufs: Vec<*mut u8>,
     q_ring: IoUring<squeue::Entry>,
 }
 
@@ -432,12 +404,11 @@ impl Drop for UblkQueue<'_> {
         }
 
         for i in 0..depth {
-            let io = &self.ios[i as usize];
-            super::ublk_dealloc_buf(
-                io.__buf_addr,
-                dev.dev_info.max_io_buf_bytes as usize,
-                unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize },
-            );
+            let buf = self.bufs[i as usize];
+
+            super::ublk_dealloc_buf(buf, dev.dev_info.max_io_buf_bytes as usize, unsafe {
+                libc::sysconf(libc::_SC_PAGESIZE) as usize
+            });
         }
     }
 }
@@ -515,28 +486,27 @@ impl UblkQueue<'_> {
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
-        let mut ios = Vec::<UblkIO>::with_capacity(nr_ios as usize);
+        let mut bufs = Vec::<*mut u8>::with_capacity(nr_ios as usize);
         unsafe {
-            ios.set_len(nr_ios as usize);
+            bufs.set_len(nr_ios as usize);
         }
 
         for i in 0..nr_ios {
-            let io = &mut ios[i as usize];
-
             // extra io slot needn't to allocate buffer
-            if i < depth {
-                if (dev.dev_info.flags & (super::sys::UBLK_F_USER_COPY as u64)) == 0 {
-                    io.__buf_addr =
+            let addr = {
+                if i < depth {
+                    if (dev.dev_info.flags & (super::sys::UBLK_F_USER_COPY as u64)) == 0 {
                         super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
                             libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
-                        });
+                        })
+                    } else {
+                        std::ptr::null_mut()
+                    }
                 } else {
-                    io.__buf_addr = std::ptr::null_mut();
+                    std::ptr::null_mut()
                 }
-            } else {
-                io.__buf_addr = std::ptr::null_mut();
-            }
-            io.buf_addr = io.__buf_addr as u64;
+            };
+            bufs[i as usize] = addr;
         }
 
         let mut q = UblkQueue {
@@ -548,7 +518,7 @@ impl UblkQueue<'_> {
             cmd_inflight: 0,
             q_state: 0,
             q_ring: ring,
-            ios,
+            bufs,
             cqes_idx: 0,
             cqes_cnt: 0,
         };
@@ -561,7 +531,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn get_io_buf_addr(&self, tag: usize) -> u64 {
-        self.ios[tag].__buf_addr as u64
+        self.bufs[tag] as u64
     }
 
     #[inline(always)]
@@ -699,7 +669,7 @@ impl UblkQueue<'_> {
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
-        let mut ctx = UblkIOCtx(&mut self.q_ring, &mut self.ios[tag as usize], e);
+        let mut ctx = UblkIOCtx(&mut self.q_ring, self.bufs[tag as usize], e);
 
         let res = ops(&mut ctx);
         self.complete_ios(tag as usize, res);
