@@ -578,7 +578,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn __queue_io_cmd(&mut self, tag: u16, cmd_op:u32, res: i32) -> i32 {
+    fn queue_io_cmd(&mut self, tag: u16, cmd_op: u32, res: i32) -> i32 {
         let io = &self.ios[tag as usize];
 
         if (self.q_state & UBLK_QUEUE_STOPPING) != 0 {
@@ -605,6 +605,7 @@ impl UblkQueue<'_> {
                 .expect("submission fail");
         }
 
+        self.cmd_inflight += 1;
         trace!(
             "{}: (qid {} tag {} cmd_op {}) stopping {}",
             "queue_io_cmd",
@@ -615,17 +616,6 @@ impl UblkQueue<'_> {
         );
 
         1
-    }
-
-    #[inline(always)]
-    fn queue_io_cmd(&mut self, tag: u16, op: u32, io_cmd_result: i32) -> i32 {
-        let res = self.__queue_io_cmd(tag, op, io_cmd_result);
-
-        if res > 0 {
-            self.cmd_inflight += 1;
-        }
-
-        res
     }
 
     #[inline(always)]
