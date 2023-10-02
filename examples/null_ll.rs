@@ -19,13 +19,18 @@ fn test_add(dev_id: i32) {
     let park = s.parse::<i32>().unwrap();
     let nr_queues = 2; //two queues
                        //io depth: 64, max buf size: 512KB
+    let dflags = if park != 0 {
+        libublk::UBLK_DEV_F_COMP_BATCH
+    } else {
+        0
+    };
     let mut ctrl = UblkCtrl::new(
         dev_id,
         nr_queues,
         64,
         512 << 10,
         0,
-        libublk::UBLK_DEV_F_ADD_DEV,
+        libublk::UBLK_DEV_F_ADD_DEV | dflags,
     )
     .unwrap();
 
