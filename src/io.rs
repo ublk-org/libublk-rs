@@ -27,7 +27,6 @@ pub struct UblkIOCtx<'a, 'b, 'd>(
     &'a mut io_uring::IoUring<io_uring::squeue::Entry>,
     &'b mut UblkIO,
     &'d UblkCQE<'d>,
-    Option<Vec<(u16, i32)>>,
 );
 
 /// Check if this userdata is from target IO
@@ -115,23 +114,6 @@ impl<'a, 'b, 'd> UblkIOCtx<'a, 'b, 'd> {
     #[inline(always)]
     pub fn complete_io(&mut self, res: i32) {
         self.1.complete(res);
-    }
-
-    /// Add completed IOs represented by (tag, res) to batch list, so that
-    /// we can complete them after returning from io handling closure, which
-    /// must return `Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(batch))`, so
-    /// that we know that there are IOs in batch list.
-    ///
-    /// # Arguments:
-    ///
-    /// * `tag`: io tag
-    /// * `res`: IO handling result
-    ///
-    #[inline(always)]
-    pub fn add_to_comp_batch(&mut self, tag: u16, res: i32) {
-        if let Some(v) = self.3.as_mut() {
-            v.push((tag, res));
-        }
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -447,6 +429,7 @@ const UBLK_QUEUE_POLL: u32 = 1_u32 << 2;
 ///
 /// So far, each queue is handled by one its own io_uring.
 ///
+#[allow(dead_code)]
 pub struct UblkQueue<'a> {
     flags: u32,
     q_id: u16,
@@ -610,6 +593,7 @@ impl UblkQueue<'_> {
         Ok(q)
     }
 
+    #[cfg(feature = "fat_complete")]
     fn support_comp_batch(&self) -> bool {
         self.flags & super::UBLK_DEV_F_COMP_BATCH != 0
     }
@@ -745,13 +729,7 @@ impl UblkQueue<'_> {
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
-        let comp_batch = self.support_comp_batch();
-        let mut ctx = UblkIOCtx(
-            &mut self.q_ring,
-            &mut self.ios[tag as usize],
-            e,
-            if comp_batch { Some(Vec::new()) } else { None },
-        );
+        let mut ctx = UblkIOCtx(&mut self.q_ring, &mut self.ios[tag as usize], e);
 
         let res = ops(&mut ctx);
         self.complete_ios(res);
@@ -906,9 +884,9 @@ impl UblkQueue<'_> {
     /// only use its own `UblkIOCtx` to complete itself. But one eventfd is
     /// often reused for the whole queue, so normally multiple IOs are completed
     /// when handling single eventfd CQE. Here IO completion batch feature is
-    /// provided, and target code can call `io.add_to_comp_batch()` for each
-    /// completed IO(tag, result) in io closure. Then, all these added IOs will
-    /// be completed automatically.
+    /// provided, and target code can return UblkFatRes::BatchRes(batch) to
+    /// cover each completed IO(tag, result) in io closure. Then, all these
+    /// added IOs will be completed automatically.
     pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
