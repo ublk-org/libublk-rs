@@ -625,7 +625,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    #[cfg(feature = "fat_complete")]
     fn complete_ios(&mut self, tag: usize, res: Result<UblkIORes, UblkError>) {
         match res {
             Ok(UblkIORes::Result(res))
@@ -635,6 +634,7 @@ impl UblkQueue<'_> {
                 self.commit_and_queue_io_cmd(tag as u16, buf_addr, res);
             }
             Err(UblkError::IoQueued(_)) => {}
+            #[cfg(feature = "fat_complete")]
             Ok(UblkIORes::FatRes(fat)) => match fat {
                 UblkFatRes::BatchRes(ios) => {
                     assert!(self.support_comp_batch());
@@ -648,21 +648,6 @@ impl UblkQueue<'_> {
                     self.commit_and_queue_io_cmd(tag as u16, lba, res);
                 }
             },
-            _ => {}
-        };
-    }
-
-    #[inline(always)]
-    #[cfg(not(feature = "fat_complete"))]
-    fn complete_ios(&mut self, tag: usize, res: Result<UblkIORes, UblkError>) {
-        match res {
-            Ok(UblkIORes::Result(res))
-            | Err(UblkError::OtherError(res))
-            | Err(UblkError::UringIOError(res)) => {
-                let buf_addr = self.get_io_buf_addr(tag);
-                self.commit_and_queue_io_cmd(tag as u16, buf_addr, res);
-            }
-            Err(UblkError::IoQueued(_)) => {}
             _ => {}
         };
     }
