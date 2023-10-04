@@ -644,6 +644,9 @@ impl UblkQueue<'_> {
                         self.commit_and_queue_io_cmd(tag, buf_addr, item.1);
                     }
                 }
+                UblkFatRes::ZonedAppendRes((res, lba)) => {
+                    self.commit_and_queue_io_cmd(tag as u16, lba, res);
+                }
             },
             _ => {}
         };

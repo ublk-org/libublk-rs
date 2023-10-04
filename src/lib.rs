@@ -27,6 +27,7 @@ const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DE
 
 pub enum UblkFatRes {
     BatchRes(Vec<(u16, i32)>),
+    ZonedAppendRes((i32, u64)),
 }
 
 pub enum UblkIORes {
