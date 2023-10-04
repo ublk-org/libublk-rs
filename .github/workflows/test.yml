@@ -77,6 +77,13 @@ jobs:
         mkosi ssh /usr/share/libublk-rs/target/debug/test-libublk --nocapture
         mkosi ssh /usr/share/libublk-rs/target/debug/test-basic --nocapture
 
+        mkosi ssh echo "test --features=fat_complete"
+        mkosi ssh ls -l /usr/share/libublk-rs2/target/debug/deps/libublk*
+        mkosi ssh ls -l /usr/share/libublk-rs2/target/debug/deps/basic*
+        mkosi ssh ls -l /usr/share/libublk-rs2/target/debug/
+        mkosi ssh /usr/share/libublk-rs2/target/debug/test-libublk --nocapture
+        mkosi ssh /usr/share/libublk-rs2/target/debug/test-basic --nocapture
+
     - name: "cleanup"
       if: always()
       continue-on-error: true

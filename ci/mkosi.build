@@ -8,6 +8,29 @@
 #     $DESTDIR
 #     $BUILDDIR
 #
+#
+
+
+create_libublk()
+{
+	local src=$1
+	local rs_dir=$2
+
+	shift 2
+	local para=$@
+
+	cp -fr $src $rs_dir
+
+	cd $rs_dir
+	cargo test $para -v --no-run
+	cd -
+
+	TA=`find $rs_dir/target/debug/deps/ -type f -executable -name "libublk*"`
+	TB=`find $rs_dir/target/debug/deps/ -type f -executable -name "basic*"`
+	ln $TA $rs_dir/target/debug/test-libublk
+	ln $TB $rs_dir/target/debug/test-basic
+	ls -l $rs_dir/ci/
+}
 
 set -eo pipefail
 
@@ -17,14 +40,6 @@ chmod +x $DESTDIR/root/.bash_profile
 
 # Copy tests into the dest
 mkdir -p $DESTDIR/usr/share
-cp -fr $SRCDIR $DESTDIR/usr/share/libublk-rs
 
-cd $DESTDIR/usr/share/libublk-rs
-cargo test -v --no-run
-cd -
-
-TA=`find $DESTDIR/usr/share/libublk-rs/target/debug/deps/ -type f -executable -name "libublk*"`
-TB=`find $DESTDIR/usr/share/libublk-rs/target/debug/deps/ -type f -executable -name "basic*"`
-ln $TA $DESTDIR/usr/share/libublk-rs/target/debug/test-libublk
-ln $TB $DESTDIR/usr/share/libublk-rs/target/debug/test-basic
-ls -l $DESTDIR/usr/share/libublk-rs/ci/
+create_libublk $SRCDIR $DESTDIR/usr/share/libublk-rs
+create_libublk $SRCDIR $DESTDIR/usr/share/libublk-rs2 --features=fat_complete
