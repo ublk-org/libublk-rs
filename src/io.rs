@@ -380,8 +380,6 @@ pub struct UblkQueue<'a> {
     pub dev: &'a UblkDev,
     cmd_inflight: u32,
     q_state: u32,
-    cqes_idx: usize,
-    cqes_cnt: usize,
     bufs: Vec<*mut u8>,
     q_ring: IoUring<squeue::Entry>,
 }
@@ -519,8 +517,6 @@ impl UblkQueue<'_> {
             q_state: 0,
             q_ring: ring,
             bufs,
-            cqes_idx: 0,
-            cqes_cnt: 0,
         };
         q.submit_fetch_commands();
 
@@ -716,12 +712,11 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn reap_one_event<F>(&mut self, ops: F) -> usize
+    fn reap_one_event<F>(&mut self, ops: F, idx: i32, cnt: i32) -> usize
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
-        let idx = self.cqes_idx;
-        if idx >= self.cqes_cnt {
+        if idx >= cnt {
             return 0;
         }
 
@@ -733,28 +728,52 @@ impl UblkQueue<'_> {
         let ublk_cqe = UblkCQE(
             &cqe,
             if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
-                | if idx + 1 == self.cqes_cnt {
-                    UBLK_IO_F_LAST
-                } else {
-                    0
-                },
+                | if idx + 1 == cnt { UBLK_IO_F_LAST } else { 0 },
         );
         self.handle_cqe(ops, &ublk_cqe);
-
-        self.cqes_idx += 1;
 
         1
     }
 
     #[inline(always)]
     fn prep_reap_events(&mut self) -> usize {
-        self.cqes_cnt = self.q_ring.completion().len();
-        self.cqes_idx = 0;
-
-        self.cqes_cnt
+        self.q_ring.completion().len()
     }
 
-    /// Process the incoming IO from io_uring
+    #[inline(always)]
+    fn process_io(&mut self) -> Result<i32, UblkError> {
+        let to_wait = if self.get_poll() { 0 } else { 1 };
+
+        info!(
+            "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
+            self.dev.dev_info.dev_id,
+            self.q_id,
+            0,
+            self.cmd_inflight,
+            (self.q_state & UBLK_QUEUE_STOPPING)
+        );
+
+        if self.queue_is_done() && self.q_ring.submission().is_empty() {
+            return Err(UblkError::QueueIsDown(-libc::ENODEV));
+        }
+
+        let ret = self
+            .q_ring
+            .submit_and_wait(to_wait)
+            .map_err(UblkError::UringSubmissionError)?;
+        let reapped = self.prep_reap_events();
+
+        info!(
+            "submit result {}, reapped {} stop {} idle {}",
+            ret,
+            reapped,
+            (self.q_state & UBLK_QUEUE_STOPPING),
+            (self.q_state & UBLK_QUEUE_IDLE)
+        );
+        Ok(reapped as i32)
+    }
+
+    /// Process the incoming IOs(io commands & target IOs) from io_uring
     ///
     /// # Arguments:
     ///
@@ -801,43 +820,19 @@ impl UblkQueue<'_> {
     /// provided, and target code can return UblkFatRes::BatchRes(batch) to
     /// cover each completed IO(tag, result) in io closure. Then, all these
     /// added IOs will be completed automatically.
-    pub fn process_io<F>(&mut self, ops: F) -> Result<i32, UblkError>
+    pub fn process_ios<F>(&mut self, mut ops: F) -> Result<i32, UblkError>
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
-        let to_wait = if self.get_poll() { 0 } else { 1 };
-
-        info!(
-            "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
-            self.dev.dev_info.dev_id,
-            self.q_id,
-            0,
-            self.cmd_inflight,
-            (self.q_state & UBLK_QUEUE_STOPPING)
-        );
-
-        if self.reap_one_event(ops) > 0 {
-            return Ok(0);
+        match self.process_io() {
+            Err(r) => Err(r),
+            Ok(done) => {
+                for idx in 0..done {
+                    self.reap_one_event(&mut ops, idx, done);
+                }
+                Ok(0)
+            }
         }
-
-        if self.queue_is_done() && self.q_ring.submission().is_empty() {
-            return Err(UblkError::QueueIsDown(-libc::ENODEV));
-        }
-
-        let ret = self
-            .q_ring
-            .submit_and_wait(to_wait)
-            .map_err(UblkError::UringSubmissionError)?;
-        let reapped = self.prep_reap_events();
-
-        info!(
-            "submit result {}, reapped {} stop {} idle {}",
-            ret,
-            reapped,
-            (self.q_state & UBLK_QUEUE_STOPPING),
-            (self.q_state & UBLK_QUEUE_IDLE)
-        );
-        Ok(reapped as i32)
     }
 
     /// Wait and handle incoming IO
@@ -849,13 +844,12 @@ impl UblkQueue<'_> {
     /// Called in queue context. won't return unless error is observed.
     /// Wait and handle any incoming cqe until queue is down.
     ///
-    #[inline(always)]
     pub fn wait_and_handle_io<F>(&mut self, mut ops: F)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         loop {
-            match self.process_io(&mut ops) {
+            match self.process_ios(&mut ops) {
                 Err(_) => break,
                 _ => continue,
             }

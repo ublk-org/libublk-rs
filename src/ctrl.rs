@@ -758,7 +758,7 @@ impl UblkCtrl {
                     return Err(UblkError::UringIOError(res));
                 }
             }
-            match q.process_io(&mut ops) {
+            match q.process_ios(&mut ops) {
                 Err(r) => return Err(r),
                 _ => continue,
             }
