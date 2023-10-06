@@ -747,7 +747,6 @@ impl UblkCtrl {
         let mut started = false;
         let token = self.__start_dev(dev, true)?;
 
-        q.set_poll(true);
         while !started {
             std::thread::sleep(std::time::Duration::from_millis(10));
             if let Ok(res) = self.poll_cmd(token) {
@@ -758,12 +757,11 @@ impl UblkCtrl {
                     return Err(UblkError::UringIOError(res));
                 }
             }
-            match q.process_ios(&mut ops) {
+            match q.process_ios(&mut ops, 0) {
                 Err(r) => return Err(r),
                 _ => continue,
             }
         }
-        q.set_poll(false);
 
         Ok(0)
     }

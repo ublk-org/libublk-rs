@@ -356,7 +356,6 @@ impl UblkQueueCtx {
 
 const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
 const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
-const UBLK_QUEUE_POLL: u32 = 1_u32 << 2;
 
 /// UBLK queue abstraction
 ///
@@ -534,18 +533,6 @@ impl UblkQueue<'_> {
     #[cfg(feature = "fat_complete")]
     fn support_comp_batch(&self) -> bool {
         self.flags & super::UBLK_DEV_F_COMP_BATCH != 0
-    }
-
-    pub fn set_poll(&mut self, val: bool) {
-        if val {
-            self.q_state |= UBLK_QUEUE_POLL;
-        } else {
-            self.q_state &= !UBLK_QUEUE_POLL;
-        }
-    }
-
-    pub fn get_poll(&mut self) -> bool {
-        self.q_state & UBLK_QUEUE_POLL != 0
     }
 
     #[inline(always)]
@@ -736,9 +723,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn process_io(&mut self) -> Result<i32, UblkError> {
-        let to_wait = if self.get_poll() { 0 } else { 1 };
-
+    fn process_io(&mut self, to_wait: usize) -> Result<i32, UblkError> {
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
@@ -773,6 +758,9 @@ impl UblkQueue<'_> {
     /// # Arguments:
     ///
     /// * `ops`: IO handling Closure
+    ///
+    /// * `to_wait`: passed to io_uring_enter(), wait until how many events are
+    /// available
     ///
     /// When either io command or target io is coming, we are called for
     /// handling both. Basically the IO handling closure is called for
@@ -815,11 +803,11 @@ impl UblkQueue<'_> {
     /// provided, and target code can return UblkFatRes::BatchRes(batch) to
     /// cover each completed IO(tag, result) in io closure. Then, all these
     /// added IOs will be completed automatically.
-    pub fn process_ios<F>(&mut self, mut ops: F) -> Result<i32, UblkError>
+    pub fn process_ios<F>(&mut self, mut ops: F, to_wait: usize) -> Result<i32, UblkError>
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
-        match self.process_io() {
+        match self.process_io(to_wait) {
             Err(r) => Err(r),
             Ok(done) => {
                 for idx in 0..done {
@@ -844,7 +832,7 @@ impl UblkQueue<'_> {
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
         loop {
-            match self.process_ios(&mut ops) {
+            match self.process_ios(&mut ops, 1) {
                 Err(_) => break,
                 _ => continue,
             }
