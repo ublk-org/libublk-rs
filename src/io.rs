@@ -723,7 +723,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn process_io(&mut self, to_wait: usize) -> Result<i32, UblkError> {
+    fn wait_ios(&mut self, to_wait: usize) -> Result<i32, UblkError> {
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
@@ -807,7 +807,7 @@ impl UblkQueue<'_> {
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
-        match self.process_io(to_wait) {
+        match self.wait_ios(to_wait) {
             Err(r) => Err(r),
             Ok(done) => {
                 for idx in 0..done {
