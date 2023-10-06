@@ -433,7 +433,7 @@ pub struct UblkQueue<'a> {
     pub dev: &'a UblkDev,
     bufs: Vec<*mut u8>,
     state: RefCell<UblkQueueState>,
-    q_ring: IoUring<squeue::Entry>,
+    q_ring: RefCell<IoUring<squeue::Entry>>,
 }
 
 impl Drop for UblkQueue<'_> {
@@ -441,7 +441,7 @@ impl Drop for UblkQueue<'_> {
         let dev = self.dev;
         trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
-        if let Err(r) = self.q_ring.submitter().unregister_files() {
+        if let Err(r) = self.q_ring.borrow_mut().submitter().unregister_files() {
             error!("unregister fixed files failed {}", r);
         }
 
@@ -559,7 +559,7 @@ impl UblkQueue<'_> {
             bufs[i as usize] = addr;
         }
 
-        let mut q = UblkQueue {
+        let q = UblkQueue {
             flags: dev.flags,
             q_id,
             q_depth: depth,
@@ -569,7 +569,7 @@ impl UblkQueue<'_> {
                 cmd_inflight: 0,
                 state: 0,
             }),
-            q_ring: ring,
+            q_ring: RefCell::new(ring),
             bufs,
         };
         q.submit_fetch_commands();
@@ -592,7 +592,14 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn queue_io_cmd(&mut self, tag: u16, cmd_op: u32, buf_addr: u64, res: i32) -> i32 {
+    fn queue_io_cmd(
+        &self,
+        r: &mut IoUring<squeue::Entry>,
+        tag: u16,
+        cmd_op: u32,
+        buf_addr: u64,
+        res: i32,
+    ) -> i32 {
         let mut state = self.state.borrow_mut();
         if state.is_stopping() {
             return 0;
@@ -612,10 +619,7 @@ impl UblkQueue<'_> {
             .user_data(data);
 
         unsafe {
-            self.q_ring
-                .submission()
-                .push(&sqe)
-                .expect("submission fail");
+            r.submission().push(&sqe).expect("submission fail");
         }
 
         state.inc_cmd_inflight();
@@ -633,8 +637,15 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn commit_and_queue_io_cmd(&mut self, tag: u16, buf_addr: u64, io_cmd_result: i32) {
+    fn commit_and_queue_io_cmd(
+        &self,
+        r: &mut IoUring<squeue::Entry>,
+        tag: u16,
+        buf_addr: u64,
+        io_cmd_result: i32,
+    ) {
         self.queue_io_cmd(
+            r,
             tag,
             sys::UBLK_IO_COMMIT_AND_FETCH_REQ,
             buf_addr,
@@ -647,21 +658,32 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
-    fn submit_fetch_commands(&mut self) {
+    fn submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as usize);
-            self.queue_io_cmd(i as u16, sys::UBLK_IO_FETCH_REQ, buf_addr, -1);
+            self.queue_io_cmd(
+                &mut self.q_ring.borrow_mut(),
+                i as u16,
+                sys::UBLK_IO_FETCH_REQ,
+                buf_addr,
+                -1,
+            );
         }
     }
 
     #[inline(always)]
-    fn complete_ios(&mut self, tag: usize, res: Result<UblkIORes, UblkError>) {
+    fn complete_ios(
+        &self,
+        r: &mut IoUring<squeue::Entry>,
+        tag: usize,
+        res: Result<UblkIORes, UblkError>,
+    ) {
         match res {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
             | Err(UblkError::UringIOError(res)) => {
                 let buf_addr = self.get_io_buf_addr(tag);
-                self.commit_and_queue_io_cmd(tag as u16, buf_addr, res);
+                self.commit_and_queue_io_cmd(r, tag as u16, buf_addr, res);
             }
             Err(UblkError::IoQueued(_)) => {}
             #[cfg(feature = "fat_complete")]
@@ -671,11 +693,11 @@ impl UblkQueue<'_> {
                     for item in ios {
                         let tag = item.0;
                         let buf_addr = self.get_io_buf_addr(tag as usize);
-                        self.commit_and_queue_io_cmd(tag, buf_addr, item.1);
+                        self.commit_and_queue_io_cmd(r, tag, buf_addr, item.1);
                     }
                 }
                 UblkFatRes::ZonedAppendRes((res, lba)) => {
-                    self.commit_and_queue_io_cmd(tag as u16, lba, res);
+                    self.commit_and_queue_io_cmd(r, tag as u16, lba, res);
                 }
             },
             _ => {}
@@ -683,19 +705,20 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn call_io_closure<F>(&mut self, mut ops: F, tag: u32, e: &UblkCQE)
+    fn call_io_closure<F>(&self, mut ops: F, tag: u32, e: &UblkCQE)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
-        let mut ctx = UblkIOCtx(&mut self.q_ring, self.bufs[tag as usize], e);
+        let mut r = self.q_ring.borrow_mut();
+        let mut ctx = UblkIOCtx(&mut r, self.bufs[tag as usize], e);
 
         let res = ops(&mut ctx);
-        self.complete_ios(tag as usize, res);
+        self.complete_ios(&mut r, tag as usize, res);
     }
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe<F>(&mut self, ops: F, e: &UblkCQE)
+    fn handle_cqe<F>(&self, ops: F, e: &UblkCQE)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
@@ -751,7 +774,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn reap_one_event<F>(&mut self, ops: F, idx: i32, cnt: i32) -> usize
+    fn reap_one_event<F>(&self, ops: F, idx: i32, cnt: i32) -> usize
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
@@ -759,9 +782,11 @@ impl UblkQueue<'_> {
             return 0;
         }
 
-        let cqe = match self.q_ring.completion().next() {
-            None => return 0,
-            Some(r) => r,
+        let cqe = {
+            match self.q_ring.borrow_mut().completion().next() {
+                None => return 0,
+                Some(r) => r,
+            }
         };
 
         let ublk_cqe = UblkCQE(
@@ -775,7 +800,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn wait_ios(&mut self, to_wait: usize) -> Result<i32, UblkError> {
+    fn wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
         let state = self.state.borrow();
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
@@ -786,16 +811,18 @@ impl UblkQueue<'_> {
             state.is_stopping(),
         );
 
-        if state.queue_is_done() && self.q_ring.submission().is_empty() {
-            return Err(UblkError::QueueIsDown(-libc::ENODEV));
+        if state.queue_is_done() {
+            if self.q_ring.borrow_mut().submission().is_empty() {
+                return Err(UblkError::QueueIsDown(-libc::ENODEV));
+            }
         }
 
-        let ret = self
-            .q_ring
+        let mut r = self.q_ring.borrow_mut();
+        let ret = r
             .submit_and_wait(to_wait)
             .map_err(UblkError::UringSubmissionError)?;
 
-        let nr_cqes = self.q_ring.completion().len() as i32;
+        let nr_cqes = r.completion().len() as i32;
         info!(
             "submit result {}, nr_cqes {} stop {} idle {}",
             ret,
@@ -856,7 +883,7 @@ impl UblkQueue<'_> {
     /// provided, and target code can return UblkFatRes::BatchRes(batch) to
     /// cover each completed IO(tag, result) in io closure. Then, all these
     /// added IOs will be completed automatically.
-    pub fn process_ios<F>(&mut self, mut ops: F, to_wait: usize) -> Result<i32, UblkError>
+    pub fn process_ios<F>(&self, mut ops: F, to_wait: usize) -> Result<i32, UblkError>
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {
@@ -880,7 +907,7 @@ impl UblkQueue<'_> {
     /// Called in queue context. won't return unless error is observed.
     /// Wait and handle any incoming cqe until queue is down.
     ///
-    pub fn wait_and_handle_io<F>(&mut self, mut ops: F)
+    pub fn wait_and_handle_io<F>(&self, mut ops: F)
     where
         F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
     {

@@ -197,7 +197,7 @@ impl UblkSession {
                 }
                 _tx.send((q, unsafe { libc::gettid() })).unwrap();
 
-                let mut queue = io::UblkQueue::new(q, &_dev).unwrap();
+                let queue = io::UblkQueue::new(q, &_dev).unwrap();
                 let queue_closure = {
                     let ctx = queue.make_queue_ctx();
                     move |io_ctx: &mut io::UblkIOCtx| _q_fn(&ctx, io_ctx)

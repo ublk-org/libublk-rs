@@ -71,7 +71,7 @@ fn test_add(dev_id: i32) {
     for q in 0..nr_queues {
         let dev = Arc::clone(&ublk_dev);
         threads.push(std::thread::spawn(move || {
-            let mut queue = UblkQueue::new(q as u16, &dev).unwrap();
+            let queue = UblkQueue::new(q as u16, &dev).unwrap();
             let ctx = queue.make_queue_ctx();
 
             //IO handling closure(FnMut), we are driven by io_uring CQE, and
