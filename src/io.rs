@@ -736,11 +736,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn prep_reap_events(&mut self) -> usize {
-        self.q_ring.completion().len()
-    }
-
-    #[inline(always)]
     fn process_io(&mut self) -> Result<i32, UblkError> {
         let to_wait = if self.get_poll() { 0 } else { 1 };
 
@@ -761,16 +756,16 @@ impl UblkQueue<'_> {
             .q_ring
             .submit_and_wait(to_wait)
             .map_err(UblkError::UringSubmissionError)?;
-        let reapped = self.prep_reap_events();
 
+        let nr_cqes = self.q_ring.completion().len() as i32;
         info!(
-            "submit result {}, reapped {} stop {} idle {}",
+            "submit result {}, nr_cqes {} stop {} idle {}",
             ret,
-            reapped,
+            nr_cqes,
             (self.q_state & UBLK_QUEUE_STOPPING),
             (self.q_state & UBLK_QUEUE_IDLE)
         );
-        Ok(reapped as i32)
+        Ok(nr_cqes)
     }
 
     /// Process the incoming IOs(io commands & target IOs) from io_uring
