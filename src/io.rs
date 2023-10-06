@@ -580,6 +580,12 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
+        assert!(tag < self.q_depth as u32);
+        (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc
+    }
+
+    #[inline(always)]
     fn get_io_buf_addr(&self, tag: usize) -> u64 {
         self.bufs[tag] as u64
     }
@@ -713,6 +719,13 @@ impl UblkQueue<'_> {
         let mut ctx = UblkIOCtx(&mut r, self.bufs[tag as usize], e);
 
         let res = ops(&mut ctx);
+        self.complete_ios(&mut r, tag as usize, res);
+    }
+
+    #[inline(always)]
+    pub fn complete_io_cmd(&self, tag: u32, res: Result<UblkIORes, UblkError>) {
+        let mut r = self.q_ring.borrow_mut();
+
         self.complete_ios(&mut r, tag as usize, res);
     }
 
