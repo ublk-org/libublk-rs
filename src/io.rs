@@ -717,6 +717,18 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    fn update_state(&self, cqe: &cqueue::Entry) {
+        if !is_target_io(cqe.user_data()) {
+            let mut state = self.state.borrow_mut();
+
+            state.dec_cmd_inflight();
+            if cqe.result() == sys::UBLK_IO_RES_ABORT {
+                state.mark_stopping();
+            }
+        }
+    }
+
+    #[inline(always)]
     #[allow(unused_assignments)]
     fn handle_cqe<F>(&self, ops: F, e: &UblkCQE)
     where
@@ -758,14 +770,7 @@ impl UblkQueue<'_> {
             return;
         }
 
-        {
-            let mut state = self.state.borrow_mut();
-            state.dec_cmd_inflight();
-
-            if res == sys::UBLK_IO_RES_ABORT {
-                state.mark_stopping();
-            }
-        }
+        self.update_state(e.0);
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
