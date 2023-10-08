@@ -77,7 +77,7 @@ fn ublk_ctrl_prep_cmd(
             0
         },
         data: if (data.flags & CTRL_CMD_HAS_DATA) != 0 {
-            [data.data[0] as u64]
+            [data.data[0]]
         } else {
             [0]
         },

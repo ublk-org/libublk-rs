@@ -73,9 +73,9 @@ pub const BDEV_PATH: &str = "/dev/ublkb";
 pub fn ublk_alloc_buf(size: usize, align: usize) -> *mut u8 {
     let layout = match Layout::from_size_align(size, align) {
         Ok(r) => r,
-        Err(_) => return std::ptr::null_mut() as *mut u8,
+        Err(_) => return std::ptr::null_mut(),
     };
-    unsafe { alloc(layout) as *mut u8 }
+    unsafe { alloc(layout) }
 }
 
 pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
