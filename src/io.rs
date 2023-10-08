@@ -26,12 +26,6 @@ use std::os::unix::io::AsRawFd;
 ///
 pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u32);
 
-/// Check if this userdata is from target IO
-#[inline(always)]
-fn is_target_io(user_data: u64) -> bool {
-    (user_data & (1_u64 << 63)) != 0
-}
-
 impl<'a> UblkIOCtx<'a> {
     const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
     const UBLK_IO_F_LAST: u32 = 1u32 << 17;
@@ -69,7 +63,7 @@ impl<'a> UblkIOCtx<'a> {
     /// it is one target IO submitted from IO closure
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
-        is_target_io(self.0.user_data())
+        Self::is_target_io(self.0.user_data())
     }
 
     /// if this IO represented by CQE is the last one in current batch
@@ -139,6 +133,12 @@ impl<'a> UblkIOCtx<'a> {
     #[inline(always)]
     pub fn user_data_to_op(user_data: u64) -> u32 {
         ((user_data >> 16) & 0xff) as u32
+    }
+
+    /// Check if this userdata is from target IO
+    #[inline(always)]
+    fn is_target_io(user_data: u64) -> bool {
+        (user_data & (1_u64 << 63)) != 0
     }
 }
 
@@ -667,7 +667,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn update_state(&self, cqe: &cqueue::Entry) {
-        if !is_target_io(cqe.user_data()) {
+        if !UblkIOCtx::is_target_io(cqe.user_data()) {
             let mut state = self.state.borrow_mut();
 
             state.dec_cmd_inflight();
@@ -696,12 +696,12 @@ impl UblkQueue<'_> {
                 self.q_id,
                 tag,
                 cmd_op,
-                is_target_io(data),
+                UblkIOCtx::is_target_io(data),
                 self.state.borrow(),
             );
         }
 
-        if is_target_io(data) {
+        if UblkIOCtx::is_target_io(data) {
             let res = e.result();
 
             if res < 0 && res != -(libc::EAGAIN) {
