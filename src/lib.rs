@@ -25,14 +25,30 @@ pub const UBLK_DEV_F_RECOVER_DEV: u32 = 1u32 << 2;
 
 const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV;
 
+/// Ublk Fat completion result
 pub enum UblkFatRes {
+    /// Batch completion
+    ///
+    /// Vector is returned, and each element(`tag`, `result`) describes one
+    /// io command completion result.
     BatchRes(Vec<(u16, i32)>),
+
+    /// Zoned Append completion result
+    ///
+    /// (`result`, `returned lba`) is included in this result.
     ZonedAppendRes((i32, u64)),
 }
 
+/// Ublk IO completion result
+///
+/// Ok() part of io command completion result `Result<UblkIORes, UblkError>`
 pub enum UblkIORes {
+    /// normal result
+    ///
+    /// Completion result of this io command
     Result(i32),
 
+    /// Fat completion result
     #[cfg(feature = "fat_complete")]
     FatRes(UblkFatRes),
 }
