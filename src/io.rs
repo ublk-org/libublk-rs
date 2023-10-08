@@ -276,7 +276,7 @@ impl Drop for UblkDev {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct UblkQueueState {
+struct UblkQueueState {
     cmd_inflight: u32,
     state: u32,
 }
@@ -284,12 +284,6 @@ pub struct UblkQueueState {
 impl UblkQueueState {
     const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
     const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
-
-    pub fn new() -> Self {
-        Self {
-            ..Default::default()
-        }
-    }
 
     #[inline(always)]
     fn queue_is_quiesced(&self) -> bool {
@@ -845,7 +839,7 @@ impl UblkQueue<'_> {
     /// provided, and target code can return UblkFatRes::BatchRes(batch) to
     /// cover each completed IO(tag, result) in io closure. Then, all these
     /// added IOs will be completed automatically.
-    pub fn process_ios<F>(&self, mut ops: F, to_wait: usize) -> Result<i32, UblkError>
+    pub(crate) fn process_ios<F>(&self, mut ops: F, to_wait: usize) -> Result<i32, UblkError>
     where
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),
     {
