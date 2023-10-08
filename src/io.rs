@@ -275,9 +275,6 @@ impl Drop for UblkDev {
     }
 }
 
-const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
-const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
-
 #[derive(Debug, Clone, Default)]
 pub struct UblkQueueState {
     cmd_inflight: u32,
@@ -285,6 +282,9 @@ pub struct UblkQueueState {
 }
 
 impl UblkQueueState {
+    const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
+    const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
+
     pub fn new() -> Self {
         Self {
             ..Default::default()
@@ -308,12 +308,12 @@ impl UblkQueueState {
 
     #[inline(always)]
     fn is_stopping(&self) -> bool {
-        (self.state & UBLK_QUEUE_STOPPING) != 0
+        (self.state & Self::UBLK_QUEUE_STOPPING) != 0
     }
 
     #[inline(always)]
     fn is_idle(&self) -> bool {
-        (self.state & UBLK_QUEUE_IDLE) != 0
+        (self.state & Self::UBLK_QUEUE_IDLE) != 0
     }
 
     #[inline(always)]
@@ -327,7 +327,7 @@ impl UblkQueueState {
     }
 
     fn mark_stopping(&mut self) {
-        self.state |= UBLK_QUEUE_STOPPING;
+        self.state |= Self::UBLK_QUEUE_STOPPING;
     }
 }
 
