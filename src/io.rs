@@ -21,7 +21,7 @@ use std::os::unix::io::AsRawFd;
 /// `libublk::UBLK_DEV_F_COMP_BATCH`, and native & generic IO offloading will
 /// be added soon.
 ///
-/// UblkIOCtx & UblkQueueCtx provide enough information for target code to
+/// UblkIOCtx & UblkQueue provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
 ///
 pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u32);
@@ -275,37 +275,6 @@ impl Drop for UblkDev {
     }
 }
 
-/// UblkQueue Context info
-///
-///
-/// Can only hold read-only info for UblkQueue, so it is safe to
-/// mark it as Copy
-#[derive(Copy, Clone)]
-pub struct UblkQueueCtx {
-    pub depth: u16,
-    pub q_id: u16,
-
-    /// io command buffer start address of this queue
-    buf_addr: u64,
-}
-
-impl UblkQueueCtx {
-    /// Return IO command description info represented by `ublksrv_io_desc`
-    ///
-    /// # Arguments:
-    ///
-    /// * `tag`: io tag
-    ///
-    /// Returned `ublksrv_io_desc` data is readonly, and filled by ublk kernel
-    /// driver
-    ///
-    #[inline(always)]
-    pub fn get_iod(&self, tag: u16) -> *const sys::ublksrv_io_desc {
-        assert!(tag < self.depth);
-        (self.buf_addr + tag as u64 * 24) as *const sys::ublksrv_io_desc
-    }
-}
-
 const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
 const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
 
@@ -431,15 +400,6 @@ impl UblkQueue<'_> {
         round_up(size, page_sz)
     }
 
-    #[inline(always)]
-    pub fn make_queue_ctx(&self) -> UblkQueueCtx {
-        UblkQueueCtx {
-            buf_addr: self.io_cmd_buf,
-            depth: self.q_depth as u16,
-            q_id: self.q_id,
-        }
-    }
-
     /// New one ublk queue
     ///
     /// # Arguments:
@@ -533,6 +493,31 @@ impl UblkQueue<'_> {
         Ok(q)
     }
 
+    /// Return queue depth
+    ///
+    /// Queue depth decides the max count of inflight io command
+    #[inline(always)]
+    pub fn get_depth(&self) -> u32 {
+        self.q_depth
+    }
+
+    /// Return queue id
+    ///
+    /// Queue id is aligned with blk-mq's queue_num
+    #[inline(always)]
+    pub fn get_qid(&self) -> u16 {
+        self.q_id
+    }
+
+    /// Return IO command description info represented by `ublksrv_io_desc`
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io tag
+    ///
+    /// Returned `ublksrv_io_desc` data is readonly, and filled by ublk kernel
+    /// driver
+    ///
     #[inline(always)]
     pub fn get_iod(&self, tag: u16) -> *const sys::ublksrv_io_desc {
         assert!((tag as u32) < self.q_depth);
