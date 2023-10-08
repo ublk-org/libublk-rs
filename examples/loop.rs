@@ -1,6 +1,6 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 use log::trace;
 use serde::Serialize;
@@ -55,20 +55,20 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
     )
 }
 
-fn loop_queue_tgt_io(
-    io: &mut UblkIOCtx,
-    tag: u32,
-    iod: &libublk::sys::ublksrv_io_desc,
-) -> Result<UblkIORes, UblkError> {
+fn loop_queue_tgt_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx) {
+    // either start to handle or retry
+    let _iod = q.get_iod(tag);
+    let iod = unsafe { &*_iod };
+
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
-    let buf_addr = io.io_buf_addr();
-    let r = io.get_ring();
+    let buf_addr = q.get_io_buf_addr(tag);
 
     if op == libublk::sys::UBLK_IO_OP_WRITE_ZEROES || op == libublk::sys::UBLK_IO_OP_DISCARD {
-        return Err(UblkError::OtherError(-libc::EINVAL));
+        q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
+        return;
     }
 
     match op {
@@ -79,7 +79,11 @@ fn loop_queue_tgt_io(
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                r.submission().push(sqe).expect("submission fail");
+                q.q_ring
+                    .borrow_mut()
+                    .submission()
+                    .push(sqe)
+                    .expect("submission fail");
             }
         }
         libublk::sys::UBLK_IO_OP_READ => {
@@ -89,7 +93,11 @@ fn loop_queue_tgt_io(
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                r.submission().push(sqe).expect("submission fail");
+                q.q_ring
+                    .borrow_mut()
+                    .submission()
+                    .push(sqe)
+                    .expect("submission fail");
             }
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
@@ -99,36 +107,33 @@ fn loop_queue_tgt_io(
                 .flags(squeue::Flags::FIXED_FILE)
                 .user_data(data);
             unsafe {
-                r.submission().push(sqe).expect("submission fail");
+                q.q_ring
+                    .borrow_mut()
+                    .submission()
+                    .push(sqe)
+                    .expect("submission fail");
             }
         }
-        _ => return Err(UblkError::OtherError(-libc::EINVAL)),
-    }
-
-    Err(UblkError::IoQueued(0))
+        _ => q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL))),
+    };
 }
 
-fn _lo_handle_io(ctx: &UblkQueueCtx, i: &mut UblkIOCtx) -> Result<UblkIORes, UblkError> {
-    let tag = i.get_tag();
-
+fn _lo_handle_io(q: &UblkQueue, tag: u16, i: &UblkIOCtx) {
     // our IO on backing file is done
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
         let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
 
-        assert!(cqe_tag == tag);
+        assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            return Ok(UblkIORes::Result(res));
+            q.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+            return;
         }
     }
 
-    // either start to handle or retry
-    let _iod = ctx.get_iod(tag);
-    let iod = unsafe { &*_iod };
-
-    loop_queue_tgt_io(i, tag, iod)
+    loop_queue_tgt_io(q, tag, i);
 }
 
 fn test_add() {
@@ -156,9 +161,7 @@ fn test_add() {
             let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
             let lo_handle_io =
-                move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
-                    _lo_handle_io(ctx, io)
-                };
+                move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| _lo_handle_io(q, tag, io);
 
             sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
                 let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
+    use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     #[cfg(feature = "fat_complete")]
     use libublk::UblkFatRes;
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
@@ -32,13 +32,12 @@ mod tests {
             Ok(serde_json::json!({}))
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let handle_io =
-            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
-                let iod = ctx.get_iod(io.get_tag());
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+            let iod = q.get_iod(tag);
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                Ok(UblkIORes::Result(bytes))
-            };
+            q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+        };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
@@ -63,31 +62,26 @@ mod tests {
         assert!(Path::new(&dev_path).exists() == true);
     }
 
-    fn null_handle_io(ctx: &UblkQueueCtx, io: &mut UblkIOCtx) -> Result<UblkIORes, UblkError> {
-        let iod = ctx.get_iod(io.get_tag());
+    fn null_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx) {
+        let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        Ok(UblkIORes::Result(bytes))
+        q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
     }
 
     #[cfg(feature = "fat_complete")]
-    fn null_handle_io_batch(
-        ctx: &UblkQueueCtx,
-        io: &mut UblkIOCtx,
-    ) -> Result<UblkIORes, UblkError> {
-        let iod = ctx.get_iod(io.get_tag());
+    fn null_handle_io_batch(q: &UblkQueue, tag: u16, io: &UblkIOCtx) {
+        let iod = q.get_iod(tag);
         let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-        Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
+        let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
             io.get_tag() as u16,
             bytes,
-        )])))
+        )])));
+        q.complete_io_cmd(tag, res);
     }
 
-    fn __test_ublk_null(
-        dev_flags: u32,
-        handler: fn(&UblkQueueCtx, &mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
-    ) {
+    fn __test_ublk_null(dev_flags: u32, handler: fn(&UblkQueue, tag: u16, &UblkIOCtx)) {
         let sess = UblkSessionBuilder::default()
             .name("null")
             .depth(64_u32)
@@ -103,9 +97,7 @@ mod tests {
 
         let wh = {
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let handle_io = move |ctx: &UblkQueueCtx,
-                                  io: &mut UblkIOCtx|
-                  -> Result<UblkIORes, UblkError> { handler(ctx, io) };
+            let handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| handler(q, tag, io);
 
             sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
                 let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
@@ -144,17 +136,13 @@ mod tests {
         );
     }
 
-    fn rd_handle_io(
-        ctx: &UblkQueueCtx,
-        io: &mut UblkIOCtx,
-        start: u64,
-    ) -> Result<UblkIORes, UblkError> {
-        let _iod = ctx.get_iod(io.get_tag());
+    fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, start: u64) {
+        let _iod = q.get_iod(tag);
         let iod = unsafe { &*_iod };
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
         let op = iod.op_flags & 0xff;
-        let buf_addr = io.io_buf_addr();
+        let buf_addr = q.get_io_buf_addr(tag);
 
         match op {
             sys::UBLK_IO_OP_FLUSH => {}
@@ -172,10 +160,14 @@ mod tests {
                     bytes as usize,
                 );
             },
-            _ => return Err(UblkError::OtherError(-libc::EINVAL)),
+            _ => {
+                q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
+                return;
+            }
         }
 
-        Ok(UblkIORes::Result(bytes as i32))
+        let res = Ok(UblkIORes::Result(bytes as i32));
+        q.complete_io_cmd(tag, res);
     }
 
     fn __test_ublk_ramdisk(dev_id: i32) {
@@ -237,8 +229,7 @@ mod tests {
         .unwrap();
 
         let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
-        let ctx = queue.make_queue_ctx();
-        let qc = move |i: &mut UblkIOCtx| rd_handle_io(&ctx, i, buf_addr);
+        let qc = move |q: &UblkQueue, tag: u16, i: &UblkIOCtx| rd_handle_io(q, tag, i, buf_addr);
         ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })
             .unwrap();
 
@@ -285,18 +276,17 @@ mod tests {
         let mut q_vec = Vec::<i32>::new();
 
         let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
-        let ctx = queue.make_queue_ctx();
         // FuMut closure for handling our io_uring IO
-        let mut qc = move |i: &mut UblkIOCtx| {
-            let tag = i.get_tag();
+        let mut qc = move |q: &UblkQueue, tag: u16, _i: &UblkIOCtx| {
             q_vec.push(tag as i32);
             if q_vec.len() >= 64 {
                 q_vec.clear();
             }
 
-            let iod = ctx.get_iod(tag);
+            let iod = q.get_iod(tag);
 
-            Ok(UblkIORes::Result(unsafe { (*iod).nr_sectors << 9 } as i32))
+            let res = Ok(UblkIORes::Result(unsafe { (*iod).nr_sectors << 9 } as i32));
+            q.complete_io_cmd(tag, res);
         };
 
         ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })

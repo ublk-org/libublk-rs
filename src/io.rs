@@ -24,11 +24,7 @@ use std::os::unix::io::AsRawFd;
 /// UblkIOCtx & UblkQueueCtx provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
 ///
-pub struct UblkIOCtx<'a, 'd>(
-    &'a mut io_uring::IoUring<io_uring::squeue::Entry>,
-    *mut u8,
-    &'d UblkCQE<'d>,
-);
+pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u32);
 
 /// Check if this userdata is from target IO
 #[inline(always)]
@@ -36,22 +32,16 @@ fn is_target_io(user_data: u64) -> bool {
     (user_data & (1_u64 << 63)) != 0
 }
 
-impl<'a, 'd> UblkIOCtx<'a, 'd> {
-    /// Return io_uring instance which is shared in queue wide.
-    ///
-    /// Target IO often needs to handle IO command by io_uring further,
-    /// so io_uring instance has to be exposed.
-    #[inline(always)]
-    pub fn get_ring(&mut self) -> &mut io_uring::IoUring<io_uring::squeue::Entry> {
-        self.0
-    }
+impl<'a> UblkIOCtx<'a> {
+    const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
+    const UBLK_IO_F_LAST: u32 = 1u32 << 17;
 
     /// Return CQE's request of this IO, and used for handling target IO by
     /// io_uring. When the target IO is completed, its CQE is coming and we
     /// parse the IO result with result().
     #[inline(always)]
     pub fn result(&self) -> i32 {
-        self.2.result()
+        self.0.result()
     }
 
     /// Get this IO's tag.
@@ -65,42 +55,33 @@ impl<'a, 'd> UblkIOCtx<'a, 'd> {
     /// by passing `tag` via `Self::build_user_data()`
     #[inline(always)]
     pub fn get_tag(&self) -> u32 {
-        self.2.get_tag()
+        UblkIOCtx::user_data_to_tag(self.0.user_data())
     }
 
     /// Get this CQE's userdata
     ///
     #[inline(always)]
     pub fn user_data(&self) -> u64 {
-        self.2.user_data()
+        self.0.user_data()
     }
 
     /// Return false if it is one IO command from ublk driver, otherwise
     /// it is one target IO submitted from IO closure
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
-        self.2.is_tgt_io()
+        is_target_io(self.0.user_data())
     }
 
     /// if this IO represented by CQE is the last one in current batch
     #[inline(always)]
     pub fn is_last_cqe(&self) -> bool {
-        (self.2.flags() & UBLK_IO_F_LAST) != 0
+        (self.1 & Self::UBLK_IO_F_LAST) != 0
     }
 
     /// if this IO represented by CQE is the first one in current batch
     #[inline(always)]
     pub fn is_first_cqe(&self) -> bool {
-        (self.2.flags() & UBLK_IO_F_FIRST) != 0
-    }
-
-    /// Return pre-allocated io buffer for this tag.
-    ///
-    /// Don't use it in case of UBLK_F_USER_COPY, which needs target code
-    /// to manage io buffer.
-    #[inline(always)]
-    pub fn io_buf_addr(&self) -> *mut u8 {
-        self.1
+        (self.1 & Self::UBLK_IO_F_FIRST) != 0
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -158,36 +139,6 @@ impl<'a, 'd> UblkIOCtx<'a, 'd> {
     #[inline(always)]
     pub fn user_data_to_op(user_data: u64) -> u32 {
         ((user_data >> 16) & 0xff) as u32
-    }
-}
-
-const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
-const UBLK_IO_F_LAST: u32 = 1u32 << 17;
-
-struct UblkCQE<'d>(&'d cqueue::Entry, u32);
-
-impl<'a> UblkCQE<'a> {
-    #[inline(always)]
-    fn result(&self) -> i32 {
-        self.0.result()
-    }
-    #[inline(always)]
-    fn user_data(&self) -> u64 {
-        self.0.user_data()
-    }
-
-    #[inline(always)]
-    fn get_tag(&self) -> u32 {
-        UblkIOCtx::user_data_to_tag(self.0.user_data())
-    }
-
-    #[inline(always)]
-    fn is_tgt_io(&self) -> bool {
-        is_target_io(self.0.user_data())
-    }
-    #[inline(always)]
-    fn flags(&self) -> u32 {
-        self.1
     }
 }
 
@@ -349,8 +300,8 @@ impl UblkQueueCtx {
     /// driver
     ///
     #[inline(always)]
-    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
-        assert!(tag < self.depth as u32);
+    pub fn get_iod(&self, tag: u16) -> *const sys::ublksrv_io_desc {
+        assert!(tag < self.depth);
         (self.buf_addr + tag as u64 * 24) as *const sys::ublksrv_io_desc
     }
 }
@@ -433,7 +384,10 @@ pub struct UblkQueue<'a> {
     pub dev: &'a UblkDev,
     bufs: Vec<*mut u8>,
     state: RefCell<UblkQueueState>,
-    q_ring: RefCell<IoUring<squeue::Entry>>,
+
+    /// uring is shared for handling target IO, so has to be
+    /// public
+    pub q_ring: RefCell<IoUring<squeue::Entry>>,
 }
 
 impl Drop for UblkQueue<'_> {
@@ -580,14 +534,14 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    pub fn get_iod(&self, tag: u32) -> *const sys::ublksrv_io_desc {
-        assert!(tag < self.q_depth as u32);
+    pub fn get_iod(&self, tag: u16) -> *const sys::ublksrv_io_desc {
+        assert!((tag as u32) < self.q_depth);
         (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc
     }
 
     #[inline(always)]
-    fn get_io_buf_addr(&self, tag: usize) -> u64 {
-        self.bufs[tag] as u64
+    pub fn get_io_buf_addr(&self, tag: u16) -> *mut u8 {
+        self.bufs[tag as usize]
     }
 
     #[inline(always)]
@@ -666,7 +620,7 @@ impl UblkQueue<'_> {
     /// result and fetching new incoming IO
     fn submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
-            let buf_addr = self.get_io_buf_addr(i as usize);
+            let buf_addr = self.get_io_buf_addr(i as u16) as u64;
             self.queue_io_cmd(
                 &mut self.q_ring.borrow_mut(),
                 i as u16,
@@ -681,15 +635,15 @@ impl UblkQueue<'_> {
     fn complete_ios(
         &self,
         r: &mut IoUring<squeue::Entry>,
-        tag: usize,
+        tag: u16,
         res: Result<UblkIORes, UblkError>,
     ) {
         match res {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
             | Err(UblkError::UringIOError(res)) => {
-                let buf_addr = self.get_io_buf_addr(tag);
-                self.commit_and_queue_io_cmd(r, tag as u16, buf_addr, res);
+                let buf_addr = self.get_io_buf_addr(tag) as u64;
+                self.commit_and_queue_io_cmd(r, tag, buf_addr, res);
             }
             Err(UblkError::IoQueued(_)) => {}
             #[cfg(feature = "fat_complete")]
@@ -698,35 +652,32 @@ impl UblkQueue<'_> {
                     assert!(self.support_comp_batch());
                     for item in ios {
                         let tag = item.0;
-                        let buf_addr = self.get_io_buf_addr(tag as usize);
+                        let buf_addr = self.get_io_buf_addr(tag) as u64;
                         self.commit_and_queue_io_cmd(r, tag, buf_addr, item.1);
                     }
                 }
                 UblkFatRes::ZonedAppendRes((res, lba)) => {
-                    self.commit_and_queue_io_cmd(r, tag as u16, lba, res);
+                    self.commit_and_queue_io_cmd(r, tag, lba, res);
                 }
             },
             _ => {}
         };
     }
 
-    #[inline(always)]
-    fn call_io_closure<F>(&self, mut ops: F, tag: u32, e: &UblkCQE)
-    where
-        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
-    {
-        let mut r = self.q_ring.borrow_mut();
-        let mut ctx = UblkIOCtx(&mut r, self.bufs[tag as usize], e);
-
-        let res = ops(&mut ctx);
-        self.complete_ios(&mut r, tag as usize, res);
-    }
-
-    #[inline(always)]
-    pub fn complete_io_cmd(&self, tag: u32, res: Result<UblkIORes, UblkError>) {
+    /// Complete one io command
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io command tag
+    /// * `res`: io command result
+    ///
+    /// When calling this API, target code has to make sure that q_ring
+    /// won't be borrowed.
+    #[inline]
+    pub fn complete_io_cmd(&self, tag: u16, res: Result<UblkIORes, UblkError>) {
         let mut r = self.q_ring.borrow_mut();
 
-        self.complete_ios(&mut r, tag as usize, res);
+        self.complete_ios(&mut r, tag, res);
     }
 
     #[inline(always)]
@@ -743,9 +694,9 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn handle_cqe<F>(&self, ops: F, e: &UblkCQE)
+    fn handle_cqe<F>(&self, mut ops: F, e: &UblkIOCtx)
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
+        F: FnMut(&UblkQueue, u16, &UblkIOCtx),
     {
         let data = e.user_data();
         let res = e.result();
@@ -779,7 +730,7 @@ impl UblkQueue<'_> {
                     UblkIOCtx::user_data_to_op(data)
                 );
             }
-            self.call_io_closure(ops, tag, e);
+            ops(self, tag as u16, e);
             return;
         }
 
@@ -787,14 +738,14 @@ impl UblkQueue<'_> {
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            self.call_io_closure(ops, tag, e);
+            ops(self, tag as u16, e);
         }
     }
 
     #[inline(always)]
     fn reap_one_event<F>(&self, ops: F, idx: i32, cnt: i32) -> usize
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
+        F: FnMut(&UblkQueue, u16, &UblkIOCtx),
     {
         if idx >= cnt {
             return 0;
@@ -807,12 +758,19 @@ impl UblkQueue<'_> {
             }
         };
 
-        let ublk_cqe = UblkCQE(
+        let ctx = UblkIOCtx(
             &cqe,
-            if idx == 0 { UBLK_IO_F_FIRST } else { 0 }
-                | if idx + 1 == cnt { UBLK_IO_F_LAST } else { 0 },
+            if idx == 0 {
+                UblkIOCtx::UBLK_IO_F_FIRST
+            } else {
+                0
+            } | if idx + 1 == cnt {
+                UblkIOCtx::UBLK_IO_F_LAST
+            } else {
+                0
+            },
         );
-        self.handle_cqe(ops, &ublk_cqe);
+        self.handle_cqe(ops, &ctx);
 
         1
     }
@@ -829,6 +787,7 @@ impl UblkQueue<'_> {
             state.is_stopping(),
         );
 
+        #[allow(clippy::collapsible_if)]
         if state.queue_is_done() {
             if self.q_ring.borrow_mut().submission().is_empty() {
                 return Err(UblkError::QueueIsDown(-libc::ENODEV));
@@ -903,7 +862,7 @@ impl UblkQueue<'_> {
     /// added IOs will be completed automatically.
     pub fn process_ios<F>(&self, mut ops: F, to_wait: usize) -> Result<i32, UblkError>
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
+        F: FnMut(&UblkQueue, u16, &UblkIOCtx),
     {
         match self.wait_ios(to_wait) {
             Err(r) => Err(r),
@@ -927,7 +886,7 @@ impl UblkQueue<'_> {
     ///
     pub fn wait_and_handle_io<F>(&self, mut ops: F)
     where
-        F: FnMut(&mut UblkIOCtx) -> Result<UblkIORes, UblkError>,
+        F: FnMut(&UblkQueue, u16, &UblkIOCtx),
     {
         loop {
             match self.process_ios(&mut ops, 1) {

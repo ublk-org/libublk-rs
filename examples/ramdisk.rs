@@ -1,15 +1,13 @@
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 
-fn handle_io(
-    io: &mut UblkIOCtx,
-    iod: &libublk::sys::ublksrv_io_desc,
-    start: u64,
-) -> Result<UblkIORes, UblkError> {
+fn handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, start: u64) {
+    let _iod = q.get_iod(tag);
+    let iod = unsafe { &*_iod };
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as i32;
     let op = iod.op_flags & 0xff;
-    let buf_addr = io.io_buf_addr();
+    let buf_addr = q.get_io_buf_addr(tag);
 
     match op {
         libublk::sys::UBLK_IO_OP_READ => unsafe {
@@ -26,10 +24,13 @@ fn handle_io(
                 bytes as usize,
             );
         },
-        _ => return Err(UblkError::OtherError(-libc::EINVAL)),
+        _ => {
+            q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
+            return;
+        }
     }
 
-    Ok(UblkIORes::Result(bytes))
+    q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
 }
 
 ///run this ramdisk ublk daemon completely in single context with
@@ -61,12 +62,8 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     .unwrap();
 
     let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
-    let ctx = queue.make_queue_ctx();
-    let qc = move |i: &mut UblkIOCtx| {
-        let _iod = ctx.get_iod(i.get_tag());
-        let iod = unsafe { &*_iod };
-
-        handle_io(i, iod, buf_addr)
+    let qc = move |q: &UblkQueue, tag: u16, i: &UblkIOCtx| {
+        handle_io(q, tag, i, buf_addr);
     };
     ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })
         .unwrap();

@@ -1,7 +1,7 @@
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 #[cfg(feature = "fat_complete")]
 use libublk::UblkFatRes;
-use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
+use libublk::{ctrl::UblkCtrl, UblkIORes};
 
 fn null_add(dev_id: i32, comp_batch: bool) {
     let dflags = if comp_batch {
@@ -27,24 +27,23 @@ fn null_add(dev_id: i32, comp_batch: bool) {
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         #[cfg(feature = "fat_complete")]
-        let handle_io_batch =
-            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
-                let iod = ctx.get_iod(io.get_tag());
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        let handle_io_batch = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+            let iod = q.get_iod(tag);
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
-                    io.get_tag() as u16,
-                    bytes,
-                )])))
-            };
+            let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
+                io.get_tag() as u16,
+                bytes,
+            )])));
+            q.complete_io_cmd(tag, res);
+        };
 
-        let handle_io =
-            move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<UblkIORes, UblkError> {
-                let iod = ctx.get_iod(io.get_tag());
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+            let iod = q.get_iod(tag);
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                Ok(UblkIORes::Result(bytes))
-            };
+            q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+        };
         #[cfg(not(feature = "fat_complete"))]
         let handle_io_batch = handle_io;
 

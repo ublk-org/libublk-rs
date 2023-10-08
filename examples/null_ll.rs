@@ -1,39 +1,31 @@
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, UblkQueueCtx};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 #[cfg(feature = "fat_complete")]
 use libublk::UblkFatRes;
-use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
+use libublk::{ctrl::UblkCtrl, UblkIORes};
 use std::sync::Arc;
 
 #[cfg(not(feature = "fat_complete"))]
-fn null_handle_io(
-    ctx: &UblkQueueCtx,
-    io: &mut UblkIOCtx,
-    park: bool,
-) -> Result<UblkIORes, UblkError> {
-    let iod = ctx.get_iod(io.get_tag());
+fn null_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, park: bool) {
+    let iod = q.get_iod(tag);
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
     assert!(!park);
 
-    Ok(UblkIORes::Result(bytes))
+    q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
 }
 
 #[cfg(feature = "fat_complete")]
-fn null_handle_io(
-    ctx: &UblkQueueCtx,
-    io: &mut UblkIOCtx,
-    park: bool,
-) -> Result<UblkIORes, UblkError> {
-    let iod = ctx.get_iod(io.get_tag());
+fn null_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, park: bool) {
+    let iod = q.get_iod(tag);
     let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
     if !park {
-        Ok(UblkIORes::Result(bytes))
+        q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
     } else {
-        Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
-            io.get_tag() as u16,
-            bytes,
-        )])))
+        q.complete_io_cmd(
+            tag,
+            Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)]))),
+        );
     }
 }
 
@@ -72,12 +64,13 @@ fn test_add(dev_id: i32) {
         let dev = Arc::clone(&ublk_dev);
         threads.push(std::thread::spawn(move || {
             let queue = UblkQueue::new(q as u16, &dev).unwrap();
-            let ctx = queue.make_queue_ctx();
 
             //IO handling closure(FnMut), we are driven by io_uring CQE, and
             //this closure is called for every incoming CQE(io command or
             //target io completion)
-            let io_handler = move |io: &mut UblkIOCtx| null_handle_io(&ctx, io, park != 0);
+            let io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                null_handle_io(q, tag, io, park != 0)
+            };
             queue.wait_and_handle_io(io_handler);
         }));
     }

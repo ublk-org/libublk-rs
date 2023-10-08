@@ -36,8 +36,8 @@ The following is quick introduction for adding ublk-null block device, which
 is against low level APIs.
 
 ``` rust
-use libublk::{ctrl::UblkCtrl, UBLK_DEV_F_ADD_DEV};
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+use libublk::{ctrl::UblkCtrl, UblkIORes, UBLK_DEV_F_ADD_DEV};
 use std::sync::Arc;
 
 fn main() {
@@ -51,24 +51,22 @@ fn main() {
         dev.set_default_params(250_u64 << 30);
         Ok(serde_json::json!({}))
     };
-    let ublk_dev =
-        Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl).unwrap());
+    let ublk_dev = Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl).unwrap());
     let mut threads = Vec::new();
 
     for q in 0..nr_queues {
         let dev = Arc::clone(&ublk_dev);
         threads.push(std::thread::spawn(move || {
-            let mut queue = UblkQueue::new(q as u16, &dev).unwrap();
-            let ctx = queue.make_queue_ctx();
+            let queue = UblkQueue::new(q as u16, &dev).unwrap();
 
             //IO handling closure(FnMut), we are driven by io_uring
             //CQE, and this closure is called for every incoming CQE
             //(IO command or target io completion)
-            let io_handler = move |io: &mut UblkIOCtx| {
-                let iod = ctx.get_iod(io.get_tag());
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                Ok(UblkIORes::Result(bytes))
+                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
             };
             queue.wait_and_handle_io(io_handler);
         }));
@@ -86,8 +84,8 @@ The following ublk-null block device is built over high level
 APIs, which doesn't support IO closure of FnMut.
 
 ``` rust
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueueCtx};
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+use libublk::{ctrl::UblkCtrl, UblkIORes, UBLK_DEV_F_ADD_DEV};
 
 fn main() {
     let sess = libublk::UblkSessionBuilder::default()
@@ -103,9 +101,12 @@ fn main() {
     };
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let handle_io = move |ctx: &UblkQueueCtx, io: &mut UblkIOCtx| -> Result<i32, UblkError> {
-            let iod = ctx.get_iod(io.get_tag());
-            Ok(UblkIORes::Result((unsafe { (*iod).nr_sectors << 9 } as i32)))
+        let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+            let iod = q.get_iod(tag);
+            let res = Ok(UblkIORes::Result(
+                (unsafe { (*iod).nr_sectors << 9 } as i32),
+            ));
+            q.complete_io_cmd(tag, res);
         };
 
         sess.run(&mut ctrl, &dev, handle_io, |dev_id| {

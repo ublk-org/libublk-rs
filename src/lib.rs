@@ -164,11 +164,7 @@ impl UblkSession {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: Fn(&io::UblkQueueCtx, &mut io::UblkIOCtx) -> Result<UblkIORes, UblkError>
-            + Send
-            + Sync
-            + Clone
-            + 'static,
+        Q: Fn(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
     {
         use std::sync::mpsc;
 
@@ -199,9 +195,9 @@ impl UblkSession {
 
                 let queue = io::UblkQueue::new(q, &_dev).unwrap();
                 let queue_closure = {
-                    let ctx = queue.make_queue_ctx();
-                    move |io_ctx: &mut io::UblkIOCtx| _q_fn(&ctx, io_ctx)
+                    move |q: &io::UblkQueue, tag: u16, io_ctx: &io::UblkIOCtx| _q_fn(q, tag, io_ctx)
                 };
+
                 queue.wait_and_handle_io(queue_closure);
             }));
         }
@@ -234,11 +230,7 @@ impl UblkSession {
         worker_fn: W,
     ) -> Result<std::thread::JoinHandle<()>, UblkError>
     where
-        Q: Fn(&io::UblkQueueCtx, &mut io::UblkIOCtx) -> Result<UblkIORes, UblkError>
-            + Send
-            + Sync
-            + Clone
-            + 'static,
+        Q: Fn(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
         W: Fn(i32) + Send + Sync + 'static,
     {
         let handles = self.create_queue_handlers(ctrl, dev, io_closure);
