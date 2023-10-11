@@ -37,7 +37,8 @@ is against low level APIs.
 
 ``` rust
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkIORes, UBLK_DEV_F_ADD_DEV};
+use libublk::{ctrl::UblkCtrl, UblkIORes};
+use libublk::dev_flags::*;
 use std::sync::Arc;
 
 fn main() {
@@ -85,7 +86,8 @@ APIs, which doesn't support IO closure of FnMut.
 
 ``` rust
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkIORes, UBLK_DEV_F_ADD_DEV};
+use libublk::{ctrl::UblkCtrl, UblkIORes};
+use libublk::dev_flags::*;
 
 fn main() {
     let sess = libublk::UblkSessionBuilder::default()

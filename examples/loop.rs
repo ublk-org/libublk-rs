@@ -1,5 +1,6 @@
 use anyhow::Result;
 use io_uring::{opcode, squeue, types};
+use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 use log::trace;
@@ -154,7 +155,7 @@ fn test_add() {
         let wh = {
             let sess = libublk::UblkSessionBuilder::default()
                 .name("loop")
-                .dev_flags(libublk::UBLK_DEV_F_ADD_DEV)
+                .dev_flags(UBLK_DEV_F_ADD_DEV)
                 .build()
                 .unwrap();
 

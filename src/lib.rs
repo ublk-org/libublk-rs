@@ -13,17 +13,20 @@ pub mod ctrl;
 pub mod io;
 pub mod sys;
 
-/// feature: support IO batch completion from single IO tag, typical
-/// usecase is to complete IOs from eventfd CQE handler
-pub const UBLK_DEV_F_COMP_BATCH: u32 = 1u32 << 0;
+pub mod dev_flags {
+    /// feature: support IO batch completion from single IO tag, typical
+    /// usecase is to complete IOs from eventfd CQE handler
+    pub const UBLK_DEV_F_COMP_BATCH: u32 = 1u32 << 0;
 
-/// tell UblkCtrl that we are adding one new device
-pub const UBLK_DEV_F_ADD_DEV: u32 = 1u32 << 1;
+    /// tell UblkCtrl that we are adding one new device
+    pub const UBLK_DEV_F_ADD_DEV: u32 = 1u32 << 1;
 
-/// tell UblkCtrl that we are recovering one old device
-pub const UBLK_DEV_F_RECOVER_DEV: u32 = 1u32 << 2;
+    /// tell UblkCtrl that we are recovering one old device
+    pub const UBLK_DEV_F_RECOVER_DEV: u32 = 1u32 << 2;
 
-const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV;
+    pub const UBLK_DEV_F_ALL: u32 =
+        UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV;
+}
 
 /// Ublk Fat completion result
 pub enum UblkFatRes {

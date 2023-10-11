@@ -1,5 +1,5 @@
 use super::io::{UblkDev, UblkTgt};
-use super::{sys, UblkError};
+use super::{dev_flags, sys, UblkError};
 use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
@@ -201,7 +201,7 @@ impl UblkCtrl {
             return Err(UblkError::OtherError(-libc::ENOENT));
         }
 
-        if (dev_flags & !super::UBLK_DEV_F_ALL) != 0 {
+        if (dev_flags & !dev_flags::UBLK_DEV_F_ALL) != 0 {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
@@ -275,16 +275,16 @@ impl UblkCtrl {
     /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
     /// and it can't be done for adding device
     pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
-        assert!((dev_flags & super::UBLK_DEV_F_ADD_DEV) == 0);
+        assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
         Self::new(id, 0, 0, 0, 0, dev_flags)
     }
 
     fn for_add_dev(&self) -> bool {
-        (self.dev_flags & super::UBLK_DEV_F_ADD_DEV) != 0
+        (self.dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) != 0
     }
 
     fn for_recover_dev(&self) -> bool {
-        (self.dev_flags & super::UBLK_DEV_F_RECOVER_DEV) != 0
+        (self.dev_flags & dev_flags::UBLK_DEV_F_RECOVER_DEV) != 0
     }
 
     pub fn get_dev_flags(&self) -> u32 {

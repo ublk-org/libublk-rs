@@ -18,7 +18,7 @@ use std::os::unix::io::AsRawFd;
 /// If target won't use io_uring to handle IO, eventfd needs to be sent from
 /// the real handler context to wakeup ublk queue/io_uring context for
 /// driving the machinery. Eventfd gets minimized support with
-/// `libublk::UBLK_DEV_F_COMP_BATCH`, and native & generic IO offloading will
+/// `dev_flags::UBLK_DEV_F_COMP_BATCH`, and native & generic IO offloading will
 /// be added soon.
 ///
 /// UblkIOCtx & UblkQueue provide enough information for target code to
@@ -526,7 +526,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     #[cfg(feature = "fat_complete")]
     fn support_comp_batch(&self) -> bool {
-        self.flags & super::UBLK_DEV_F_COMP_BATCH != 0
+        self.flags & super::dev_flags::UBLK_DEV_F_COMP_BATCH != 0
     }
 
     #[inline(always)]

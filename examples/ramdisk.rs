@@ -1,3 +1,4 @@
+use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
 
@@ -45,9 +46,9 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         512 << 10,
         libublk::sys::UBLK_F_USER_RECOVERY as u64,
         if for_add {
-            libublk::UBLK_DEV_F_ADD_DEV
+            UBLK_DEV_F_ADD_DEV
         } else {
-            libublk::UBLK_DEV_F_RECOVER_DEV
+            UBLK_DEV_F_RECOVER_DEV
         },
     )
     .unwrap();

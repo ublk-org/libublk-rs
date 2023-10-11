@@ -1,21 +1,18 @@
+use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 #[cfg(feature = "fat_complete")]
 use libublk::UblkFatRes;
 use libublk::{ctrl::UblkCtrl, UblkIORes};
 
 fn null_add(dev_id: i32, comp_batch: bool) {
-    let dflags = if comp_batch {
-        libublk::UBLK_DEV_F_COMP_BATCH
-    } else {
-        0
-    };
+    let dflags = if comp_batch { UBLK_DEV_F_COMP_BATCH } else { 0 };
     println!("IO complete batch {}", comp_batch);
     let sess = libublk::UblkSessionBuilder::default()
         .name("null")
         .depth(64_u32)
         .nr_queues(2_u32)
         .id(dev_id)
-        .dev_flags(dflags | libublk::UBLK_DEV_F_ADD_DEV)
+        .dev_flags(dflags | UBLK_DEV_F_ADD_DEV)
         .build()
         .unwrap();
 

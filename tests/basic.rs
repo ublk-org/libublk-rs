@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use libublk::dev_flags::*;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     #[cfg(feature = "fat_complete")]
     use libublk::UblkFatRes;
@@ -23,7 +24,7 @@ mod tests {
             .name("null")
             .depth(16_u32)
             .nr_queues(2_u32)
-            .dev_flags(libublk::UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
@@ -54,8 +55,7 @@ mod tests {
 
     #[test]
     fn test_add_ctrl_dev() {
-        let ctrl =
-            UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, libublk::UBLK_DEV_F_ADD_DEV).unwrap();
+        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, UBLK_DEV_F_ADD_DEV).unwrap();
         let dev_path = format!("{}{}", libublk::CDEV_PATH, ctrl.dev_info.dev_id);
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -123,7 +123,7 @@ mod tests {
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
-        __test_ublk_null(libublk::UBLK_DEV_F_ADD_DEV, null_handle_io);
+        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_handle_io);
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn test_ublk_null_comp_batch() {
         __test_ublk_null(
-            libublk::UBLK_DEV_F_ADD_DEV | libublk::UBLK_DEV_F_COMP_BATCH,
+            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_COMP_BATCH,
             null_handle_io_batch,
         );
     }
@@ -209,15 +209,8 @@ mod tests {
     ) -> std::thread::JoinHandle<()> {
         let depth = 128;
         let nr_queues = 1;
-        let mut ctrl = UblkCtrl::new(
-            dev_id,
-            nr_queues,
-            depth,
-            512 << 10,
-            0,
-            libublk::UBLK_DEV_F_ADD_DEV,
-        )
-        .unwrap();
+        let mut ctrl =
+            UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, UBLK_DEV_F_ADD_DEV).unwrap();
         let ublk_dev = UblkDev::new(
             "ramdisk".to_string(),
             |dev: &mut UblkDev| {
@@ -261,7 +254,7 @@ mod tests {
     }
 
     fn __test_fn_mut_io_closure() -> std::thread::JoinHandle<()> {
-        let mut ctrl = UblkCtrl::new(-1, 1, 64, 512 << 10, 0, libublk::UBLK_DEV_F_ADD_DEV).unwrap();
+        let mut ctrl = UblkCtrl::new(-1, 1, 64, 512 << 10, 0, UBLK_DEV_F_ADD_DEV).unwrap();
         let ublk_dev = UblkDev::new(
             "FnMutClosure".to_string(),
             |dev: &mut UblkDev| {
