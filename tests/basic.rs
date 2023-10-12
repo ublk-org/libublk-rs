@@ -1,12 +1,15 @@
 #[cfg(test)]
 mod integration {
+    use io_uring::opcode;
     use libublk::dev_flags::*;
+    use libublk::exe::{Executor, UringOpFuture};
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
     use std::path::Path;
     use std::process::{Command, Stdio};
+    use std::rc::Rc;
 
     fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_flags: u32) {
         use std::os::unix::fs::PermissionsExt;
@@ -121,6 +124,91 @@ mod integration {
             UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_COMP_BATCH,
             null_handle_queue_batch,
         );
+    }
+
+    #[test]
+    fn test_ublk_null_async() {
+        // submit one io_uring Nop via io-uring crate and UringOpFuture, and
+        // user_data has to unique among io tasks, also has to encode tag
+        // info, so please build user_data by UblkIOCtx::build_user_data_async()
+        fn null_submit_nop(q: &UblkQueue<'_>, user_data: u64) -> UringOpFuture {
+            let nop_e = opcode::Nop::new().build().user_data(user_data);
+
+            unsafe {
+                q.q_ring
+                    .borrow_mut()
+                    .submission()
+                    .push(&nop_e)
+                    .expect("submission fail");
+            };
+            UringOpFuture { user_data }
+        }
+        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+            let iod = q.get_iod(tag);
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+            let data = UblkIOCtx::build_user_data_async(tag, 0xff, 0);
+
+            bytes + null_submit_nop(&q, data).await
+        }
+
+        // submit one io_uring Nop via io-uring crate and UringOpFuture, and
+        // user_data has to unique among io tasks, also has to encode tag
+        // info, so please build user_data by UblkIOCtx::build_user_data_async()
+        let dev_flags = UBLK_DEV_F_ADD_DEV;
+        let depth = 64_u16;
+        let sess = libublk::UblkSessionBuilder::default()
+            .name("null")
+            .nr_queues(2_u16)
+            .depth(depth)
+            .id(-1)
+            .dev_flags(dev_flags)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(serde_json::json!({}))
+        };
+
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        // queue handler supports Clone(), so will be cloned in each
+        // queue pthread context
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let exe = Executor::new(dev.get_nr_ios());
+
+            for tag in 0..depth {
+                let q = q_rc.clone();
+
+                exe.spawn(tag as u16, async move {
+                    let buf_addr = q.get_io_buf_addr(tag) as u64;
+                    let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
+                    let mut res = 0;
+                    loop {
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                        if cmd_res == sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        res = handle_io_cmd(&q, tag).await;
+                        cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                });
+            }
+            q_rc.wait_and_wake_io_tasks(&exe);
+        };
+
+        // kick off our targets
+        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
+            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+
+            // run sanity and disk IO test after ublk disk is ready
+            run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
+            read_ublk_disk(dev_id);
+
+            ctrl.del().unwrap();
+        })
+        .unwrap();
     }
 
     /// make one ublk-ramdisk and test:

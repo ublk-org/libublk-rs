@@ -34,52 +34,97 @@ libublk = "0.1"
 Next we can start using `libublk` crate.
 The following is quick introduction for creating one ublk-null target,
 and ublk block device(/dev/ublkbN) will be created after the code is
-run.
+run. And the device will be deleted after terminating this process
+by ctrl+C.
 
 ``` rust
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkIORes};
-use libublk::dev_flags::*;
+
+use libublk::{ctrl::UblkCtrl, exe::Executor, io::UblkDev, io::UblkQueue};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 fn main() {
+    let depth = 64_u32;
     let sess = libublk::UblkSessionBuilder::default()
-        .name("null")
-        .depth(64_u32)
+        .name("async_null")
+        .depth(depth)
         .nr_queues(2_u32)
-        .dev_flags(UBLK_DEV_F_ADD_DEV)
+        .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
+        .dev_flags(libublk::dev_flags::UBLK_DEV_F_ADD_DEV)
         .build()
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(250_u64 << 30);
         Ok(serde_json::json!({}))
     };
+    let g_dev_id = Arc::new(Mutex::new(-1));
+    let dev_id_sig = g_dev_id.clone();
+    let _ = ctrlc::set_handler(move || {
+        let dev_id = *dev_id_sig.lock().unwrap();
+        if dev_id >= 0 {
+            UblkCtrl::new_simple(dev_id, 0).unwrap().del_dev().unwrap();
+        }
+    });
+
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        // queue level logic
-        let q_handler = move |qid: u16, _dev: &UblkDev| {
-            // logic for io handling
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+        let q_handler = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let exe = Executor::new(dev.get_nr_ios());
+
+            // handle_io_cmd() can be .await nested, and support join!() over
+            // multiple Future objects(async function/block)
+            async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
                 let iod = q.get_iod(tag);
                 let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
-            };
+                bytes
+            }
 
-            UblkQueue::new(qid, _dev, true)
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+            for tag in 0..depth as u16 {
+                let q = q_rc.clone();
+
+                // spawn background io cmd task
+                exe.spawn(tag as u16, async move {
+                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                    let mut res = 0;
+                    loop {
+                        // commit io command result and queue new command for
+                        // incoming ublk io request
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, 0, res).await;
+                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        res = handle_io_cmd(&q, tag).await;
+                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                });
+            }
+
+            // flush all and wait for any completion.
+            q_rc.wait_and_wake_io_tasks(&exe);
         };
 
         // Now start this ublk target
-        sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
+        let dev_id_wh = g_dev_id.clone();
+        sess.run_target(&mut ctrl, &dev, q_handler, move |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
+
+            let mut guard = dev_id_wh.lock().unwrap();
+            *guard = dev_id;
         })
         .unwrap()
     };
     wh.join().unwrap();
 }
 ```
+
+With Rust async/.await, each io command is handled in one standalone io task.
+Both io command submission and its handling can be written via .await, it looks
+like sync programming, but everything is run in async actually. .await can
+be nested inside handle_io_cmd(), futures::join!() is supported too.
 
 ## unprivileged ublk support
 

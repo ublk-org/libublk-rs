@@ -1,6 +1,6 @@
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, exe::UringOpFuture, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
@@ -123,6 +123,21 @@ impl<'a> UblkIOCtx<'a> {
         tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
     }
 
+    /// Build userdata for async io_uring OP
+    ///
+    /// # Arguments:
+    /// * `tag`: io tag, length is 16bit
+    /// * `op`: io operation code, length is 8bit
+    /// * `op_id`: unique id in io task
+    ///
+    /// The built userdata has to be unique in this io task, so that
+    /// our executor can figure out the exact submitted OP with
+    /// completed cqe
+    #[inline(always)]
+    pub fn build_user_data_async(tag: u16, op: u32, op_id: u32) -> u64 {
+        Self::build_user_data(tag, op, op_id, true)
+    }
+
     /// Extract tag from userdata
     #[inline(always)]
     pub fn user_data_to_tag(user_data: u64) -> u32 {
@@ -139,6 +154,13 @@ impl<'a> UblkIOCtx<'a> {
     #[inline(always)]
     fn is_target_io(user_data: u64) -> bool {
         (user_data & (1_u64 << 63)) != 0
+    }
+
+    /// Check if this userdata is from IO command which is from
+    /// ublk driver
+    #[inline(always)]
+    fn is_io_command(user_data: u64) -> bool {
+        (user_data & (1_u64 << 63)) == 0
     }
 }
 
@@ -280,6 +302,13 @@ impl UblkDev {
             },
             ..Default::default()
         };
+    }
+
+    /// Return how many io slots, which is usually same with executor's
+    /// nr_tasks.
+    #[inline]
+    pub fn get_nr_ios(&self) -> u16 {
+        self.dev_info.queue_depth + self.tgt.extra_ios as u16
     }
 }
 
@@ -1008,6 +1037,65 @@ impl UblkQueue<'_> {
     {
         loop {
             match self.process_ios(&mut ops, 1) {
+                Err(_) => break,
+                _ => continue,
+            }
+        }
+    }
+
+    /// Flush queued SQEs to io_uring, then wait and wake up io tasks
+    ///
+    /// # Arguments:
+    ///
+    /// * `exe`: async executor
+    ///
+    /// * `to_wait`: passed to io_uring_enter(), wait until `to_wait` events
+    /// are available. It won't block in waiting for events if `to_wait` is
+    /// zero.
+    ///
+    /// Returns how many CQEs handled in this batch.
+    ///
+    /// This API is useful if user needs target specific batch handling.
+    pub fn flush_and_wake_io_tasks(
+        &self,
+        exe: &Executor,
+        to_wait: usize,
+    ) -> Result<i32, UblkError> {
+        match self.wait_ios(to_wait) {
+            Err(r) => Err(r),
+            Ok(done) => {
+                for _ in 0..done {
+                    let cqe = {
+                        match self.q_ring.borrow_mut().completion().next() {
+                            None => return Err(UblkError::OtherError(-libc::EINVAL)),
+                            Some(r) => r,
+                        }
+                    };
+                    let user_data = cqe.user_data();
+                    let tag = UblkIOCtx::user_data_to_tag(user_data);
+                    if UblkIOCtx::is_io_command(user_data) {
+                        self.update_state(&cqe);
+                    }
+                    exe.wake_with_uring_cqe(tag as u16, &cqe);
+                }
+                Ok(done)
+            }
+        }
+    }
+
+    /// Wait and handle incoming IO command
+    ///
+    /// # Arguments:
+    ///
+    /// * `exe`: Local async Executor
+    ///
+    /// Called in queue context. won't return unless error is observed.
+    /// Wait and handle any incoming cqe until queue is down.
+    ///
+    /// This should be the only foreground thing done in queue thread.
+    pub fn wait_and_wake_io_tasks(&self, exe: &Executor) {
+        loop {
+            match self.flush_and_wake_io_tasks(exe, 1) {
                 Err(_) => break,
                 _ => continue,
             }
