@@ -272,3 +272,59 @@ impl UblkSession {
         Ok(worker_qh)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::dev_flags::*;
+    use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use crate::UblkSessionBuilder;
+    use crate::{ctrl::UblkCtrl, UblkError, UblkIORes};
+
+    #[cfg(not(feature = "fat_complete"))]
+    #[test]
+    fn test_feature_fat_complete() {
+        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
+        assert!(sz == 16);
+    }
+
+    #[cfg(feature = "fat_complete")]
+    #[test]
+    fn test_feature_fat_complete() {
+        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
+        assert!(sz == 32);
+    }
+
+    fn __test_ublk_session() -> std::thread::JoinHandle<()> {
+        let sess = UblkSessionBuilder::default()
+            .name("null")
+            .depth(16_u32)
+            .nr_queues(2_u32)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(serde_json::json!({}))
+        };
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+            let iod = q.get_iod(tag);
+            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+            q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+        };
+
+        sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            d_ctrl.del().unwrap();
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_ublk_session() {
+        let wh = __test_ublk_session();
+        wh.join().unwrap();
+    }
+}

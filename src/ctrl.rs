@@ -859,3 +859,29 @@ impl UblkCtrl {
         Ok(0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::dev_flags::*;
+    use crate::ctrl::UblkCtrl;
+    use std::path::Path;
+
+    #[test]
+    fn test_ublk_get_features() {
+        let mut ctrl = UblkCtrl::new_simple(-1, 0).unwrap();
+
+        match ctrl.get_features() {
+            Ok(f) => eprintln!("features is {:04x}", f),
+            Err(_) => eprintln!("not support GET_FEATURES, require linux v6.5"),
+        }
+    }
+
+    #[test]
+    fn test_add_ctrl_dev() {
+        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, UBLK_DEV_F_ADD_DEV).unwrap();
+        let dev_path = format!("{}{}", crate::CDEV_PATH, ctrl.dev_info.dev_id);
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(Path::new(&dev_path).exists() == true);
+    }
+}
