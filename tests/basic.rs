@@ -146,40 +146,32 @@ mod tests {
         ctrl.del().unwrap();
     }
 
-    fn rd_add_dev(
-        dev_id: i32,
-        buf_addr: u64,
-        size: u64,
-        fn_ptr: fn(i32),
-    ) -> std::thread::JoinHandle<()> {
-        let depth = 128;
-        let nr_queues = 1;
-        let mut ctrl =
-            UblkCtrl::new(dev_id, nr_queues, depth, 512 << 10, 0, UBLK_DEV_F_ADD_DEV).unwrap();
-        let ublk_dev = UblkDev::new(
-            "ramdisk".to_string(),
-            |dev: &mut UblkDev| {
+    fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, fn_ptr: fn(i32)) {
+        let wh = {
+            let sess = libublk::UblkSessionBuilder::default()
+                .name("ramdisk")
+                .id(dev_id)
+                .nr_queues(1_u16)
+                .depth(128_u16)
+                .dev_flags(UBLK_DEV_F_ADD_DEV)
+                .build()
+                .unwrap();
+
+            let tgt_init = |dev: &mut UblkDev| {
                 dev.set_default_params(size);
                 Ok(serde_json::json!({}))
-            },
-            &mut ctrl,
-        )
-        .unwrap();
+            };
+            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+            let handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                rd_handle_io(q, tag, io, buf_addr);
+            };
 
-        let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
-        let qc = move |q: &UblkQueue, tag: u16, i: &UblkIOCtx| rd_handle_io(q, tag, i, buf_addr);
-        ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })
-            .unwrap();
-
-        ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
-
-        let dev_id = ctrl.dev_info.dev_id as i32;
-        let qh = std::thread::spawn(move || fn_ptr(dev_id));
-
-        queue.wait_and_handle_io(&qc);
-        ctrl.stop_dev(&ublk_dev).unwrap();
-
-        qh
+            sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
+                fn_ptr(dev_id);
+            })
+            .unwrap()
+        };
+        wh.join().unwrap();
     }
 
     /// make one ublk-ramdisk and test:
@@ -191,11 +183,9 @@ mod tests {
         let buf = libublk::ublk_alloc_buf(size as usize, 4096);
         let buf_addr = buf as u64;
 
-        let qh = rd_add_dev(-1, buf_addr, size, __test_ublk_ramdisk);
+        rd_add_dev(-1, buf_addr, size, __test_ublk_ramdisk);
 
         libublk::ublk_dealloc_buf(buf, size as usize, 4096);
-
-        qh.join().unwrap();
     }
 
     /// make FnMut closure for IO handling

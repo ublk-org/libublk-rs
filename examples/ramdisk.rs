@@ -37,42 +37,39 @@ fn handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, start: u64) {
 ///run this ramdisk ublk daemon completely in single context with
 ///async control command, no need Rust async any more
 fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
-    let depth = 128;
-    let nr_queues = 1;
-    let mut ctrl = UblkCtrl::new(
-        dev_id,
-        nr_queues,
-        depth,
-        512 << 10,
-        libublk::sys::UBLK_F_USER_RECOVERY as u64,
-        if for_add {
-            UBLK_DEV_F_ADD_DEV
-        } else {
-            UBLK_DEV_F_RECOVER_DEV
-        },
-    )
-    .unwrap();
-    let ublk_dev = UblkDev::new(
-        "ramdisk".to_string(),
-        |dev: &mut UblkDev| {
+    let dev_flags = if for_add {
+        UBLK_DEV_F_ADD_DEV
+    } else {
+        UBLK_DEV_F_RECOVER_DEV
+    };
+
+    let wh = {
+        let sess = libublk::UblkSessionBuilder::default()
+            .name("ramdisk")
+            .id(dev_id)
+            .nr_queues(1_u16)
+            .depth(128_u16)
+            .dev_flags(dev_flags)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(size);
             Ok(serde_json::json!({}))
-        },
-        &mut ctrl,
-    )
-    .unwrap();
+        };
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let lo_handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+            handle_io(q, tag, io, buf_addr);
+        };
 
-    let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
-    let qc = move |q: &UblkQueue, tag: u16, i: &UblkIOCtx| {
-        handle_io(q, tag, i, buf_addr);
+        sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
+            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            d_ctrl.dump();
+        })
+        .unwrap()
     };
-    ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })
-        .unwrap();
-
-    ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &qc).unwrap();
-    ctrl.dump();
-    queue.wait_and_handle_io(&qc);
-    ctrl.stop_dev(&ublk_dev).unwrap();
+    wh.join().unwrap();
 }
 
 fn rd_get_device_size(ctrl: &mut UblkCtrl) -> u64 {
