@@ -33,56 +33,7 @@ libublk = "0.1"
 
 Next we can start using `libublk` crate.
 The following is quick introduction for adding ublk-null block device, which
-is against low level APIs.
-
-``` rust
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkIORes};
-use libublk::dev_flags::*;
-use std::sync::Arc;
-
-fn main() {
-    let nr_queues = 2; //two queues
-                       //io depth: 64, max buf size: 512KB
-    let mut ctrl = UblkCtrl::new(-1, nr_queues, 64, 512 << 10, 0, UBLK_DEV_F_ADD_DEV).unwrap();
-
-    // target specific initialization by tgt_init closure, which is flexible
-    // for customizing target with captured environment
-    let tgt_init = |dev: &mut UblkDev| {
-        dev.set_default_params(250_u64 << 30);
-        Ok(serde_json::json!({}))
-    };
-    let ublk_dev = Arc::new(UblkDev::new("null".to_string(), tgt_init, &mut ctrl).unwrap());
-    let mut threads = Vec::new();
-
-    for q in 0..nr_queues {
-        let dev = Arc::clone(&ublk_dev);
-        threads.push(std::thread::spawn(move || {
-            let queue = UblkQueue::new(q as u16, &dev).unwrap();
-
-            //IO handling closure(FnMut), we are driven by io_uring
-            //CQE, and this closure is called for every incoming CQE
-            //(IO command or target io completion)
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                let iod = q.get_iod(tag);
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
-
-                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
-            };
-            queue.wait_and_handle_io(io_handler);
-        }));
-    }
-    ctrl.start_dev(&ublk_dev).unwrap();
-    ctrl.dump();
-    for qh in threads {
-        qh.join().unwrap();
-    }
-    ctrl.stop_dev(&ublk_dev).unwrap();
-}
-```
-
-The following ublk-null block device is built over high level
-APIs, which doesn't support IO closure of FnMut.
+is built over libublk high level APIs.
 
 ``` rust
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};

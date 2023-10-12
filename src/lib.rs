@@ -183,7 +183,7 @@ impl UblkSession {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: Fn(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
+        Q: FnMut(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
     {
         use std::sync::mpsc;
 
@@ -198,7 +198,7 @@ impl UblkSession {
 
             let mut affinity = ctrl::UblkQueueAffinity::new();
             ctrl.get_queue_affinity(q as u32, &mut affinity).unwrap();
-            let _q_fn = q_fn.clone();
+            let mut _q_fn = q_fn.clone();
 
             q_threads.push(std::thread::spawn(move || {
                 //setup pthread affinity first, so that any allocation may
@@ -249,7 +249,7 @@ impl UblkSession {
         worker_fn: W,
     ) -> Result<std::thread::JoinHandle<()>, UblkError>
     where
-        Q: Fn(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
+        Q: FnMut(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
         W: Fn(i32) + Send + Sync + 'static,
     {
         let handles = self.create_queue_handlers(ctrl, dev, io_closure);

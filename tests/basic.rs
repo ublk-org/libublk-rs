@@ -201,54 +201,46 @@ mod tests {
     /// make FnMut closure for IO handling
     #[test]
     fn test_fn_mut_io_closure() {
-        fn __test_fn_mut_io_closure() -> std::thread::JoinHandle<()> {
-            let mut ctrl = UblkCtrl::new(-1, 1, 64, 512 << 10, 0, UBLK_DEV_F_ADD_DEV).unwrap();
-            let ublk_dev = UblkDev::new(
-                "FnMutClosure".to_string(),
-                |dev: &mut UblkDev| {
-                    dev.set_default_params(32_u64 << 20);
-                    Ok(serde_json::json!({}))
-                },
-                &mut ctrl,
-            )
+        let sess = libublk::UblkSessionBuilder::default()
+            .name("FnMutClosure")
+            .depth(64_u32)
+            .nr_queues(2_u32)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
             .unwrap();
-
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(serde_json::json!({}))
+        };
+        let wh = {
+            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
             // modify this vector in io handling closure
             let mut q_vec = Vec::<i32>::new();
 
-            let mut queue = UblkQueue::new(0, &ublk_dev).unwrap();
-            // FuMut closure for handling our io_uring IO
-            let mut qc = move |q: &UblkQueue, tag: u16, _i: &UblkIOCtx| {
-                q_vec.push(tag as i32);
-                if q_vec.len() >= 64 {
-                    q_vec.clear();
+            let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let res = Ok(UblkIORes::Result(
+                    (unsafe { (*iod).nr_sectors << 9 } as i32),
+                ));
+
+                {
+                    q_vec.push(tag as i32);
+                    if q_vec.len() >= 64 {
+                        q_vec.clear();
+                    }
                 }
 
-                let iod = q.get_iod(tag);
-
-                let res = Ok(UblkIORes::Result(unsafe { (*iod).nr_sectors << 9 } as i32));
                 q.complete_io_cmd(tag, res);
             };
 
-            ctrl.configure_queue(&ublk_dev, 0, unsafe { libc::gettid() })
-                .unwrap();
-
-            ctrl.start_dev_in_queue(&ublk_dev, &mut queue, &mut qc)
-                .unwrap();
-
-            let dev_id = ctrl.dev_info.dev_id as i32;
-            let qh = std::thread::spawn(move || {
-                let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                ctrl.del().unwrap();
-            });
-
-            queue.wait_and_handle_io(&mut qc);
-            ctrl.stop_dev(&ublk_dev).unwrap();
-
-            qh
-        }
-
-        __test_fn_mut_io_closure().join().unwrap();
+            sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                d_ctrl.dump();
+                d_ctrl.del().unwrap();
+            })
+            .unwrap()
+        };
+        wh.join().unwrap();
     }
 
     fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
