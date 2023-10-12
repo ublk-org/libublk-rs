@@ -40,6 +40,7 @@ bitmaps = "3.2.0"
 log = {version = "0.4", features = ["release_max_level_off"]}
 thiserror = "1.0.43"
 derive_builder = "0.12"
+futures = "0.3"
 
 [dev-dependencies]
 block-utils = "0.11.0"
