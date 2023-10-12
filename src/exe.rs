@@ -35,34 +35,62 @@ impl Future for UringOpFuture {
 }
 
 pub struct Task<'a> {
+    cnt: i16,
     future: Pin<Box<dyn Future<Output = ()> + 'a>>,
 }
 
 impl<'a> Task<'a> {
     #[inline(always)]
     pub fn new(future: Pin<Box<dyn Future<Output = ()> + 'a>>) -> Task {
-        Task { future }
+        Task { cnt: 0, future }
     }
     #[inline(always)]
     fn poll(&mut self, context: &mut Context) -> Poll<()> {
-        self.future.as_mut().poll(context)
+        self.cnt += 1;
+        let res = self.future.as_mut().poll(context);
+        self.cnt -= 1;
+
+        res
+    }
+
+    fn poll_without_ctx(&mut self) -> Poll<()> {
+        let waker = dummy_waker(self as *mut Task);
+        let mut context = Context::from_waker(&waker);
+
+        self.poll(&mut context)
     }
 }
 
 #[inline(always)]
-fn dummy_raw_waker() -> RawWaker {
-    fn no_op(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        dummy_raw_waker()
+fn dummy_raw_waker(data: *const ()) -> RawWaker {
+    fn clone(data: *const ()) -> RawWaker {
+        dummy_raw_waker(data)
     }
+    fn wake_op(data: *const ()) {
+        let raw_task = data as *mut Task;
 
-    let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
-    RawWaker::new(std::ptr::null::<()>(), vtable)
+        unsafe {
+            if (*raw_task).cnt == 0 {
+                let _ = (*raw_task).poll_without_ctx();
+            }
+        };
+    }
+    fn drop_op(_: *const ()) {}
+
+    let vtable = &RawWakerVTable::new(clone, wake_op, wake_op, drop_op);
+    RawWaker::new(data, vtable)
 }
 
+/// Save current Task pointer into `data` of Waker, this way looks
+/// tricky and fragile, but wakeup won't be done after the task
+/// is completed, so this way is just fine.
+///
+/// But it uses raw pointer, borrow checker won't cover it any
+/// more.
 #[inline(always)]
-fn dummy_waker() -> Waker {
-    unsafe { Waker::from_raw(dummy_raw_waker()) }
+fn dummy_waker(exec: *mut Task) -> Waker {
+    let data = exec as *const ();
+    unsafe { Waker::from_raw(dummy_raw_waker(data)) }
 }
 
 // For simulating one '*const cqueue::Entry'stack variable, so just fine to
@@ -116,11 +144,15 @@ impl<'a> Executor<'a> {
 
     #[inline(always)]
     fn __tick(&self, task: &mut Task) -> Poll<()> {
-        // Dummy waker and context (not used as we poll all tasks)
-        let waker = dummy_waker();
-        let mut context = Context::from_waker(&waker);
+        task.poll_without_ctx()
+    }
 
-        task.poll(&mut context)
+    #[inline]
+    fn run_task(&self, task: &mut Task) -> bool {
+        match self.__tick(task) {
+            Poll::Ready(()) => true,
+            Poll::Pending => false,
+        }
     }
 
     /// Tick one io task
@@ -129,10 +161,7 @@ impl<'a> Executor<'a> {
         let mut tasks = self.inner.tasks.borrow_mut();
         let task = &mut tasks[tag as usize];
 
-        match self.__tick(task) {
-            Poll::Ready(()) => true,
-            Poll::Pending => false,
-        }
+        self.run_task(task)
     }
 
     /// Called when one cqe is completed
@@ -168,6 +197,7 @@ impl<'a> Executor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     /// Test Executor::spawn()
     #[test]
@@ -235,5 +265,97 @@ mod tests {
         assert!(!__test_uring_wakeup(&e, 0, k, res));
         //simulate one uring op completion
         assert!(__test_uring_wakeup(&e, 0, k2, res2));
+    }
+
+    /// Test Waker
+    ///
+    /// Also one simple prototype of spawn_blocking() for offloading
+    /// task to another threads, and the code is borrowed from Programming
+    /// Rust(2nd) crab book.
+    #[test]
+    fn test_executor_waker() {
+        struct TestWakerFuture(Arc<Mutex<WakerFutureData>>);
+        struct WakerFutureData {
+            val: i32,
+            waker: Option<Waker>,
+        }
+
+        impl Future for TestWakerFuture {
+            type Output = i32;
+            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                let mut guard = self.0.lock().unwrap();
+
+                if guard.val == 2 {
+                    Poll::Ready(5)
+                } else {
+                    guard.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+
+        async fn __test_waker(inner: Arc<Mutex<WakerFutureData>>) {
+            let wf = TestWakerFuture(inner);
+
+            let data = wf.await;
+            assert!(data == 5);
+            println!("wake successfully");
+        }
+
+        let inner = Arc::new(Mutex::new(WakerFutureData {
+            val: 0,
+            waker: None,
+        }));
+
+        let e = Executor::new(1);
+        let i = inner.clone();
+        e.spawn(0, async move { __test_waker(i).await });
+
+        {
+            let guard = inner.lock().unwrap();
+            assert!(guard.val == 0);
+        }
+
+        std::thread::spawn({
+            let inner = inner.clone();
+
+            move || {
+                let maybe_waker = {
+                    let mut guard = inner.lock().unwrap();
+                    guard.val = 2;
+                    guard.waker.take()
+                };
+
+                if let Some(waker) = maybe_waker {
+                    waker.wake();
+                }
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Test async mutex
+    #[test]
+    fn test_excutor_async_mutex() {
+        use async_std::sync::Mutex;
+        async fn __test_async_mutex(d: Rc<Mutex<i32>>) {
+            let mut guard = d.lock().await;
+            *guard += 10;
+        }
+
+        let data = Rc::new(Mutex::new(0));
+        let e = Executor::new(3);
+
+        let d0 = data.clone();
+        let d1 = data.clone();
+        let d3 = data.clone();
+        e.spawn(0, async move { __test_async_mutex(d0).await });
+        e.spawn(1, async move { __test_async_mutex(d1).await });
+        e.spawn(2, async move {
+            let guard = d3.lock().await;
+            assert!(*guard == 20);
+            println!("async mutex test is done");
+        });
     }
 }

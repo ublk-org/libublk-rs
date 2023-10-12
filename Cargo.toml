@@ -50,3 +50,4 @@ anyhow = {version = "1.0.66", features = ["default"]}
 clap = "4.3"
 nix = "0.26.2"
 ilog = "1.0.1"
+async-std = {version = "1.12.0"}
