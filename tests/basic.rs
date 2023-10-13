@@ -413,28 +413,4 @@ mod tests {
         let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
         assert!(sz == 32);
     }
-
-    #[test]
-    fn test_not_alloc_io_buf() {
-        let depth = 64_u32;
-        let sess = UblkSessionBuilder::default()
-            .name("no_buf")
-            .depth(depth)
-            .nr_queues(1_u32)
-            .dev_flags(UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_NOT_ALLOC_IO_BUF)
-            .build()
-            .unwrap();
-
-        let tgt_init = |dev: &mut UblkDev| {
-            dev.set_default_params(250_u64 << 30);
-            Ok(serde_json::json!({}))
-        };
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let q = UblkQueue::new(0, &dev).unwrap();
-
-        for i in 0..depth {
-            assert!(q.get_io_buf_addr(i as u16) == std::ptr::null_mut());
-        }
-        ctrl.stop_dev(&dev).unwrap();
-    }
 }

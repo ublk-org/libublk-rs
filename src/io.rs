@@ -453,9 +453,7 @@ impl UblkQueue<'_> {
             // extra io slot needn't to allocate buffer
             let addr = {
                 if i < depth {
-                    if (dev.dev_info.flags & (super::sys::UBLK_F_USER_COPY as u64)) == 0
-                        && (dev.flags & super::dev_flags::UBLK_DEV_F_NOT_ALLOC_IO_BUF) == 0
-                    {
+                    if (dev.dev_info.flags & (super::sys::UBLK_F_USER_COPY as u64)) == 0 {
                         super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
                             libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
                         })
