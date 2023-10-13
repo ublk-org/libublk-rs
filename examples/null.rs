@@ -13,6 +13,7 @@ fn null_add(dev_id: i32, comp_batch: bool) {
         .nr_queues(2_u32)
         .id(dev_id)
         .dev_flags(dflags | UBLK_DEV_F_ADD_DEV)
+        .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
         .build()
         .unwrap();
 

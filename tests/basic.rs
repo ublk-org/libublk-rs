@@ -13,6 +13,7 @@ mod tests {
             .depth(64_u32)
             .nr_queues(2_u32)
             .dev_flags(dev_flags)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
             .build()
             .unwrap();
 

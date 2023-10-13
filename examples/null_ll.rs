@@ -41,7 +41,7 @@ fn test_add(dev_id: i32) {
         nr_queues,
         64,
         512 << 10,
-        0,
+        libublk::sys::UBLK_F_USER_COPY as u64,
         UBLK_DEV_F_ADD_DEV | dflags,
     )
     .unwrap();
