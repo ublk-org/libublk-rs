@@ -134,6 +134,9 @@ Queue wide data is per-thread and can be shared in io handler by
 Rc() & RefCell().
 
 
+ * [`examples/loop.rs`](examples/loop.rs): real example using async/await & io_uring.
+
+
 ## unprivileged ublk support
 
 In unprivileged mode(`UBLK_F_UNPRIVILEGED_DEV`), ublk device can be created
