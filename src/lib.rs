@@ -183,7 +183,7 @@ impl UblkSession {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: FnMut(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
     {
         use std::sync::mpsc;
 
@@ -212,12 +212,7 @@ impl UblkSession {
                 }
                 _tx.send((q, unsafe { libc::gettid() })).unwrap();
 
-                let queue = io::UblkQueue::new(q, &_dev).unwrap();
-                let queue_closure = {
-                    move |q: &io::UblkQueue, tag: u16, io_ctx: &io::UblkIOCtx| _q_fn(q, tag, io_ctx)
-                };
-
-                queue.wait_and_handle_io(queue_closure);
+                _q_fn(q, &_dev);
             }));
         }
 
@@ -237,28 +232,65 @@ impl UblkSession {
     /// Kick off the ublk device, and `/dev/ublkbN` will be created and visible
     /// to userspace.
     ///
-    /// So far, IO handling closure doesn't support FnMut, and please switch to
-    /// low level APIs if your IO handling closure needs to be FnMut.
+    /// * `ctrl`: UblkCtrl device reference
+    /// * `dev`: UblkDev device reference
+    /// * `io_fn`: io handler for setting up the queue and its handler
+    /// * `device_fn`: handler called after device is started
     ///
-    /// This function won't return until the device is removed.
     pub fn run<Q, W>(
         &self,
         ctrl: &mut ctrl::UblkCtrl,
         dev: &Arc<io::UblkDev>,
-        io_closure: Q,
-        worker_fn: W,
+        io_fn: Q,
+        device_fn: W,
     ) -> Result<std::thread::JoinHandle<()>, UblkError>
     where
         Q: FnMut(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
-        W: Fn(i32) + Send + Sync + 'static,
+        W: FnOnce(i32) + Send + Sync + 'static,
     {
-        let handles = self.create_queue_handlers(ctrl, dev, io_closure);
+        let mut io_fn = io_fn.clone();
+        let q_fn = move |q: u16, dev: &io::UblkDev| {
+            let queue = io::UblkQueue::new(q, dev).unwrap();
+            let queue_closure = {
+                move |q: &io::UblkQueue, tag: u16, io_ctx: &io::UblkIOCtx| io_fn(q, tag, io_ctx)
+            };
+
+            queue.wait_and_handle_io(queue_closure);
+        };
+        self.run_target(ctrl, dev, q_fn, device_fn)
+    }
+
+    /// Run ublk daemon and kick off the ublk device, and `/dev/ublkbN` will be
+    /// created and visible to userspace.
+    ///
+    /// # Arguments:
+    ///
+    /// * `ctrl`: UblkCtrl device reference
+    /// * `dev`: UblkDev device reference
+    /// * `q_fn`: queue handler for setting up the queue and its handler
+    /// * `device_fn`: handler called after device is started
+    ///
+    /// This one is the preferred interface for creating ublk daemon, and
+    /// is friendly for user, such as, user can customize queue setup and
+    /// io handler, such as setup async/await for handling io command.
+    pub fn run_target<Q, W>(
+        &self,
+        ctrl: &mut ctrl::UblkCtrl,
+        dev: &Arc<io::UblkDev>,
+        q_fn: Q,
+        device_fn: W,
+    ) -> Result<std::thread::JoinHandle<()>, UblkError>
+    where
+        Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
+        W: FnOnce(i32) + Send + Sync + 'static,
+    {
+        let handles = self.create_queue_handlers(ctrl, dev, q_fn);
 
         ctrl.start_dev(dev)?;
 
         let dev_id = dev.dev_info.dev_id as i32;
-        let worker_qh = std::thread::spawn(move || {
-            worker_fn(dev_id);
+        let device_qh = std::thread::spawn(move || {
+            device_fn(dev_id);
         });
 
         for qh in handles {
@@ -269,12 +301,12 @@ impl UblkSession {
 
         ctrl.stop_dev(dev)?;
 
-        Ok(worker_qh)
+        Ok(device_qh)
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod libublk {
     use crate::dev_flags::*;
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkSessionBuilder;
@@ -308,14 +340,20 @@ mod tests {
             Ok(serde_json::json!({}))
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-            let iod = q.get_iod(tag);
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        let q_fn = move |qid: u16, _dev: &UblkDev| {
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+            };
+
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(io_handler);
         };
 
-        sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+        sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.del().unwrap();
         })
