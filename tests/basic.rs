@@ -6,6 +6,19 @@ mod integration {
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
     use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    fn read_ublk_disk(dev_id: i32) {
+        let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+        let mut arg_list: Vec<String> = Vec::new();
+        let if_dev = format!("if={}", &dev_path);
+
+        arg_list.push(if_dev);
+        arg_list.push("of=/dev/null".to_string());
+        arg_list.push("bs=4096".to_string());
+        arg_list.push("count=10k".to_string());
+        println!("{:?}", Command::new("dd").args(arg_list).output().unwrap());
+    }
 
     fn __test_ublk_null(dev_flags: u32, q_handler: fn(u16, &UblkDev)) {
         let sess = UblkSessionBuilder::default()
@@ -41,6 +54,8 @@ mod integration {
 
                 //ublk exported json file should be observed
                 assert!(Path::new(&ctrl.run_path()).exists() == true);
+
+                read_ublk_disk(dev_id);
 
                 ctrl.del().unwrap();
             })
@@ -276,8 +291,6 @@ mod integration {
                 assert!(count < timeout);
             }
         }
-
-        use std::process::{Command, Stdio};
 
         let tgt_dir = get_curr_bin_dir().unwrap();
         let tmpfile = tempfile::NamedTempFile::new().unwrap();
