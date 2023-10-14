@@ -74,11 +74,7 @@ fn main() {
 
 ## Test
 
-You can run the test of the library with the following command.
-
-```
-# cargo test
-```
+You can run the test of the library with ```cargo test```
 
 ## Performance
 
@@ -87,17 +83,7 @@ running same test over ublk device created by blktests `miniublk`[^3], which
 is written by pure C. And the ublk device is null, which has 2 queues, each
 queue's depth is 64.
 
-## Examples
-
-### null
-
--   add one null ublk device
-
-    cargo run \--example null \-- add
-
--   del one null ublk device
-
-    cargo run \--example null \-- del \[dev_id\]
+## Example
 
 ### loop
 
@@ -114,7 +100,7 @@ queue's depth is 64.
 This project is licensed under either of Apache License, Version 2.0 or
 MIT license at your option.
 
-## Contribution
+## Contributing
 
 Any kinds of contributions are welcome!
 
