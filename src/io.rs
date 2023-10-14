@@ -323,6 +323,14 @@ impl UblkQueueState {
     fn mark_stopping(&mut self) {
         self.state |= Self::UBLK_QUEUE_STOPPING;
     }
+
+    fn set_idle(&mut self, val: bool) {
+        if val {
+            self.state |= Self::UBLK_QUEUE_IDLE;
+        } else {
+            self.state &= !Self::UBLK_QUEUE_IDLE;
+        }
+    }
 }
 
 /// UBLK queue abstraction
@@ -386,6 +394,7 @@ fn round_up(val: u32, rnd: u32) -> u32 {
 }
 
 impl UblkQueue<'_> {
+    const UBLK_QUEUE_IDLE_SECS: u32 = 20;
     #[inline(always)]
     fn cmd_buf_sz(depth: u32) -> u32 {
         let size = depth * core::mem::size_of::<sys::ublksrv_io_desc>() as u32;
@@ -754,8 +763,49 @@ impl UblkQueue<'_> {
         1
     }
 
-    #[inline(always)]
-    fn wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
+    fn discard_io_pages(&self) {
+        let depth = self.q_depth;
+        let buf_size = self.dev.dev_info.max_io_buf_bytes as usize;
+        for i in 0..depth {
+            let buf_addr = self.get_io_buf_addr(i as u16);
+            unsafe { libc::madvise(buf_addr as *mut libc::c_void, buf_size, libc::MADV_DONTNEED) };
+        }
+    }
+
+    fn enter_queue_idle(&self) {
+        let mut state = self.state.borrow_mut();
+        let empty = self.q_ring.borrow_mut().submission().is_empty();
+
+        if empty && state.get_nr_cmd_inflight() == self.q_depth && !state.is_idle() {
+            trace!(
+                "dev {} queue {} becomes idle",
+                self.dev.dev_info.dev_id,
+                self.q_id
+            );
+            state.set_idle(true);
+            self.discard_io_pages();
+        }
+    }
+
+    #[inline]
+    fn exit_queue_idle(&self) {
+        let idle = { self.state.borrow().is_idle() };
+
+        if idle {
+            trace!(
+                "dev {} queue {} becomes busy",
+                self.dev.dev_info.dev_id,
+                self.q_id
+            );
+            self.state.borrow_mut().set_idle(false);
+        }
+    }
+
+    #[inline]
+    fn __wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
+        let ts = types::Timespec::new().sec(Self::UBLK_QUEUE_IDLE_SECS as u64);
+        let args = types::SubmitArgs::new().timespec(&ts);
+
         let state = self.state.borrow();
         info!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
@@ -774,19 +824,40 @@ impl UblkQueue<'_> {
         }
 
         let mut r = self.q_ring.borrow_mut();
-        let ret = r
-            .submit_and_wait(to_wait)
-            .map_err(UblkError::UringSubmissionError)?;
+        let ret = r.submitter().submit_with_args(to_wait, &args);
+        match ret {
+            Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
+                return Err(UblkError::UringSubmissionTimeout(-libc::ETIME));
+            }
+            Err(err) => return Err(UblkError::UringSubmissionError(err)),
+            Ok(_) => {}
+        };
 
         let nr_cqes = r.completion().len() as i32;
         info!(
-            "submit result {}, nr_cqes {} stop {} idle {}",
-            ret,
+            "nr_cqes {} stop {} idle {}",
             nr_cqes,
             state.is_stopping(),
             state.is_idle(),
         );
         Ok(nr_cqes)
+    }
+
+    #[inline]
+    fn wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
+        match self.__wait_ios(to_wait) {
+            Ok(nr_cqes) => {
+                if nr_cqes > 0 {
+                    self.exit_queue_idle();
+                }
+                Ok(nr_cqes)
+            }
+            Err(UblkError::UringSubmissionTimeout(_)) => {
+                self.enter_queue_idle();
+                Ok(0)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Process the incoming IOs(io commands & target IOs) from io_uring

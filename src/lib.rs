@@ -61,6 +61,9 @@ pub enum UblkError {
     #[error("failed to read the key file")]
     UringSubmissionError(#[source] std::io::Error),
 
+    #[error("uring submission timeout")]
+    UringSubmissionTimeout(i32),
+
     #[error("failed to push SQE to uring")]
     UringPushError(#[from] io_uring::squeue::PushError),
 
