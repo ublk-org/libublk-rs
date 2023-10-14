@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+mod integration {
     use libublk::dev_flags::*;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
@@ -93,111 +93,110 @@ mod tests {
         );
     }
 
-    fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, start: u64) {
-        let _iod = q.get_iod(tag);
-        let iod = unsafe { &*_iod };
-        let off = (iod.start_sector << 9) as u64;
-        let bytes = (iod.nr_sectors << 9) as u32;
-        let op = iod.op_flags & 0xff;
-        let buf_addr = q.get_io_buf_addr(tag);
-
-        match op {
-            sys::UBLK_IO_OP_FLUSH => {}
-            sys::UBLK_IO_OP_READ => unsafe {
-                libc::memcpy(
-                    buf_addr as *mut libc::c_void,
-                    (start + off) as *mut libc::c_void,
-                    bytes as usize,
-                );
-            },
-            sys::UBLK_IO_OP_WRITE => unsafe {
-                libc::memcpy(
-                    (start + off) as *mut libc::c_void,
-                    buf_addr as *mut libc::c_void,
-                    bytes as usize,
-                );
-            },
-            _ => {
-                q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
-                return;
-            }
-        }
-
-        let res = Ok(UblkIORes::Result(bytes as i32));
-        q.complete_io_cmd(tag, res);
-    }
-
-    fn __test_ublk_ramdisk(dev_id: i32) {
-        let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-        let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
-
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        //ublk block device should be observed now
-        assert!(Path::new(&dev_path).exists() == true);
-
-        //ublk exported json file should be observed
-        assert!(Path::new(&ctrl.run_path()).exists() == true);
-
-        //format as ext4 and mount over the created ublk-ramdisk
-        {
-            let ext4_options = block_utils::Filesystem::Ext4 {
-                inode_size: 512,
-                stride: Some(2),
-                stripe_width: None,
-                reserved_blocks_percentage: 10,
-            };
-            block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
-
-            let tmp_dir = tempfile::TempDir::new().unwrap();
-            let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
-
-            block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
-            block_utils::unmount_device(tmp_dir.path()).unwrap();
-        }
-        ctrl.del().unwrap();
-    }
-
-    fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, fn_ptr: fn(i32)) {
-        let wh = {
-            let sess = libublk::UblkSessionBuilder::default()
-                .name("ramdisk")
-                .id(dev_id)
-                .nr_queues(1_u16)
-                .depth(128_u16)
-                .dev_flags(UBLK_DEV_F_ADD_DEV)
-                .build()
-                .unwrap();
-
-            let tgt_init = |dev: &mut UblkDev| {
-                dev.set_default_params(size);
-                Ok(serde_json::json!({}))
-            };
-            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-                rd_handle_io(q, tag, io, buf_addr);
-            };
-
-            sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
-                fn_ptr(dev_id);
-            })
-            .unwrap()
-        };
-        wh.join().unwrap();
-    }
-
     /// make one ublk-ramdisk and test:
     /// - if /dev/ublkbN can be created successfully
     /// - if yes, then test format/mount/umount over this ublk-ramdisk
     #[test]
     fn test_ublk_ramdisk() {
-        let size = 32_u64 << 20;
-        let buf = libublk::ublk_alloc_buf(size as usize, 4096);
-        let buf_addr = buf as u64;
+        fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, start: u64) {
+            let _iod = q.get_iod(tag);
+            let iod = unsafe { &*_iod };
+            let off = (iod.start_sector << 9) as u64;
+            let bytes = (iod.nr_sectors << 9) as u32;
+            let op = iod.op_flags & 0xff;
+            let buf_addr = q.get_io_buf_addr(tag);
 
-        rd_add_dev(-1, buf_addr, size, __test_ublk_ramdisk);
+            match op {
+                sys::UBLK_IO_OP_FLUSH => {}
+                sys::UBLK_IO_OP_READ => unsafe {
+                    libc::memcpy(
+                        buf_addr as *mut libc::c_void,
+                        (start + off) as *mut libc::c_void,
+                        bytes as usize,
+                    );
+                },
+                sys::UBLK_IO_OP_WRITE => unsafe {
+                    libc::memcpy(
+                        (start + off) as *mut libc::c_void,
+                        buf_addr as *mut libc::c_void,
+                        bytes as usize,
+                    );
+                },
+                _ => {
+                    q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
+                    return;
+                }
+            }
 
-        libublk::ublk_dealloc_buf(buf, size as usize, 4096);
+            let res = Ok(UblkIORes::Result(bytes as i32));
+            q.complete_io_cmd(tag, res);
+        }
+
+        fn __test_ublk_ramdisk(dev_id: i32) {
+            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            //ublk block device should be observed now
+            assert!(Path::new(&dev_path).exists() == true);
+
+            //ublk exported json file should be observed
+            assert!(Path::new(&ctrl.run_path()).exists() == true);
+
+            //format as ext4 and mount over the created ublk-ramdisk
+            {
+                let ext4_options = block_utils::Filesystem::Ext4 {
+                    inode_size: 512,
+                    stride: Some(2),
+                    stripe_width: None,
+                    reserved_blocks_percentage: 10,
+                };
+                block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
+
+                let tmp_dir = tempfile::TempDir::new().unwrap();
+                let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
+
+                block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
+                block_utils::unmount_device(tmp_dir.path()).unwrap();
+            }
+            ctrl.del().unwrap();
+        }
+
+        fn rd_add_dev(dev_id: i32, fn_ptr: fn(i32)) {
+            let size = 32_u64 << 20;
+            let buf = libublk::ublk_alloc_buf(size as usize, 4096);
+            let buf_addr = buf as u64;
+
+            let wh = {
+                let sess = libublk::UblkSessionBuilder::default()
+                    .name("ramdisk")
+                    .id(dev_id)
+                    .nr_queues(1_u16)
+                    .depth(128_u16)
+                    .dev_flags(UBLK_DEV_F_ADD_DEV)
+                    .build()
+                    .unwrap();
+
+                let tgt_init = |dev: &mut UblkDev| {
+                    dev.set_default_params(size);
+                    Ok(serde_json::json!({}))
+                };
+                let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+                let handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                    rd_handle_io(q, tag, io, buf_addr);
+                };
+
+                sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
+                    fn_ptr(dev_id);
+                })
+                .unwrap()
+            };
+            wh.join().unwrap();
+            libublk::ublk_dealloc_buf(buf, size as usize, 4096);
+        }
+
+        rd_add_dev(-1, __test_ublk_ramdisk);
     }
 
     /// make FnMut closure for IO handling
@@ -245,39 +244,39 @@ mod tests {
         wh.join().unwrap();
     }
 
-    fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
-        if let Err(_current_exe) = env::current_exe() {
-            None
-        } else {
-            env::current_exe().ok().map(|mut path| {
-                path.pop();
-                if path.ends_with("deps") {
-                    path.pop();
-                }
-                path
-            })
-        }
-    }
-
-    fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u16, timeout: u32) {
-        let mut count = 0;
-        let unit = 100_u32;
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(unit as u64));
-
-            ctrl.get_info().unwrap();
-            if ctrl.dev_info.state == state {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                break;
-            }
-            count += unit;
-            assert!(count < timeout);
-        }
-    }
-
     /// run examples/ramdisk recovery test
     #[test]
     fn test_ublk_ramdisk_recovery() {
+        fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
+            if let Err(_current_exe) = env::current_exe() {
+                None
+            } else {
+                env::current_exe().ok().map(|mut path| {
+                    path.pop();
+                    if path.ends_with("deps") {
+                        path.pop();
+                    }
+                    path
+                })
+            }
+        }
+
+        fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u16, timeout: u32) {
+            let mut count = 0;
+            let unit = 100_u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(unit as u64));
+
+                ctrl.get_info().unwrap();
+                if ctrl.dev_info.state == state {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    break;
+                }
+                count += unit;
+                assert!(count < timeout);
+            }
+        }
+
         use std::process::{Command, Stdio};
 
         let tgt_dir = get_curr_bin_dir().unwrap();
