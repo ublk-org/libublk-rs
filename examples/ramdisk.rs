@@ -59,11 +59,16 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
             Ok(serde_json::json!({}))
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let lo_handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-            handle_io(q, tag, io, buf_addr);
+        let q_fn = move |qid: u16, _dev: &UblkDev| {
+            let rd_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                handle_io(q, tag, io, buf_addr);
+            };
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(rd_io_handler);
         };
 
-        sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
+        sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
         })

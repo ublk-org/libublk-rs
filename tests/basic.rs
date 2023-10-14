@@ -7,7 +7,7 @@ mod tests {
     use std::env;
     use std::path::Path;
 
-    fn __test_ublk_null(dev_flags: u32, handler: fn(&UblkQueue, tag: u16, &UblkIOCtx)) {
+    fn __test_ublk_null(dev_flags: u32, q_handler: fn(u16, &UblkDev)) {
         let sess = UblkSessionBuilder::default()
             .name("null")
             .depth(64_u32)
@@ -24,9 +24,11 @@ mod tests {
 
         let wh = {
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| handler(q, tag, io);
+            let q_fn = move |qid: u16, _dev: &UblkDev| {
+                q_handler(qid, _dev);
+            };
 
-            sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
+            sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
                 let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
@@ -50,14 +52,20 @@ mod tests {
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
-        fn null_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx) {
-            let iod = q.get_iod(tag);
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        fn null_handle_queue(qid: u16, _dev: &UblkDev) {
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+            };
+
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_handle_io);
+        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_handle_queue);
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -65,20 +73,23 @@ mod tests {
     #[test]
     fn test_ublk_null_comp_batch() {
         use libublk::UblkFatRes;
-        fn null_handle_io_batch(q: &UblkQueue, tag: u16, io: &UblkIOCtx) {
-            let iod = q.get_iod(tag);
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        fn null_handle_queue_batch(qid: u16, _dev: &UblkDev) {
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
 
-            let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(
-                io.get_tag() as u16,
-                bytes,
-            )])));
-            q.complete_io_cmd(tag, res);
+                let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)])));
+                q.complete_io_cmd(tag, res);
+            };
+
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(io_handler);
         }
 
         __test_ublk_null(
             UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_COMP_BATCH,
-            null_handle_io_batch,
+            null_handle_queue_batch,
         );
     }
 

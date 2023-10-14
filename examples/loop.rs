@@ -161,10 +161,16 @@ fn test_add() {
 
             let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
             let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let lo_handle_io =
-                move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| _lo_handle_io(q, tag, io);
+            let q_fn = move |qid: u16, _dev: &UblkDev| {
+                let lo_io_handler =
+                    move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| _lo_handle_io(q, tag, io);
 
-            sess.run(&mut ctrl, &dev, lo_handle_io, |dev_id| {
+                UblkQueue::new(qid, _dev)
+                    .unwrap()
+                    .wait_and_handle_io(lo_io_handler);
+            };
+
+            sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
                 let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
             })

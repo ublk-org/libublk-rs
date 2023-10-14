@@ -32,8 +32,9 @@ libublk = "0.1"
 ```
 
 Next we can start using `libublk` crate.
-The following is quick introduction for adding ublk-null block device, which
-is built over libublk high level APIs.
+The following is quick introduction for creating one ublk-null target,
+and ublk block device(/dev/ublkbN) will be created after the code is
+run.
 
 ``` rust
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
@@ -54,15 +55,23 @@ fn main() {
     };
     let wh = {
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-            let iod = q.get_iod(tag);
-            let res = Ok(UblkIORes::Result(
-                (unsafe { (*iod).nr_sectors << 9 } as i32),
-            ));
-            q.complete_io_cmd(tag, res);
+        // queue level logic
+        let q_handler = move |qid: u16, _dev: &UblkDev| {
+            // logic for io handling
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+
+                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+            };
+
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(io_handler);
         };
 
-        sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
+        // Now start this ublk target
+        sess.run_target(&mut ctrl, &dev, q_handler, |dev_id| {
             let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             d_ctrl.dump();
         })
