@@ -215,6 +215,11 @@ impl UblkSession {
                 }
                 _tx.send((q, unsafe { libc::gettid() })).unwrap();
 
+                unsafe {
+                    const PR_SET_IO_FLUSHER: i32 = 57; //include/uapi/linux/prctl.h
+                    libc::prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
+                };
+
                 _q_fn(q, &_dev);
             }));
         }
