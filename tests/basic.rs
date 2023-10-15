@@ -217,23 +217,10 @@ mod integration {
     /// make FnMut closure for IO handling
     #[test]
     fn test_fn_mut_io_closure() {
-        let sess = libublk::UblkSessionBuilder::default()
-            .name("FnMutClosure")
-            .depth(64_u32)
-            .nr_queues(2_u32)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
-            .build()
-            .unwrap();
-        let tgt_init = |dev: &mut UblkDev| {
-            dev.set_default_params(250_u64 << 30);
-            Ok(serde_json::json!({}))
-        };
-        let wh = {
-            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        fn null_queue_mut_io(qid: u16, _dev: &UblkDev) {
             // modify this vector in io handling closure
             let mut q_vec = Vec::<i32>::new();
-
-            let handle_io = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let res = Ok(UblkIORes::Result(
                     (unsafe { (*iod).nr_sectors << 9 } as i32),
@@ -249,14 +236,12 @@ mod integration {
                 q.complete_io_cmd(tag, res);
             };
 
-            sess.run(&mut ctrl, &dev, handle_io, |dev_id| {
-                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-                d_ctrl.del().unwrap();
-            })
-            .unwrap()
-        };
-        wh.join().unwrap();
+            UblkQueue::new(qid, _dev)
+                .unwrap()
+                .wait_and_handle_io(io_handler);
+        }
+
+        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_queue_mut_io);
     }
 
     /// run examples/ramdisk recovery test
