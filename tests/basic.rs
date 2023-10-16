@@ -43,7 +43,6 @@ mod integration {
             .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
             .build()
             .unwrap();
-
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
             Ok(serde_json::json!({}))
@@ -71,6 +70,7 @@ mod integration {
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
+        /// called from queue_handler closure(), which supports Clone(),
         fn null_handle_queue(qid: u16, _dev: &UblkDev) {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
@@ -92,6 +92,7 @@ mod integration {
     #[test]
     fn test_ublk_null_comp_batch() {
         use libublk::UblkFatRes;
+        /// called from queue_handler closure(), which supports Clone(),
         fn null_handle_queue_batch(qid: u16, _dev: &UblkDev) {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
@@ -176,50 +177,46 @@ mod integration {
             ctrl.del().unwrap();
         }
 
-        fn rd_add_dev(dev_id: i32, fn_ptr: fn(i32)) {
-            let size = 32_u64 << 20;
-            let buf = libublk::ublk_alloc_buf(size as usize, 4096);
-            let buf_addr = buf as u64;
+        let size = 32_u64 << 20;
+        let buf = libublk::ublk_alloc_buf(size as usize, 4096);
+        let buf_addr = buf as u64;
+        let sess = libublk::UblkSessionBuilder::default()
+            .name("ramdisk")
+            .id(-1)
+            .nr_queues(1_u16)
+            .depth(128_u16)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(size);
+            Ok(serde_json::json!({}))
+        };
 
-            let wh = {
-                let sess = libublk::UblkSessionBuilder::default()
-                    .name("ramdisk")
-                    .id(dev_id)
-                    .nr_queues(1_u16)
-                    .depth(128_u16)
-                    .dev_flags(UBLK_DEV_F_ADD_DEV)
-                    .build()
-                    .unwrap();
-
-                let tgt_init = |dev: &mut UblkDev| {
-                    dev.set_default_params(size);
-                    Ok(serde_json::json!({}))
+        let wh = {
+            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+            let q_fn = move |qid: u16, _dev: &UblkDev| {
+                let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                    rd_handle_io(q, tag, _io, buf_addr);
                 };
-                let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-                let q_fn = move |qid: u16, _dev: &UblkDev| {
-                    let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                        rd_handle_io(q, tag, _io, buf_addr);
-                    };
-                    UblkQueue::new(qid, _dev)
-                        .unwrap()
-                        .wait_and_handle_io(io_handler);
-                };
-
-                sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
-                    fn_ptr(dev_id);
-                })
-                .unwrap()
+                UblkQueue::new(qid, _dev)
+                    .unwrap()
+                    .wait_and_handle_io(io_handler);
             };
-            wh.join().unwrap();
-            libublk::ublk_dealloc_buf(buf, size as usize, 4096);
-        }
 
-        rd_add_dev(-1, __test_ublk_ramdisk);
+            sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
+                __test_ublk_ramdisk(dev_id);
+            })
+            .unwrap()
+        };
+        wh.join().unwrap();
+        libublk::ublk_dealloc_buf(buf, size as usize, 4096);
     }
 
     /// make FnMut closure for IO handling
     #[test]
     fn test_fn_mut_io_closure() {
+        /// called from queue_handler closure(), which supports Clone(),
         fn null_queue_mut_io(qid: u16, _dev: &UblkDev) {
             // modify this vector in io handling closure
             let mut q_vec = Vec::<i32>::new();
