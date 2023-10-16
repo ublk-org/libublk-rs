@@ -237,37 +237,6 @@ impl UblkSession {
         q_threads
     }
 
-    /// Kick off the ublk device, and `/dev/ublkbN` will be created and visible
-    /// to userspace.
-    ///
-    /// * `ctrl`: UblkCtrl device reference
-    /// * `dev`: UblkDev device reference
-    /// * `io_fn`: io handler for setting up the queue and its handler
-    /// * `device_fn`: handler called after device is started
-    ///
-    pub fn run<Q, W>(
-        &self,
-        ctrl: &mut ctrl::UblkCtrl,
-        dev: &Arc<io::UblkDev>,
-        io_fn: Q,
-        device_fn: W,
-    ) -> Result<std::thread::JoinHandle<()>, UblkError>
-    where
-        Q: FnMut(&io::UblkQueue, u16, &io::UblkIOCtx) + Send + Sync + Clone + 'static,
-        W: FnOnce(i32) + Send + Sync + 'static,
-    {
-        let mut io_fn = io_fn.clone();
-        let q_fn = move |q: u16, dev: &io::UblkDev| {
-            let queue = io::UblkQueue::new(q, dev).unwrap();
-            let queue_closure = {
-                move |q: &io::UblkQueue, tag: u16, io_ctx: &io::UblkIOCtx| io_fn(q, tag, io_ctx)
-            };
-
-            queue.wait_and_handle_io(queue_closure);
-        };
-        self.run_target(ctrl, dev, q_fn, device_fn)
-    }
-
     /// Run ublk daemon and kick off the ublk device, and `/dev/ublkbN` will be
     /// created and visible to userspace.
     ///

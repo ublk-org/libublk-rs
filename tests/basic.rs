@@ -198,11 +198,16 @@ mod integration {
                     Ok(serde_json::json!({}))
                 };
                 let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-                let handle_io = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-                    rd_handle_io(q, tag, io, buf_addr);
+                let q_fn = move |qid: u16, _dev: &UblkDev| {
+                    let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                        rd_handle_io(q, tag, _io, buf_addr);
+                    };
+                    UblkQueue::new(qid, _dev)
+                        .unwrap()
+                        .wait_and_handle_io(io_handler);
                 };
 
-                sess.run(&mut ctrl, &dev, handle_io, move |dev_id| {
+                sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
                     fn_ptr(dev_id);
                 })
                 .unwrap()
