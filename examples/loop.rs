@@ -138,7 +138,7 @@ fn _lo_handle_io(q: &UblkQueue, tag: u16, i: &UblkIOCtx) {
 }
 
 fn test_add() {
-    let back_file = std::env::args().nth(2).unwrap();
+    let back_file = std::env::args().nth(3).unwrap();
     let _pid = unsafe { libc::fork() };
 
     if _pid == 0 {
