@@ -156,6 +156,27 @@ pub struct UblkSession {
 }
 
 impl UblkSession {
+    // iterator over each ublk device ID
+    pub fn for_each_dev_id<T>(ops: T)
+    where
+        T: Fn(u32) + Clone + 'static,
+    {
+        if let Ok(entries) = std::fs::read_dir(ctrl::UblkCtrl::run_dir()) {
+            for entry in entries.flatten() {
+                let f = entry.path();
+                if f.is_file() {
+                    if let Some(file_stem) = f.file_stem() {
+                        if let Some(stem) = file_stem.to_str() {
+                            if let Ok(num) = stem.parse::<u32>() {
+                                ops(num);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// create one pair of ublk devices, the 1st one is control device(`UblkCtrl`),
     /// and the 2nd one is data device(`UblkDev`)
     pub fn create_devices<T>(
@@ -286,8 +307,11 @@ impl UblkSession {
 mod libublk {
     use crate::dev_flags::*;
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
-    use crate::UblkSessionBuilder;
     use crate::{ctrl::UblkCtrl, UblkError, UblkIORes};
+    use crate::{UblkSession, UblkSessionBuilder};
+    use std::cell::Cell;
+    use std::path::Path;
+    use std::rc::Rc;
 
     #[cfg(not(feature = "fat_complete"))]
     #[test]
@@ -303,7 +327,10 @@ mod libublk {
         assert!(sz == 32);
     }
 
-    fn __test_ublk_session() -> std::thread::JoinHandle<()> {
+    fn __test_ublk_session<T>(w_fn: T) -> std::thread::JoinHandle<()>
+    where
+        T: Fn(i32) + Send + Sync + Clone + 'static,
+    {
         let sess = UblkSessionBuilder::default()
             .name("null")
             .depth(16_u32)
@@ -330,16 +357,49 @@ mod libublk {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&mut ctrl, &dev, q_fn, |dev_id| {
-            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-            d_ctrl.del().unwrap();
+        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
+            w_fn(dev_id);
         })
         .unwrap()
     }
 
     #[test]
     fn test_ublk_session() {
-        let wh = __test_ublk_session();
-        wh.join().unwrap();
+        __test_ublk_session(|dev_id| {
+            UblkCtrl::new_simple(dev_id, 0).unwrap().del().unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// test for_each_dev_id
+    #[test]
+    fn test_ublk_for_each_dev_id() {
+        // Create one ublk device
+        let handle = std::thread::spawn(|| {
+            __test_ublk_session(|dev_id| {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                UblkCtrl::new_simple(dev_id, 0).unwrap().del().unwrap();
+            })
+            .join()
+            .unwrap()
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let cnt_arc = Rc::new(Cell::new(0));
+        let cnt = cnt_arc.clone();
+
+        //count all existed ublk devices
+        UblkSession::for_each_dev_id(move |dev_id| {
+            cnt.set(cnt.get() + 1);
+
+            let dev_path = format!("{}{}", crate::CDEV_PATH, dev_id);
+            assert!(Path::new(&dev_path).exists() == true);
+        });
+
+        // we created one
+        assert!(cnt_arc.get() > 0);
+
+        handle.join().unwrap();
     }
 }
