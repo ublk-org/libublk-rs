@@ -45,7 +45,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
     let wh = {
         let sess = libublk::UblkSessionBuilder::default()
-            .name("ramdisk")
+            .name("example_ramdisk")
             .id(dev_id)
             .nr_queues(1_u16)
             .depth(128_u16)
