@@ -1,8 +1,9 @@
 use anyhow::Result;
+use clap::{Arg, ArgAction, Command};
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
+use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes, UblkSession};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::io::AsRawFd;
@@ -137,8 +138,7 @@ fn _lo_handle_io(q: &UblkQueue, tag: u16, i: &UblkIOCtx) {
     loop_queue_tgt_io(q, tag, i);
 }
 
-fn test_add() {
-    let back_file = std::env::args().nth(3).unwrap();
+fn test_add(id: i32, nr_queues: u32, depth: u32, buf_sz: u32, backing_file: &String) {
     let _pid = unsafe { libc::fork() };
 
     if _pid == 0 {
@@ -147,14 +147,18 @@ fn test_add() {
             back_file: std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(&back_file)
+                .open(&backing_file)
                 .unwrap(),
             direct_io: 1,
-            back_file_path: back_file.clone(),
+            back_file_path: backing_file.clone(),
         };
         let wh = {
             let sess = libublk::UblkSessionBuilder::default()
-                .name("loop")
+                .name("example_loop")
+                .id(id)
+                .nr_queues(nr_queues)
+                .depth(depth)
+                .io_buf_bytes(buf_sz)
                 .dev_flags(UBLK_DEV_F_ADD_DEV)
                 .build()
                 .unwrap();
@@ -180,20 +184,107 @@ fn test_add() {
     }
 }
 
-fn test_del() {
-    let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
-    let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
-
-    ctrl.del().unwrap();
-}
-
 fn main() {
-    if let Some(cmd) = std::env::args().nth(1) {
-        match cmd.as_str() {
-            "add" => test_add(),
-            "del" => test_del(),
-            _ => todo!(),
+    let matches = Command::new("ublk-loop-example")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("add")
+                .about("Add ublk device")
+                .arg(
+                    Arg::new("number")
+                        .short('n')
+                        .long("number")
+                        .default_value("-1")
+                        .allow_hyphen_values(true)
+                        .help("device id, -1: auto-allocation")
+                        .action(ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("queues")
+                        .long("queues")
+                        .short('q')
+                        .default_value("1")
+                        .help("nr_hw_queues")
+                        .action(ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("depth")
+                        .long("depth")
+                        .short('d')
+                        .default_value("64")
+                        .help("queue depth: max in-flight io commands")
+                        .action(ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("buf_size")
+                        .long("buf_size")
+                        .short('b')
+                        .default_value("524288")
+                        .help("io buffer size")
+                        .action(ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("backing_file")
+                        .long("backing_file")
+                        .short('f')
+                        .required(true)
+                        .help("backing file")
+                        .action(ArgAction::Set),
+                ),
+        )
+        .subcommand(
+            Command::new("del").about("Delete ublk device").arg(
+                Arg::new("number")
+                    .short('n')
+                    .long("number")
+                    .required(true)
+                    .help("device id")
+                    .action(ArgAction::Set),
+            ),
+        )
+        .subcommand(Command::new("list").about("List ublk device"))
+        .get_matches();
+
+    match matches.subcommand() {
+        Some(("add", add_matches)) => {
+            let id = add_matches
+                .get_one::<String>("number")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap_or(-1);
+            let nr_queues = add_matches
+                .get_one::<String>("queues")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap_or(1);
+            let depth = add_matches
+                .get_one::<String>("depth")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap_or(64);
+            let buf_size = add_matches
+                .get_one::<String>("buf_size")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap_or(52288);
+            let backing_file = add_matches.get_one::<String>("backing_file").unwrap();
+
+            test_add(id, nr_queues, depth, buf_size, backing_file);
         }
-    }
+        Some(("del", add_matches)) => {
+            let id = add_matches
+                .get_one::<String>("number")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap_or(-1);
+            UblkCtrl::new_simple(id, 0).unwrap().del().unwrap();
+        }
+        Some(("list", _add_matches)) => UblkSession::for_each_dev_id(|dev_id| {
+            UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();
+        }),
+        _ => {
+            println!("unsupported command");
+        }
+    };
 }
