@@ -8,12 +8,12 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_id: i32, dev_flags: u64) {
+    fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_id: i32, dev_flags: u32) {
         let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        assert!(ctrl.get_target_flags_from_json().unwrap() as u64 == dev_flags);
+        assert!(ctrl.get_target_flags_from_json().unwrap() == dev_flags);
 
         //ublk block device should be observed now
         assert!(Path::new(&dev_path).exists() == true);
@@ -57,7 +57,7 @@ mod integration {
             sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
                 let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
 
-                run_ublk_disk_sanity_test(&mut ctrl, dev_id, dev_flags as u64);
+                run_ublk_disk_sanity_test(&mut ctrl, dev_id, dev_flags);
                 read_ublk_disk(dev_id);
 
                 ctrl.del().unwrap();
@@ -156,7 +156,7 @@ mod integration {
             let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
 
-            run_ublk_disk_sanity_test(&mut ctrl, dev_id, UBLK_DEV_F_ADD_DEV as u64);
+            run_ublk_disk_sanity_test(&mut ctrl, dev_id, UBLK_DEV_F_ADD_DEV);
 
             //format as ext4 and mount over the created ublk-ramdisk
             {
