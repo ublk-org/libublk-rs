@@ -3,10 +3,16 @@ use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
 
-fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32) {
-    let _pid = unsafe { libc::fork() };
+fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, fg: bool) {
+    let _pid = if !fg { unsafe { libc::fork() } } else { 0 };
 
     if _pid == 0 {
+        __test_add(id, nr_queues, depth, ctrl_flags, buf_size);
+    }
+}
+
+fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32) {
+    {
         let sess = libublk::UblkSessionBuilder::default()
             .name("example_null")
             .id(id)
@@ -102,6 +108,12 @@ fn main() {
                         .short('p')
                         .action(ArgAction::SetTrue)
                         .help("enable UBLK_F_UN_PRIVILEGED_DEV"),
+                )
+                .arg(
+                    Arg::new("forground")
+                        .long("forground")
+                        .action(ArgAction::SetTrue)
+                        .help("run in forground mode"),
                 ),
         )
         .subcommand(
@@ -140,6 +152,11 @@ fn main() {
                 .parse::<u32>()
                 .unwrap_or(52288);
 
+            let fg = if add_matches.get_flag("forground") {
+                true
+            } else {
+                false
+            };
             let ctrl_flags: u64 = if add_matches.get_flag("user_copy") {
                 libublk::sys::UBLK_F_USER_COPY as u64
             } else {
@@ -150,7 +167,7 @@ fn main() {
                 0
             };
 
-            test_add(id, nr_queues, depth, ctrl_flags, buf_size);
+            test_add(id, nr_queues, depth, ctrl_flags, buf_size, fg);
         }
         Some(("del", add_matches)) => {
             let id = add_matches

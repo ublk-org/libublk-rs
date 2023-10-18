@@ -145,10 +145,23 @@ fn test_add(
     buf_sz: u32,
     backing_file: &String,
     ctrl_flags: u64,
+    fg: bool,
 ) {
-    let _pid = unsafe { libc::fork() };
-
+    let _pid = if !fg { unsafe { libc::fork() } } else { 0 };
     if _pid == 0 {
+        __test_add(id, nr_queues, depth, buf_sz, backing_file, ctrl_flags);
+    }
+}
+
+fn __test_add(
+    id: i32,
+    nr_queues: u32,
+    depth: u32,
+    buf_sz: u32,
+    backing_file: &String,
+    ctrl_flags: u64,
+) {
+    {
         // LooTgt has to live in the whole device lifetime
         let lo = LoopTgt {
             back_file: std::fs::OpenOptions::new()
@@ -240,6 +253,12 @@ fn main() {
                         .help("enable UBLK_F_UN_PRIVILEGED_DEV"),
                 )
                 .arg(
+                    Arg::new("forground")
+                        .long("forground")
+                        .action(ArgAction::SetTrue)
+                        .help("run in forground mode"),
+                )
+                .arg(
                     Arg::new("backing_file")
                         .long("backing_file")
                         .short('f')
@@ -285,12 +304,17 @@ fn main() {
                 .unwrap_or(52288);
             let backing_file = add_matches.get_one::<String>("backing_file").unwrap();
 
+            let fg = if add_matches.get_flag("forground") {
+                true
+            } else {
+                false
+            };
             let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
                 libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64
             } else {
                 0
             };
-            test_add(id, nr_queues, depth, buf_size, backing_file, ctrl_flags);
+            test_add(id, nr_queues, depth, buf_size, backing_file, ctrl_flags, fg);
         }
         Some(("del", add_matches)) => {
             let id = add_matches
