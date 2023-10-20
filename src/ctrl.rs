@@ -477,6 +477,10 @@ impl UblkCtrl {
             info.flags,
             self.dev_state_desc()
         );
+        println!(
+            "\tublkc: {}:{} ublkb: {}:{}",
+            p.devt.char_major, p.devt.char_minor, p.devt.disk_major, p.devt.disk_minor,
+        );
 
         self.dump_from_json();
     }
