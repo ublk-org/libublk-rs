@@ -50,11 +50,16 @@ const CTRL_CMD_HAS_DATA: u32 = 1;
 const CTRL_CMD_HAS_BUF: u32 = 2;
 const CTRL_CMD_ASYNC: u32 = 4;
 
+#[allow(dead_code)]
 #[derive(Debug, Default, Copy, Clone)]
 struct UblkCtrlCmdData {
     cmd_op: u32,
     flags: u32,
-    data: [u64; 2],
+    data: u64,
+    dev_path_len: u16,
+    pad: u16,
+    reserved: u32,
+
     addr: u64,
     len: u32,
 }
@@ -77,12 +82,13 @@ fn ublk_ctrl_prep_cmd(
             0
         },
         data: if (data.flags & CTRL_CMD_HAS_DATA) != 0 {
-            [data.data[0]]
+            [data.data]
         } else {
             [0]
         },
         dev_id,
         queue_id: u16::MAX,
+        dev_path_len: data.dev_path_len,
         ..Default::default()
     };
     let c_cmd = CtrlCmd { ctrl_cmd: cmd };
@@ -501,7 +507,7 @@ impl UblkCtrl {
             flags: CTRL_CMD_HAS_BUF,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
             len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            data: [0, 0],
+            ..Default::default()
         };
 
         ublk_ctrl_cmd(self, &data)
@@ -587,7 +593,7 @@ impl UblkCtrl {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_START_DEV,
             flags: CTRL_CMD_HAS_DATA | if async_cmd { CTRL_CMD_ASYNC } else { 0 },
-            data: [pid as u64, 0],
+            data: pid as u64,
             ..Default::default()
         };
 
@@ -656,8 +662,9 @@ impl UblkCtrl {
             cmd_op: sys::UBLK_CMD_GET_QUEUE_AFFINITY,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA,
             addr: bm.addr() as u64,
-            data: [q as u64, 0],
+            data: q as u64,
             len: bm.buf_len() as u32,
+            ..Default::default()
         };
         ublk_ctrl_cmd(self, &data)
     }
@@ -698,7 +705,7 @@ impl UblkCtrl {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
             flags: CTRL_CMD_HAS_DATA | if async_cmd { CTRL_CMD_ASYNC } else { 0 },
-            data: [pid as u64, 0],
+            data: pid as u64,
             ..Default::default()
         };
 
