@@ -89,9 +89,6 @@ pub enum UblkError {
     OtherError(i32),
 }
 
-pub const CDEV_PATH: &str = "/dev/ublkc";
-pub const BDEV_PATH: &str = "/dev/ublkb";
-
 pub fn ublk_alloc_buf(size: usize, align: usize) -> *mut u8 {
     let layout = match Layout::from_size_align(size, align) {
         Ok(r) => r,
@@ -391,9 +388,10 @@ mod libublk {
 
         //count all existed ublk devices
         UblkSession::for_each_dev_id(move |dev_id| {
+            let ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
             cnt.set(cnt.get() + 1);
 
-            let dev_path = format!("{}{}", crate::CDEV_PATH, dev_id);
+            let dev_path = ctrl.get_cdev_path();
             assert!(Path::new(&dev_path).exists() == true);
         });
 

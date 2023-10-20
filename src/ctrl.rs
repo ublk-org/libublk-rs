@@ -171,6 +171,11 @@ impl Drop for UblkCtrl {
 }
 
 impl UblkCtrl {
+    /// char device and block device name may change according to system policy,
+    /// such udev may rename it in its own namespaces.
+    const CDEV_PATH: &str = "/dev/ublkc";
+    const BDEV_PATH: &str = "/dev/ublkb";
+
     /// New one ublk control device
     ///
     /// # Arguments:
@@ -270,6 +275,16 @@ impl UblkCtrl {
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    /// Return ublk char device path
+    pub fn get_cdev_path(&self) -> String {
+        format!("{}{}", Self::CDEV_PATH, self.dev_info.dev_id)
+    }
+
+    /// Return ublk block device path
+    pub fn get_bdev_path(&self) -> String {
+        format!("{}{}", Self::BDEV_PATH, self.dev_info.dev_id)
     }
 
     /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
@@ -879,7 +894,7 @@ mod tests {
     #[test]
     fn test_add_ctrl_dev() {
         let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, UBLK_DEV_F_ADD_DEV).unwrap();
-        let dev_path = format!("{}{}", crate::CDEV_PATH, ctrl.dev_info.dev_id);
+        let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(Path::new(&dev_path).exists() == true);

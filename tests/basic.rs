@@ -8,8 +8,8 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
 
-    fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_id: i32, dev_flags: u32) {
-        let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+    fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_flags: u32) {
+        let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -23,7 +23,8 @@ mod integration {
     }
 
     fn read_ublk_disk(dev_id: i32) {
-        let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+        let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+        let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
         let if_dev = format!("if={}", &dev_path);
 
@@ -57,7 +58,7 @@ mod integration {
             sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
                 let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
 
-                run_ublk_disk_sanity_test(&mut ctrl, dev_id, dev_flags);
+                run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
                 read_ublk_disk(dev_id);
 
                 ctrl.del().unwrap();
@@ -154,9 +155,9 @@ mod integration {
 
         fn __test_ublk_ramdisk(dev_id: i32) {
             let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-            let dev_path = format!("{}{}", libublk::BDEV_PATH, dev_id);
+            let dev_path = ctrl.get_bdev_path();
 
-            run_ublk_disk_sanity_test(&mut ctrl, dev_id, UBLK_DEV_F_ADD_DEV);
+            run_ublk_disk_sanity_test(&mut ctrl, UBLK_DEV_F_ADD_DEV);
 
             //format as ext4 and mount over the created ublk-ramdisk
             {
@@ -312,7 +313,7 @@ mod integration {
         ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
 
         //ublk block device should be observed now
-        let dev_path = format!("{}{}", libublk::BDEV_PATH, id);
+        let dev_path = ctrl.get_bdev_path();
         assert!(Path::new(&dev_path).exists() == true);
 
         //simulate one panic by sending KILL to queue pthread

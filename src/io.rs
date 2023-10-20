@@ -219,7 +219,7 @@ impl UblkDev {
             ..Default::default()
         };
 
-        let cdev_path = format!("{}{}", super::CDEV_PATH, info.dev_id);
+        let cdev_path = ctrl.get_cdev_path();
         let cdev_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
