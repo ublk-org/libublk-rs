@@ -49,9 +49,18 @@ union CtrlCmd {
     buf: [u8; 80],
 }
 
+/// the max supported length of char device path, which
+/// is one implementation limit, and can be increased
+/// without breaking anything.
+const CTRL_UBLKC_PATH_MAX: usize = 32;
 const CTRL_CMD_HAS_DATA: u32 = 1;
 const CTRL_CMD_HAS_BUF: u32 = 2;
 const CTRL_CMD_ASYNC: u32 = 4;
+/// this command need to read data back from device
+const CTRL_CMD_BUF_READ: u32 = 8;
+/// this command needn't to attach char device path for audit in
+/// case of unprivileged ublk, such as get_features(), add_dev().
+const CTRL_CMD_NO_NEED_DEV_PATH: u32 = 16;
 
 #[allow(dead_code)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -65,6 +74,76 @@ struct UblkCtrlCmdData {
 
     addr: u64,
     len: u32,
+}
+
+impl UblkCtrlCmdData {
+    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrl) -> u64 {
+        // handle GET_DEV_INFO2 always with dev_path attached
+        if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
+            && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
+        {
+            return 0;
+        }
+
+        let buf: *mut u8 = {
+            let size = {
+                if self.flags & CTRL_CMD_HAS_BUF != 0 {
+                    self.len as usize + CTRL_UBLKC_PATH_MAX
+                } else {
+                    CTRL_UBLKC_PATH_MAX
+                }
+            };
+            super::ublk_alloc_buf(size, 8)
+        };
+
+        let path_str = format!("{}", dev.get_cdev_path());
+        assert!(path_str.len() <= CTRL_UBLKC_PATH_MAX);
+
+        unsafe {
+            libc::memset(buf as *mut libc::c_void, 0, CTRL_UBLKC_PATH_MAX);
+            libc::memcpy(
+                buf as *mut libc::c_void,
+                path_str.as_ptr() as *const libc::c_void,
+                path_str.len(),
+            );
+
+            if self.flags & CTRL_CMD_HAS_BUF != 0 {
+                libc::memcpy(
+                    (buf as u64 + CTRL_UBLKC_PATH_MAX as u64) as *mut libc::c_void,
+                    self.addr as *const libc::c_void,
+                    self.len as usize,
+                );
+            }
+        }
+
+        self.flags |= CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA;
+        self.len += CTRL_UBLKC_PATH_MAX as u32;
+        self.dev_path_len = CTRL_UBLKC_PATH_MAX as u16;
+        let addr = self.addr;
+        self.addr = buf as u64;
+        addr
+    }
+
+    fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrl, buf: u64) {
+        if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
+            && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
+        {
+            return;
+        }
+
+        let addr = self.addr + CTRL_UBLKC_PATH_MAX as u64;
+        let len = self.len - CTRL_UBLKC_PATH_MAX as u32;
+        if self.flags & CTRL_CMD_BUF_READ != 0 {
+            unsafe {
+                libc::memcpy(
+                    buf as *mut libc::c_void,
+                    addr as *const libc::c_void,
+                    len as usize,
+                );
+            }
+        }
+        super::ublk_dealloc_buf(self.addr as *mut u8, self.len as usize, 8);
+    }
 }
 
 fn ublk_ctrl_prep_cmd(
@@ -106,7 +185,10 @@ fn ublk_ctrl_prep_cmd(
 }
 
 fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-    let sqe = ublk_ctrl_prep_cmd(ctrl, ctrl.file.as_raw_fd(), ctrl.dev_info.dev_id, data);
+    let mut data = data.clone();
+    let old_buf = data.prep_un_privileged_dev_path(ctrl);
+
+    let sqe = ublk_ctrl_prep_cmd(ctrl, ctrl.file.as_raw_fd(), ctrl.dev_info.dev_id, &data);
     let to_wait = if data.flags & CTRL_CMD_ASYNC != 0 {
         0
     } else {
@@ -126,6 +208,8 @@ fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> Result<i32, Ubl
     if to_wait == 0 {
         return Ok(ctrl.cmd_token);
     }
+
+    data.unprep_un_privileged_dev_path(ctrl, old_buf);
 
     let cqe = ctrl.ring.completion().next().expect("cqueue is empty");
     let res: i32 = cqe.result();
@@ -284,6 +368,10 @@ impl UblkCtrl {
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    fn is_unprivileged(&self) -> bool {
+        (self.dev_info.flags & (super::sys::UBLK_F_UNPRIVILEGED_DEV as u64)) != 0
     }
 
     /// Return ublk char device path
@@ -487,8 +575,13 @@ impl UblkCtrl {
             self.dev_state_desc()
         );
         println!(
-            "\tublkc: {}:{} ublkb: {}:{}",
-            p.devt.char_major, p.devt.char_minor, p.devt.disk_major, p.devt.disk_minor,
+            "\tublkc: {}:{} ublkb: {}:{} owner: {}:{}",
+            p.devt.char_major,
+            p.devt.char_minor,
+            p.devt.disk_major,
+            p.devt.disk_minor,
+            info.owner_uid,
+            info.owner_gid
         );
 
         self.dump_from_json();
@@ -507,7 +600,7 @@ impl UblkCtrl {
     fn add(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_ADD_DEV,
-            flags: CTRL_CMD_HAS_BUF,
+            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_NO_NEED_DEV_PATH,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
             len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             ..Default::default()
@@ -565,7 +658,7 @@ impl UblkCtrl {
         let features = 0_u64;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_U_CMD_GET_FEATURES,
-            flags: CTRL_CMD_HAS_BUF,
+            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ | CTRL_CMD_NO_NEED_DEV_PATH,
             addr: std::ptr::addr_of!(features) as u64,
             len: core::mem::size_of::<u64>() as u32,
             ..Default::default()
@@ -576,18 +669,40 @@ impl UblkCtrl {
         Ok(features)
     }
 
-    /// Retrieving device info from ublk driver
-    ///
-    pub fn get_info(&mut self) -> Result<i32, UblkError> {
+    fn __get_info(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_DEV_INFO,
-            flags: CTRL_CMD_HAS_BUF,
+            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
             len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             ..Default::default()
         };
 
         ublk_ctrl_cmd(self, &data)
+    }
+
+    fn __get_info2(&mut self) -> Result<i32, UblkError> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_CMD_GET_DEV_INFO2,
+            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
+            addr: std::ptr::addr_of!(self.dev_info) as u64,
+            len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
+            ..Default::default()
+        };
+
+        ublk_ctrl_cmd(self, &data)
+    }
+
+    /// Retrieving device info from ublk driver
+    ///
+    pub fn get_info(&mut self) -> Result<i32, UblkError> {
+        let res = self.__get_info2();
+
+        if res.is_err() {
+            self.__get_info()
+        } else {
+            res
+        }
     }
 
     /// Start this device by sending command to ublk driver
@@ -625,7 +740,7 @@ impl UblkCtrl {
         params.len = core::mem::size_of::<sys::ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_PARAMS,
-            flags: CTRL_CMD_HAS_BUF,
+            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
             addr: std::ptr::addr_of!(params) as u64,
             len: params.len,
             ..Default::default()
@@ -663,7 +778,7 @@ impl UblkCtrl {
     ) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_QUEUE_AFFINITY,
-            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA,
+            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA | CTRL_CMD_BUF_READ,
             addr: bm.addr() as u64,
             data: q as u64,
             len: bm.buf_len() as u32,
@@ -716,6 +831,7 @@ impl UblkCtrl {
     }
 
     fn __start_dev(&mut self, dev: &UblkDev, async_cmd: bool) -> Result<i32, UblkError> {
+        assert!(!self.is_unprivileged() || !async_cmd);
         self.get_info()?;
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
             return Ok(0);
@@ -933,6 +1049,24 @@ mod tests {
     #[test]
     fn test_add_ctrl_dev() {
         let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, UBLK_DEV_F_ADD_DEV).unwrap();
+        let dev_path = ctrl.get_cdev_path();
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(Path::new(&dev_path).exists() == true);
+    }
+
+    /// minimized unprivileged ublk test, may just run in root privilege
+    #[test]
+    fn test_add_un_privileted_ublk() {
+        let ctrl = UblkCtrl::new(
+            -1,
+            1,
+            64,
+            512_u32 * 1024,
+            crate::sys::UBLK_F_UNPRIVILEGED_DEV as u64,
+            UBLK_DEV_F_ADD_DEV,
+        )
+        .unwrap();
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
