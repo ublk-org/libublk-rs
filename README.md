@@ -65,7 +65,7 @@ fn main() {
                 q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
             };
 
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, _dev, true)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         };

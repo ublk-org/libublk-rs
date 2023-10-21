@@ -236,7 +236,7 @@ fn __test_add(
                 let lo_io_handler =
                     move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| _lo_handle_io(q, tag, io);
 
-                UblkQueue::new(qid, _dev)
+                UblkQueue::new(qid, _dev, true)
                     .unwrap()
                     .wait_and_handle_io(lo_io_handler);
             };

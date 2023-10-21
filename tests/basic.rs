@@ -89,7 +89,7 @@ mod integration {
                 q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
             };
 
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, _dev, true)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         }
@@ -112,7 +112,7 @@ mod integration {
                 q.complete_io_cmd(tag, res);
             };
 
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, _dev, true)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         }
@@ -209,7 +209,7 @@ mod integration {
                 let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                     rd_handle_io(q, tag, _io, buf_addr);
                 };
-                UblkQueue::new(qid, _dev)
+                UblkQueue::new(qid, _dev, true)
                     .unwrap()
                     .wait_and_handle_io(io_handler);
             };
@@ -246,7 +246,7 @@ mod integration {
                 q.complete_io_cmd(tag, res);
             };
 
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, _dev, true)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         }

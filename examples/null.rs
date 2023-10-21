@@ -39,7 +39,7 @@ fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u3
                     q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
                 };
 
-                UblkQueue::new(qid, _dev)
+                UblkQueue::new(qid, _dev, true)
                     .unwrap()
                     .wait_and_handle_io(io_handler);
             };

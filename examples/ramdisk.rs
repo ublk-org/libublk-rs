@@ -63,7 +63,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
             let rd_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
                 handle_io(q, tag, io, buf_addr);
             };
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, _dev, true)
                 .unwrap()
                 .wait_and_handle_io(rd_io_handler);
         };
