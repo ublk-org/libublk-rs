@@ -16,6 +16,13 @@ maintenance = { status = "actively-developed" }
 [features]
 fat_complete = []
 
+[[bin]]
+name = "ublk_user_id"
+path = "utils/ublk_user_id_rs.rs"
+
+[package.metadata]
+scripts = ["utils/ublk_chown.sh"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]

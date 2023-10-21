@@ -81,6 +81,26 @@ fn main() {
 }
 ```
 
+## unprivileged ublk support
+
+In unprivileged mode(`UBLK_F_UNPRIVILEGED_DEV`), ublk device can be created
+in non-admin user session. For supporting this feature:
+
+- install udev rules
+
+```
+KERNEL=="ublk-control", MODE="0666", OPTIONS+="static_node=ublk-control"
+ACTION=="add",KERNEL=="ublk[bc]*",RUN+="/usr/local/sbin/ublk_chown.sh %k 'add' '%M' '%m'"
+ACTION=="remove",KERNEL=="ublk[bc]*",RUN+="/usr/local/sbin/ublk_chown.sh %k 'remove' '%M' '%m'"
+```
+
+- install utility and script
+
+`utils/ublk_chown.sh` and binary of `utils/ublk_user_id.rs` needs to be
+installed under /usr/local/sbin or other directory which has to match
+with the udev rules.
+
+
 ## Test
 
 You can run the test of the library with ```cargo test```
