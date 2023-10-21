@@ -81,6 +81,23 @@ fn main() {
 }
 ```
 
+## unprivileged ublk support
+
+- install udev rules
+
+```
+KERNEL=="ublk-control", MODE="0666", OPTIONS+="static_node=ublk-control"
+ACTION=="add",KERNEL=="ublk[bc]*",RUN+="/usr/local/sbin/ublk_chown.sh %k 'add' '%M' '%m'"
+ACTION=="remove",KERNEL=="ublk[bc]*",RUN+="/usr/local/sbin/ublk_chown.sh %k 'remove' '%M' '%m'"
+```
+
+- install utility and script
+
+`utils/ublk_chown.sh` and binary of `utils/ublk_user_id.rs` needs to be
+/usr/local/sbin or other directory which need to be same with the one taken
+in udev rules.
+
+
 ## Test
 
 You can run the test of the library with ```cargo test```
