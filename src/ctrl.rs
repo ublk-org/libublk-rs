@@ -4,9 +4,12 @@ use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
-use std::fs;
-use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::{
+    fs,
+    io::{Read, Write},
+    path::Path,
+};
 
 const CTRL_PATH: &str = "/dev/ublk-control";
 
@@ -207,7 +210,7 @@ impl UblkCtrl {
         flags: u64,
         dev_flags: u32,
     ) -> Result<UblkCtrl, UblkError> {
-        if !std::path::Path::new(CTRL_PATH).exists() {
+        if !Path::new(CTRL_PATH).exists() {
             eprintln!("Please run `modprobe ublk_drv` first");
             return Err(UblkError::OtherError(-libc::ENOENT));
         }
@@ -404,7 +407,7 @@ impl UblkCtrl {
     }
 
     pub fn dump_from_json(&self) {
-        if !std::path::Path::new(&self.run_path()).exists() {
+        if !Path::new(&self.run_path()).exists() {
             return;
         }
         let mut file = fs::File::open(self.run_path()).expect("Failed to open file");
@@ -549,7 +552,7 @@ impl UblkCtrl {
     ///
     pub fn del_dev(&mut self) -> Result<i32, UblkError> {
         self.del()?;
-        if std::path::Path::new(&self.run_path()).exists() {
+        if Path::new(&self.run_path()).exists() {
             fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
         }
         Ok(0)
@@ -801,10 +804,22 @@ impl UblkCtrl {
     /// Remove json export, and send stop command to control device
     ///
     pub fn stop_dev(&mut self, _dev: &UblkDev) -> Result<i32, UblkError> {
-        if self.for_add_dev() && std::path::Path::new(&self.run_path()).exists() {
+        if self.for_add_dev() && Path::new(&self.run_path()).exists() {
             fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
         }
         self.stop()
+    }
+
+    fn set_path_permission(path: &Path, mode: u32) -> Result<i32, UblkError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(path).map_err(UblkError::OtherIOError)?;
+        let mut permissions = metadata.permissions();
+
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions).map_err(UblkError::OtherIOError)?;
+
+        Ok(0)
     }
 
     /// Flush this device's json info as file
@@ -820,11 +835,24 @@ impl UblkCtrl {
         }
 
         let run_path = self.run_path();
+        let json_path = Path::new(&run_path);
 
-        if let Some(parent_dir) = std::path::Path::new(&run_path).parent() {
-            fs::create_dir_all(parent_dir).map_err(UblkError::OtherIOError)?;
+        if let Some(parent_dir) = json_path.parent() {
+            if !Path::new(&parent_dir).exists() {
+                fs::create_dir_all(parent_dir).map_err(UblkError::OtherIOError)?;
+
+                // It is just fine to expose the running parent directory as
+                // 777, and we will make sure every exported running json
+                // file as 700.
+                Self::set_path_permission(parent_dir, 0o777)?;
+            }
         }
-        let mut run_file = fs::File::create(&run_path).map_err(UblkError::OtherIOError)?;
+        let mut run_file = fs::File::create(&json_path).map_err(UblkError::OtherIOError)?;
+
+        // each exported json file is only visible for the owner
+        // in future, it can be relaxed for the group according to
+        // ublk use policy
+        Self::set_path_permission(&json_path, 0o700)?;
 
         run_file
             .write_all(self.json.to_string().as_bytes())

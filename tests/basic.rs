@@ -9,6 +9,7 @@ mod integration {
     use std::process::{Command, Stdio};
 
     fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_flags: u32) {
+        use std::os::unix::fs::PermissionsExt;
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -19,7 +20,15 @@ mod integration {
         assert!(Path::new(&dev_path).exists() == true);
 
         //ublk exported json file should be observed
-        assert!(Path::new(&ctrl.run_path()).exists() == true);
+        let run_path = ctrl.run_path();
+        let json_path = Path::new(&run_path);
+        assert!(json_path.exists() == true);
+
+        let metadata = std::fs::metadata(json_path)
+            .map_err(UblkError::OtherIOError)
+            .unwrap();
+        let permissions = metadata.permissions();
+        assert!((permissions.mode() & 0o777) == 0o700);
     }
 
     fn read_ublk_disk(dev_id: i32) {
