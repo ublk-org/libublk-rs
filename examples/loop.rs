@@ -138,7 +138,14 @@ fn _lo_handle_io(q: &UblkQueue, tag: u16, i: &UblkIOCtx) {
     loop_queue_tgt_io(q, tag, i);
 }
 
-fn test_add(id: i32, nr_queues: u32, depth: u32, buf_sz: u32, backing_file: &String) {
+fn test_add(
+    id: i32,
+    nr_queues: u32,
+    depth: u32,
+    buf_sz: u32,
+    backing_file: &String,
+    ctrl_flags: u64,
+) {
     let _pid = unsafe { libc::fork() };
 
     if _pid == 0 {
@@ -156,6 +163,7 @@ fn test_add(id: i32, nr_queues: u32, depth: u32, buf_sz: u32, backing_file: &Str
             let sess = libublk::UblkSessionBuilder::default()
                 .name("example_loop")
                 .id(id)
+                .ctrl_flags(ctrl_flags)
                 .nr_queues(nr_queues)
                 .depth(depth)
                 .io_buf_bytes(buf_sz)
@@ -225,6 +233,13 @@ fn main() {
                         .action(ArgAction::Set),
                 )
                 .arg(
+                    Arg::new("unprivileged")
+                        .long("unprivileged")
+                        .short('p')
+                        .action(ArgAction::SetTrue)
+                        .help("enable UBLK_F_UN_PRIVILEGED_DEV"),
+                )
+                .arg(
                     Arg::new("backing_file")
                         .long("backing_file")
                         .short('f')
@@ -270,7 +285,12 @@ fn main() {
                 .unwrap_or(52288);
             let backing_file = add_matches.get_one::<String>("backing_file").unwrap();
 
-            test_add(id, nr_queues, depth, buf_size, backing_file);
+            let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
+                libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64
+            } else {
+                0
+            };
+            test_add(id, nr_queues, depth, buf_size, backing_file, ctrl_flags);
         }
         Some(("del", add_matches)) => {
             let id = add_matches
