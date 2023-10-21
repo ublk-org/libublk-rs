@@ -1,6 +1,6 @@
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, exe::UringOpFuture, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
@@ -557,12 +557,13 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     #[allow(unused_assignments)]
-    fn queue_io_cmd(
+    fn __queue_io_cmd(
         &self,
         r: &mut IoUring<squeue::Entry>,
         tag: u16,
         cmd_op: u32,
         buf_addr: u64,
+        user_data: u64,
         res: i32,
     ) -> i32 {
         let mut state = self.state.borrow_mut();
@@ -576,12 +577,11 @@ impl UblkQueue<'_> {
             q_id: self.q_id,
             result: res,
         };
-        let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
 
         let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
-            .user_data(data);
+            .user_data(user_data);
 
         unsafe {
             r.submission().push(&sqe).expect("submission fail");
@@ -602,6 +602,19 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    fn queue_io_cmd(
+        &self,
+        r: &mut IoUring<squeue::Entry>,
+        tag: u16,
+        cmd_op: u32,
+        buf_addr: u64,
+        res: i32,
+    ) -> i32 {
+        let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
+        self.__queue_io_cmd(r, tag, cmd_op, buf_addr, data, res)
+    }
+
+    #[inline(always)]
     fn commit_and_queue_io_cmd(
         &self,
         r: &mut IoUring<squeue::Entry>,
@@ -616,6 +629,44 @@ impl UblkQueue<'_> {
             buf_addr,
             io_cmd_result,
         );
+    }
+
+    #[inline(always)]
+    fn __submit_io_cmd(
+        &self,
+        tag: u16,
+        cmd_op: u32,
+        buf_addr: u64,
+        user_data: u64,
+        io_cmd_result: i32,
+    ) {
+        let mut r = self.q_ring.borrow_mut();
+        self.__queue_io_cmd(&mut r, tag, cmd_op, buf_addr, user_data, io_cmd_result);
+    }
+
+    /// Submit one io command.
+    ///
+    /// When it is called 1st time on this tag, the `cmd_op` has to be
+    /// UBLK_IO_FETCH_REQ, otherwise it is UBLK_IO_COMMIT_AND_FETCH_REQ.
+    ///
+    /// UringOpFuture is one Future object, so this function is actually
+    /// one async function, and user can get result by submit_io_cmd().await
+    ///
+    /// Once result is returned, it means this command is completed and
+    /// one ublk IO command is coming from ublk driver.
+    #[inline]
+    pub fn submit_io_cmd(
+        &self,
+        tag: u16,
+        cmd_op: u32,
+        buf_addr: u64,
+        result: i32,
+    ) -> UringOpFuture {
+        let user_data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
+
+        self.__submit_io_cmd(tag, cmd_op, buf_addr, user_data, result);
+
+        UringOpFuture { user_data }
     }
 
     /// Submit all commands for fetching IO
