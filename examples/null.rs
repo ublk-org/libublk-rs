@@ -95,6 +95,13 @@ fn main() {
                         .short('u')
                         .action(ArgAction::SetTrue)
                         .help("enable UBLK_F_USER_COPY"),
+                )
+                .arg(
+                    Arg::new("unprivileged")
+                        .long("unprivileged")
+                        .short('p')
+                        .action(ArgAction::SetTrue)
+                        .help("enable UBLK_F_UN_PRIVILEGED_DEV"),
                 ),
         )
         .subcommand(
@@ -135,6 +142,10 @@ fn main() {
 
             let ctrl_flags: u64 = if add_matches.get_flag("user_copy") {
                 libublk::sys::UBLK_F_USER_COPY as u64
+            } else {
+                0
+            } | if add_matches.get_flag("unprivileged") {
+                libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64
             } else {
                 0
             };
