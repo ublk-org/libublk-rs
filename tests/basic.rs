@@ -10,6 +10,7 @@ mod integration {
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_flags: u32) {
         use std::os::unix::fs::PermissionsExt;
@@ -151,6 +152,11 @@ mod integration {
             bytes + null_submit_nop(&q, data).await
         }
 
+        //Device wide data shared among all queue context
+        struct DevData {
+            done: u64,
+        }
+
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
@@ -169,6 +175,9 @@ mod integration {
             dev.set_default_params(250_u64 << 30);
             Ok(serde_json::json!({}))
         };
+        // device data is shared among all queue contexts
+        let dev_data = Arc::new(Mutex::new(DevData { done: 0 }));
+        let wh_dev_data = dev_data.clone();
 
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         // queue handler supports Clone(), so will be cloned in each
@@ -177,8 +186,13 @@ mod integration {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
             let exe = Executor::new(dev.get_nr_ios());
 
+            // `q_fn` closure implements Clone() Trait, so the captured
+            // `dev_data` is cloned to `q_fn` context.
+            let _dev_data = Rc::new(dev_data);
+
             for tag in 0..depth {
                 let q = q_rc.clone();
+                let __dev_data = _dev_data.clone();
 
                 exe.spawn(tag as u16, async move {
                     let buf_addr = q.get_io_buf_addr(tag) as u64;
@@ -192,6 +206,10 @@ mod integration {
 
                         res = handle_io_cmd(&q, tag).await;
                         cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                        {
+                            let mut guard = __dev_data.lock().unwrap();
+                            (*guard).done += 1;
+                        }
                     }
                 });
             }
@@ -205,6 +223,11 @@ mod integration {
             // run sanity and disk IO test after ublk disk is ready
             run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
             read_ublk_disk(dev_id);
+
+            {
+                let guard = wh_dev_data.lock().unwrap();
+                assert!((*guard).done > 0);
+            }
 
             ctrl.del().unwrap();
         })
