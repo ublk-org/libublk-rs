@@ -218,13 +218,27 @@ impl UblkDev {
             ring_flags: 0,
             ..Default::default()
         };
-
+        let mut cnt = 0;
         let cdev_path = ctrl.get_cdev_path();
-        let cdev_file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(cdev_path)
-            .map_err(UblkError::OtherIOError)?;
+
+        // ublk char device setup(udev event handling, ...) may not be done
+        // successfully, so wait a while. And the timeout is set as 3sec now.
+        let cdev_file = loop {
+            let f_result = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&cdev_path);
+
+            if let Ok(f) = f_result {
+                break f;
+            }
+
+            cnt += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if cnt >= 300 {
+                return Err(UblkError::OtherError(-libc::EACCES));
+            }
+        };
 
         tgt.fds[0] = cdev_file.as_raw_fd();
         tgt.nr_fds = 1;
