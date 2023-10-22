@@ -116,13 +116,11 @@ queue's depth is 64.
 
 ### loop
 
--   add one loop ublk device
+  cargo run \--example loop help
 
-    cargo run \--example loop \-- add \${backing_file_path}
+### null
 
--   del one loop ublk device
-
-    cargo run \--example loop \-- del \[dev_id\]
+  cargo run \--example null help
 
 ## License
 
