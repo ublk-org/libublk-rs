@@ -4,7 +4,7 @@ use bitmaps::Bitmap;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::{
     fs,
     io::{Read, Write},
@@ -173,6 +173,12 @@ pub struct UblkCtrl {
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
     ring: IoUring<squeue::Entry128>,
+}
+
+impl AsRawFd for UblkCtrl {
+    fn as_raw_fd(&self) -> RawFd {
+        self.ring.as_raw_fd()
+    }
 }
 
 impl Drop for UblkCtrl {
