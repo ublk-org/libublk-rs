@@ -528,6 +528,7 @@ impl UblkCtrl {
         fd: i32,
         dev_id: u32,
         data: &UblkCtrlCmdData,
+        token: i32,
     ) -> squeue::Entry128 {
         let cmd = sys::ublksrv_ctrl_cmd {
             addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
@@ -555,24 +556,24 @@ impl UblkCtrl {
         opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
             .cmd(unsafe { c_cmd.buf })
             .build()
-            .user_data({
-                self.cmd_token += 1;
-                self.cmd_token as u64
-            })
+            .user_data(token as u64)
     }
 
-    fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let mut data = data.clone();
-        let old_buf = data.prep_un_privileged_dev_path(self);
-
+    fn ublk_submit_ctrl_cmd(
+        &mut self,
+        data: &mut UblkCtrlCmdData,
+        to_wait: usize,
+    ) -> Result<i32, UblkError> {
         let fd = self.file.as_raw_fd();
         let dev_id = self.dev_info.dev_id;
-        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, &data);
-        let to_wait = if data.flags & CTRL_CMD_ASYNC != 0 {
-            0
-        } else {
-            1
+
+        // token is generated uniquely because '&mut self' is
+        // passed in
+        let token = {
+            self.cmd_token += 1;
+            self.cmd_token
         };
+        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, &data, token);
 
         unsafe {
             self.ring
@@ -584,19 +585,45 @@ impl UblkCtrl {
             .submit_and_wait(to_wait)
             .map_err(UblkError::UringSubmissionError)?;
 
-        if to_wait == 0 {
-            return Ok(self.cmd_token);
+        Ok(token)
+    }
+
+    /// Poll one control command until it is completed
+    ///
+    /// Note: so far, we only support to poll at most one-inflight
+    /// command, and the use case is for supporting to run start_dev
+    /// in queue io handling context
+    fn poll_cmd(&mut self, token: i32) -> Result<i32, UblkError> {
+        if self.ring.completion().is_empty() {
+            return Err(UblkError::UringIOError(-libc::EAGAIN));
         }
 
-        data.unprep_un_privileged_dev_path(self, old_buf);
-
         let cqe = self.ring.completion().next().expect("cqueue is empty");
+        if cqe.user_data() != token as u64 {
+            return Err(UblkError::UringIOError(-libc::EAGAIN));
+        }
+
         let res: i32 = cqe.result();
         if res == 0 || res == -libc::EBUSY {
             Ok(res)
         } else {
             Err(UblkError::UringIOError(res))
         }
+    }
+
+    fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        let mut data = data.clone();
+        let to_wait = 1;
+
+        assert!(data.flags & CTRL_CMD_ASYNC == 0);
+
+        let old_buf = data.prep_un_privileged_dev_path(self);
+        let token = self.ublk_submit_ctrl_cmd(&mut data, to_wait)?;
+        let res = self.poll_cmd(token);
+
+        data.unprep_un_privileged_dev_path(self, old_buf);
+
+        res
     }
 
     fn add(&mut self) -> Result<i32, UblkError> {
@@ -609,25 +636,6 @@ impl UblkCtrl {
         };
 
         self.ublk_ctrl_cmd(&data)
-    }
-
-    /// Poll one control command until it is completed
-    ///
-    /// Note: so far, we only support to poll at most one-inflight
-    /// command, and the use case is for supporting to run start_dev
-    /// in queue io handling context
-    pub fn poll_cmd(&mut self, token: i32) -> Result<i32, UblkError> {
-        if self.ring.completion().is_empty() {
-            return Err(UblkError::UringIOError(-libc::EAGAIN));
-        }
-
-        let cqe = self.ring.completion().next().expect("cqueue is empty");
-        let res: i32 = cqe.result();
-        if res == 0 && cqe.user_data() == token as u64 {
-            Ok(res)
-        } else {
-            Err(UblkError::UringIOError(res))
-        }
     }
 
     /// Remove this device
@@ -891,26 +899,28 @@ impl UblkCtrl {
     where
         F: FnMut(&super::io::UblkQueue, u16, &super::io::UblkIOCtx),
     {
-        let mut started = false;
         let token = self.__start_dev(dev, true)?;
 
-        while !started {
+        loop {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            if let Ok(res) = self.poll_cmd(token) {
-                started = true;
-                if res == 0 {
-                    continue;
-                } else {
-                    return Err(UblkError::UringIOError(res));
-                }
-            }
             match q.process_ios(&mut ops, 0) {
                 Err(r) => return Err(r),
-                _ => continue,
+                _ => {}
+            }
+            match self.poll_cmd(token) {
+                Ok(res) => {
+                    return Ok(res);
+                }
+                Err(UblkError::UringIOError(res)) => {
+                    if res == -libc::EAGAIN {
+                        continue;
+                    } else {
+                        return Err(UblkError::UringIOError(res));
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
-
-        Ok(0)
     }
 
     /// Stop ublk device
