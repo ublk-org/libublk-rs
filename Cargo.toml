@@ -47,3 +47,5 @@ tempfile = "3.6.0"
 regex = "1.8.4"
 anyhow = {version = "1.0.66", features = ["default"]}
 clap = "4.3"
+nix = "0.26.2"
+ilog = "1.0.1"

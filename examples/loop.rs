@@ -1,11 +1,13 @@
 use anyhow::Result;
 use clap::{Arg, ArgAction, Command};
+use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes, UblkSession};
 use log::trace;
 use serde::Serialize;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 
 #[derive(Debug, Serialize)]
@@ -20,10 +22,44 @@ struct LoopTgt {
     direct_io: i32,
 }
 
-fn lo_file_size(f: &std::fs::File) -> Result<u64> {
+// Generate ioctl function
+const BLK_IOCTL_TYPE: u8 = 0x12; // Defined in linux/fs.h
+const BLKGETSIZE64_NR: u8 = 114;
+const BLKSSZGET_NR: u8 = 104;
+const BLKPBSZGET_NR: u8 = 123;
+
+nix::ioctl_read!(ioctl_blkgetsize64, BLK_IOCTL_TYPE, BLKGETSIZE64_NR, u64);
+nix::ioctl_read_bad!(
+    ioctl_blksszget,
+    nix::request_code_none!(BLK_IOCTL_TYPE, BLKSSZGET_NR),
+    i32
+);
+nix::ioctl_read_bad!(
+    ioctl_blkpbszget,
+    nix::request_code_none!(BLK_IOCTL_TYPE, BLKPBSZGET_NR),
+    u32
+);
+fn lo_file_size(f: &std::fs::File) -> Result<(u64, u8, u8)> {
     if let Ok(meta) = f.metadata() {
-        if meta.file_type().is_file() {
-            Ok(f.metadata().unwrap().len())
+        if meta.file_type().is_block_device() {
+            let fd = f.as_raw_fd();
+            let mut cap = 0_u64;
+            let mut ssz = 0_i32;
+            let mut pbsz = 0_u32;
+
+            unsafe {
+                let cap_ptr = &mut cap as *mut u64;
+                let ssz_ptr = &mut ssz as *mut i32;
+                let pbsz_ptr = &mut pbsz as *mut u32;
+
+                ioctl_blkgetsize64(fd, cap_ptr).unwrap();
+                ioctl_blksszget(fd, ssz_ptr).unwrap();
+                ioctl_blkpbszget(fd, pbsz_ptr).unwrap();
+            }
+
+            Ok((cap, ssz.log2() as u8, pbsz.log2() as u8))
+        } else if meta.file_type().is_file() {
+            Ok((f.metadata().unwrap().len(), 9, 12))
         } else {
             Err(anyhow::anyhow!("unsupported file"))
         }
@@ -41,17 +77,27 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<serde_json::Value, Ubl
         }
     }
 
-    let dev_size = {
-        let tgt = &mut dev.tgt;
-        let nr_fds = tgt.nr_fds;
-        tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
-        tgt.nr_fds = nr_fds + 1;
+    let tgt = &mut dev.tgt;
+    let nr_fds = tgt.nr_fds;
+    tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
+    tgt.nr_fds = nr_fds + 1;
 
-        tgt.dev_size = lo_file_size(&lo.back_file).unwrap();
-        tgt.dev_size
+    let sz = { lo_file_size(&lo.back_file).unwrap() };
+    tgt.dev_size = sz.0;
+    //todo: figure out correct block size
+    tgt.params = libublk::sys::ublk_params {
+        types: libublk::sys::UBLK_PARAM_TYPE_BASIC,
+        basic: libublk::sys::ublk_param_basic {
+            logical_bs_shift: sz.1,
+            physical_bs_shift: sz.2,
+            io_opt_shift: 12,
+            io_min_shift: 9,
+            max_sectors: dev.dev_info.max_io_buf_bytes >> 9,
+            dev_sectors: tgt.dev_size >> 9,
+            ..Default::default()
+        },
+        ..Default::default()
     };
-    dev.set_default_params(dev_size);
-
     Ok(
         serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: 1 } }),
     )
