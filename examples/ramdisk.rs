@@ -5,7 +5,7 @@
 ///
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::{ctrl::UblkCtrl, exe::Executor};
+use libublk::{ctrl::UblkCtrl, exe::Executor, UblkError};
 use std::rc::Rc;
 
 fn handle_io(q: &UblkQueue, tag: u16, start: u64) -> i32 {
@@ -91,10 +91,30 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     ctrl.configure_queue(&dev, 0, unsafe { libc::gettid() })
         .unwrap();
 
-    ctrl.start_dev_in_queue(&dev, &q_rc, &exe).unwrap();
-    ctrl.dump();
-    q_rc.wait_and_wake_io_tasks(&exe);
+    let (token, buf) = ctrl.submit_start_dev(&dev).unwrap();
+    let res = loop {
+        let _ = q_rc.flush_and_wake_io_tasks(&exe, 0);
+        let _res = ctrl.poll_start_dev(token);
+        match _res {
+            Ok(res) => break Ok(res),
+            Err(UblkError::UringIOError(res)) => {
+                if res != -libc::EAGAIN {
+                    break Err(UblkError::UringIOError(res));
+                }
+            }
+            Err(r) => break Err(r),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    libublk::ublk_dealloc_buf(buf.0, buf.1, buf.2);
 
+    match res {
+        Ok(res) if res >= 0 => {
+            ctrl.dump();
+            q_rc.wait_and_wake_io_tasks(&exe);
+        }
+        _ => {}
+    };
     //device may be deleted from another context, so it is normal
     //to see -ENOENT failure here
     let _ = ctrl.stop_dev(&dev);

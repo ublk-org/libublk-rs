@@ -876,33 +876,36 @@ impl UblkCtrl {
         }
     }
 
-    /// Start ublk device from queue daemon context
+    /// submit starting of ublk device from queue daemon context
     ///
     /// # Arguments:
     ///
     /// * `dev`: ublk device
-    /// * `queue`: ublk queue, if both `queue` and `ops`  isn't none, we
-    ///     start device in queue daemon context
-    /// * `exe`: async Executor
     ///
     /// Send parameter to driver, and flush json to storage, finally
-    /// send START command
+    /// submit START command
     ///
     /// When ublk driver handles START_DEV, ublk IO starts to come from
     /// this kernel code path, such as, reading partition table, so we
     /// have make io handler working before sending START_DEV to kernel
     ///
-    /// Only works for using async/.await for handling IO command
-    ///
     /// This kind of usage should be avoided as far as possible, and it
     /// is suggested to start device in one standalone & one-shot context.
     ///
-    pub fn start_dev_in_queue(
+    /// Temporary buffer is returned, and the buffer has to be freed after
+    /// start_dev is done.
+    ///
+    /// TODO: convert control path into async/.await. It shouldn't be hard,
+    /// everything can be done in one background task, and block_on() can
+    /// be added for this purpose. The main trouble is that almost every
+    /// methods of UblkCtrl need to be switched to async, and still not
+    /// confident for this kind of big change. The main use case is to
+    /// run everything(control & io) in single thread context.
+    ///
+    pub fn submit_start_dev(
         &mut self,
         dev: &UblkDev,
-        q: &super::io::UblkQueue,
-        exe: &super::exe::Executor,
-    ) -> Result<i32, UblkError> {
+    ) -> Result<(i32, (*mut u8, usize, usize)), UblkError> {
         let mut data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: if self.for_recover_dev() {
                 sys::UBLK_CMD_END_USER_RECOVERY
@@ -919,21 +922,12 @@ impl UblkCtrl {
         let old_buf = data.prep_un_privileged_dev_path(self);
         let token = self.ublk_submit_ctrl_cmd(&mut data, 0)?;
 
-        let res = loop {
-            let _ = q.flush_and_wake_io_tasks(&exe, 0);
-            match self.poll_cmd(token) {
-                Ok(res) => break Ok(res),
-                Err(UblkError::UringIOError(res)) => {
-                    if res != -libc::EAGAIN {
-                        break Err(UblkError::UringIOError(res));
-                    }
-                }
-                Err(e) => break Err(e),
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        data.unprep_un_privileged_dev_path(self, old_buf);
-        res
+        Ok((token, (old_buf as *mut u8, CTRL_UBLKC_PATH_MAX, 8)))
+    }
+
+    // poll the submitted start_dev
+    pub fn poll_start_dev(&mut self, token: i32) -> Result<i32, UblkError> {
+        self.poll_cmd(token)
     }
 
     /// Stop ublk device
