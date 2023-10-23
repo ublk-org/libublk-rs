@@ -146,80 +146,6 @@ impl UblkCtrlCmdData {
     }
 }
 
-fn ublk_ctrl_prep_cmd(
-    ctrl: &mut UblkCtrl,
-    fd: i32,
-    dev_id: u32,
-    data: &UblkCtrlCmdData,
-) -> squeue::Entry128 {
-    let cmd = sys::ublksrv_ctrl_cmd {
-        addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
-            data.addr
-        } else {
-            0
-        },
-        len: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
-            data.len as u16
-        } else {
-            0
-        },
-        data: if (data.flags & CTRL_CMD_HAS_DATA) != 0 {
-            [data.data]
-        } else {
-            [0]
-        },
-        dev_id,
-        queue_id: u16::MAX,
-        dev_path_len: data.dev_path_len,
-        ..Default::default()
-    };
-    let c_cmd = CtrlCmd { ctrl_cmd: cmd };
-
-    opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
-        .cmd(unsafe { c_cmd.buf })
-        .build()
-        .user_data({
-            ctrl.cmd_token += 1;
-            ctrl.cmd_token as u64
-        })
-}
-
-fn ublk_ctrl_cmd(ctrl: &mut UblkCtrl, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-    let mut data = data.clone();
-    let old_buf = data.prep_un_privileged_dev_path(ctrl);
-
-    let sqe = ublk_ctrl_prep_cmd(ctrl, ctrl.file.as_raw_fd(), ctrl.dev_info.dev_id, &data);
-    let to_wait = if data.flags & CTRL_CMD_ASYNC != 0 {
-        0
-    } else {
-        1
-    };
-
-    unsafe {
-        ctrl.ring
-            .submission()
-            .push(&sqe)
-            .map_err(UblkError::UringPushError)?;
-    }
-    ctrl.ring
-        .submit_and_wait(to_wait)
-        .map_err(UblkError::UringSubmissionError)?;
-
-    if to_wait == 0 {
-        return Ok(ctrl.cmd_token);
-    }
-
-    data.unprep_un_privileged_dev_path(ctrl, old_buf);
-
-    let cqe = ctrl.ring.completion().next().expect("cqueue is empty");
-    let res: i32 = cqe.result();
-    if res == 0 || res == -libc::EBUSY {
-        Ok(res)
-    } else {
-        Err(UblkError::UringIOError(res))
-    }
-}
-
 #[derive(Debug, Deserialize)]
 struct QueueAffinityJson {
     affinity: Vec<u32>,
@@ -597,6 +523,82 @@ impl UblkCtrl {
         format!("{}/{:04}.json", UblkCtrl::run_dir(), self.dev_info.dev_id)
     }
 
+    fn ublk_ctrl_prep_cmd(
+        &mut self,
+        fd: i32,
+        dev_id: u32,
+        data: &UblkCtrlCmdData,
+    ) -> squeue::Entry128 {
+        let cmd = sys::ublksrv_ctrl_cmd {
+            addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
+                data.addr
+            } else {
+                0
+            },
+            len: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
+                data.len as u16
+            } else {
+                0
+            },
+            data: if (data.flags & CTRL_CMD_HAS_DATA) != 0 {
+                [data.data]
+            } else {
+                [0]
+            },
+            dev_id,
+            queue_id: u16::MAX,
+            dev_path_len: data.dev_path_len,
+            ..Default::default()
+        };
+        let c_cmd = CtrlCmd { ctrl_cmd: cmd };
+
+        opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
+            .cmd(unsafe { c_cmd.buf })
+            .build()
+            .user_data({
+                self.cmd_token += 1;
+                self.cmd_token as u64
+            })
+    }
+
+    fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        let mut data = data.clone();
+        let old_buf = data.prep_un_privileged_dev_path(self);
+
+        let fd = self.file.as_raw_fd();
+        let dev_id = self.dev_info.dev_id;
+        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, &data);
+        let to_wait = if data.flags & CTRL_CMD_ASYNC != 0 {
+            0
+        } else {
+            1
+        };
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&sqe)
+                .map_err(UblkError::UringPushError)?;
+        }
+        self.ring
+            .submit_and_wait(to_wait)
+            .map_err(UblkError::UringSubmissionError)?;
+
+        if to_wait == 0 {
+            return Ok(self.cmd_token);
+        }
+
+        data.unprep_un_privileged_dev_path(self, old_buf);
+
+        let cqe = self.ring.completion().next().expect("cqueue is empty");
+        let res: i32 = cqe.result();
+        if res == 0 || res == -libc::EBUSY {
+            Ok(res)
+        } else {
+            Err(UblkError::UringIOError(res))
+        }
+    }
+
     fn add(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_ADD_DEV,
@@ -606,7 +608,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Poll one control command until it is completed
@@ -636,7 +638,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Remove this device and its exported json file
@@ -664,7 +666,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)?;
+        self.ublk_ctrl_cmd(&data)?;
 
         Ok(features)
     }
@@ -678,7 +680,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     fn __get_info2(&mut self) -> Result<i32, UblkError> {
@@ -690,7 +692,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Retrieving device info from ublk driver
@@ -715,7 +717,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Stop this device by sending command to ublk driver
@@ -726,7 +728,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Retrieve this device's parameter from ublk driver by
@@ -746,7 +748,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)?;
+        self.ublk_ctrl_cmd(&data)?;
         Ok(params)
     }
 
@@ -766,7 +768,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Retrieving the specified queue's affinity from ublk driver
@@ -784,7 +786,7 @@ impl UblkCtrl {
             len: bm.buf_len() as u32,
             ..Default::default()
         };
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
@@ -793,7 +795,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Start user recover for this device
@@ -827,7 +829,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        ublk_ctrl_cmd(self, &data)
+        self.ublk_ctrl_cmd(&data)
     }
 
     fn __start_dev(&mut self, dev: &UblkDev, async_cmd: bool) -> Result<i32, UblkError> {
