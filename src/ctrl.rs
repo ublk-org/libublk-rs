@@ -55,7 +55,6 @@ union CtrlCmd {
 const CTRL_UBLKC_PATH_MAX: usize = 32;
 const CTRL_CMD_HAS_DATA: u32 = 1;
 const CTRL_CMD_HAS_BUF: u32 = 2;
-const CTRL_CMD_ASYNC: u32 = 4;
 /// this command need to read data back from device
 const CTRL_CMD_BUF_READ: u32 = 8;
 /// this command needn't to attach char device path for audit in
@@ -615,8 +614,6 @@ impl UblkCtrl {
         let mut data = data.clone();
         let to_wait = 1;
 
-        assert!(data.flags & CTRL_CMD_ASYNC == 0);
-
         let old_buf = data.prep_un_privileged_dev_path(self);
         let token = self.ublk_submit_ctrl_cmd(&mut data, to_wait)?;
         let res = self.poll_cmd(token);
@@ -717,10 +714,10 @@ impl UblkCtrl {
 
     /// Start this device by sending command to ublk driver
     ///
-    pub fn start(&mut self, pid: i32, async_cmd: bool) -> Result<i32, UblkError> {
+    pub fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_START_DEV,
-            flags: CTRL_CMD_HAS_DATA | if async_cmd { CTRL_CMD_ASYNC } else { 0 },
+            flags: CTRL_CMD_HAS_DATA,
             data: pid as u64,
             ..Default::default()
         };
@@ -829,10 +826,10 @@ impl UblkCtrl {
 
     /// End user recover for this device
     ///
-    pub fn end_user_recover(&mut self, pid: i32, async_cmd: bool) -> Result<i32, UblkError> {
+    pub fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
-            flags: CTRL_CMD_HAS_DATA | if async_cmd { CTRL_CMD_ASYNC } else { 0 },
+            flags: CTRL_CMD_HAS_DATA,
             data: pid as u64,
             ..Default::default()
         };
@@ -840,25 +837,22 @@ impl UblkCtrl {
         self.ublk_ctrl_cmd(&data)
     }
 
-    fn __start_dev(&mut self, dev: &UblkDev, async_cmd: bool) -> Result<i32, UblkError> {
-        assert!(!self.is_unprivileged() || !async_cmd);
+    fn prep_start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
         self.get_info()?;
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
             return Ok(0);
         }
 
-        let token = if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             self.set_params(&dev.tgt.params)?;
             self.flush_json()?;
-            self.start(unsafe { libc::getpid() as i32 }, async_cmd)?
         } else if self.for_recover_dev() {
             self.flush_json()?;
-            self.end_user_recover(unsafe { libc::getpid() as i32 }, async_cmd)?
         } else {
-            panic!();
+            return Err(crate::UblkError::OtherError(-libc::EINVAL));
         };
 
-        Ok(token)
+        Ok(0)
     }
 
     /// Start ublk device
@@ -871,7 +865,15 @@ impl UblkCtrl {
     /// send START command
     ///
     pub fn start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        self.__start_dev(dev, false)
+        self.prep_start_dev(dev)?;
+
+        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            self.start(unsafe { libc::getpid() as i32 })
+        } else if self.for_recover_dev() {
+            self.end_user_recover(unsafe { libc::getpid() as i32 })
+        } else {
+            Err(crate::UblkError::OtherError(-libc::EINVAL))
+        }
     }
 
     /// Start ublk device from queue daemon context
@@ -881,7 +883,7 @@ impl UblkCtrl {
     /// * `dev`: ublk device
     /// * `queue`: ublk queue, if both `queue` and `ops`  isn't none, we
     ///     start device in queue daemon context
-    /// * `ops`: ublk queue trait
+    /// * `exe`: async Executor
     ///
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
@@ -890,37 +892,48 @@ impl UblkCtrl {
     /// this kernel code path, such as, reading partition table, so we
     /// have make io handler working before sending START_DEV to kernel
     ///
-    pub fn start_dev_in_queue<F>(
+    /// Only works for using async/.await for handling IO command
+    ///
+    /// This kind of usage should be avoided as far as possible, and it
+    /// is suggested to start device in one standalone & one-shot context.
+    ///
+    pub fn start_dev_in_queue(
         &mut self,
         dev: &UblkDev,
-        q: &mut super::io::UblkQueue,
-        mut ops: F,
-    ) -> Result<i32, UblkError>
-    where
-        F: FnMut(&super::io::UblkQueue, u16, &super::io::UblkIOCtx),
-    {
-        let token = self.__start_dev(dev, true)?;
+        q: &super::io::UblkQueue,
+        exe: &super::exe::Executor,
+    ) -> Result<i32, UblkError> {
+        let mut data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: if self.for_recover_dev() {
+                sys::UBLK_CMD_END_USER_RECOVERY
+            } else {
+                sys::UBLK_CMD_START_DEV
+            },
+            flags: CTRL_CMD_HAS_DATA,
+            data: unsafe { libc::getpid() as u64 },
+            ..Default::default()
+        };
 
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            match q.process_ios(&mut ops, 0) {
-                Err(r) => return Err(r),
-                _ => {}
-            }
+        self.prep_start_dev(dev)?;
+
+        let old_buf = data.prep_un_privileged_dev_path(self);
+        let token = self.ublk_submit_ctrl_cmd(&mut data, 0)?;
+
+        let res = loop {
+            let _ = q.flush_and_wake_io_tasks(&exe, 0);
             match self.poll_cmd(token) {
-                Ok(res) => {
-                    return Ok(res);
-                }
+                Ok(res) => break Ok(res),
                 Err(UblkError::UringIOError(res)) => {
-                    if res == -libc::EAGAIN {
-                        continue;
-                    } else {
-                        return Err(UblkError::UringIOError(res));
+                    if res != -libc::EAGAIN {
+                        break Err(UblkError::UringIOError(res));
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => break Err(e),
             }
-        }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        data.unprep_un_privileged_dev_path(self, old_buf);
+        res
     }
 
     /// Stop ublk device
