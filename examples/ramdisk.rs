@@ -55,10 +55,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         .nr_queues(1_u16)
         .depth(depth)
         .dev_flags(dev_flags)
-        .ctrl_flags(
-            libublk::sys::UBLK_F_USER_RECOVERY as u64
-                | libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64,
-        )
+        .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
         .build()
         .unwrap();
 
