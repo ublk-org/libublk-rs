@@ -319,6 +319,7 @@ impl UblkCtrl {
     /// and it can't be done for adding device
     pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
         assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
+        assert!(id >= 0);
         Self::new(id, 0, 0, 0, 0, dev_flags)
     }
 
@@ -661,10 +662,7 @@ impl UblkCtrl {
         Ok(0)
     }
 
-    /// Retrieving supported UBLK FEATURES from ublk driver
-    ///
-    /// Supported since linux kernel v6.5
-    pub fn get_features(&mut self) -> Result<u64, UblkError> {
+    fn __get_features(&mut self) -> Result<u64, UblkError> {
         let features = 0_u64;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_U_CMD_GET_FEATURES,
@@ -675,6 +673,16 @@ impl UblkCtrl {
         };
 
         self.ublk_ctrl_cmd(&data)?;
+
+        Ok(features)
+    }
+
+    /// Retrieving supported UBLK FEATURES from ublk driver
+    ///
+    /// Supported since linux kernel v6.5
+    pub fn get_features() -> Result<u64, UblkError> {
+        let mut ctrl = Self::new(-1, 0, 0, 0, 0, 0)?;
+        let features = ctrl.__get_features()?;
 
         Ok(features)
     }
@@ -1068,9 +1076,7 @@ mod tests {
 
     #[test]
     fn test_ublk_get_features() {
-        let mut ctrl = UblkCtrl::new_simple(-1, 0).unwrap();
-
-        match ctrl.get_features() {
+        match UblkCtrl::get_features() {
             Ok(f) => eprintln!("features is {:04x}", f),
             Err(_) => eprintln!("not support GET_FEATURES, require linux v6.5"),
         }
