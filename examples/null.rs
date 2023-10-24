@@ -50,60 +50,57 @@ fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u3
             dev.set_default_params(250_u64 << 30);
             Ok(serde_json::json!({}))
         };
-        let wh = {
-            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            // queue level logic
-            let q_sync_handler = move |qid: u16, dev: &UblkDev| {
-                // logic for io handling
-                let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                    handle_io_cmd(q, tag);
-                };
-
-                UblkQueue::new(qid, dev, true)
-                    .unwrap()
-                    .wait_and_handle_io(io_handler);
-            };
-            let q_async_handler = move |qid: u16, dev: &UblkDev| {
-                let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
-                let exe = Executor::new(dev.get_nr_ios());
-
-                for tag in 0..depth as u16 {
-                    let q = q_rc.clone();
-
-                    exe.spawn(tag as u16, async move {
-                        let buf_addr = q.get_io_buf_addr(tag);
-                        let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
-                        let mut res = 0;
-                        loop {
-                            let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
-                            if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                                break;
-                            }
-
-                            res = get_io_cmd_result(&q, tag);
-                            cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
-                        }
-                    });
-                }
-                q_rc.wait_and_wake_io_tasks(&exe);
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        // queue level logic
+        let q_sync_handler = move |qid: u16, dev: &UblkDev| {
+            // logic for io handling
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                handle_io_cmd(q, tag);
             };
 
-            if aio {
-                // Now start this ublk target
-                sess.run_target(&mut ctrl, &dev, q_async_handler, |dev_id| {
-                    let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                    d_ctrl.dump();
-                })
+            UblkQueue::new(qid, dev, true)
                 .unwrap()
-            } else {
-                sess.run_target(&mut ctrl, &dev, q_sync_handler, |dev_id| {
-                    let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                    d_ctrl.dump();
-                })
-                .unwrap()
-            }
+                .wait_and_handle_io(io_handler);
         };
-        wh.join().unwrap();
+        let q_async_handler = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let exe = Executor::new(dev.get_nr_ios());
+
+            for tag in 0..depth as u16 {
+                let q = q_rc.clone();
+
+                exe.spawn(tag as u16, async move {
+                    let buf_addr = q.get_io_buf_addr(tag);
+                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                    let mut res = 0;
+                    loop {
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
+                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        res = get_io_cmd_result(&q, tag);
+                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                });
+            }
+            q_rc.wait_and_wake_io_tasks(&exe);
+        };
+
+        if aio {
+            // Now start this ublk target
+            sess.run_target(&mut ctrl, &dev, q_async_handler, |dev_id| {
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                d_ctrl.dump();
+            })
+            .unwrap();
+        } else {
+            sess.run_target(&mut ctrl, &dev, q_sync_handler, |dev_id| {
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                d_ctrl.dump();
+            })
+            .unwrap();
+        }
     }
 }
 

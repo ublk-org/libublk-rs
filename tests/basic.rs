@@ -62,23 +62,20 @@ mod integration {
             Ok(serde_json::json!({}))
         };
 
-        let wh = {
-            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let q_fn = move |qid: u16, _dev: &UblkDev| {
-                q_handler(qid, _dev);
-            };
-
-            sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
-                let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-
-                run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
-                read_ublk_disk(dev_id);
-
-                ctrl.kill_dev().unwrap();
-            })
-            .unwrap()
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let q_fn = move |qid: u16, _dev: &UblkDev| {
+            q_handler(qid, _dev);
         };
-        wh.join().unwrap();
+
+        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
+            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+
+            run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
+            read_ublk_disk(dev_id);
+
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -314,23 +311,20 @@ mod integration {
             Ok(serde_json::json!({}))
         };
 
-        let wh = {
-            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let q_fn = move |qid: u16, _dev: &UblkDev| {
-                let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                    rd_handle_io(q, tag, _io, buf_addr);
-                };
-                UblkQueue::new(qid, _dev, true)
-                    .unwrap()
-                    .wait_and_handle_io(io_handler);
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let q_fn = move |qid: u16, _dev: &UblkDev| {
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                rd_handle_io(q, tag, _io, buf_addr);
             };
-
-            sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
-                __test_ublk_ramdisk(dev_id);
-            })
-            .unwrap()
+            UblkQueue::new(qid, _dev, true)
+                .unwrap()
+                .wait_and_handle_io(io_handler);
         };
-        wh.join().unwrap();
+
+        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
+            __test_ublk_ramdisk(dev_id);
+        })
+        .unwrap();
         libublk::ublk_dealloc_buf(buf, size as usize, 4096);
     }
 

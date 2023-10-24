@@ -264,7 +264,8 @@ impl UblkSession {
     /// * `ctrl`: UblkCtrl device reference
     /// * `dev`: UblkDev device reference
     /// * `q_fn`: queue handler for setting up the queue and its handler
-    /// * `device_fn`: handler called after device is started
+    /// * `device_fn`: handler called after device is started, run in current
+    ///     context
     ///
     /// This one is the preferred interface for creating ublk daemon, and
     /// is friendly for user, such as, user can customize queue setup and
@@ -275,19 +276,17 @@ impl UblkSession {
         dev: &Arc<io::UblkDev>,
         q_fn: Q,
         device_fn: W,
-    ) -> Result<std::thread::JoinHandle<()>, UblkError>
+    ) -> Result<i32, UblkError>
     where
         Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
         W: FnOnce(i32) + Send + Sync + 'static,
     {
         let handles = self.create_queue_handlers(ctrl, dev, q_fn);
+        let dev_id = dev.dev_info.dev_id as i32;
 
         ctrl.start_dev(dev)?;
 
-        let dev_id = dev.dev_info.dev_id as i32;
-        let device_qh = std::thread::spawn(move || {
-            device_fn(dev_id);
-        });
+        device_fn(dev_id);
 
         for qh in handles {
             qh.join().unwrap_or_else(|_| {
@@ -299,7 +298,7 @@ impl UblkSession {
         //to see -ENOENT failure here
         let _ = ctrl.stop_dev(dev);
 
-        Ok(device_qh)
+        Ok(0)
     }
 }
 
@@ -327,7 +326,7 @@ mod libublk {
         assert!(sz == 32);
     }
 
-    fn __test_ublk_session<T>(w_fn: T) -> std::thread::JoinHandle<()>
+    fn __test_ublk_session<T>(w_fn: T) -> String
     where
         T: Fn(i32) + Send + Sync + Clone + 'static,
     {
@@ -360,16 +359,25 @@ mod libublk {
         sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
             w_fn(dev_id);
         })
-        .unwrap()
+        .unwrap();
+
+        // could be too strict because of udev
+        let bdev = ctrl.get_bdev_path();
+        assert!(Path::new(&bdev).exists() == false);
+
+        ctrl.get_cdev_path()
     }
 
+    /// Covers basic ublk device creation and destroying by UblkSession
+    /// APIs
     #[test]
     fn test_ublk_session() {
-        __test_ublk_session(|dev_id| {
+        let cdev = __test_ublk_session(|dev_id| {
             UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
-        })
-        .join()
-        .unwrap();
+        });
+
+        // could be too strict because of udev
+        assert!(Path::new(&cdev).exists() == false);
     }
 
     /// test for_each_dev_id
@@ -377,12 +385,12 @@ mod libublk {
     fn test_ublk_for_each_dev_id() {
         // Create one ublk device
         let handle = std::thread::spawn(|| {
-            __test_ublk_session(|dev_id| {
+            let cdev = __test_ublk_session(|dev_id| {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
-            })
-            .join()
-            .unwrap()
+            });
+            // could be too strict because of udev
+            assert!(Path::new(&cdev).exists() == false);
         });
 
         std::thread::sleep(std::time::Duration::from_millis(400));

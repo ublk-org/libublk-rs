@@ -256,70 +256,66 @@ fn __test_add(
             direct_io: 1,
             back_file_path: backing_file.clone(),
         };
-        let wh = {
-            let sess = libublk::UblkSessionBuilder::default()
-                .name("example_loop")
-                .id(id)
-                .ctrl_flags(ctrl_flags)
-                .nr_queues(nr_queues)
-                .depth(depth)
-                .io_buf_bytes(buf_sz)
-                .dev_flags(UBLK_DEV_F_ADD_DEV)
-                .build()
-                .unwrap();
+        let sess = libublk::UblkSessionBuilder::default()
+            .name("example_loop")
+            .id(id)
+            .ctrl_flags(ctrl_flags)
+            .nr_queues(nr_queues)
+            .depth(depth)
+            .io_buf_bytes(buf_sz)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
 
-            let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
-            let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-            let q_async_fn = move |qid: u16, dev: &UblkDev| {
-                let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
-                let exe = Executor::new(dev.get_nr_ios());
+        let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
+        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let q_async_fn = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let exe = Executor::new(dev.get_nr_ios());
 
-                for tag in 0..depth as u16 {
-                    let q = q_rc.clone();
+            for tag in 0..depth as u16 {
+                let q = q_rc.clone();
 
-                    exe.spawn(tag as u16, async move {
-                        let buf_addr = q.get_io_buf_addr(tag) as u64;
-                        let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
-                        let mut res = 0;
-                        loop {
-                            let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
-                            if cmd_res == sys::UBLK_IO_RES_ABORT {
-                                break;
-                            }
-
-                            res = lo_handle_io_cmd_async(&q, tag).await;
-                            cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                exe.spawn(tag as u16, async move {
+                    let buf_addr = q.get_io_buf_addr(tag) as u64;
+                    let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
+                    let mut res = 0;
+                    loop {
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                        if cmd_res == sys::UBLK_IO_RES_ABORT {
+                            break;
                         }
-                    });
-                }
-                q_rc.wait_and_wake_io_tasks(&exe);
-            };
 
-            let q_sync_fn = move |qid: u16, _dev: &UblkDev| {
-                let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
-                    lo_handle_io_cmd_sync(q, tag, io)
-                };
-
-                UblkQueue::new(qid, _dev, true)
-                    .unwrap()
-                    .wait_and_handle_io(lo_io_handler);
-            };
-
-            if aio {
-                sess.run_target(&mut ctrl, &dev, q_async_fn, |dev_id| {
-                    let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                    d_ctrl.dump();
-                })
-                .unwrap()
-            } else {
-                sess.run_target(&mut ctrl, &dev, q_sync_fn, |dev_id| {
-                    let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                    d_ctrl.dump();
-                })
-                .unwrap()
+                        res = lo_handle_io_cmd_async(&q, tag).await;
+                        cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                });
             }
+            q_rc.wait_and_wake_io_tasks(&exe);
         };
-        wh.join().unwrap();
+
+        let q_sync_fn = move |qid: u16, _dev: &UblkDev| {
+            let lo_io_handler =
+                move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| lo_handle_io_cmd_sync(q, tag, io);
+
+            UblkQueue::new(qid, _dev, true)
+                .unwrap()
+                .wait_and_handle_io(lo_io_handler);
+        };
+
+        if aio {
+            sess.run_target(&mut ctrl, &dev, q_async_fn, |dev_id| {
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                d_ctrl.dump();
+            })
+            .unwrap();
+        } else {
+            sess.run_target(&mut ctrl, &dev, q_sync_fn, |dev_id| {
+                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                d_ctrl.dump();
+            })
+            .unwrap();
+        }
     }
 }
 
