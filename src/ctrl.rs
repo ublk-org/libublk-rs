@@ -481,12 +481,9 @@ impl UblkCtrl {
             return;
         }
 
-        match self.get_params(p) {
-            Ok(r) => p = r,
-            Err(_) => {
-                error!("Dump dev {} failed\n", self.dev_info.dev_id);
-                return;
-            }
+        if let Err(_) = self.get_params(&mut p) {
+            error!("Dump dev {} failed\n", self.dev_info.dev_id);
+            return;
         }
 
         let info = &self.dev_info;
@@ -762,21 +759,17 @@ impl UblkCtrl {
     /// sending command
     ///
     /// Can't pass params by reference(&mut), why?
-    pub fn get_params(
-        &mut self,
-        mut params: sys::ublk_params,
-    ) -> Result<sys::ublk_params, UblkError> {
+    pub fn get_params(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         params.len = core::mem::size_of::<sys::ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_PARAMS,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
-            addr: std::ptr::addr_of!(params) as u64,
+            addr: params as *const sys::ublk_params as u64,
             len: params.len,
             ..Default::default()
         };
 
-        self.ublk_ctrl_cmd(&data)?;
-        Ok(params)
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Send this device's parameter to ublk driver
