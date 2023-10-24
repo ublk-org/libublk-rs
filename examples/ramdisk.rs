@@ -161,7 +161,7 @@ fn test_del() {
     let dev_id = s.parse::<i32>().unwrap();
     let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
 
-    ctrl.del().unwrap();
+    ctrl.del_dev().unwrap();
 }
 
 fn main() {

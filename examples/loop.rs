@@ -461,7 +461,7 @@ fn main() {
                 .unwrap()
                 .parse::<i32>()
                 .unwrap_or(-1);
-            UblkCtrl::new_simple(id, 0).unwrap().del().unwrap();
+            UblkCtrl::new_simple(id, 0).unwrap().del_dev().unwrap();
         }
         Some(("list", _add_matches)) => UblkSession::for_each_dev_id(|dev_id| {
             UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();

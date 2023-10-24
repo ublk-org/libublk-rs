@@ -74,7 +74,7 @@ mod integration {
                 run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
                 read_ublk_disk(dev_id);
 
-                ctrl.del().unwrap();
+                ctrl.kill_dev().unwrap();
             })
             .unwrap()
         };
@@ -229,7 +229,7 @@ mod integration {
                 assert!((*guard).done > 0);
             }
 
-            ctrl.del().unwrap();
+            ctrl.kill_dev().unwrap();
         })
         .unwrap();
     }
@@ -295,7 +295,7 @@ mod integration {
                 block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
                 block_utils::unmount_device(tmp_dir.path()).unwrap();
             }
-            ctrl.del().unwrap();
+            ctrl.kill_dev().unwrap();
         }
 
         let size = 32_u64 << 20;

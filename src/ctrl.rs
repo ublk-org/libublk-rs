@@ -643,7 +643,7 @@ impl UblkCtrl {
 
     /// Remove this device
     ///
-    pub fn del(&mut self) -> Result<i32, UblkError> {
+    fn del(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_DEL_DEV,
             ..Default::default()
@@ -655,6 +655,10 @@ impl UblkCtrl {
     /// Remove this device and its exported json file
     ///
     /// Called when the user wants to remove one device really
+    ///
+    /// Be careful, this interface may cause deadlock if the
+    /// for-add control device is live, and it is always safe
+    /// to kill device via .kill_dev().
     ///
     pub fn del_dev(&mut self) -> Result<i32, UblkError> {
         self.del()?;
@@ -720,7 +724,7 @@ impl UblkCtrl {
 
     /// Start this device by sending command to ublk driver
     ///
-    pub fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
+    fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_START_DEV,
             flags: CTRL_CMD_HAS_DATA,
@@ -733,13 +737,25 @@ impl UblkCtrl {
 
     /// Stop this device by sending command to ublk driver
     ///
-    pub fn stop(&mut self) -> Result<i32, UblkError> {
+    fn stop(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_STOP_DEV,
             ..Default::default()
         };
 
         self.ublk_ctrl_cmd(&data)
+    }
+
+    /// Kill this device
+    ///
+    /// Preferred method for target code to stop & delete device,
+    /// which is safe and can avoid deadlock.
+    ///
+    /// But device may not be really removed yet, and the device ID
+    /// can still be in-use after kill_dev() returns.
+    ///
+    pub fn kill_dev(&mut self) -> Result<i32, UblkError> {
+        self.stop()
     }
 
     /// Retrieve this device's parameter from ublk driver by

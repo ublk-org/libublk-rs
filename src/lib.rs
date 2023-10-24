@@ -366,7 +366,7 @@ mod libublk {
     #[test]
     fn test_ublk_session() {
         __test_ublk_session(|dev_id| {
-            UblkCtrl::new_simple(dev_id, 0).unwrap().del().unwrap();
+            UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
         })
         .join()
         .unwrap();
@@ -379,7 +379,7 @@ mod libublk {
         let handle = std::thread::spawn(|| {
             __test_ublk_session(|dev_id| {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
-                UblkCtrl::new_simple(dev_id, 0).unwrap().del().unwrap();
+                UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
             })
             .join()
             .unwrap()
