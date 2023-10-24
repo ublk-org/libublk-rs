@@ -166,6 +166,7 @@ pub struct UblkCtrl {
     file: fs::File,
     pub dev_info: sys::ublksrv_ctrl_dev_info,
     pub json: serde_json::Value,
+    pub features: Option<u64>,
 
     /// global flags, shared with UblkDev and UblkQueue
     dev_flags: u32,
@@ -284,7 +285,14 @@ impl UblkCtrl {
             },
             nr_queues_configured: 0,
             dev_flags,
+            features: None,
         };
+
+        let features = match dev.__get_features() {
+            Ok(f) => Some(f),
+            _ => None,
+        };
+        dev.features = features;
 
         //add cdev if the device is for adding device
         if dev.for_add_dev() {
@@ -299,6 +307,14 @@ impl UblkCtrl {
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    // Return ublk_driver's features
+    //
+    // Target code may need to query driver features runtime, so
+    // cache it inside device
+    pub fn get_driver_features(&self) -> Option<u64> {
+        self.features
     }
 
     fn is_unprivileged(&self) -> bool {
@@ -680,11 +696,11 @@ impl UblkCtrl {
     /// Retrieving supported UBLK FEATURES from ublk driver
     ///
     /// Supported since linux kernel v6.5
-    pub fn get_features() -> Result<u64, UblkError> {
-        let mut ctrl = Self::new(-1, 0, 0, 0, 0, 0)?;
-        let features = ctrl.__get_features()?;
-
-        Ok(features)
+    pub fn get_features() -> Option<u64> {
+        match Self::new(-1, 0, 0, 0, 0, 0) {
+            Ok(ctrl) => ctrl.get_driver_features(),
+            _ => None,
+        }
     }
 
     fn __get_info(&mut self) -> Result<i32, UblkError> {
@@ -1077,8 +1093,8 @@ mod tests {
     #[test]
     fn test_ublk_get_features() {
         match UblkCtrl::get_features() {
-            Ok(f) => eprintln!("features is {:04x}", f),
-            Err(_) => eprintln!("not support GET_FEATURES, require linux v6.5"),
+            Some(f) => eprintln!("features is {:04x}", f),
+            None => eprintln!("not support GET_FEATURES, require linux v6.5"),
         }
     }
 
