@@ -421,11 +421,7 @@ impl UblkCtrl {
         Ok(0)
     }
 
-    pub fn queues_configured(&self) -> bool {
-        self.nr_queues_configured == self.dev_info.nr_hw_queues
-    }
-
-    pub fn dump_from_json(&self) {
+    fn dump_from_json(&self) {
         if !Path::new(&self.run_path()).exists() {
             return;
         }
@@ -839,9 +835,9 @@ impl UblkCtrl {
         }
     }
 
-    /// End user recover for this device
+    /// End user recover for this device, do similar thing done in start_dev()
     ///
-    pub fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
+    fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
             flags: CTRL_CMD_HAS_DATA,
@@ -973,7 +969,7 @@ impl UblkCtrl {
     }
 
     /// Flush this device's json info as file
-    pub fn flush_json(&mut self) -> Result<i32, UblkError> {
+    fn flush_json(&mut self) -> Result<i32, UblkError> {
         if self.json == serde_json::json!({}) {
             return Ok(0);
         }
@@ -1052,7 +1048,7 @@ impl UblkCtrl {
 
     /// Reload json info for this device
     ///
-    pub fn reload_json(&mut self) -> Result<i32, UblkError> {
+    fn reload_json(&mut self) -> Result<i32, UblkError> {
         let mut file = fs::File::open(self.run_path()).map_err(UblkError::OtherIOError)?;
         let mut json_str = String::new();
 
