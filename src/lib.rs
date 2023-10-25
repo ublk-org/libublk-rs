@@ -182,7 +182,7 @@ impl UblkSession {
         tgt_fn: T,
     ) -> Result<(ctrl::UblkCtrl, Arc<io::UblkDev>), UblkError>
     where
-        T: FnOnce(&mut io::UblkDev) -> Result<serde_json::Value, UblkError>,
+        T: FnOnce(&mut io::UblkDev) -> Result<i32, UblkError>,
     {
         let mut ctrl = ctrl::UblkCtrl::new(
             self.id,
@@ -340,7 +340,7 @@ mod libublk {
 
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
-            Ok(serde_json::json!({}))
+            Ok(0)
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, _dev: &UblkDev| {

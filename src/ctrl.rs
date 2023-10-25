@@ -165,7 +165,7 @@ struct QueueAffinityJson {
 pub struct UblkCtrl {
     file: fs::File,
     pub dev_info: sys::ublksrv_ctrl_dev_info,
-    pub json: serde_json::Value,
+    json: serde_json::Value,
     pub features: Option<u64>,
 
     /// global flags, shared with UblkDev and UblkQueue
@@ -1040,7 +1040,7 @@ impl UblkCtrl {
     /// pthread tid
     ///
     fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        let tgt_data = self.json.clone();
+        let tgt_data = dev.get_target_json();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
@@ -1063,7 +1063,11 @@ impl UblkCtrl {
                     "target_flags": dev.flags,
         });
 
-        json["target_data"] = tgt_data;
+        match tgt_data {
+            Some(val) => json["target_data"] = val.clone(),
+            _ => {}
+        };
+
         json["queues"] = serde_json::Value::Object(map);
 
         self.json = json;

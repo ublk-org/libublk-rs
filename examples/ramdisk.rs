@@ -60,7 +60,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
-        Ok(serde_json::json!({}))
+        Ok(0)
     };
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 

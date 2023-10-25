@@ -59,7 +59,7 @@ mod integration {
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
-            Ok(serde_json::json!({}))
+            Ok(0)
         };
 
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
@@ -170,7 +170,7 @@ mod integration {
 
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
-            Ok(serde_json::json!({}))
+            Ok(0)
         };
         // device data is shared among all queue contexts
         let dev_data = Arc::new(Mutex::new(DevData { done: 0 }));
@@ -307,7 +307,7 @@ mod integration {
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(size);
-            Ok(serde_json::json!({}))
+            Ok(0)
         };
 
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();

@@ -210,6 +210,7 @@ pub struct UblkDev {
     cdev_file: fs::File,
 
     pub tgt: UblkTgt,
+    tgt_json: Option<serde_json::Value>,
 }
 
 unsafe impl Send for UblkDev {}
@@ -229,7 +230,7 @@ impl UblkDev {
     /// structure which implements UblkTgtImpl.
     pub fn new<F>(tgt_name: String, ops: F, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError>
     where
-        F: FnOnce(&mut UblkDev) -> Result<serde_json::Value, UblkError>,
+        F: FnOnce(&mut UblkDev) -> Result<i32, UblkError>,
     {
         let info = ctrl.dev_info;
         let mut tgt = UblkTgt {
@@ -270,9 +271,10 @@ impl UblkDev {
             cdev_file,
             tgt,
             flags: ctrl.get_dev_flags(),
+            tgt_json: None,
         };
 
-        ctrl.json = ops(&mut dev)?;
+        ops(&mut dev)?;
         info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
@@ -302,6 +304,17 @@ impl UblkDev {
             },
             ..Default::default()
         };
+    }
+
+    pub fn set_target_json(&mut self, val: serde_json::Value) {
+        self.tgt_json = Some(val);
+    }
+
+    pub fn get_target_json(&self) -> Option<&serde_json::Value> {
+        match self.tgt_json.as_ref() {
+            None => None,
+            Some(val) => Some(val),
+        }
     }
 
     /// Return how many io slots, which is usually same with executor's

@@ -48,7 +48,7 @@ fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u3
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
-            Ok(serde_json::json!({}))
+            Ok(0)
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         // queue level logic
