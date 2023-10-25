@@ -568,9 +568,10 @@ impl UblkQueue<'_> {
     /// driver
     ///
     #[inline(always)]
-    pub fn get_iod(&self, tag: u16) -> *const sys::ublksrv_io_desc {
+    pub fn get_iod(&self, tag: u16) -> &sys::ublksrv_io_desc {
         assert!((tag as u32) < self.q_depth);
-        (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc
+        let iod = (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc;
+        unsafe { &*iod }
     }
 
     #[inline(always)]

@@ -85,7 +85,7 @@ mod integration {
         fn null_handle_queue(qid: u16, _dev: &UblkDev) {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+                let bytes = (iod.nr_sectors << 9) as i32;
 
                 q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
             };
@@ -107,7 +107,7 @@ mod integration {
         fn null_handle_queue_batch(qid: u16, _dev: &UblkDev) {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+                let bytes = (iod.nr_sectors << 9) as i32;
 
                 let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)])));
                 q.complete_io_cmd(tag, res);
@@ -143,7 +143,7 @@ mod integration {
         }
         async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
-            let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+            let bytes = (iod.nr_sectors << 9) as i32;
             let data = UblkIOCtx::build_user_data_async(tag, 0xff, 0);
 
             bytes + null_submit_nop(&q, data).await
@@ -237,8 +237,7 @@ mod integration {
     #[test]
     fn test_ublk_ramdisk() {
         fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, start: u64) {
-            let _iod = q.get_iod(tag);
-            let iod = unsafe { &*_iod };
+            let iod = q.get_iod(tag);
             let off = (iod.start_sector << 9) as u64;
             let bytes = (iod.nr_sectors << 9) as u32;
             let op = iod.op_flags & 0xff;
@@ -337,9 +336,7 @@ mod integration {
             let mut q_vec = Vec::<i32>::new();
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
-                let res = Ok(UblkIORes::Result(
-                    (unsafe { (*iod).nr_sectors << 9 } as i32),
-                ));
+                let res = Ok(UblkIORes::Result((iod.nr_sectors << 9) as i32));
 
                 {
                     q_vec.push(tag as i32);

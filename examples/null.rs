@@ -7,7 +7,7 @@ use std::rc::Rc;
 #[inline]
 fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
     let iod = q.get_iod(tag);
-    let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+    let bytes = (iod.nr_sectors << 9) as i32;
 
     bytes
 }

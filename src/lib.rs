@@ -346,7 +346,7 @@ mod libublk {
         let q_fn = move |qid: u16, _dev: &UblkDev| {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+                let bytes = (iod.nr_sectors << 9) as i32;
 
                 q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
             };

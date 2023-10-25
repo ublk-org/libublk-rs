@@ -9,8 +9,7 @@ use libublk::{ctrl::UblkCtrl, exe::Executor, UblkError};
 use std::rc::Rc;
 
 fn handle_io(q: &UblkQueue, tag: u16, start: u64) -> i32 {
-    let _iod = q.get_iod(tag);
-    let iod = unsafe { &*_iod };
+    let iod = q.get_iod(tag);
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as i32;
     let op = iod.op_flags & 0xff;

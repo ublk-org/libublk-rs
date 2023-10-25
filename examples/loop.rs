@@ -174,8 +174,7 @@ fn __lo_submit_io_cmd(q: &UblkQueue<'_>, tag: u16, iod: &libublk::sys::ublksrv_i
 }
 
 async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
-    let _iod = q.get_iod(tag);
-    let iod = unsafe { &*_iod };
+    let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
     let res = __lo_prep_submit_io_cmd(iod);
@@ -195,8 +194,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
 }
 
 fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
-    let _iod = q.get_iod(tag);
-    let iod = unsafe { &*_iod };
+    let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
     if i.is_tgt_io() {
