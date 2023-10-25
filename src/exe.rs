@@ -34,6 +34,51 @@ impl Future for UringOpFuture {
     }
 }
 
+/// MultiShot CQE
+///
+/// Totally un-tested, so far serves as sample reference implementation, and
+/// target code can define its own MultiShot version too
+pub struct UringOpFutureMultiShot {
+    pub user_data: u64,
+    done: u32,
+    expected: u32,
+}
+
+impl Future for UringOpFutureMultiShot {
+    type Output = u32;
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
+        let cqe = Executor::get_thread_local_cqe();
+        if cqe != std::ptr::null() && unsafe { (*cqe).user_data() } == self.user_data {
+            Executor::set_thread_local_cqe(std::ptr::null());
+
+            let cqe_r = unsafe { &*cqe };
+            if cqueue::more(cqe_r.flags()) {
+                let me = self.as_ref();
+                if me.done + cqe_r.result() as u32 == me.expected {
+                    Poll::Ready(me.expected)
+                } else {
+                    self.get_mut().done += cqe_r.result() as u32;
+                    Poll::Pending
+                }
+            } else {
+                Poll::Ready(cqe_r.result() as u32 + self.as_ref().done)
+            }
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl UringOpFutureMultiShot {
+    pub fn new(user_data: u64, expected: u32) -> UringOpFutureMultiShot {
+        UringOpFutureMultiShot {
+            user_data,
+            expected,
+            done: 0,
+        }
+    }
+}
+
 pub struct Task<'a> {
     cnt: i16,
     future: Pin<Box<dyn Future<Output = ()> + 'a>>,
