@@ -95,7 +95,7 @@ impl UblkCtrlCmdData {
             super::ublk_alloc_buf(size, 8)
         };
 
-        let path_str = format!("{}", dev.get_cdev_path());
+        let path_str = dev.get_cdev_path().to_string();
         assert!(path_str.len() <= CTRL_UBLKC_PATH_MAX);
 
         unsafe {
@@ -494,7 +494,7 @@ impl UblkCtrl {
             return;
         }
 
-        if let Err(_) = self.get_params(&mut p) {
+        if self.get_params(&mut p).is_err() {
             error!("Dump dev {} failed\n", self.dev_info.dev_id);
             return;
         }
@@ -588,7 +588,7 @@ impl UblkCtrl {
             self.cmd_token += 1;
             self.cmd_token
         };
-        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, &data, token);
+        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
         unsafe {
             self.ring
@@ -627,7 +627,7 @@ impl UblkCtrl {
     }
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let mut data = data.clone();
+        let mut data = *data;
         let to_wait = 1;
 
         let old_buf = data.prep_un_privileged_dev_path(self);
@@ -1017,12 +1017,12 @@ impl UblkCtrl {
                 Self::set_path_permission(parent_dir, 0o777)?;
             }
         }
-        let mut run_file = fs::File::create(&json_path).map_err(UblkError::OtherIOError)?;
+        let mut run_file = fs::File::create(json_path).map_err(UblkError::OtherIOError)?;
 
         // Each exported json file is only visible for the device owner.
         // In future, it can be relaxed, such as allowing group to access,
         // according to ublk use policy
-        Self::set_path_permission(&json_path, 0o700)?;
+        Self::set_path_permission(json_path, 0o700)?;
 
         run_file
             .write_all(self.json.to_string().as_bytes())
@@ -1063,10 +1063,9 @@ impl UblkCtrl {
                     "target_flags": dev.flags,
         });
 
-        match tgt_data {
-            Some(val) => json["target_data"] = val.clone(),
-            _ => {}
-        };
+        if let Some(val) = tgt_data {
+            json["target_data"] = val.clone()
+        }
 
         json["queues"] = serde_json::Value::Object(map);
 

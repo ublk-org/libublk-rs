@@ -25,7 +25,7 @@ impl Future for UringOpFuture {
     type Output = i32;
     fn poll(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
         let cqe = Executor::get_thread_local_cqe();
-        if cqe != std::ptr::null() && unsafe { (*cqe).user_data() } == self.user_data {
+        if !cqe.is_null() && unsafe { (*cqe).user_data() } == self.user_data {
             Executor::set_thread_local_cqe(std::ptr::null());
             Poll::Ready(unsafe { (*cqe).result() })
         } else {
@@ -48,7 +48,7 @@ impl Future for UringOpFutureMultiShot {
     type Output = u32;
     fn poll(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
         let cqe = Executor::get_thread_local_cqe();
-        if cqe != std::ptr::null() && unsafe { (*cqe).user_data() } == self.user_data {
+        if !cqe.is_null() && unsafe { (*cqe).user_data() } == self.user_data {
             Executor::set_thread_local_cqe(std::ptr::null());
 
             let cqe_r = unsafe { &*cqe };
@@ -166,7 +166,6 @@ impl<'a> Executor<'a> {
 
         let inner = Rc::new(ExecutorInner {
             tasks: RefCell::new(tasks),
-            ..Default::default()
         });
 
         Executor { inner }
