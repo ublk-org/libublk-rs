@@ -403,6 +403,19 @@ impl UblkCtrl {
         }
     }
 
+    // Return target json data
+    //
+    // Should only be called after device is started, otherwise target data
+    // won't be serialized out, and this API returns None
+    pub fn get_target_data_from_json(&self) -> Option<&serde_json::Value> {
+        let val = &self.json["target_data"];
+        if !val.is_null() {
+            Some(&val)
+        } else {
+            None
+        }
+    }
+
     /// Get target type from exported json file for this device
     ///
     pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
@@ -1090,7 +1103,7 @@ impl UblkCtrl {
 #[cfg(test)]
 mod tests {
     use super::dev_flags::*;
-    use crate::ctrl::UblkCtrl;
+    use crate::{ctrl::UblkCtrl, io::UblkDev, UblkSessionBuilder};
     use std::path::Path;
 
     #[test]
@@ -1126,5 +1139,25 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(Path::new(&dev_path).exists() == true);
+    }
+
+    #[test]
+    fn test_ublk_target_json() {
+        let sess = UblkSessionBuilder::default()
+            .name("null")
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            dev.set_target_json(serde_json::json!({"null": "test_data" }));
+            Ok(0)
+        };
+        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+
+        //not built & flushed out yet
+        assert!(ctrl.get_target_data_from_json().is_none());
+        assert!(dev.get_target_json().is_some());
     }
 }

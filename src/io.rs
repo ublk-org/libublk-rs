@@ -306,10 +306,12 @@ impl UblkDev {
         };
     }
 
+    // Store target specific json data, json["target_data"]
     pub fn set_target_json(&mut self, val: serde_json::Value) {
         self.tgt_json = Some(val);
     }
 
+    // Retrieve target specific json data
     pub fn get_target_json(&self) -> Option<&serde_json::Value> {
         match self.tgt_json.as_ref() {
             None => None,

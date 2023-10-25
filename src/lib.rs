@@ -340,6 +340,7 @@ mod libublk {
 
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
+            dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(0)
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
@@ -373,7 +374,10 @@ mod libublk {
     #[test]
     fn test_ublk_session() {
         let cdev = __test_ublk_session(|dev_id| {
-            UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
+            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+
+            assert!(ctrl.get_target_data_from_json().is_some());
+            ctrl.kill_dev().unwrap();
         });
 
         // could be too strict because of udev
