@@ -1053,6 +1053,21 @@ impl UblkCtrl {
     /// pthread tid
     ///
     fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        // keep everything not changed except for queue tid
+        if dev.dev_info.state == sys::UBLK_S_DEV_QUIESCED as u16 {
+            if let Some(queues) = self.json.get_mut("queues") {
+                for qid in 0..dev.dev_info.nr_hw_queues {
+                    let t = format!("{}", qid);
+                    if let Some(q) = queues.get_mut(t) {
+                        if let Some(tid) = q.get_mut("tid") {
+                            *tid = serde_json::json!(self.queue_tids[qid as usize]);
+                        }
+                    }
+                }
+            }
+            return Ok(0);
+        }
+
         let tgt_data = dev.get_target_json();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
