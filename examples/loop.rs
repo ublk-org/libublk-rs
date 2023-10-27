@@ -72,7 +72,7 @@ fn lo_file_size(f: &std::fs::File) -> Result<(u64, u8, u8)> {
 }
 
 // setup loop target
-fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, split: bool) -> Result<i32, UblkError> {
     trace!("loop: init_tgt {}", dev.dev_info.dev_id);
     if lo.direct_io != 0 {
         unsafe {
@@ -84,6 +84,10 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
     let nr_fds = tgt.nr_fds;
     tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
     tgt.nr_fds = nr_fds + 1;
+
+    let depth = dev.dev_info.queue_depth;
+    tgt.sq_depth = if split { depth * 2 } else { depth };
+    tgt.cq_depth = if split { depth * 2 } else { depth };
 
     let sz = { lo_file_size(&lo.back_file).unwrap() };
     tgt.dev_size = sz.0;
@@ -120,13 +124,14 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
 }
 
 #[inline]
-fn __lo_submit_io_cmd(q: &UblkQueue<'_>, tag: u16, iod: &libublk::sys::ublksrv_io_desc, data: u64) {
-    let op = iod.op_flags & 0xff;
-    // either start to handle or retry
-    let off = (iod.start_sector << 9) as u64;
-    let bytes = (iod.nr_sectors << 9) as u32;
-    let buf_addr = q.get_io_buf_addr(tag);
-
+fn __lo_submit_io_cmd(
+    q: &UblkQueue<'_>,
+    op: u32,
+    off: u64,
+    bytes: u32,
+    buf_addr: *mut u8,
+    data: u64,
+) {
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => {
             let sqe = &opcode::SyncFileRange::new(types::Fixed(1), bytes)
@@ -176,15 +181,20 @@ fn __lo_submit_io_cmd(q: &UblkQueue<'_>, tag: u16, iod: &libublk::sys::ublksrv_i
 
 async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
     let iod = q.get_iod(tag);
-    let op = iod.op_flags & 0xff;
-    let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
         return res;
     }
 
     for _ in 0..4 {
-        __lo_submit_io_cmd(q, tag, iod, user_data);
+        let op = iod.op_flags & 0xff;
+        let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
+        // either start to handle or retry
+        let off = (iod.start_sector << 9) as u64;
+        let bytes = (iod.nr_sectors << 9) as u32;
+        let buf_addr = q.get_io_buf_addr(tag);
+
+        __lo_submit_io_cmd(q, op, off, bytes, buf_addr, user_data);
         let res = UringOpFuture { user_data }.await;
         if res != -(libc::EAGAIN) {
             return res;
@@ -192,6 +202,46 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
     }
 
     return -libc::EAGAIN;
+}
+
+async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
+    let iod = q.get_iod(tag);
+    let res = __lo_prep_submit_io_cmd(iod);
+    if res < 0 {
+        return res;
+    }
+
+    let op = iod.op_flags & 0xff;
+    let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
+    let off = (iod.start_sector << 9) as u64;
+    let bytes = (iod.nr_sectors << 9) as u32;
+    let buf_addr = q.get_io_buf_addr(tag);
+
+    if bytes > 4096 {
+        __lo_submit_io_cmd(q, op, off, 4096, buf_addr, user_data);
+        let user_data2 = UblkIOCtx::build_user_data_async(tag as u16, op, 1);
+        __lo_submit_io_cmd(
+            q,
+            op,
+            off + 4096,
+            bytes - 4096,
+            ((buf_addr as u64) + 4096) as *mut u8,
+            user_data2,
+        );
+
+        let f = UringOpFuture { user_data };
+        let f2 = UringOpFuture {
+            user_data: user_data2,
+        };
+        let (res, res2) = futures::join!(f, f2);
+
+        res + res2
+    } else {
+        __lo_submit_io_cmd(q, op, off, bytes, buf_addr, user_data);
+        let res = UringOpFuture { user_data };
+
+        res.await
+    }
 }
 
 fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
@@ -215,7 +265,12 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
     if res < 0 {
         q.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
     } else {
-        __lo_submit_io_cmd(q, tag, iod, data);
+        let op = iod.op_flags & 0xff;
+        // either start to handle or retry
+        let off = (iod.start_sector << 9) as u64;
+        let bytes = (iod.nr_sectors << 9) as u32;
+        let buf_addr = q.get_io_buf_addr(tag);
+        __lo_submit_io_cmd(q, op, off, bytes, buf_addr, data);
     }
 }
 
@@ -228,10 +283,20 @@ fn test_add(
     ctrl_flags: u64,
     fg: bool,
     aio: bool,
+    split: bool,
 ) {
     let _pid = if !fg { unsafe { libc::fork() } } else { 0 };
     if _pid == 0 {
-        __test_add(id, nr_queues, depth, buf_sz, backing_file, ctrl_flags, aio);
+        __test_add(
+            id,
+            nr_queues,
+            depth,
+            buf_sz,
+            backing_file,
+            ctrl_flags,
+            aio,
+            split,
+        );
     }
 }
 
@@ -243,6 +308,7 @@ fn __test_add(
     backing_file: &String,
     ctrl_flags: u64,
     aio: bool,
+    split: bool,
 ) {
     {
         // LooTgt has to live in the whole device lifetime
@@ -266,7 +332,7 @@ fn __test_add(
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
+        let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, split);
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
@@ -285,7 +351,11 @@ fn __test_add(
                             break;
                         }
 
-                        res = lo_handle_io_cmd_async(&q, tag).await;
+                        res = if !split {
+                            lo_handle_io_cmd_async(&q, tag).await
+                        } else {
+                            lo_handle_io_cmd_async_split(&q, tag).await
+                        };
                         cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
                 });
@@ -385,6 +455,13 @@ fn main() {
                         .short('a')
                         .action(ArgAction::SetTrue)
                         .help("use async/await to handle IO command"),
+                )
+                .arg(
+                    Arg::new("split")
+                        .long("split")
+                        .short('s')
+                        .action(ArgAction::SetTrue)
+                        .help("Split big IO into two small IOs, only for --async"),
                 ),
         )
         .subcommand(
@@ -429,6 +506,15 @@ fn main() {
             } else {
                 false
             };
+            let split = if aio {
+                if add_matches.get_flag("split") {
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             let fg = if add_matches.get_flag("forground") {
                 true
             } else {
@@ -448,6 +534,7 @@ fn main() {
                 ctrl_flags,
                 fg,
                 aio,
+                split,
             );
         }
         Some(("del", add_matches)) => {
