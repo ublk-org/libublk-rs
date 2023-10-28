@@ -28,7 +28,9 @@ pub mod dev_flags {
     /// use async/.await
     pub const UBLK_DEV_F_ASYNC: u32 = 1u32 << 3;
 
-    /// need to preallocate io buffer
+    /// don't preallocate io buffer, target code has to allocate
+    /// IO buffer, and often work with ASYNC and UBLK_F_USER_COPY
+    /// together
     pub const UBLK_DEV_F_DONT_ALLOC_BUF: u32 = 1u32 << 4;
 
     pub const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH
