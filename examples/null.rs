@@ -1,8 +1,17 @@
+use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, exe::Executor, UblkIORes, UblkSession};
 use std::rc::Rc;
+
+bitflags! {
+    #[derive(Default)]
+    struct NullFlags: u32 {
+        const ASYNC = 0b00000001;
+        const FORGROUND = 0b00000010;
+    }
+}
 
 #[inline]
 fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
@@ -18,30 +27,30 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16) {
     q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
 }
 
-fn test_add(
-    id: i32,
-    nr_queues: u32,
-    depth: u32,
-    ctrl_flags: u64,
-    buf_size: u32,
-    fg: bool,
-    aio: bool,
-) {
-    if fg {
-        __test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio);
+fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, flags: NullFlags) {
+    if flags.intersects(NullFlags::FORGROUND) {
+        __test_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
     } else {
         let daemonize = daemonize::Daemonize::new()
             .stdout(daemonize::Stdio::keep())
             .stderr(daemonize::Stdio::keep());
 
         match daemonize.start() {
-            Ok(_) => __test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio),
+            Ok(_) => __test_add(id, nr_queues, depth, ctrl_flags, buf_size, flags),
             _ => panic!(),
         }
     }
 }
 
-fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, aio: bool) {
+fn __test_add(
+    id: i32,
+    nr_queues: u32,
+    depth: u32,
+    ctrl_flags: u64,
+    buf_size: u32,
+    flags: NullFlags,
+) {
+    let aio = flags.intersects(NullFlags::ASYNC);
     {
         let sess = libublk::UblkSessionBuilder::default()
             .name("example_null")
@@ -222,16 +231,13 @@ fn main() {
                 .unwrap()
                 .parse::<u32>()
                 .unwrap_or(52288);
+            let mut flags: NullFlags = Default::default();
 
-            let aio = if add_matches.get_flag("async") {
-                true
-            } else {
-                false
+            if add_matches.get_flag("async") {
+                flags |= NullFlags::ASYNC;
             };
-            let fg = if add_matches.get_flag("forground") {
-                true
-            } else {
-                false
+            if add_matches.get_flag("forground") {
+                flags |= NullFlags::FORGROUND;
             };
             let ctrl_flags: u64 = if add_matches.get_flag("user_copy") {
                 libublk::sys::UBLK_F_USER_COPY as u64
@@ -243,7 +249,7 @@ fn main() {
                 0
             };
 
-            test_add(id, nr_queues, depth, ctrl_flags, buf_size, fg, aio);
+            test_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
         }
         Some(("del", add_matches)) => {
             let id = add_matches
