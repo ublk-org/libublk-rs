@@ -32,6 +32,7 @@ bitflags! {
         const ASYNC = 0b00000001;
         const FORGROUND = 0b00000010;
         const SPLIT = 0b00000100;
+        const ONESHOT = 0b00001000;
     }
 }
 
@@ -334,6 +335,7 @@ fn __test_add(
 ) {
     let aio = lo_flags.intersects(LoFlags::ASYNC);
     let split = lo_flags.intersects(LoFlags::SPLIT);
+    let oneshot = lo_flags.intersects(LoFlags::ONESHOT);
     {
         // LooTgt has to live in the whole device lifetime
         let lo = LoopTgt {
@@ -397,15 +399,22 @@ fn __test_add(
         };
 
         if aio {
-            sess.run_target(&mut ctrl, &dev, q_async_fn, |dev_id| {
+            sess.run_target(&mut ctrl, &dev, q_async_fn, move |dev_id| {
                 let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
+
+                if oneshot {
+                    d_ctrl.kill_dev().unwrap();
+                }
             })
             .unwrap();
         } else {
-            sess.run_target(&mut ctrl, &dev, q_sync_fn, |dev_id| {
+            sess.run_target(&mut ctrl, &dev, q_sync_fn, move |dev_id| {
                 let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
+                if oneshot {
+                    d_ctrl.kill_dev().unwrap();
+                }
             })
             .unwrap();
         }
@@ -481,6 +490,12 @@ fn main() {
                         .help("use async/await to handle IO command"),
                 )
                 .arg(
+                    Arg::new("oneshot")
+                        .long("oneshot")
+                        .action(ArgAction::SetTrue)
+                        .help("create, dump and remove device automatically"),
+                )
+                .arg(
                     Arg::new("split")
                         .long("split")
                         .short('s')
@@ -536,6 +551,9 @@ fn main() {
             };
             if add_matches.get_flag("forground") {
                 lo_flags |= LoFlags::FORGROUND;
+            };
+            if add_matches.get_flag("oneshot") {
+                lo_flags |= LoFlags::ONESHOT;
             };
             let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
                 libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64

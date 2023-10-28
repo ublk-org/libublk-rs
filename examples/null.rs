@@ -10,6 +10,7 @@ bitflags! {
     struct NullFlags: u32 {
         const ASYNC = 0b00000001;
         const FORGROUND = 0b00000010;
+        const ONESHOT = 0b00000100;
     }
 }
 
@@ -51,6 +52,7 @@ fn __test_add(
     flags: NullFlags,
 ) {
     let aio = flags.intersects(NullFlags::ASYNC);
+    let oneshot = flags.intersects(NullFlags::ONESHOT);
     {
         let sess = libublk::UblkSessionBuilder::default()
             .name("example_null")
@@ -113,15 +115,21 @@ fn __test_add(
 
         if aio {
             // Now start this ublk target
-            sess.run_target(&mut ctrl, &dev, q_async_handler, |dev_id| {
+            sess.run_target(&mut ctrl, &dev, q_async_handler, move |dev_id| {
                 let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
+                if oneshot {
+                    d_ctrl.kill_dev().unwrap();
+                }
             })
             .unwrap();
         } else {
-            sess.run_target(&mut ctrl, &dev, q_sync_handler, |dev_id| {
+            sess.run_target(&mut ctrl, &dev, q_sync_handler, move |dev_id| {
                 let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
+                if oneshot {
+                    d_ctrl.kill_dev().unwrap();
+                }
             })
             .unwrap();
         }
@@ -189,6 +197,12 @@ fn main() {
                         .help("run in forground mode"),
                 )
                 .arg(
+                    Arg::new("oneshot")
+                        .long("oneshot")
+                        .action(ArgAction::SetTrue)
+                        .help("create, dump and remove device automatically"),
+                )
+                .arg(
                     Arg::new("async")
                         .long("async")
                         .short('a')
@@ -238,6 +252,9 @@ fn main() {
             };
             if add_matches.get_flag("forground") {
                 flags |= NullFlags::FORGROUND;
+            };
+            if add_matches.get_flag("oneshot") {
+                flags |= NullFlags::ONESHOT;
             };
             let ctrl_flags: u64 = if add_matches.get_flag("user_copy") {
                 libublk::sys::UBLK_F_USER_COPY as u64
