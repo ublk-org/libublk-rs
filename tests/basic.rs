@@ -95,7 +95,10 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_handle_queue);
+        __test_ublk_null(
+            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF,
+            null_handle_queue,
+        );
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -119,7 +122,7 @@ mod integration {
         }
 
         __test_ublk_null(
-            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_COMP_BATCH,
+            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF | UBLK_DEV_F_COMP_BATCH,
             null_handle_queue_batch,
         );
     }
@@ -192,11 +195,11 @@ mod integration {
                 let __dev_data = _dev_data.clone();
 
                 exe.spawn(tag as u16, async move {
-                    let buf_addr = q.get_io_buf_addr(tag) as u64;
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
+                    let buf = q.get_io_buf_addr(tag);
                     let mut res = 0;
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf as u64, res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -353,7 +356,10 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_queue_mut_io);
+        __test_ublk_null(
+            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF,
+            null_queue_mut_io,
+        );
     }
 
     /// run examples/ramdisk recovery test

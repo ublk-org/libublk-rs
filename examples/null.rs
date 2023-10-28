@@ -43,7 +43,15 @@ fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u3
             .nr_queues(nr_queues)
             .io_buf_bytes(buf_size)
             .ctrl_flags(ctrl_flags)
-            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
+            .dev_flags(
+                UBLK_DEV_F_ADD_DEV
+                    | if aio { UBLK_DEV_F_ASYNC } else { 0 }
+                    | if (ctrl_flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0 {
+                        UBLK_DEV_F_DONT_ALLOC_BUF
+                    } else {
+                        0
+                    },
+            )
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {

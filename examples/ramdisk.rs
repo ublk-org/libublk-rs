@@ -8,12 +8,11 @@ use libublk::io::{UblkDev, UblkQueue};
 use libublk::{ctrl::UblkCtrl, exe::Executor, UblkError};
 use std::rc::Rc;
 
-fn handle_io(q: &UblkQueue, tag: u16, start: u64) -> i32 {
+fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: u64) -> i32 {
     let iod = q.get_iod(tag);
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as i32;
     let op = iod.op_flags & 0xff;
-    let buf_addr = q.get_io_buf_addr(tag);
 
     match op {
         libublk::sys::UBLK_IO_OP_READ => unsafe {
@@ -45,7 +44,8 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         UBLK_DEV_F_ADD_DEV
     } else {
         UBLK_DEV_F_RECOVER_DEV
-    } | UBLK_DEV_F_ASYNC;
+    } | UBLK_DEV_F_ASYNC
+        | UBLK_DEV_F_DONT_ALLOC_BUF;
 
     let depth = 128_u16;
     let sess = libublk::UblkSessionBuilder::default()
@@ -66,20 +66,24 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
     let exe = Executor::new(dev.get_nr_ios());
     let q_rc = Rc::new(UblkQueue::new(0, &dev).unwrap());
+    let buf_size = dev.dev_info.max_io_buf_bytes as usize;
 
     for tag in 0..depth as u16 {
         let q = q_rc.clone();
+        assert!(q.get_io_buf_addr(tag) == std::ptr::null_mut());
         exe.spawn(tag as u16, async move {
-            let addr = q.get_io_buf_addr(tag);
+            let mut buffer: Vec<u8> = vec![0; buf_size];
+            let addr = buffer.as_mut_ptr();
             let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
             let mut res = 0;
+
             loop {
                 let cmd_res = q.submit_io_cmd(tag, cmd_op, addr as u64, res).await;
                 if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                     break;
                 }
 
-                res = handle_io(&q, tag, buf_addr);
+                res = handle_io(&q, tag, addr, buf_addr);
                 cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
             }
         });

@@ -28,8 +28,14 @@ pub mod dev_flags {
     /// use async/.await
     pub const UBLK_DEV_F_ASYNC: u32 = 1u32 << 3;
 
-    pub const UBLK_DEV_F_ALL: u32 =
-        UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV | UBLK_DEV_F_ASYNC;
+    /// need to preallocate io buffer
+    pub const UBLK_DEV_F_DONT_ALLOC_BUF: u32 = 1u32 << 4;
+
+    pub const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH
+        | UBLK_DEV_F_ADD_DEV
+        | UBLK_DEV_F_RECOVER_DEV
+        | UBLK_DEV_F_ASYNC
+        | UBLK_DEV_F_DONT_ALLOC_BUF;
 }
 
 /// Ublk Fat completion result

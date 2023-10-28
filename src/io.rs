@@ -477,6 +477,12 @@ impl UblkQueue<'_> {
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
 
+        if ((dev.flags & UBLK_DEV_F_ASYNC) == 0)
+            && ((dev.dev_info.flags & (sys::UBLK_F_USER_COPY as u64)) == 0)
+            && ((dev.flags & UBLK_DEV_F_DONT_ALLOC_BUF) != 0)
+        {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth as u32)
             .setup_coop_taskrun()
@@ -521,7 +527,7 @@ impl UblkQueue<'_> {
             // extra io slot needn't to allocate buffer
             let addr = {
                 if i < depth {
-                    if (dev.dev_info.flags & (super::sys::UBLK_F_USER_COPY as u64)) == 0 {
+                    if (dev.flags & UBLK_DEV_F_DONT_ALLOC_BUF) == 0 {
                         super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
                             libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
                         })
