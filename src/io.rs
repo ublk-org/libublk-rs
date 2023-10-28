@@ -707,6 +707,9 @@ impl UblkQueue<'_> {
     ///
     /// Once result is returned, it means this command is completed and
     /// one ublk IO command is coming from ublk driver.
+    ///
+    /// In case of zoned, `buf_addr` can be the returned LBA for zone append
+    /// command.
     #[inline]
     pub fn submit_io_cmd(
         &self,
