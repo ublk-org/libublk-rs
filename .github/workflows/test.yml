@@ -76,6 +76,11 @@ jobs:
         mkosi ssh ls -l /usr/share/libublk-rs/target/debug/
         mkosi ssh /usr/share/libublk-rs/target/debug/test-libublk --nocapture
         mkosi ssh /usr/share/libublk-rs/target/debug/test-basic --nocapture
+        mkosi ssh truncate -s 128M /tmp/test.img
+        mkosi ssh /usr/share/libublk-rs/target/debug/examples/loop add --forground --oneshot -f /tmp/test.img -a
+        mkosi ssh /usr/share/libublk-rs/target/debug/examples/loop add --forground --oneshot -f /tmp/test.img -a -s
+        mkosi ssh /usr/share/libublk-rs/target/debug/examples/null add --forground --oneshot -a
+        mkosi ssh /usr/share/libublk-rs/target/debug/examples/null add --forground --oneshot -a -u
 
         mkosi ssh echo "test --features=fat_complete"
         mkosi ssh ls -l /usr/share/libublk-rs2/target/debug/deps/libublk*

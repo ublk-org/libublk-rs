@@ -23,6 +23,8 @@ create_libublk()
 
 	cd $rs_dir
 	cargo test $para -v --no-run
+	cargo run --example loop -- help
+	cargo run --example null -- help
 	cd -
 
 	TA=`find $rs_dir/target/debug/deps/ -type f -executable -name "libublk*"`
