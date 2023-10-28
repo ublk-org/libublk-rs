@@ -285,8 +285,7 @@ fn test_add(
     aio: bool,
     split: bool,
 ) {
-    let _pid = if !fg { unsafe { libc::fork() } } else { 0 };
-    if _pid == 0 {
+    if fg {
         __test_add(
             id,
             nr_queues,
@@ -297,6 +296,24 @@ fn test_add(
             aio,
             split,
         );
+    } else {
+        let daemonize = daemonize::Daemonize::new()
+            .stdout(daemonize::Stdio::keep())
+            .stderr(daemonize::Stdio::keep());
+
+        match daemonize.start() {
+            Ok(_) => __test_add(
+                id,
+                nr_queues,
+                depth,
+                buf_sz,
+                backing_file,
+                ctrl_flags,
+                aio,
+                split,
+            ),
+            Err(_) => panic!(),
+        }
     }
 }
 

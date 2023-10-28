@@ -137,22 +137,27 @@ fn test_add(recover: usize) {
     let s = std::env::args().nth(3).unwrap_or_else(|| "32".to_string());
     let mb = s.parse::<u64>().unwrap();
 
-    let _pid = unsafe { libc::fork() };
-    if _pid == 0 {
-        let mut size = (mb << 20) as u64;
+    let daemonize = daemonize::Daemonize::new()
+        .stdout(daemonize::Stdio::keep())
+        .stderr(daemonize::Stdio::keep());
+    match daemonize.start() {
+        Ok(_) => {
+            let mut size = (mb << 20) as u64;
 
-        if recover > 0 {
-            assert!(dev_id >= 0);
-            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-            size = rd_get_device_size(&mut ctrl);
+            if recover > 0 {
+                assert!(dev_id >= 0);
+                let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                size = rd_get_device_size(&mut ctrl);
 
-            ctrl.start_user_recover().unwrap();
+                ctrl.start_user_recover().unwrap();
+            }
+            let buf = libublk::ublk_alloc_buf(size as usize, 4096);
+
+            rd_add_dev(dev_id, buf as u64, size, recover == 0);
+
+            libublk::ublk_dealloc_buf(buf, size as usize, 4096);
         }
-        let buf = libublk::ublk_alloc_buf(size as usize, 4096);
-
-        rd_add_dev(dev_id, buf as u64, size, recover == 0);
-
-        libublk::ublk_dealloc_buf(buf, size as usize, 4096);
+        Err(_) => panic!(),
     }
 }
 

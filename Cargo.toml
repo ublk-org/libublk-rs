@@ -54,3 +54,4 @@ nix = "0.26.2"
 ilog = "1.0.1"
 async-std = {version = "1.12.0"}
 ctrlc = "3.4.0"
+daemonize = "0.5"

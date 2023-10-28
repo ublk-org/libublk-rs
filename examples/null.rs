@@ -27,10 +27,17 @@ fn test_add(
     fg: bool,
     aio: bool,
 ) {
-    let _pid = if !fg { unsafe { libc::fork() } } else { 0 };
-
-    if _pid == 0 {
+    if fg {
         __test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio);
+    } else {
+        let daemonize = daemonize::Daemonize::new()
+            .stdout(daemonize::Stdio::keep())
+            .stderr(daemonize::Stdio::keep());
+
+        match daemonize.start() {
+            Ok(_) => __test_add(id, nr_queues, depth, ctrl_flags, buf_size, aio),
+            _ => panic!(),
+        }
     }
 }
 
