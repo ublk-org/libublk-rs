@@ -84,8 +84,9 @@ fn main() {
             exe.spawn(tag, async move {
                 let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                 let mut result = 0;
+                let addr = std::ptr::null_mut();
                 loop {
-                    if q.submit_io_cmd(tag, cmd_op, 0, result).await
+                    if q.submit_io_cmd(tag, cmd_op, addr, result).await
                         == libublk::sys::UBLK_IO_RES_ABORT
                     {
                         break;
@@ -112,7 +113,6 @@ fn main() {
     })
     .unwrap();
 }
-
 ```
 
 With Rust async/.await, each io command is handled in one standalone io task.

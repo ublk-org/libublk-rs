@@ -82,7 +82,7 @@ fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u3
                     let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr as u64, res).await;
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
                         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                             break;
                         }

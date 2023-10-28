@@ -78,7 +78,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
             let mut res = 0;
 
             loop {
-                let cmd_res = q.submit_io_cmd(tag, cmd_op, addr as u64, res).await;
+                let cmd_res = q.submit_io_cmd(tag, cmd_op, addr, res).await;
                 if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                     break;
                 }

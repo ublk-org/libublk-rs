@@ -199,7 +199,7 @@ mod integration {
                     let buf = q.get_io_buf_addr(tag);
                     let mut res = 0;
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf as u64, res).await;
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf, res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }

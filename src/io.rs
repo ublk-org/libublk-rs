@@ -712,12 +712,12 @@ impl UblkQueue<'_> {
         &self,
         tag: u16,
         cmd_op: u32,
-        buf_addr: u64,
+        buf_addr: *mut u8,
         result: i32,
     ) -> UringOpFuture {
         let user_data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
 
-        self.__submit_io_cmd(tag, cmd_op, buf_addr, user_data, result);
+        self.__submit_io_cmd(tag, cmd_op, buf_addr as u64, user_data, result);
 
         UringOpFuture { user_data }
     }

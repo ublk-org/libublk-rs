@@ -342,7 +342,7 @@ fn __test_add(
                 let q = q_rc.clone();
 
                 exe.spawn(tag as u16, async move {
-                    let buf_addr = q.get_io_buf_addr(tag) as u64;
+                    let buf_addr = q.get_io_buf_addr(tag);
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
                     loop {
