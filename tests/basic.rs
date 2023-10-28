@@ -90,7 +90,7 @@ mod integration {
                 q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
             };
 
-            UblkQueue::new(qid, _dev, true)
+            UblkQueue::new(qid, _dev)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         }
@@ -113,7 +113,7 @@ mod integration {
                 q.complete_io_cmd(tag, res);
             };
 
-            UblkQueue::new(qid, _dev, true)
+            UblkQueue::new(qid, _dev)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         }
@@ -157,7 +157,7 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        let dev_flags = UBLK_DEV_F_ADD_DEV;
+        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC;
         let depth = 64_u16;
         let sess = libublk::UblkSessionBuilder::default()
             .name("null")
@@ -180,7 +180,7 @@ mod integration {
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
         let q_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = Executor::new(dev.get_nr_ios());
 
             // `q_fn` closure implements Clone() Trait, so the captured
@@ -315,7 +315,7 @@ mod integration {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 rd_handle_io(q, tag, _io, buf_addr);
             };
-            UblkQueue::new(qid, _dev, true)
+            UblkQueue::new(qid, _dev)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         };
@@ -348,7 +348,7 @@ mod integration {
                 q.complete_io_cmd(tag, res);
             };
 
-            UblkQueue::new(qid, _dev, true)
+            UblkQueue::new(qid, _dev)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         }

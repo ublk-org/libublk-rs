@@ -38,10 +38,8 @@ run. And the device will be deleted after terminating this process
 by ctrl+C.
 
 ``` rust
-
+use libublk::dev_flags::*;
 use libublk::{ctrl::UblkCtrl, exe::Executor, io::UblkDev, io::UblkQueue};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
 fn main() {
     let depth = 64_u32;
@@ -50,75 +48,71 @@ fn main() {
         .depth(depth)
         .nr_queues(2_u32)
         .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
-        .dev_flags(libublk::dev_flags::UBLK_DEV_F_ADD_DEV)
+        .dev_flags(UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC)
         .build()
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(250_u64 << 30);
-        Ok(serde_json::json!({}))
+        Ok(0)
     };
-    let g_dev_id = Arc::new(Mutex::new(-1));
+
+    // kill created ublk device for handling "ctrl + c"
+    let g_dev_id = std::sync::Arc::new(std::sync::Mutex::new(-1));
     let dev_id_sig = g_dev_id.clone();
     let _ = ctrlc::set_handler(move || {
         let dev_id = *dev_id_sig.lock().unwrap();
         if dev_id >= 0 {
-            UblkCtrl::new_simple(dev_id, 0).unwrap().del_dev().unwrap();
+            UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
         }
     });
 
-    let wh = {
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let q_handler = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
-            let exe = Executor::new(dev.get_nr_ios());
+    let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+    let q_handler = move |qid: u16, dev: &UblkDev| {
+        let q_rc = std::rc::Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+        let exe = Executor::new(dev.get_nr_ios());
 
-            // handle_io_cmd() can be .await nested, and support join!() over
-            // multiple Future objects(async function/block)
-            async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
-                let iod = q.get_iod(tag);
-                let bytes = unsafe { (*iod).nr_sectors << 9 } as i32;
+        // handle_io_cmd() can be .await nested, and support join!() over
+        // multiple Future objects from async function/block
+        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+            (q.get_iod(tag).nr_sectors << 9) as i32
+        }
 
-                bytes
-            }
+        for tag in 0..depth as u16 {
+            let q = q_rc.clone();
 
-            for tag in 0..depth as u16 {
-                let q = q_rc.clone();
-
-                // spawn background io cmd task
-                exe.spawn(tag as u16, async move {
-                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
-                    let mut res = 0;
-                    loop {
-                        // commit io command result and queue new command for
-                        // incoming ublk io request
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, 0, res).await;
-                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                            break;
-                        }
-
-                        res = handle_io_cmd(&q, tag).await;
-                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+            // spawn background task(coroutine) for handling each io command
+            exe.spawn(tag, async move {
+                let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                let mut result = 0;
+                loop {
+                    if q.submit_io_cmd(tag, cmd_op, 0, result).await
+                        == libublk::sys::UBLK_IO_RES_ABORT
+                    {
+                        break;
                     }
-                });
-            }
 
-            // flush all and wait for any completion.
-            q_rc.wait_and_wake_io_tasks(&exe);
-        };
+                    // io_uring async is preferred
+                    result = handle_io_cmd(&q, tag).await;
+                    cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                }
+            });
+        }
 
-        // Now start this ublk target
-        let dev_id_wh = g_dev_id.clone();
-        sess.run_target(&mut ctrl, &dev, q_handler, move |dev_id| {
-            let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-            d_ctrl.dump();
-
-            let mut guard = dev_id_wh.lock().unwrap();
-            *guard = dev_id;
-        })
-        .unwrap()
+        q_rc.wait_and_wake_io_tasks(&exe);
     };
-    wh.join().unwrap();
+
+    // Now start this ublk target
+    let dev_id_wh = g_dev_id.clone();
+    sess.run_target(&mut ctrl, &dev, q_handler, move |dev_id| {
+        let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+        d_ctrl.dump();
+
+        let mut guard = dev_id_wh.lock().unwrap();
+        *guard = dev_id;
+    })
+    .unwrap();
 }
+
 ```
 
 With Rust async/.await, each io command is handled in one standalone io task.

@@ -328,14 +328,14 @@ fn __test_add(
             .nr_queues(nr_queues)
             .depth(depth)
             .io_buf_bytes(buf_sz)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
             .build()
             .unwrap();
 
         let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, split);
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = Executor::new(dev.get_nr_ios());
 
             for tag in 0..depth as u16 {
@@ -367,7 +367,7 @@ fn __test_add(
             let lo_io_handler =
                 move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| lo_handle_io_cmd_sync(q, tag, io);
 
-            UblkQueue::new(qid, _dev, true)
+            UblkQueue::new(qid, _dev)
                 .unwrap()
                 .wait_and_handle_io(lo_io_handler);
         };

@@ -45,7 +45,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         UBLK_DEV_F_ADD_DEV
     } else {
         UBLK_DEV_F_RECOVER_DEV
-    };
+    } | UBLK_DEV_F_ASYNC;
 
     let depth = 128_u16;
     let sess = libublk::UblkSessionBuilder::default()
@@ -65,7 +65,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 
     let exe = Executor::new(dev.get_nr_ios());
-    let q_rc = Rc::new(UblkQueue::new(0, &dev, false).unwrap());
+    let q_rc = Rc::new(UblkQueue::new(0, &dev).unwrap());
 
     for tag in 0..depth as u16 {
         let q = q_rc.clone();

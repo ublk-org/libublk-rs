@@ -43,7 +43,7 @@ fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u3
             .nr_queues(nr_queues)
             .io_buf_bytes(buf_size)
             .ctrl_flags(ctrl_flags)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
@@ -58,12 +58,12 @@ fn __test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u3
                 handle_io_cmd(q, tag);
             };
 
-            UblkQueue::new(qid, dev, true)
+            UblkQueue::new(qid, dev)
                 .unwrap()
                 .wait_and_handle_io(io_handler);
         };
         let q_async_handler = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev, false).unwrap());
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = Executor::new(dev.get_nr_ios());
 
             for tag in 0..depth as u16 {

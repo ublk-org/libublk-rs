@@ -1,3 +1,4 @@
+use super::dev_flags::*;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, sys, UblkError, UblkIORes};
@@ -471,7 +472,7 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
-    pub fn new(q_id: u16, dev: &UblkDev, start_fetch: bool) -> Result<UblkQueue, UblkError> {
+    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
@@ -548,7 +549,8 @@ impl UblkQueue<'_> {
             bufs,
         };
 
-        if start_fetch {
+        // async/.await needn't to submit FETCH_REQ command beforehand
+        if (dev.flags & UBLK_DEV_F_ASYNC) == 0 {
             q.submit_fetch_commands();
         }
 
