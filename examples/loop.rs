@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
@@ -23,6 +24,15 @@ struct LoopTgt {
     back_file_path: String,
     back_file: std::fs::File,
     direct_io: i32,
+}
+
+bitflags! {
+    #[derive(Default)]
+    struct LoFlags: u32 {
+        const ASYNC = 0b00000001;
+        const FORGROUND = 0b00000010;
+        const SPLIT = 0b00000100;
+    }
 }
 
 // Generate ioctl function
@@ -281,11 +291,9 @@ fn test_add(
     buf_sz: u32,
     backing_file: &String,
     ctrl_flags: u64,
-    fg: bool,
-    aio: bool,
-    split: bool,
+    lo_flags: LoFlags,
 ) {
-    if fg {
+    if lo_flags.intersects(LoFlags::FORGROUND) {
         __test_add(
             id,
             nr_queues,
@@ -293,8 +301,7 @@ fn test_add(
             buf_sz,
             backing_file,
             ctrl_flags,
-            aio,
-            split,
+            lo_flags,
         );
     } else {
         let daemonize = daemonize::Daemonize::new()
@@ -309,8 +316,7 @@ fn test_add(
                 buf_sz,
                 backing_file,
                 ctrl_flags,
-                aio,
-                split,
+                lo_flags,
             ),
             Err(_) => panic!(),
         }
@@ -324,9 +330,10 @@ fn __test_add(
     buf_sz: u32,
     backing_file: &String,
     ctrl_flags: u64,
-    aio: bool,
-    split: bool,
+    lo_flags: LoFlags,
 ) {
+    let aio = lo_flags.intersects(LoFlags::ASYNC);
+    let split = lo_flags.intersects(LoFlags::SPLIT);
     {
         // LooTgt has to live in the whole device lifetime
         let lo = LoopTgt {
@@ -517,25 +524,18 @@ fn main() {
                 .parse::<u32>()
                 .unwrap_or(52288);
             let backing_file = add_matches.get_one::<String>("backing_file").unwrap();
+            let mut lo_flags: LoFlags = Default::default();
 
-            let aio = if add_matches.get_flag("async") {
-                true
-            } else {
-                false
+            if add_matches.get_flag("async") {
+                lo_flags |= LoFlags::ASYNC;
             };
-            let split = if aio {
+            if lo_flags.intersects(LoFlags::ASYNC) {
                 if add_matches.get_flag("split") {
-                    true
-                } else {
-                    false
+                    lo_flags |= LoFlags::SPLIT;
                 }
-            } else {
-                false
             };
-            let fg = if add_matches.get_flag("forground") {
-                true
-            } else {
-                false
+            if add_matches.get_flag("forground") {
+                lo_flags |= LoFlags::FORGROUND;
             };
             let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
                 libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64
@@ -549,9 +549,7 @@ fn main() {
                 buf_size,
                 backing_file,
                 ctrl_flags,
-                fg,
-                aio,
-                split,
+                lo_flags,
             );
         }
         Some(("del", add_matches)) => {
