@@ -224,6 +224,7 @@ impl UblkCtrl {
         depth: u32,
         io_buf_bytes: u32,
         flags: u64,
+        tgt_flags: u64,
         dev_flags: u32,
     ) -> Result<UblkCtrl, UblkError> {
         if !Path::new(CTRL_PATH).exists() {
@@ -262,6 +263,7 @@ impl UblkCtrl {
             dev_id: id as u32,
             ublksrv_pid: unsafe { libc::getpid() } as i32,
             flags,
+            ublksrv_flags: tgt_flags,
             ..Default::default()
         };
         let fd = fs::OpenOptions::new()
@@ -336,7 +338,7 @@ impl UblkCtrl {
     pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
         assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
         assert!(id >= 0);
-        Self::new(id, 0, 0, 0, 0, dev_flags)
+        Self::new(id, 0, 0, 0, 0, 0, dev_flags)
     }
 
     fn for_add_dev(&self) -> bool {
@@ -710,7 +712,7 @@ impl UblkCtrl {
     ///
     /// Supported since linux kernel v6.5
     pub fn get_features() -> Option<u64> {
-        match Self::new(-1, 0, 0, 0, 0, 0) {
+        match Self::new(-1, 0, 0, 0, 0, 0, 0) {
             Ok(ctrl) => ctrl.get_driver_features(),
             _ => None,
         }
@@ -1131,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_add_ctrl_dev() {
-        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, UBLK_DEV_F_ADD_DEV).unwrap();
+        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, 0, UBLK_DEV_F_ADD_DEV).unwrap();
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1146,6 +1148,7 @@ mod tests {
             1,
             64,
             512_u32 * 1024,
+            0,
             crate::sys::UBLK_F_UNPRIVILEGED_DEV as u64,
             UBLK_DEV_F_ADD_DEV,
         )
@@ -1160,6 +1163,7 @@ mod tests {
     fn test_ublk_target_json() {
         let sess = UblkSessionBuilder::default()
             .name("null")
+            .ctrl_target_flags(0xbeef as u64)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
@@ -1174,5 +1178,7 @@ mod tests {
         //not built & flushed out yet
         assert!(ctrl.get_target_data_from_json().is_none());
         assert!(dev.get_target_json().is_some());
+        assert!(dev.dev_info.ublksrv_flags == 0xbeef as u64);
+        assert!(ctrl.dev_info.ublksrv_flags == 0xbeef as u64);
     }
 }

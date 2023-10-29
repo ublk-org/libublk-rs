@@ -159,6 +159,11 @@ pub struct UblkSession {
     #[builder(default = "0")]
     ctrl_flags: u64,
 
+    /// store target flags in `sys::ublksrv_ctrl_dev_info.ublksrv_flags`,
+    /// which is immutable in the whole device lifetime
+    #[builder(default = "0")]
+    ctrl_target_flags: u64,
+
     /// libublk feature flags: UBLK_DEV_F_*
     #[builder(default = "0")]
     dev_flags: u32,
@@ -201,6 +206,7 @@ impl UblkSession {
             self.depth,
             self.io_buf_bytes,
             self.ctrl_flags,
+            self.ctrl_target_flags,
             self.dev_flags,
         )?;
 
