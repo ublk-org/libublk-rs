@@ -30,7 +30,7 @@ bitflags! {
     #[derive(Default)]
     struct LoFlags: u32 {
         const ASYNC = 0b00000001;
-        const FORGROUND = 0b00000010;
+        const FOREGROUND = 0b00000010;
         const SPLIT = 0b00000100;
         const ONESHOT = 0b00001000;
     }
@@ -294,7 +294,7 @@ fn test_add(
     ctrl_flags: u64,
     lo_flags: LoFlags,
 ) {
-    if lo_flags.intersects(LoFlags::FORGROUND) {
+    if lo_flags.intersects(LoFlags::FOREGROUND) {
         __test_add(
             id,
             nr_queues,
@@ -469,10 +469,10 @@ fn main() {
                         .help("enable UBLK_F_UN_PRIVILEGED_DEV"),
                 )
                 .arg(
-                    Arg::new("forground")
-                        .long("forground")
+                    Arg::new("foreground")
+                        .long("foreground")
                         .action(ArgAction::SetTrue)
-                        .help("run in forground mode"),
+                        .help("run in foreground mode"),
                 )
                 .arg(
                     Arg::new("backing_file")
@@ -549,8 +549,8 @@ fn main() {
                     lo_flags |= LoFlags::SPLIT;
                 }
             };
-            if add_matches.get_flag("forground") {
-                lo_flags |= LoFlags::FORGROUND;
+            if add_matches.get_flag("foreground") {
+                lo_flags |= LoFlags::FOREGROUND;
             };
             if add_matches.get_flag("oneshot") {
                 lo_flags |= LoFlags::ONESHOT;

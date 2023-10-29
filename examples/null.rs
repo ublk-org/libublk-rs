@@ -9,7 +9,7 @@ bitflags! {
     #[derive(Default)]
     struct NullFlags: u32 {
         const ASYNC = 0b00000001;
-        const FORGROUND = 0b00000010;
+        const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00000100;
     }
 }
@@ -29,7 +29,7 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16) {
 }
 
 fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, flags: NullFlags) {
-    if flags.intersects(NullFlags::FORGROUND) {
+    if flags.intersects(NullFlags::FOREGROUND) {
         __test_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
     } else {
         let daemonize = daemonize::Daemonize::new()
@@ -191,10 +191,10 @@ fn main() {
                         .help("enable UBLK_F_UN_PRIVILEGED_DEV"),
                 )
                 .arg(
-                    Arg::new("forground")
-                        .long("forground")
+                    Arg::new("foreground")
+                        .long("foreground")
                         .action(ArgAction::SetTrue)
-                        .help("run in forground mode"),
+                        .help("run in foreground mode"),
                 )
                 .arg(
                     Arg::new("oneshot")
@@ -250,8 +250,8 @@ fn main() {
             if add_matches.get_flag("async") {
                 flags |= NullFlags::ASYNC;
             };
-            if add_matches.get_flag("forground") {
-                flags |= NullFlags::FORGROUND;
+            if add_matches.get_flag("foreground") {
+                flags |= NullFlags::FOREGROUND;
             };
             if add_matches.get_flag("oneshot") {
                 flags |= NullFlags::ONESHOT;
