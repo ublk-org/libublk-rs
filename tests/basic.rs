@@ -408,9 +408,14 @@ mod integration {
             .expect("fail to add ublk ramdisk");
         cmd.wait().unwrap();
 
-        //this magic wait makes a difference
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
+        let buf = loop {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _buf = std::fs::read_to_string(tmpfile.path()).unwrap();
+
+            if _buf.len() >= 200 {
+                break _buf;
+            }
+        };
 
         let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
         let tid_regx = regex::Regex::new(r"queue 0 tid: (\d+)").unwrap();
