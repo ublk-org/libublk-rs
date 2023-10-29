@@ -28,7 +28,7 @@ To use `libublk` crate, first add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-libublk = "0.1"
+libublk = "0.2"
 ```
 
 Next we can start using `libublk` crate.
