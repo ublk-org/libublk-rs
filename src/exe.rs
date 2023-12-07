@@ -82,16 +82,19 @@ impl UringOpFutureMultiShot {
 pub struct Task<'a> {
     cnt: i16,
     tag: u16,
+    flags: u32,
     future: Pin<Box<dyn Future<Output = ()> + 'a>>,
 }
 
 impl<'a> Task<'a> {
+    const PENDING: u32 = 1;
     #[inline(always)]
     pub fn new(tag: u16, future: Pin<Box<dyn Future<Output = ()> + 'a>>) -> Task {
         Task {
             tag,
             cnt: 0,
             future,
+            flags: 0,
         }
     }
     #[inline(always)]
@@ -105,8 +108,8 @@ impl<'a> Task<'a> {
         res
     }
 
-    fn poll_without_ctx(&mut self) -> Poll<()> {
-        let waker = dummy_waker(self as *mut Task);
+    fn poll_without_ctx(&mut self, data: *const Executor) -> Poll<()> {
+        let waker = dummy_waker(data as *const ());
         let mut context = Context::from_waker(&waker);
 
         self.poll(&mut context)
@@ -119,13 +122,11 @@ fn dummy_raw_waker(data: *const ()) -> RawWaker {
         dummy_raw_waker(data)
     }
     fn wake_op(data: *const ()) {
-        let raw_task = data as *mut Task;
+        let exec = data as *const Executor;
 
         unsafe {
-            if (*raw_task).cnt == 0 {
-                let _ = (*raw_task).poll_without_ctx();
-            }
-        };
+            (*exec).run_all();
+        }
     }
     fn drop_op(_: *const ()) {}
 
@@ -140,8 +141,7 @@ fn dummy_raw_waker(data: *const ()) -> RawWaker {
 /// But it uses raw pointer, borrow checker won't cover it any
 /// more.
 #[inline(always)]
-fn dummy_waker(exec: *mut Task) -> Waker {
-    let data = exec as *const ();
+fn dummy_waker(data: *const ()) -> Waker {
     unsafe { Waker::from_raw(dummy_raw_waker(data)) }
 }
 
@@ -216,14 +216,36 @@ impl<'a> Executor<'a> {
 
     #[inline(always)]
     fn __tick(&self, task: &mut Task) -> Poll<()> {
-        task.poll_without_ctx()
+        task.poll_without_ctx(self as *const Self)
     }
 
     #[inline]
     fn run_task(&self, task: &mut Task) -> bool {
         match self.__tick(task) {
-            Poll::Ready(()) => true,
-            Poll::Pending => false,
+            Poll::Ready(()) => {
+                task.flags &= !Task::PENDING;
+                true
+            }
+            Poll::Pending => {
+                task.flags |= Task::PENDING;
+                false
+            }
+        }
+    }
+
+    // only called from wake_op()
+    //
+    // todo: convert to bitmap or similar way for avoiding big loop
+    fn run_all(&self) {
+        let mut tasks = self.inner.tasks.borrow_mut();
+        for i in 0..tasks.len() {
+            let task = &mut tasks[i];
+
+            if (task.flags & Task::PENDING) != 0 {
+                if task.cnt == 0 {
+                    self.run_task(task);
+                }
+            }
         }
     }
 
@@ -413,6 +435,11 @@ mod tests {
         use async_std::sync::Mutex;
         async fn __test_async_mutex(d: Rc<Mutex<i32>>) {
             let mut guard = d.lock().await;
+            let val = *guard;
+            async_std::task::sleep(std::time::Duration::from_millis(
+                (30 - val).try_into().unwrap(),
+            ))
+            .await;
             *guard += 10;
         }
 
