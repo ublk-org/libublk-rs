@@ -81,16 +81,23 @@ impl UringOpFutureMultiShot {
 
 pub struct Task<'a> {
     cnt: i16,
+    tag: u16,
     future: Pin<Box<dyn Future<Output = ()> + 'a>>,
 }
 
 impl<'a> Task<'a> {
     #[inline(always)]
-    pub fn new(future: Pin<Box<dyn Future<Output = ()> + 'a>>) -> Task {
-        Task { cnt: 0, future }
+    pub fn new(tag: u16, future: Pin<Box<dyn Future<Output = ()> + 'a>>) -> Task {
+        Task {
+            tag,
+            cnt: 0,
+            future,
+        }
     }
     #[inline(always)]
     fn poll(&mut self, context: &mut Context) -> Poll<()> {
+        set_current_task_tag(self.tag);
+
         self.cnt += 1;
         let res = self.future.as_mut().poll(context);
         self.cnt -= 1;
@@ -138,6 +145,25 @@ fn dummy_waker(exec: *mut Task) -> Waker {
     unsafe { Waker::from_raw(dummy_raw_waker(data)) }
 }
 
+// For simulating one 'tag' stack variable, so just fine to
+// let it unsafe
+thread_local! {
+    static MY_THREAD_LOCAL_TAG: UnsafeCell<u16> = UnsafeCell::new(0);
+}
+
+/// Get current io task's tag from thread_local
+///
+#[inline]
+pub fn get_current_task_tag() -> u16 {
+    MY_THREAD_LOCAL_TAG.with(|cell| unsafe { *cell.get() })
+}
+
+fn set_current_task_tag(tag: u16) {
+    MY_THREAD_LOCAL_TAG.with(|cell| unsafe {
+        *cell.get() = tag;
+    });
+}
+
 // For simulating one '*const cqueue::Entry'stack variable, so just fine to
 // let it unsafe
 thread_local! {
@@ -160,8 +186,8 @@ impl<'a> Executor<'a> {
         let mut tasks = Vec::<Task>::with_capacity(nr_tasks as usize);
 
         // initialize this vector for avoiding segment fault when assigning task
-        for _i in 0..nr_tasks as usize {
-            tasks.push(Task::new(Box::pin(async {})));
+        for i in 0..nr_tasks as usize {
+            tasks.push(Task::new(i as u16, Box::pin(async {})));
         }
 
         let inner = Rc::new(ExecutorInner {
@@ -176,7 +202,9 @@ impl<'a> Executor<'a> {
     #[inline(always)]
     pub fn spawn(&self, tag: u16, future: impl Future<Output = ()> + 'a) {
         let mut tasks = self.inner.tasks.borrow_mut();
-        let mut task = Task::new(Box::pin(future));
+        let mut task = Task::new(tag, Box::pin(future));
+
+        set_current_task_tag(tag);
 
         match self.__tick(&mut task) {
             Poll::Ready(()) => {}
@@ -401,5 +429,14 @@ mod tests {
             assert!(*guard == 20);
             println!("async mutex test is done");
         });
+    }
+
+    /// Test get_current_task_tag()
+    #[test]
+    fn test_get_current_task_tag() {
+        let e = Executor::new(2);
+
+        e.spawn(0, async move { assert!(get_current_task_tag() == 0) });
+        e.spawn(1, async move { assert!(get_current_task_tag() == 1) });
     }
 }
