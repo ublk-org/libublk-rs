@@ -3,7 +3,6 @@ use super::dev_flags::*;
 use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
-use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;
@@ -276,7 +275,7 @@ impl UblkDev {
         };
 
         ops(&mut dev)?;
-        info!("dev {} initialized", dev.dev_info.dev_id);
+        log::info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
     }
@@ -285,7 +284,7 @@ impl UblkDev {
     fn deinit_cdev(&mut self) {
         let id = self.dev_info.dev_id;
 
-        info!("dev {} deinitialized", id);
+        log::info!("dev {} deinitialized", id);
     }
 
     pub fn set_default_params(&mut self, dev_size: u64) {
@@ -423,10 +422,10 @@ pub struct UblkQueue<'a> {
 impl Drop for UblkQueue<'_> {
     fn drop(&mut self) {
         let dev = self.dev;
-        trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
+        log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
         if let Err(r) = self.q_ring.borrow_mut().submitter().unregister_files() {
-            error!("unregister fixed files failed {}", r);
+            log::error!("unregister fixed files failed {}", r);
         }
 
         let depth = dev.dev_info.queue_depth as u32;
@@ -560,7 +559,7 @@ impl UblkQueue<'_> {
             q.submit_fetch_commands();
         }
 
-        trace!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
+        log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
         Ok(q)
     }
@@ -642,7 +641,7 @@ impl UblkQueue<'_> {
 
         state.inc_cmd_inflight();
 
-        trace!(
+        log::trace!(
             "{}: (qid {} tag {} cmd_op {}) stopping {}",
             "queue_io_cmd",
             self.q_id,
@@ -816,7 +815,7 @@ impl UblkQueue<'_> {
         let cmd_op = UblkIOCtx::user_data_to_op(data);
 
         {
-            trace!(
+            log::trace!(
                 "{}: res {} (qid {} tag {} cmd_op {} target {}) state {:?}",
                 "handle_cqe",
                 res,
@@ -833,7 +832,7 @@ impl UblkQueue<'_> {
 
             if res < 0 && res != -(libc::EAGAIN) {
                 let data = e.user_data();
-                error!(
+                log::error!(
                     "{}: failed tgt io: res {} qid {} tag {}, cmd_op {}\n",
                     "handle_tgt_cqe",
                     res,
@@ -901,7 +900,7 @@ impl UblkQueue<'_> {
         let empty = self.q_ring.borrow_mut().submission().is_empty();
 
         if empty && state.get_nr_cmd_inflight() == self.q_depth && !state.is_idle() {
-            trace!(
+            log::trace!(
                 "dev {} queue {} becomes idle",
                 self.dev.dev_info.dev_id,
                 self.q_id
@@ -916,7 +915,7 @@ impl UblkQueue<'_> {
         let idle = { self.state.borrow().is_idle() };
 
         if idle {
-            trace!(
+            log::trace!(
                 "dev {} queue {} becomes busy",
                 self.dev.dev_info.dev_id,
                 self.q_id
@@ -931,7 +930,7 @@ impl UblkQueue<'_> {
         let args = types::SubmitArgs::new().timespec(&ts);
 
         let state = self.state.borrow();
-        info!(
+        log::trace!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
             self.q_id,
@@ -958,7 +957,7 @@ impl UblkQueue<'_> {
         };
 
         let nr_cqes = r.completion().len() as i32;
-        info!(
+        log::trace!(
             "nr_cqes {} stop {} idle {}",
             nr_cqes,
             state.is_stopping(),
