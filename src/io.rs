@@ -684,7 +684,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn __submit_io_cmd(
+    pub fn __submit_io_cmd(
         &self,
         tag: u16,
         cmd_op: u32,
