@@ -1082,15 +1082,18 @@ impl UblkQueue<'_> {
     /// Returns how many CQEs handled in this batch.
     ///
     /// This API is useful if user needs target specific batch handling.
-    pub fn flush_and_wake_io_tasks(
+    pub fn flush_and_wake_io_tasks<F>(
         &self,
-        exe: &Executor,
+        wake_handler: F,
         to_wait: usize,
-    ) -> Result<i32, UblkError> {
+    ) -> Result<i32, UblkError>
+    where
+        F: Fn(u64, &cqueue::Entry, bool),
+    {
         match self.wait_ios(to_wait) {
             Err(r) => Err(r),
             Ok(done) => {
-                for _ in 0..done {
+                for i in 0..done {
                     let cqe = {
                         match self.q_ring.borrow_mut().completion().next() {
                             None => return Err(UblkError::OtherError(-libc::EINVAL)),
@@ -1098,11 +1101,10 @@ impl UblkQueue<'_> {
                         }
                     };
                     let user_data = cqe.user_data();
-                    let tag = UblkIOCtx::user_data_to_tag(user_data);
                     if UblkIOCtx::is_io_command(user_data) {
                         self.update_state(&cqe);
                     }
-                    exe.wake_with_uring_cqe(tag as u16, &cqe);
+                    wake_handler(user_data, &cqe, i == done - 1);
                 }
                 Ok(done)
             }
@@ -1120,8 +1122,12 @@ impl UblkQueue<'_> {
     ///
     /// This should be the only foreground thing done in queue thread.
     pub fn wait_and_wake_io_tasks(&self, exe: &Executor) {
+        let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| {
+            let tag = UblkIOCtx::user_data_to_tag(data);
+            exe.wake_with_uring_cqe(tag as u16, &cqe);
+        };
         loop {
-            match self.flush_and_wake_io_tasks(exe, 1) {
+            match self.flush_and_wake_io_tasks(wake_handler, 1) {
                 Err(_) => break,
                 _ => continue,
             }

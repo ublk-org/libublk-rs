@@ -260,7 +260,7 @@ impl<'a> Executor<'a> {
 
     /// Called when one cqe is completed
     #[inline]
-    pub(crate) fn wake_with_uring_cqe(&self, tag: u16, cqe: &cqueue::Entry) -> bool {
+    pub fn wake_with_uring_cqe(&self, tag: u16, cqe: &cqueue::Entry) -> bool {
         Executor::set_thread_local_cqe(cqe as *const cqueue::Entry);
         let done = self.tick(tag);
         Executor::set_thread_local_cqe(std::ptr::null());
