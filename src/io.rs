@@ -924,6 +924,12 @@ impl UblkQueue<'_> {
         }
     }
 
+    /// Return inflight IOs being handled by target code
+    #[inline]
+    pub fn get_inflight_nr_io(&self) -> u32 {
+        self.q_depth - self.state.borrow().get_nr_cmd_inflight()
+    }
+
     #[inline]
     fn __wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
         let ts = types::Timespec::new().sec(Self::UBLK_QUEUE_IDLE_SECS as u64);
