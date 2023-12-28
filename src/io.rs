@@ -635,8 +635,16 @@ impl UblkQueue<'_> {
             .build()
             .user_data(user_data);
 
-        unsafe {
-            r.submission().push(&sqe).expect("submission fail");
+        loop {
+            let res = unsafe { r.submission().push(&sqe) };
+
+            match res {
+                Ok(_) => break,
+                Err(_) => {
+                    log::debug!("__queue_io_cmd: flush submission and retry");
+                    r.submit_and_wait(0).unwrap();
+                }
+            }
         }
 
         state.inc_cmd_inflight();
