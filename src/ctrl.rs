@@ -198,8 +198,8 @@ impl Drop for UblkCtrl {
 impl UblkCtrl {
     /// char device and block device name may change according to system policy,
     /// such udev may rename it in its own namespaces.
-    const CDEV_PATH: &str = "/dev/ublkc";
-    const BDEV_PATH: &str = "/dev/ublkb";
+    const CDEV_PATH: &'static str = "/dev/ublkc";
+    const BDEV_PATH: &'static str = "/dev/ublkb";
 
     /// New one ublk control device
     ///

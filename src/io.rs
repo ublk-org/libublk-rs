@@ -3,7 +3,6 @@ use super::dev_flags::*;
 use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
-use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;
@@ -276,7 +275,7 @@ impl UblkDev {
         };
 
         ops(&mut dev)?;
-        info!("dev {} initialized", dev.dev_info.dev_id);
+        log::info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
     }
@@ -285,7 +284,7 @@ impl UblkDev {
     fn deinit_cdev(&mut self) {
         let id = self.dev_info.dev_id;
 
-        info!("dev {} deinitialized", id);
+        log::info!("dev {} deinitialized", id);
     }
 
     pub fn set_default_params(&mut self, dev_size: u64) {
@@ -423,10 +422,10 @@ pub struct UblkQueue<'a> {
 impl Drop for UblkQueue<'_> {
     fn drop(&mut self) {
         let dev = self.dev;
-        trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
+        log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
         if let Err(r) = self.q_ring.borrow_mut().submitter().unregister_files() {
-            error!("unregister fixed files failed {}", r);
+            log::error!("unregister fixed files failed {}", r);
         }
 
         let depth = dev.dev_info.queue_depth as u32;
@@ -560,7 +559,7 @@ impl UblkQueue<'_> {
             q.submit_fetch_commands();
         }
 
-        trace!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
+        log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
         Ok(q)
     }
@@ -636,13 +635,21 @@ impl UblkQueue<'_> {
             .build()
             .user_data(user_data);
 
-        unsafe {
-            r.submission().push(&sqe).expect("submission fail");
+        loop {
+            let res = unsafe { r.submission().push(&sqe) };
+
+            match res {
+                Ok(_) => break,
+                Err(_) => {
+                    log::debug!("__queue_io_cmd: flush submission and retry");
+                    r.submit_and_wait(0).unwrap();
+                }
+            }
         }
 
         state.inc_cmd_inflight();
 
-        trace!(
+        log::trace!(
             "{}: (qid {} tag {} cmd_op {}) stopping {}",
             "queue_io_cmd",
             self.q_id,
@@ -685,7 +692,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn __submit_io_cmd(
+    pub fn __submit_io_cmd(
         &self,
         tag: u16,
         cmd_op: u32,
@@ -816,7 +823,7 @@ impl UblkQueue<'_> {
         let cmd_op = UblkIOCtx::user_data_to_op(data);
 
         {
-            trace!(
+            log::trace!(
                 "{}: res {} (qid {} tag {} cmd_op {} target {}) state {:?}",
                 "handle_cqe",
                 res,
@@ -833,7 +840,7 @@ impl UblkQueue<'_> {
 
             if res < 0 && res != -(libc::EAGAIN) {
                 let data = e.user_data();
-                error!(
+                log::error!(
                     "{}: failed tgt io: res {} qid {} tag {}, cmd_op {}\n",
                     "handle_tgt_cqe",
                     res,
@@ -901,7 +908,7 @@ impl UblkQueue<'_> {
         let empty = self.q_ring.borrow_mut().submission().is_empty();
 
         if empty && state.get_nr_cmd_inflight() == self.q_depth && !state.is_idle() {
-            trace!(
+            log::trace!(
                 "dev {} queue {} becomes idle",
                 self.dev.dev_info.dev_id,
                 self.q_id
@@ -916,7 +923,7 @@ impl UblkQueue<'_> {
         let idle = { self.state.borrow().is_idle() };
 
         if idle {
-            trace!(
+            log::trace!(
                 "dev {} queue {} becomes busy",
                 self.dev.dev_info.dev_id,
                 self.q_id
@@ -925,13 +932,19 @@ impl UblkQueue<'_> {
         }
     }
 
+    /// Return inflight IOs being handled by target code
+    #[inline]
+    pub fn get_inflight_nr_io(&self) -> u32 {
+        self.q_depth - self.state.borrow().get_nr_cmd_inflight()
+    }
+
     #[inline]
     fn __wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
         let ts = types::Timespec::new().sec(Self::UBLK_QUEUE_IDLE_SECS as u64);
         let args = types::SubmitArgs::new().timespec(&ts);
 
         let state = self.state.borrow();
-        info!(
+        log::trace!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
             self.q_id,
@@ -958,7 +971,7 @@ impl UblkQueue<'_> {
         };
 
         let nr_cqes = r.completion().len() as i32;
-        info!(
+        log::trace!(
             "nr_cqes {} stop {} idle {}",
             nr_cqes,
             state.is_stopping(),
@@ -1083,15 +1096,18 @@ impl UblkQueue<'_> {
     /// Returns how many CQEs handled in this batch.
     ///
     /// This API is useful if user needs target specific batch handling.
-    pub fn flush_and_wake_io_tasks(
+    pub fn flush_and_wake_io_tasks<F>(
         &self,
-        exe: &Executor,
+        wake_handler: F,
         to_wait: usize,
-    ) -> Result<i32, UblkError> {
+    ) -> Result<i32, UblkError>
+    where
+        F: Fn(u64, &cqueue::Entry, bool),
+    {
         match self.wait_ios(to_wait) {
             Err(r) => Err(r),
             Ok(done) => {
-                for _ in 0..done {
+                for i in 0..done {
                     let cqe = {
                         match self.q_ring.borrow_mut().completion().next() {
                             None => return Err(UblkError::OtherError(-libc::EINVAL)),
@@ -1099,11 +1115,10 @@ impl UblkQueue<'_> {
                         }
                     };
                     let user_data = cqe.user_data();
-                    let tag = UblkIOCtx::user_data_to_tag(user_data);
                     if UblkIOCtx::is_io_command(user_data) {
                         self.update_state(&cqe);
                     }
-                    exe.wake_with_uring_cqe(tag as u16, &cqe);
+                    wake_handler(user_data, &cqe, i == done - 1);
                 }
                 Ok(done)
             }
@@ -1121,8 +1136,12 @@ impl UblkQueue<'_> {
     ///
     /// This should be the only foreground thing done in queue thread.
     pub fn wait_and_wake_io_tasks(&self, exe: &Executor) {
+        let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| {
+            let tag = UblkIOCtx::user_data_to_tag(data);
+            exe.wake_with_uring_cqe(tag as u16, &cqe);
+        };
         loop {
-            match self.flush_and_wake_io_tasks(exe, 1) {
+            match self.flush_and_wake_io_tasks(wake_handler, 1) {
                 Err(_) => break,
                 _ => continue,
             }

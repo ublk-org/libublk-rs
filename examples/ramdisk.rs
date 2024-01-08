@@ -1,10 +1,11 @@
+use io_uring::cqueue;
 ///! # Example of ramdisk
 ///
 /// Serves for covering recovery test[`test_ublk_ramdisk_recovery`],
 /// UblkCtrl::start_dev_in_queue() and low level interface example.
 ///
 use libublk::dev_flags::*;
-use libublk::io::{UblkDev, UblkQueue};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{ctrl::UblkCtrl, exe::Executor, UblkError};
 use std::rc::Rc;
 
@@ -92,8 +93,13 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         .unwrap();
 
     let (token, buf) = ctrl.submit_start_dev(&dev).unwrap();
+    let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| {
+        let tag = UblkIOCtx::user_data_to_tag(data);
+        exe.wake_with_uring_cqe(tag as u16, &cqe);
+    };
+
     let res = loop {
-        let _ = q_rc.flush_and_wake_io_tasks(&exe, 0);
+        let _ = q_rc.flush_and_wake_io_tasks(wake_handler, 0);
         let _res = ctrl.poll_start_dev(token);
         match _res {
             Ok(res) => break Ok(res),
