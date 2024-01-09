@@ -26,14 +26,17 @@ impl Future for UringOpFuture {
     fn poll(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Self::Output> {
         let cqe = Executor::get_thread_local_cqe();
         if !cqe.is_null() && unsafe { (*cqe).user_data() } == self.user_data {
+            log::trace!("uring cqe ready {}", get_current_task_tag());
             Executor::set_thread_local_cqe(std::ptr::null());
             Poll::Ready(unsafe { (*cqe).result() })
         } else {
+            log::trace!("uring cqe pending {}", get_current_task_tag());
             Poll::Pending
         }
     }
 }
 
+/*
 /// MultiShot CQE
 ///
 /// Totally un-tested, so far serves as sample reference implementation, and
@@ -77,30 +80,34 @@ impl UringOpFutureMultiShot {
             done: 0,
         }
     }
-}
+}*/
 
-pub struct Task<'a> {
-    cnt: i16,
+struct Task<'a> {
+    finished: bool,
     tag: u16,
     future: Pin<Box<dyn Future<Output = ()> + 'a>>,
+    exe_h: *const (),
 }
 
 impl<'a> Task<'a> {
     #[inline(always)]
-    pub fn new(tag: u16, future: Pin<Box<dyn Future<Output = ()> + 'a>>) -> Task {
+    fn new(tag: u16, future: Pin<Box<dyn Future<Output = ()> + 'a>>, exe_h: *const ()) -> Task {
         Task {
             tag,
-            cnt: 0,
             future,
+            exe_h,
+            finished: false,
         }
     }
     #[inline(always)]
     fn poll(&mut self, context: &mut Context) -> Poll<()> {
         set_current_task_tag(self.tag);
 
-        self.cnt += 1;
         let res = self.future.as_mut().poll(context);
-        self.cnt -= 1;
+        match res {
+            Poll::Ready(_) => self.finished = true,
+            _ => {}
+        }
 
         res
     }
@@ -122,9 +129,8 @@ fn dummy_raw_waker(data: *const ()) -> RawWaker {
         let raw_task = data as *mut Task;
 
         unsafe {
-            if (*raw_task).cnt == 0 {
-                let _ = (*raw_task).poll_without_ctx();
-            }
+            let raw_exe = (*raw_task).exe_h as *mut Executor;
+            (*raw_exe).wake_task((*raw_task).tag);
         };
     }
     fn drop_op(_: *const ()) {}
@@ -164,15 +170,36 @@ fn set_current_task_tag(tag: u16) {
     });
 }
 
+struct UringOpResult {
+    user_data: u64,
+    result: i32,
+}
+
+impl UringOpResult {
+    fn new(user_data: u64, result: i32) -> Self {
+        UringOpResult { user_data, result }
+    }
+
+    fn result(&self) -> i32 {
+        self.result
+    }
+    fn user_data(&self) -> u64 {
+        self.user_data
+    }
+}
+
 // For simulating one '*const cqueue::Entry'stack variable, so just fine to
 // let it unsafe
 thread_local! {
-    static MY_THREAD_LOCAL_CQE: UnsafeCell<*const cqueue::Entry> = UnsafeCell::new(std::ptr::null());
+    static MY_THREAD_LOCAL_CQE: UnsafeCell<*const UringOpResult> = UnsafeCell::new(std::ptr::null());
 }
 
 #[derive(Default)]
 struct ExecutorInner<'a> {
     tasks: RefCell<Vec<Task<'a>>>,
+
+    // timer may be waken up from another context
+    runnable: std::sync::Mutex<Vec<(u16, Option<UringOpResult>)>>,
 }
 
 /// ublk dedicated executor
@@ -187,14 +214,30 @@ impl<'a> Executor<'a> {
 
         // initialize this vector for avoiding segment fault when assigning task
         for i in 0..nr_tasks as usize {
-            tasks.push(Task::new(i as u16, Box::pin(async {})));
+            tasks.push(Task::new(i as u16, Box::pin(async {}), std::ptr::null()));
         }
 
         let inner = Rc::new(ExecutorInner {
             tasks: RefCell::new(tasks),
+            runnable: std::sync::Mutex::new(Vec::new()),
         });
 
         Executor { inner }
+    }
+
+    #[inline]
+    // `res` is only valid for io uring
+    fn wake_uring_task(&self, tag: u16, cqe: &cqueue::Entry) {
+        let mut queue = self.inner.runnable.lock().unwrap();
+
+        queue.push((tag, Some(UringOpResult::new(cqe.user_data(), cqe.result()))));
+    }
+
+    #[inline]
+    fn wake_task(&self, tag: u16) {
+        let mut queue = self.inner.runnable.lock().unwrap();
+
+        queue.push((tag, None));
     }
 
     /// Spawn one ublk io task, which is for handling one specific io command
@@ -202,16 +245,15 @@ impl<'a> Executor<'a> {
     #[inline(always)]
     pub fn spawn(&self, tag: u16, future: impl Future<Output = ()> + 'a) {
         let mut tasks = self.inner.tasks.borrow_mut();
-        let mut task = Task::new(tag, Box::pin(future));
+        let mut task = Task::new(tag, Box::pin(future), self as *const Executor as *const ());
 
         set_current_task_tag(tag);
 
         match self.__tick(&mut task) {
-            Poll::Ready(()) => {}
-            Poll::Pending => {
-                tasks[tag as usize] = task;
-            }
+            Poll::Ready(()) => task.finished = true,
+            Poll::Pending => {}
         }
+        tasks[tag as usize] = task;
     }
 
     #[inline(always)]
@@ -236,14 +278,47 @@ impl<'a> Executor<'a> {
         self.run_task(task)
     }
 
+    pub fn task_is_finished(&self, tag: u16) -> bool {
+        let tasks = self.inner.tasks.borrow();
+        let task = &tasks[tag as usize];
+
+        task.finished
+    }
+
+    pub fn try_run(&self) -> bool {
+        let queue = {
+            let mut v = Vec::new();
+            let mut queue = self.inner.runnable.lock().unwrap();
+
+            v.append(&mut queue);
+
+            v
+        };
+
+        if queue.is_empty() {
+            return false;
+        }
+
+        for (tag, res) in queue {
+            match res {
+                Some(data) => {
+                    Executor::set_thread_local_cqe(&data as *const UringOpResult);
+                    self.tick(tag);
+                    Executor::set_thread_local_cqe(std::ptr::null());
+                }
+                None => {
+                    let _ = self.tick(tag);
+                }
+            };
+        }
+
+        return true;
+    }
+
     /// Called when one cqe is completed
     #[inline]
-    pub fn wake_with_uring_cqe(&self, tag: u16, cqe: &cqueue::Entry) -> bool {
-        Executor::set_thread_local_cqe(cqe as *const cqueue::Entry);
-        let done = self.tick(tag);
-        Executor::set_thread_local_cqe(std::ptr::null());
-
-        done
+    pub fn wake_with_uring_cqe(&self, tag: u16, cqe: &cqueue::Entry) {
+        self.wake_uring_task(tag, cqe);
     }
 
     /// Store cqe const pointer to thread_local for avoiding unnecessary
@@ -251,7 +326,7 @@ impl<'a> Executor<'a> {
     ///
     /// Called when one cqe is completed.
     #[inline]
-    pub(crate) fn set_thread_local_cqe(cqe: *const cqueue::Entry) {
+    fn set_thread_local_cqe(cqe: *const UringOpResult) {
         MY_THREAD_LOCAL_CQE.with(|cell| unsafe {
             *cell.get() = cqe;
         });
@@ -261,7 +336,7 @@ impl<'a> Executor<'a> {
     ///
     /// Called from Future's poll() method.
     #[inline]
-    pub(crate) fn get_thread_local_cqe() -> *const cqueue::Entry {
+    fn get_thread_local_cqe() -> *const UringOpResult {
         MY_THREAD_LOCAL_CQE.with(|cell| unsafe { *cell.get() })
     }
 }
@@ -290,7 +365,9 @@ mod tests {
         let my_cqe = (k, res, 0_i32);
         let cqe = unsafe { std::mem::transmute::<(u64, i32, i32), cqueue::Entry>(my_cqe) };
 
-        e.wake_with_uring_cqe(tag, &cqe)
+        e.wake_with_uring_cqe(tag, &cqe);
+
+        e.try_run()
     }
     /// Test if uring future works as expected
     #[test]
@@ -334,7 +411,7 @@ mod tests {
         assert!(!e.tick(0));
 
         //simulate one uring op completion
-        assert!(!__test_uring_wakeup(&e, 0, k, res));
+        assert!(__test_uring_wakeup(&e, 0, k, res));
         //simulate one uring op completion
         assert!(__test_uring_wakeup(&e, 0, k2, res2));
     }
@@ -438,5 +515,8 @@ mod tests {
 
         e.spawn(0, async move { assert!(get_current_task_tag() == 0) });
         e.spawn(1, async move { assert!(get_current_task_tag() == 1) });
+
+        assert!(e.task_is_finished(0) == true);
+        assert!(e.task_is_finished(1) == true);
     }
 }

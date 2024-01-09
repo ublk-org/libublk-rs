@@ -1138,12 +1138,16 @@ impl UblkQueue<'_> {
     pub fn wait_and_wake_io_tasks(&self, exe: &Executor) {
         let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| {
             let tag = UblkIOCtx::user_data_to_tag(data);
+            log::trace!("wake_io_task {}", UblkIOCtx::user_data_to_tag(data));
             exe.wake_with_uring_cqe(tag as u16, &cqe);
         };
         loop {
             match self.flush_and_wake_io_tasks(wake_handler, 1) {
                 Err(_) => break,
-                _ => continue,
+                _ => {
+                    exe.try_run();
+                    continue;
+                }
             }
         }
     }

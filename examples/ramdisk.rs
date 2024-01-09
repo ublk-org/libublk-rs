@@ -100,6 +100,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
     let res = loop {
         let _ = q_rc.flush_and_wake_io_tasks(wake_handler, 0);
+        exe.try_run();
         let _res = ctrl.poll_start_dev(token);
         match _res {
             Ok(res) => break Ok(res),
