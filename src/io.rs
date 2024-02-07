@@ -3,6 +3,7 @@ use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
+use crate::helpers::IoBuf;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -412,7 +413,7 @@ pub struct UblkQueue<'a> {
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
     pub dev: &'a UblkDev,
-    bufs: Vec<*mut u8>,
+    bufs: RefCell<Vec<*mut u8>>,
     state: RefCell<UblkQueueState>,
 
     /// uring is shared for handling target IO, so has to be
@@ -438,7 +439,7 @@ impl Drop for UblkQueue<'_> {
         }
 
         for i in 0..depth {
-            let buf = self.bufs[i as usize];
+            let buf = self.bufs.borrow()[i as usize];
 
             super::ublk_dealloc_buf(buf, dev.dev_info.max_io_buf_bytes as usize, unsafe {
                 libc::sysconf(libc::_SC_PAGESIZE) as usize
@@ -477,12 +478,6 @@ impl UblkQueue<'_> {
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
 
-        if ((dev.flags & UBLK_DEV_F_ASYNC) == 0)
-            && ((dev.dev_info.flags & (sys::UBLK_F_USER_COPY as u64)) == 0)
-            && ((dev.flags & UBLK_DEV_F_DONT_ALLOC_BUF) != 0)
-        {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth as u32)
             .setup_coop_taskrun()
@@ -552,12 +547,12 @@ impl UblkQueue<'_> {
                 state: 0,
             }),
             q_ring: RefCell::new(ring),
-            bufs,
+            bufs: RefCell::new(bufs),
         };
 
         // async/.await needn't to submit FETCH_REQ command beforehand
-        if (dev.flags & UBLK_DEV_F_ASYNC) == 0 {
-            q.submit_fetch_commands();
+        if (dev.flags & UBLK_DEV_F_ASYNC) == 0 && (dev.flags & UBLK_DEV_F_DONT_ALLOC_BUF) == 0 {
+            q.__submit_fetch_commands();
         }
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
@@ -599,7 +594,42 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     pub fn get_io_buf_addr(&self, tag: u16) -> *mut u8 {
-        self.bufs[tag as usize]
+        self.bufs.borrow()[tag as usize]
+    }
+
+    /// Register IO buffer, so that pages in this buffer can
+    /// be discarded in case queue becomes idle
+    pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
+        self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
+    }
+
+    /// Register IO buffer, so that pages in this buffer can
+    /// be discarded in case queue becomes idle
+    pub fn unregister_io_buf(&self, tag: u16) {
+        self.bufs.borrow_mut()[tag as usize] = std::ptr::null_mut();
+    }
+
+    /// unregister all io buffers
+    fn unregister_io_bufs(&self) {
+        for tag in 0..self.q_depth {
+            self.unregister_io_buf(tag.try_into().unwrap());
+        }
+    }
+
+    /// Allocate IoBuf for each io command slot
+    pub fn alloc_io_bufs(&self, register: bool) -> Vec<IoBuf<u8>> {
+        let mut bvec = Vec::with_capacity(self.q_depth as usize);
+
+        for tag in 0..self.q_depth {
+            let buf = IoBuf::<u8>::new(self.dev.dev_info.max_io_buf_bytes as usize);
+
+            if register {
+                self.register_io_buf(tag.try_into().unwrap(), &buf);
+            }
+            bvec.push(buf);
+        }
+
+        bvec
     }
 
     #[inline(always)]
@@ -746,7 +776,28 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
-    fn submit_fetch_commands(&self) {
+    pub fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
+        for i in 0..self.q_depth {
+            let buf_addr = match bufs {
+                Some(b) => b[i as usize].as_mut_ptr(),
+                None => std::ptr::null_mut(),
+            };
+
+            assert!(
+                ((self.dev.dev_info.flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0)
+                    == bufs.is_none()
+            );
+            self.queue_io_cmd(
+                &mut self.q_ring.borrow_mut(),
+                i as u16,
+                sys::UBLK_IO_FETCH_REQ,
+                buf_addr as u64,
+                -1,
+            );
+        }
+        self
+    }
+    fn __submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as u16) as u64;
             self.queue_io_cmd(
@@ -1077,6 +1128,10 @@ impl UblkQueue<'_> {
                 Err(_) => break,
                 _ => continue,
             }
+        }
+
+        if (self.flags & UBLK_DEV_F_DONT_ALLOC_BUF) != 0 {
+            self.unregister_io_bufs();
         }
     }
 

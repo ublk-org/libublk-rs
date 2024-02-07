@@ -2,6 +2,7 @@
 mod integration {
     use io_uring::opcode;
     use libublk::dev_flags::*;
+    use libublk::helpers::IoBuf;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     use libublk::uring_async::ublk_wait_and_handle_ios;
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
@@ -93,6 +94,7 @@ mod integration {
 
             UblkQueue::new(qid, _dev)
                 .unwrap()
+                .submit_fetch_commands(None)
                 .wait_and_handle_io(io_handler);
         }
 
@@ -120,6 +122,7 @@ mod integration {
 
             UblkQueue::new(qid, _dev)
                 .unwrap()
+                .submit_fetch_commands(None)
                 .wait_and_handle_io(io_handler);
         }
 
@@ -150,7 +153,7 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC;
+        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC | UBLK_DEV_F_DONT_ALLOC_BUF;
         let depth = 64_u16;
         let sess = libublk::UblkSessionBuilder::default()
             .name("null")
@@ -187,10 +190,12 @@ mod integration {
 
                 f_vec.push(exe.spawn(async move {
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
-                    let buf = q.get_io_buf_addr(tag);
+                    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
                     let mut res = 0;
+
+                    q.register_io_buf(tag, &buf);
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf, res).await;
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -202,6 +207,7 @@ mod integration {
                             (*guard).done += 1;
                         }
                     }
+                    q.unregister_io_buf(tag);
                 }));
             }
 
@@ -232,12 +238,11 @@ mod integration {
     /// - if yes, then test format/mount/umount over this ublk-ramdisk
     #[test]
     fn test_ublk_ramdisk() {
-        fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, start: u64) {
+        fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, buf_addr: *mut u8, start: u64) {
             let iod = q.get_iod(tag);
             let off = (iod.start_sector << 9) as u64;
             let bytes = (iod.nr_sectors << 9) as u32;
             let op = iod.op_flags & 0xff;
-            let buf_addr = q.get_io_buf_addr(tag);
 
             match op {
                 sys::UBLK_IO_OP_FLUSH => {}
@@ -265,11 +270,11 @@ mod integration {
             q.complete_io_cmd(tag, buf_addr, res);
         }
 
-        fn __test_ublk_ramdisk(dev_id: i32) {
+        fn __test_ublk_ramdisk(dev_id: i32, dev_flags: u32) {
             let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             let dev_path = ctrl.get_bdev_path();
 
-            run_ublk_disk_sanity_test(&mut ctrl, UBLK_DEV_F_ADD_DEV);
+            run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
 
             //format as ext4 and mount over the created ublk-ramdisk
             {
@@ -292,13 +297,14 @@ mod integration {
 
         let size = 32_u64 << 20;
         let buf = libublk::ublk_alloc_buf(size as usize, 4096);
-        let buf_addr = buf as u64;
+        let dev_addr = buf as u64;
+        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF;
         let sess = libublk::UblkSessionBuilder::default()
             .name("ramdisk")
             .id(-1)
             .nr_queues(1_u16)
             .depth(128_u16)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(dev_flags)
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
@@ -308,16 +314,23 @@ mod integration {
 
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, _dev: &UblkDev| {
+            let q = UblkQueue::new(qid, _dev).unwrap();
+            let bufs_rc = Rc::new(q.alloc_io_bufs(true));
+            let bufs = bufs_rc.clone();
+
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                rd_handle_io(q, tag, _io, buf_addr);
+                let bufs = bufs_rc.clone();
+                let buf_addr = bufs[tag as usize].as_mut_ptr();
+
+                rd_handle_io(q, tag, _io, buf_addr, dev_addr);
             };
-            UblkQueue::new(qid, _dev)
-                .unwrap()
+
+            q.submit_fetch_commands(Some(&bufs))
                 .wait_and_handle_io(io_handler);
         };
 
         sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
-            __test_ublk_ramdisk(dev_id);
+            __test_ublk_ramdisk(dev_id, dev_flags);
         })
         .unwrap();
         libublk::ublk_dealloc_buf(buf, size as usize, 4096);
@@ -347,6 +360,7 @@ mod integration {
 
             UblkQueue::new(qid, _dev)
                 .unwrap()
+                .submit_fetch_commands(None)
                 .wait_and_handle_io(io_handler);
         }
 
