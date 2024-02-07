@@ -10,6 +10,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::sync::Arc;
 
 pub mod ctrl;
+pub mod helpers;
 pub mod io;
 pub mod sys;
 pub mod uring_async;
@@ -351,7 +352,7 @@ mod libublk {
             .name("null")
             .depth(16_u32)
             .nr_queues(2_u32)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF)
             .build()
             .unwrap();
 
@@ -362,16 +363,20 @@ mod libublk {
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, _dev: &UblkDev| {
+            let q = UblkQueue::new(qid, _dev).unwrap();
+            let bufs_rc = Rc::new(q.alloc_io_bufs(true));
+            let bufs = bufs_rc.clone();
+
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
-                let buf_addr = q.get_io_buf_addr(tag);
+                let bufs = bufs_rc.clone();
+                let buf_addr = bufs[tag as usize].as_mut_ptr();
 
                 q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
-            UblkQueue::new(qid, _dev)
-                .unwrap()
+            q.submit_fetch_commands(Some(&bufs))
                 .wait_and_handle_io(io_handler);
         };
 
