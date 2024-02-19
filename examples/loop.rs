@@ -5,9 +5,8 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{
-    ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, sys, UblkError, UblkIORes, UblkSession,
-};
+use libublk::uring_async::{ublk_submit_io_cmd, ublk_submit_sqe, ublk_wake_task};
+use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes, UblkSession};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
@@ -135,59 +134,22 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
 }
 
 #[inline]
-fn __lo_submit_io_cmd(
-    q: &UblkQueue<'_>,
-    op: u32,
-    off: u64,
-    bytes: u32,
-    buf_addr: *mut u8,
-    data: u64,
-) {
+fn __lo_submit_io_cmd(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_uring::squeue::Entry {
     match op {
-        libublk::sys::UBLK_IO_OP_FLUSH => {
-            let sqe = &opcode::SyncFileRange::new(types::Fixed(1), bytes)
-                .offset(off)
-                .build()
-                .flags(squeue::Flags::FIXED_FILE)
-                .user_data(data);
-            unsafe {
-                q.q_ring
-                    .borrow_mut()
-                    .submission()
-                    .push(sqe)
-                    .expect("submission fail");
-            }
-        }
-        libublk::sys::UBLK_IO_OP_READ => {
-            let sqe = &opcode::Read::new(types::Fixed(1), buf_addr, bytes)
-                .offset(off)
-                .build()
-                .flags(squeue::Flags::FIXED_FILE)
-                .user_data(data);
-            unsafe {
-                q.q_ring
-                    .borrow_mut()
-                    .submission()
-                    .push(sqe)
-                    .expect("submission fail");
-            }
-        }
-        libublk::sys::UBLK_IO_OP_WRITE => {
-            let sqe = &opcode::Write::new(types::Fixed(1), buf_addr, bytes)
-                .offset(off)
-                .build()
-                .flags(squeue::Flags::FIXED_FILE)
-                .user_data(data);
-            unsafe {
-                q.q_ring
-                    .borrow_mut()
-                    .submission()
-                    .push(sqe)
-                    .expect("submission fail");
-            }
-        }
-        _ => {}
-    };
+        libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(types::Fixed(1), bytes)
+            .offset(off)
+            .build()
+            .flags(squeue::Flags::FIXED_FILE),
+        libublk::sys::UBLK_IO_OP_READ => opcode::Read::new(types::Fixed(1), buf_addr, bytes)
+            .offset(off)
+            .build()
+            .flags(squeue::Flags::FIXED_FILE),
+        libublk::sys::UBLK_IO_OP_WRITE => opcode::Write::new(types::Fixed(1), buf_addr, bytes)
+            .offset(off)
+            .build()
+            .flags(squeue::Flags::FIXED_FILE),
+        _ => panic!(),
+    }
 }
 
 async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
@@ -199,14 +161,13 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
 
     for _ in 0..4 {
         let op = iod.op_flags & 0xff;
-        let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
         let buf_addr = q.get_io_buf_addr(tag);
 
-        __lo_submit_io_cmd(q, op, off, bytes, buf_addr, user_data);
-        let res = UringOpFuture { user_data }.await;
+        let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr);
+        let res = ublk_submit_sqe(q, sqe).await;
         if res != -(libc::EAGAIN) {
             return res;
         }
@@ -223,35 +184,29 @@ async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
     }
 
     let op = iod.op_flags & 0xff;
-    let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
     let buf_addr = q.get_io_buf_addr(tag);
 
     if bytes > 4096 {
-        __lo_submit_io_cmd(q, op, off, 4096, buf_addr, user_data);
-        let user_data2 = UblkIOCtx::build_user_data_async(tag as u16, op, 1);
-        __lo_submit_io_cmd(
-            q,
+        let sqe = __lo_submit_io_cmd(op, off, 4096, buf_addr);
+        let sqe2 = __lo_submit_io_cmd(
             op,
             off + 4096,
             bytes - 4096,
             ((buf_addr as u64) + 4096) as *mut u8,
-            user_data2,
         );
 
-        let f = UringOpFuture { user_data };
-        let f2 = UringOpFuture {
-            user_data: user_data2,
-        };
+        let f = ublk_submit_sqe(q, sqe);
+        let f2 = ublk_submit_sqe(q, sqe2);
         let (res, res2) = futures::join!(f, f2);
 
         res + res2
     } else {
-        __lo_submit_io_cmd(q, op, off, bytes, buf_addr, user_data);
-        let res = UringOpFuture { user_data };
+        let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr);
+        let f = ublk_submit_sqe(q, sqe);
 
-        res.await
+        f.await
     }
 }
 
@@ -281,7 +236,14 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
         let buf_addr = q.get_io_buf_addr(tag);
-        __lo_submit_io_cmd(q, op, off, bytes, buf_addr, data);
+        let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr).user_data(data);
+        unsafe {
+            q.q_ring
+                .borrow_mut()
+                .submission()
+                .push(&sqe)
+                .expect("submission fail");
+        }
     }
 }
 
@@ -362,17 +324,18 @@ fn __test_add(
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe = Executor::new(dev.get_nr_ios());
+            let exe_rc = Rc::new(smol::LocalExecutor::new());
+            let mut f_vec = Vec::new();
 
             for tag in 0..depth as u16 {
                 let q = q_rc.clone();
 
-                exe.spawn(tag as u16, async move {
+                f_vec.push(exe_rc.spawn(async move {
                     let buf_addr = q.get_io_buf_addr(tag);
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                        let cmd_res = ublk_submit_io_cmd(&q, tag, cmd_op, buf_addr, res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -384,9 +347,16 @@ fn __test_add(
                         };
                         cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
-                });
+                }));
             }
-            q_rc.wait_and_wake_io_tasks(&exe);
+            loop {
+                while exe_rc.try_tick() {}
+                match q_rc.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
         let q_sync_fn = move |qid: u16, _dev: &UblkDev| {
