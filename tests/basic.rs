@@ -2,8 +2,10 @@
 mod integration {
     use io_uring::opcode;
     use libublk::dev_flags::*;
-    use libublk::exe::{Executor, UringOpFuture};
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use libublk::uring_async::{
+        ublk_submit_io_cmd, ublk_submit_sqe, ublk_wake_task, UblkUringOpFuture,
+    };
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
@@ -132,24 +134,16 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        fn null_submit_nop(q: &UblkQueue<'_>, user_data: u64) -> UringOpFuture {
-            let nop_e = opcode::Nop::new().build().user_data(user_data);
+        fn null_submit_nop(q: &UblkQueue<'_>) -> UblkUringOpFuture {
+            let nop_e = opcode::Nop::new().build();
 
-            unsafe {
-                q.q_ring
-                    .borrow_mut()
-                    .submission()
-                    .push(&nop_e)
-                    .expect("submission fail");
-            };
-            UringOpFuture { user_data }
+            ublk_submit_sqe(q, nop_e)
         }
         async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
-            let data = UblkIOCtx::build_user_data_async(tag, 0xff, 0);
 
-            bytes + null_submit_nop(&q, data).await
+            bytes + null_submit_nop(&q).await
         }
 
         //Device wide data shared among all queue context
@@ -184,7 +178,8 @@ mod integration {
         // queue pthread context
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe = Executor::new(dev.get_nr_ios());
+            let exe_rc = Rc::new(smol::LocalExecutor::new());
+            let mut f_vec = Vec::new();
 
             // `q_fn` closure implements Clone() Trait, so the captured
             // `dev_data` is cloned to `q_fn` context.
@@ -194,12 +189,12 @@ mod integration {
                 let q = q_rc.clone();
                 let __dev_data = _dev_data.clone();
 
-                exe.spawn(tag as u16, async move {
+                f_vec.push(exe_rc.spawn(async move {
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
                     let buf = q.get_io_buf_addr(tag);
                     let mut res = 0;
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf, res).await;
+                        let cmd_res = ublk_submit_io_cmd(&q, tag, cmd_op, buf, res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -211,9 +206,17 @@ mod integration {
                             (*guard).done += 1;
                         }
                     }
-                });
+                }));
             }
-            q_rc.wait_and_wake_io_tasks(&exe);
+
+            loop {
+                while exe_rc.try_tick() {}
+                match q_rc.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
         // kick off our targets

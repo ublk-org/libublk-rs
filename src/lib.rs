@@ -13,6 +13,7 @@ pub mod ctrl;
 pub mod exe;
 pub mod io;
 pub mod sys;
+pub mod uring_async;
 
 pub mod dev_flags {
     /// feature: support IO batch completion from single IO tag, typical
