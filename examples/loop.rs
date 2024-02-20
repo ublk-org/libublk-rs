@@ -4,6 +4,7 @@ use clap::{Arg, ArgAction, Command};
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
+use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes, UblkSession};
@@ -152,7 +153,7 @@ fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_urin
     }
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
@@ -164,7 +165,6 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
-        let buf_addr = q.get_io_buf_addr(tag);
 
         let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
         let res = q.ublk_submit_sqe(sqe).await;
@@ -176,7 +176,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
     return -libc::EAGAIN;
 }
 
-async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
+async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
@@ -186,7 +186,6 @@ async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
     let op = iod.op_flags & 0xff;
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as u32;
-    let buf_addr = q.get_io_buf_addr(tag);
 
     if bytes > 4096 {
         let sqe = __lo_make_io_sqe(op, off, 4096, buf_addr);
@@ -210,11 +209,10 @@ async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
     }
 }
 
-fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
+fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
-    let buf_addr = q.get_io_buf_addr(tag);
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
@@ -316,7 +314,11 @@ fn __test_add(
             .nr_queues(nr_queues)
             .depth(depth)
             .io_buf_bytes(buf_sz)
-            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
+            .dev_flags(
+                UBLK_DEV_F_ADD_DEV
+                    | UBLK_DEV_F_DONT_ALLOC_BUF
+                    | if aio { UBLK_DEV_F_ASYNC } else { 0 },
+            )
             .build()
             .unwrap();
 
@@ -331,9 +333,12 @@ fn __test_add(
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    let buf_addr = q.get_io_buf_addr(tag);
+                    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+                    let buf_addr = buf.as_mut_ptr();
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
+
+                    q.register_io_buf(tag, &buf);
                     loop {
                         let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
@@ -341,24 +346,30 @@ fn __test_add(
                         }
 
                         res = if !split {
-                            lo_handle_io_cmd_async(&q, tag).await
+                            lo_handle_io_cmd_async(&q, tag, buf_addr).await
                         } else {
-                            lo_handle_io_cmd_async_split(&q, tag).await
+                            lo_handle_io_cmd_async_split(&q, tag, buf_addr).await
                         };
                         cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
+                    q.unregister_io_buf(tag);
                 }));
             }
             ublk_wait_and_handle_ios(&q_rc, &exe);
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
-        let q_sync_fn = move |qid: u16, _dev: &UblkDev| {
-            let lo_io_handler =
-                move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| lo_handle_io_cmd_sync(q, tag, io);
+        let q_sync_fn = move |qid: u16, dev: &UblkDev| {
+            let q = UblkQueue::new(qid, dev).unwrap();
+            let bufs_rc = Rc::new(q.alloc_io_bufs(true));
+            let bufs = bufs_rc.clone();
+            let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                let bufs = bufs_rc.clone();
 
-            UblkQueue::new(qid, _dev)
-                .unwrap()
+                lo_handle_io_cmd_sync(q, tag, io, bufs[tag as usize].as_mut_ptr());
+            };
+
+            q.submit_fetch_commands(Some(&bufs))
                 .wait_and_handle_io(lo_io_handler);
         };
 
