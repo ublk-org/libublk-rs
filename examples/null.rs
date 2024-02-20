@@ -1,6 +1,7 @@
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::dev_flags::*;
+use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
@@ -24,9 +25,8 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 }
 
 #[inline]
-fn handle_io_cmd(q: &UblkQueue, tag: u16) {
+fn handle_io_cmd(q: &UblkQueue, tag: u16, buf_addr: *mut u8) {
     let bytes = get_io_cmd_result(q, tag);
-    let buf_addr = q.get_io_buf_addr(tag);
 
     q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
 }
@@ -67,11 +67,7 @@ fn __test_add(
             .dev_flags(
                 UBLK_DEV_F_ADD_DEV
                     | if aio { UBLK_DEV_F_ASYNC } else { 0 }
-                    | if (ctrl_flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0 {
-                        UBLK_DEV_F_DONT_ALLOC_BUF
-                    } else {
-                        0
-                    },
+                    | UBLK_DEV_F_DONT_ALLOC_BUF,
             )
             .build()
             .unwrap();
@@ -80,15 +76,25 @@ fn __test_add(
             Ok(0)
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
         // queue level logic
         let q_sync_handler = move |qid: u16, dev: &UblkDev| {
+            let q = UblkQueue::new(qid, dev).unwrap();
+            let bufs_rc = Rc::new(q.alloc_io_bufs(true));
+            let bufs = bufs_rc.clone();
+
             // logic for io handling
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                handle_io_cmd(q, tag);
+                let buf_addr = if user_copy {
+                    std::ptr::null_mut()
+                } else {
+                    let bufs = bufs_rc.clone();
+                    bufs[tag as usize].as_mut_ptr()
+                };
+                handle_io_cmd(q, tag, buf_addr);
             };
 
-            UblkQueue::new(qid, dev)
-                .unwrap()
+            q.submit_fetch_commands(if user_copy { None } else { Some(&bufs) })
                 .wait_and_handle_io(io_handler);
         };
         let q_async_handler = move |qid: u16, dev: &UblkDev| {
@@ -100,9 +106,16 @@ fn __test_add(
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    let buf_addr = q.get_io_buf_addr(tag);
+                    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
                     let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
+                    let buf_addr = if user_copy {
+                        std::ptr::null_mut()
+                    } else {
+                        buf.as_mut_ptr()
+                    };
+
+                    q.register_io_buf(tag, &buf);
                     loop {
                         let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
                         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
@@ -112,6 +125,7 @@ fn __test_add(
                         res = get_io_cmd_result(&q, tag);
                         cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
+                    q.unregister_io_buf(tag);
                 }));
             }
             ublk_wait_and_handle_ios(&q_rc, &exe);
