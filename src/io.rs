@@ -2,7 +2,7 @@ use super::dev_flags::*;
 use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, exe::Executor, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -1130,33 +1130,6 @@ impl UblkQueue<'_> {
                     wake_handler(user_data, &cqe, i == done - 1);
                 }
                 Ok(done)
-            }
-        }
-    }
-
-    /// Wait and handle incoming IO command
-    ///
-    /// # Arguments:
-    ///
-    /// * `exe`: Local async Executor
-    ///
-    /// Called in queue context. won't return unless error is observed.
-    /// Wait and handle any incoming cqe until queue is down.
-    ///
-    /// This should be the only foreground thing done in queue thread.
-    pub fn wait_and_wake_io_tasks(&self, exe: &Executor) {
-        let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| {
-            let tag = UblkIOCtx::user_data_to_tag(data);
-            log::trace!("wake_io_task {}", UblkIOCtx::user_data_to_tag(data));
-            exe.wake_with_uring_cqe(tag as u16, &cqe);
-        };
-        loop {
-            match self.flush_and_wake_io_tasks(wake_handler, 1) {
-                Err(_) => break,
-                _ => {
-                    exe.try_run();
-                    continue;
-                }
             }
         }
     }
