@@ -365,8 +365,9 @@ mod libublk {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
+                let buf_addr = q.get_io_buf_addr(tag);
 
-                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
             UblkQueue::new(qid, _dev)

@@ -214,6 +214,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
+    let buf_addr = q.get_io_buf_addr(tag);
     if i.is_tgt_io() {
         let user_data = i.user_data();
         let res = i.result();
@@ -222,20 +223,19 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+            q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+        q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
-        let buf_addr = q.get_io_buf_addr(tag);
         let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr).user_data(data);
         unsafe {
             q.q_ring
