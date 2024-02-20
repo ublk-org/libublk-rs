@@ -91,26 +91,6 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
     })
 }
 
-#[inline]
-pub fn ublk_submit_sqe(q: &UblkQueue, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-    let f = UblkUringOpFuture::new(1_u64 << 63);
-    let sqe = sqe.user_data(f.user_data);
-
-    loop {
-        let res = unsafe { q.q_ring.borrow_mut().submission().push(&sqe) };
-
-        match res {
-            Ok(_) => break,
-            Err(_) => {
-                log::debug!("ublk_submit_sqe: flush and retry");
-                q.q_ring.borrow().submit_and_wait(0).unwrap();
-            }
-        }
-    }
-
-    f
-}
-
 /// Run one task in this local Executor until the task is finished
 pub fn ublk_run_task<T>(
     q: &UblkQueue,

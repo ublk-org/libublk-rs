@@ -3,7 +3,7 @@ mod integration {
     use io_uring::opcode;
     use libublk::dev_flags::*;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-    use libublk::uring_async::{ublk_submit_sqe, ublk_wait_and_handle_ios, UblkUringOpFuture};
+    use libublk::uring_async::ublk_wait_and_handle_ios;
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
@@ -132,16 +132,12 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        fn null_submit_nop(q: &UblkQueue<'_>) -> UblkUringOpFuture {
-            let nop_e = opcode::Nop::new().build();
-
-            ublk_submit_sqe(q, nop_e)
-        }
         async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
-            bytes + null_submit_nop(&q).await
+            let res = q.ublk_submit_sqe(opcode::Nop::new().build()).await;
+            bytes + res
         }
 
         //Device wide data shared among all queue context

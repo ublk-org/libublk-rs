@@ -5,7 +5,7 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::uring_async::{ublk_submit_sqe, ublk_wait_and_handle_ios};
+use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes, UblkSession};
 use log::trace;
 use serde::Serialize;
@@ -167,7 +167,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
         let buf_addr = q.get_io_buf_addr(tag);
 
         let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr);
-        let res = ublk_submit_sqe(q, sqe).await;
+        let res = q.ublk_submit_sqe(sqe).await;
         if res != -(libc::EAGAIN) {
             return res;
         }
@@ -197,14 +197,14 @@ async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
             ((buf_addr as u64) + 4096) as *mut u8,
         );
 
-        let f = ublk_submit_sqe(q, sqe);
-        let f2 = ublk_submit_sqe(q, sqe2);
+        let f = q.ublk_submit_sqe(sqe);
+        let f2 = q.ublk_submit_sqe(sqe2);
         let (res, res2) = futures::join!(f, f2);
 
         res + res2
     } else {
         let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr);
-        let f = ublk_submit_sqe(q, sqe);
+        let f = q.ublk_submit_sqe(sqe);
 
         f.await
     }
