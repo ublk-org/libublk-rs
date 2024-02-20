@@ -91,13 +91,13 @@ fn __test_add(
         };
         let q_async_handler = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
+            let exe = smol::LocalExecutor::new();
             let mut f_vec = Vec::new();
 
             for tag in 0..depth as u16 {
                 let q = q_rc.clone();
 
-                f_vec.push(exe_rc.spawn(async move {
+                f_vec.push(exe.spawn(async move {
                     let buf_addr = q.get_io_buf_addr(tag);
                     let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
@@ -112,7 +112,7 @@ fn __test_add(
                     }
                 }));
             }
-            ublk_wait_and_handle_ios(&q_rc, &exe_rc);
+            ublk_wait_and_handle_ios(&q_rc, &exe);
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 

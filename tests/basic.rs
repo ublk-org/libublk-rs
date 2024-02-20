@@ -172,7 +172,7 @@ mod integration {
         // queue pthread context
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
+            let exe = smol::LocalExecutor::new();
             let mut f_vec = Vec::new();
 
             // `q_fn` closure implements Clone() Trait, so the captured
@@ -183,7 +183,7 @@ mod integration {
                 let q = q_rc.clone();
                 let __dev_data = _dev_data.clone();
 
-                f_vec.push(exe_rc.spawn(async move {
+                f_vec.push(exe.spawn(async move {
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
                     let buf = q.get_io_buf_addr(tag);
                     let mut res = 0;
@@ -203,7 +203,7 @@ mod integration {
                 }));
             }
 
-            ublk_wait_and_handle_ios(&q_rc, &exe_rc);
+            ublk_wait_and_handle_ios(&q_rc, &exe);
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 

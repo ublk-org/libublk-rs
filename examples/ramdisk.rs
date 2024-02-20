@@ -66,7 +66,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     };
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
+    let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
     let q_rc = Rc::new(UblkQueue::new(0, &dev).unwrap());
     let buf_size = dev.dev_info.max_io_buf_bytes as usize;
@@ -74,7 +74,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     for tag in 0..depth as u16 {
         let q = q_rc.clone();
         assert!(q.get_io_buf_addr(tag) == std::ptr::null_mut());
-        f_vec.push(exe_rc.spawn(async move {
+        f_vec.push(exe.spawn(async move {
             let mut buffer: Vec<u8> = vec![0; buf_size];
             let addr = buffer.as_mut_ptr();
             let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
@@ -90,7 +90,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
                 cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
             }
         }));
-        exe_rc.try_tick();
+        exe.try_tick();
     }
     ctrl.configure_queue(&dev, 0, unsafe { libc::gettid() })
         .unwrap();
@@ -100,7 +100,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
 
     let res = loop {
         let _ = q_rc.flush_and_wake_io_tasks(wake_handler, 0);
-        while exe_rc.try_tick() {}
+        while exe.try_tick() {}
         let _res = ctrl.poll_start_dev(token);
         match _res {
             Ok(res) => break Ok(res),
@@ -119,7 +119,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         Ok(res) if res >= 0 => {
             ctrl.dump();
             loop {
-                while exe_rc.try_tick() {}
+                while exe.try_tick() {}
                 match q_rc.flush_and_wake_io_tasks(wake_handler, 1) {
                     Err(_) => break,
                     _ => {}
