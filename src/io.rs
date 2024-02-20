@@ -1,7 +1,8 @@
 use super::dev_flags::*;
+use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, exe::Executor, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -691,25 +692,12 @@ impl UblkQueue<'_> {
         );
     }
 
-    #[inline(always)]
-    pub fn __submit_io_cmd(
-        &self,
-        tag: u16,
-        cmd_op: u32,
-        buf_addr: u64,
-        user_data: u64,
-        io_cmd_result: i32,
-    ) {
-        let mut r = self.q_ring.borrow_mut();
-        self.__queue_io_cmd(&mut r, tag, cmd_op, buf_addr, user_data, io_cmd_result);
-    }
-
     /// Submit one io command.
     ///
     /// When it is called 1st time on this tag, the `cmd_op` has to be
     /// UBLK_IO_FETCH_REQ, otherwise it is UBLK_IO_COMMIT_AND_FETCH_REQ.
     ///
-    /// UringOpFuture is one Future object, so this function is actually
+    /// UblkUringOpFuture is one Future object, so this function is actually
     /// one async function, and user can get result by submit_io_cmd().await
     ///
     /// Once result is returned, it means this command is completed and
@@ -724,12 +712,13 @@ impl UblkQueue<'_> {
         cmd_op: u32,
         buf_addr: *mut u8,
         result: i32,
-    ) -> UringOpFuture {
-        let user_data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
+    ) -> UblkUringOpFuture {
+        let f = UblkUringOpFuture::new(0);
+        let user_data = f.user_data | (tag as u64);
+        let mut r = self.q_ring.borrow_mut();
+        self.__queue_io_cmd(&mut r, tag, cmd_op, buf_addr as u64, user_data, result);
 
-        self.__submit_io_cmd(tag, cmd_op, buf_addr as u64, user_data, result);
-
-        UringOpFuture { user_data }
+        f
     }
 
     /// Submit all commands for fetching IO

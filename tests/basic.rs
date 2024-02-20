@@ -3,9 +3,7 @@ mod integration {
     use io_uring::opcode;
     use libublk::dev_flags::*;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-    use libublk::uring_async::{
-        ublk_submit_io_cmd, ublk_submit_sqe, ublk_wake_task, UblkUringOpFuture,
-    };
+    use libublk::uring_async::{ublk_submit_sqe, ublk_wake_task, UblkUringOpFuture};
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
@@ -194,7 +192,7 @@ mod integration {
                     let buf = q.get_io_buf_addr(tag);
                     let mut res = 0;
                     loop {
-                        let cmd_res = ublk_submit_io_cmd(&q, tag, cmd_op, buf, res).await;
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf, res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }

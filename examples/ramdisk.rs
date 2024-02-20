@@ -6,7 +6,7 @@ use io_uring::cqueue;
 ///
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::{ublk_submit_io_cmd, ublk_wake_task};
+use libublk::uring_async::ublk_wake_task;
 use libublk::{ctrl::UblkCtrl, UblkError};
 use std::rc::Rc;
 
@@ -81,7 +81,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
             let mut res = 0;
 
             loop {
-                let cmd_res = ublk_submit_io_cmd(&q, tag, cmd_op, addr, res).await;
+                let cmd_res = q.submit_io_cmd(tag, cmd_op, addr, res).await;
                 if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                     break;
                 }

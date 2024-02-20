@@ -111,27 +111,6 @@ pub fn ublk_submit_sqe(q: &UblkQueue, sqe: io_uring::squeue::Entry) -> UblkUring
     f
 }
 
-#[inline]
-pub fn ublk_submit_io_cmd(
-    q: &UblkQueue,
-    tag: u16,
-    cmd_op: u32,
-    buf_addr: *mut u8,
-    result: i32,
-) -> UblkUringOpFuture {
-    let f = UblkUringOpFuture::new(0);
-
-    q.__submit_io_cmd(
-        tag,
-        cmd_op,
-        buf_addr as u64,
-        f.user_data | (tag as u64),
-        result,
-    );
-
-    f
-}
-
 /// Run one task in this local Executor until the task is finished
 pub fn ublk_run_task<T>(
     q: &UblkQueue,

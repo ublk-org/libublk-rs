@@ -5,7 +5,7 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::uring_async::{ublk_submit_io_cmd, ublk_submit_sqe, ublk_wake_task};
+use libublk::uring_async::{ublk_submit_sqe, ublk_wake_task};
 use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes, UblkSession};
 use log::trace;
 use serde::Serialize;
@@ -335,7 +335,7 @@ fn __test_add(
                     let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
                     loop {
-                        let cmd_res = ublk_submit_io_cmd(&q, tag, cmd_op, buf_addr, res).await;
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }

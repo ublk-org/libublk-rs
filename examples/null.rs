@@ -2,7 +2,7 @@ use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::uring_async::{ublk_submit_io_cmd, ublk_wake_task};
+use libublk::uring_async::ublk_wake_task;
 use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
 use std::rc::Rc;
 
@@ -102,7 +102,7 @@ fn __test_add(
                     let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
                     loop {
-                        let cmd_res = ublk_submit_io_cmd(&q, tag, cmd_op, buf_addr, res).await;
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
                         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                             break;
                         }
