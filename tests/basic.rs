@@ -86,8 +86,9 @@ mod integration {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
+                let buf_addr = std::ptr::null_mut();
 
-                q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
             UblkQueue::new(qid, _dev)
@@ -111,9 +112,10 @@ mod integration {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
+                let buf_addr = std::ptr::null_mut();
 
                 let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)])));
-                q.complete_io_cmd(tag, res);
+                q.complete_io_cmd(tag, buf_addr, res);
             };
 
             UblkQueue::new(qid, _dev)
@@ -254,13 +256,13 @@ mod integration {
                     );
                 },
                 _ => {
-                    q.complete_io_cmd(tag, Err(UblkError::OtherError(-libc::EINVAL)));
+                    q.complete_io_cmd(tag, buf_addr, Err(UblkError::OtherError(-libc::EINVAL)));
                     return;
                 }
             }
 
             let res = Ok(UblkIORes::Result(bytes as i32));
-            q.complete_io_cmd(tag, res);
+            q.complete_io_cmd(tag, buf_addr, res);
         }
 
         fn __test_ublk_ramdisk(dev_id: i32) {
@@ -331,6 +333,7 @@ mod integration {
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let res = Ok(UblkIORes::Result((iod.nr_sectors << 9) as i32));
+                let buf_addr = std::ptr::null_mut();
 
                 {
                     q_vec.push(tag as i32);
@@ -339,7 +342,7 @@ mod integration {
                     }
                 }
 
-                q.complete_io_cmd(tag, res);
+                q.complete_io_cmd(tag, buf_addr, res);
             };
 
             UblkQueue::new(qid, _dev)

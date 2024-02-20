@@ -759,39 +759,6 @@ impl UblkQueue<'_> {
         }
     }
 
-    #[inline(always)]
-    fn complete_ios(
-        &self,
-        r: &mut IoUring<squeue::Entry>,
-        tag: u16,
-        res: Result<UblkIORes, UblkError>,
-    ) {
-        match res {
-            Ok(UblkIORes::Result(res))
-            | Err(UblkError::OtherError(res))
-            | Err(UblkError::UringIOError(res)) => {
-                let buf_addr = self.get_io_buf_addr(tag) as u64;
-                self.commit_and_queue_io_cmd(r, tag, buf_addr, res);
-            }
-            Err(UblkError::IoQueued(_)) => {}
-            #[cfg(feature = "fat_complete")]
-            Ok(UblkIORes::FatRes(fat)) => match fat {
-                UblkFatRes::BatchRes(ios) => {
-                    assert!(self.support_comp_batch());
-                    for item in ios {
-                        let tag = item.0;
-                        let buf_addr = self.get_io_buf_addr(tag) as u64;
-                        self.commit_and_queue_io_cmd(r, tag, buf_addr, item.1);
-                    }
-                }
-                UblkFatRes::ZonedAppendRes((res, lba)) => {
-                    self.commit_and_queue_io_cmd(r, tag, lba, res);
-                }
-            },
-            _ => {}
-        };
-    }
-
     /// Complete one io command
     ///
     /// # Arguments:
@@ -802,10 +769,31 @@ impl UblkQueue<'_> {
     /// When calling this API, target code has to make sure that q_ring
     /// won't be borrowed.
     #[inline]
-    pub fn complete_io_cmd(&self, tag: u16, res: Result<UblkIORes, UblkError>) {
-        let mut r = self.q_ring.borrow_mut();
+    pub fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
+        let r = &mut self.q_ring.borrow_mut();
 
-        self.complete_ios(&mut r, tag, res);
+        match res {
+            Ok(UblkIORes::Result(res))
+            | Err(UblkError::OtherError(res))
+            | Err(UblkError::UringIOError(res)) => {
+                self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, res);
+            }
+            Err(UblkError::IoQueued(_)) => {}
+            #[cfg(feature = "fat_complete")]
+            Ok(UblkIORes::FatRes(fat)) => match fat {
+                UblkFatRes::BatchRes(ios) => {
+                    assert!(self.support_comp_batch());
+                    for item in ios {
+                        let tag = item.0;
+                        self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, item.1);
+                    }
+                }
+                UblkFatRes::ZonedAppendRes((res, lba)) => {
+                    self.commit_and_queue_io_cmd(r, tag, lba, res);
+                }
+            },
+            _ => {}
+        };
     }
 
     #[inline(always)]

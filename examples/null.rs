@@ -26,7 +26,9 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 #[inline]
 fn handle_io_cmd(q: &UblkQueue, tag: u16) {
     let bytes = get_io_cmd_result(q, tag);
-    q.complete_io_cmd(tag, Ok(UblkIORes::Result(bytes)));
+    let buf_addr = q.get_io_buf_addr(tag);
+
+    q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
 }
 
 fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, flags: NullFlags) {
