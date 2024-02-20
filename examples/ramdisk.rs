@@ -5,6 +5,7 @@ use io_uring::cqueue;
 /// UblkCtrl::start_dev_in_queue() and low level interface example.
 ///
 use libublk::dev_flags::*;
+use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_wake_task;
 use libublk::{ctrl::UblkCtrl, UblkError};
@@ -75,7 +76,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         let q = q_rc.clone();
         assert!(q.get_io_buf_addr(tag) == std::ptr::null_mut());
         f_vec.push(exe.spawn(async move {
-            let mut buffer: Vec<u8> = vec![0; buf_size];
+            let buffer = IoBuf::<u8>::new(buf_size);
             let addr = buffer.as_mut_ptr();
             let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
             let mut res = 0;
