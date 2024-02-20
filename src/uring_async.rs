@@ -139,3 +139,24 @@ pub fn ublk_run_task<T>(
         while exe.try_tick() {}
     }
 }
+
+/// Wait and handle incoming IO command
+///
+/// # Arguments:
+///
+/// * `q`: UblkQueue instance
+/// * `exe`: Local async Executor
+///
+/// Called in queue context. won't return unless error is observed.
+/// Wait and handle any incoming cqe until queue is down.
+///
+/// This should be the only foreground thing done in queue thread.
+pub fn ublk_wait_and_handle_ios(q: &UblkQueue, exe: &smol::LocalExecutor) {
+    loop {
+        while exe.try_tick() {}
+        match q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
+            Err(_) => break,
+            _ => {}
+        }
+    }
+}

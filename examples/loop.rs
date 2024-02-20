@@ -5,7 +5,7 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::uring_async::{ublk_submit_sqe, ublk_wake_task};
+use libublk::uring_async::{ublk_submit_sqe, ublk_wait_and_handle_ios};
 use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes, UblkSession};
 use log::trace;
 use serde::Serialize;
@@ -349,13 +349,7 @@ fn __test_add(
                     }
                 }));
             }
-            loop {
-                while exe_rc.try_tick() {}
-                match q_rc.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
+            ublk_wait_and_handle_ios(&q_rc, &exe_rc);
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 

@@ -2,7 +2,7 @@ use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::uring_async::ublk_wake_task;
+use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
 use std::rc::Rc;
 
@@ -112,13 +112,7 @@ fn __test_add(
                     }
                 }));
             }
-            loop {
-                while exe_rc.try_tick() {}
-                match q_rc.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
+            ublk_wait_and_handle_ios(&q_rc, &exe_rc);
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 

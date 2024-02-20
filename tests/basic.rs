@@ -3,7 +3,7 @@ mod integration {
     use io_uring::opcode;
     use libublk::dev_flags::*;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-    use libublk::uring_async::{ublk_submit_sqe, ublk_wake_task, UblkUringOpFuture};
+    use libublk::uring_async::{ublk_submit_sqe, ublk_wait_and_handle_ios, UblkUringOpFuture};
     use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
     use libublk::{sys, UblkSessionBuilder};
     use std::env;
@@ -207,13 +207,7 @@ mod integration {
                 }));
             }
 
-            loop {
-                while exe_rc.try_tick() {}
-                match q_rc.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
+            ublk_wait_and_handle_ios(&q_rc, &exe_rc);
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
