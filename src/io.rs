@@ -1,4 +1,3 @@
-use super::dev_flags::*;
 use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
@@ -437,14 +436,6 @@ impl Drop for UblkQueue<'_> {
         unsafe {
             libc::munmap(self.io_cmd_buf as *mut libc::c_void, cmd_buf_sz);
         }
-
-        for i in 0..depth {
-            let buf = self.bufs.borrow()[i as usize];
-
-            super::ublk_dealloc_buf(buf, dev.dev_info.max_io_buf_bytes as usize, unsafe {
-                libc::sysconf(libc::_SC_PAGESIZE) as usize
-            });
-        }
     }
 }
 
@@ -519,21 +510,7 @@ impl UblkQueue<'_> {
         }
 
         for i in 0..nr_ios {
-            // extra io slot needn't to allocate buffer
-            let addr = {
-                if i < depth {
-                    if (dev.flags & UBLK_DEV_F_DONT_ALLOC_BUF) == 0 {
-                        super::ublk_alloc_buf(dev.dev_info.max_io_buf_bytes as usize, unsafe {
-                            libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
-                        })
-                    } else {
-                        std::ptr::null_mut()
-                    }
-                } else {
-                    std::ptr::null_mut()
-                }
-            };
-            bufs[i as usize] = addr;
+            bufs[i as usize] = std::ptr::null_mut();
         }
 
         let q = UblkQueue {
@@ -549,11 +526,6 @@ impl UblkQueue<'_> {
             q_ring: RefCell::new(ring),
             bufs: RefCell::new(bufs),
         };
-
-        // async/.await needn't to submit FETCH_REQ command beforehand
-        if (dev.flags & UBLK_DEV_F_ASYNC) == 0 && (dev.flags & UBLK_DEV_F_DONT_ALLOC_BUF) == 0 {
-            q.__submit_fetch_commands();
-        }
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
@@ -610,7 +582,7 @@ impl UblkQueue<'_> {
     }
 
     /// unregister all io buffers
-    fn unregister_io_bufs(&self) {
+    pub(crate) fn unregister_io_bufs(&self) {
         for tag in 0..self.q_depth {
             self.unregister_io_buf(tag.try_into().unwrap());
         }
@@ -1130,9 +1102,7 @@ impl UblkQueue<'_> {
             }
         }
 
-        if (self.flags & UBLK_DEV_F_DONT_ALLOC_BUF) != 0 {
-            self.unregister_io_bufs();
-        }
+        self.unregister_io_bufs();
     }
 
     /// Flush queued SQEs to io_uring, then wait and wake up io tasks
