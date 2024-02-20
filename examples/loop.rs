@@ -134,7 +134,7 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
 }
 
 #[inline]
-fn __lo_submit_io_cmd(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_uring::squeue::Entry {
+fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_uring::squeue::Entry {
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(types::Fixed(1), bytes)
             .offset(off)
@@ -166,7 +166,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16) -> i32 {
         let bytes = (iod.nr_sectors << 9) as u32;
         let buf_addr = q.get_io_buf_addr(tag);
 
-        let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr);
+        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
         let res = q.ublk_submit_sqe(sqe).await;
         if res != -(libc::EAGAIN) {
             return res;
@@ -189,8 +189,8 @@ async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
     let buf_addr = q.get_io_buf_addr(tag);
 
     if bytes > 4096 {
-        let sqe = __lo_submit_io_cmd(op, off, 4096, buf_addr);
-        let sqe2 = __lo_submit_io_cmd(
+        let sqe = __lo_make_io_sqe(op, off, 4096, buf_addr);
+        let sqe2 = __lo_make_io_sqe(
             op,
             off + 4096,
             bytes - 4096,
@@ -203,7 +203,7 @@ async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16) -> i32 {
 
         res + res2
     } else {
-        let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr);
+        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
         let f = q.ublk_submit_sqe(sqe);
 
         f.await
@@ -236,7 +236,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx) {
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
         let buf_addr = q.get_io_buf_addr(tag);
-        let sqe = __lo_submit_io_cmd(op, off, bytes, buf_addr).user_data(data);
+        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr).user_data(data);
         unsafe {
             q.q_ring
                 .borrow_mut()
