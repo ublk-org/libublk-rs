@@ -1,7 +1,8 @@
 use super::dev_flags::*;
+use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, exe::Executor, exe::UringOpFuture, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -691,25 +692,12 @@ impl UblkQueue<'_> {
         );
     }
 
-    #[inline(always)]
-    pub fn __submit_io_cmd(
-        &self,
-        tag: u16,
-        cmd_op: u32,
-        buf_addr: u64,
-        user_data: u64,
-        io_cmd_result: i32,
-    ) {
-        let mut r = self.q_ring.borrow_mut();
-        self.__queue_io_cmd(&mut r, tag, cmd_op, buf_addr, user_data, io_cmd_result);
-    }
-
     /// Submit one io command.
     ///
     /// When it is called 1st time on this tag, the `cmd_op` has to be
     /// UBLK_IO_FETCH_REQ, otherwise it is UBLK_IO_COMMIT_AND_FETCH_REQ.
     ///
-    /// UringOpFuture is one Future object, so this function is actually
+    /// UblkUringOpFuture is one Future object, so this function is actually
     /// one async function, and user can get result by submit_io_cmd().await
     ///
     /// Once result is returned, it means this command is completed and
@@ -724,12 +712,33 @@ impl UblkQueue<'_> {
         cmd_op: u32,
         buf_addr: *mut u8,
         result: i32,
-    ) -> UringOpFuture {
-        let user_data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
+    ) -> UblkUringOpFuture {
+        let f = UblkUringOpFuture::new(0);
+        let user_data = f.user_data | (tag as u64);
+        let mut r = self.q_ring.borrow_mut();
+        self.__queue_io_cmd(&mut r, tag, cmd_op, buf_addr as u64, user_data, result);
 
-        self.__submit_io_cmd(tag, cmd_op, buf_addr as u64, user_data, result);
+        f
+    }
 
-        UringOpFuture { user_data }
+    #[inline]
+    pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
+        let f = UblkUringOpFuture::new(1_u64 << 63);
+        let sqe = sqe.user_data(f.user_data);
+
+        loop {
+            let res = unsafe { self.q_ring.borrow_mut().submission().push(&sqe) };
+
+            match res {
+                Ok(_) => break,
+                Err(_) => {
+                    log::debug!("ublk_submit_sqe: flush and retry");
+                    self.q_ring.borrow().submit_and_wait(0).unwrap();
+                }
+            }
+        }
+
+        f
     }
 
     /// Submit all commands for fetching IO
@@ -1121,29 +1130,6 @@ impl UblkQueue<'_> {
                     wake_handler(user_data, &cqe, i == done - 1);
                 }
                 Ok(done)
-            }
-        }
-    }
-
-    /// Wait and handle incoming IO command
-    ///
-    /// # Arguments:
-    ///
-    /// * `exe`: Local async Executor
-    ///
-    /// Called in queue context. won't return unless error is observed.
-    /// Wait and handle any incoming cqe until queue is down.
-    ///
-    /// This should be the only foreground thing done in queue thread.
-    pub fn wait_and_wake_io_tasks(&self, exe: &Executor) {
-        let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| {
-            let tag = UblkIOCtx::user_data_to_tag(data);
-            exe.wake_with_uring_cqe(tag as u16, &cqe);
-        };
-        loop {
-            match self.flush_and_wake_io_tasks(wake_handler, 1) {
-                Err(_) => break,
-                _ => continue,
             }
         }
     }

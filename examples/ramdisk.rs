@@ -5,8 +5,9 @@ use io_uring::cqueue;
 /// UblkCtrl::start_dev_in_queue() and low level interface example.
 ///
 use libublk::dev_flags::*;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, exe::Executor, UblkError};
+use libublk::io::{UblkDev, UblkQueue};
+use libublk::uring_async::ublk_wake_task;
+use libublk::{ctrl::UblkCtrl, UblkError};
 use std::rc::Rc;
 
 fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: u64) -> i32 {
@@ -65,14 +66,15 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     };
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 
-    let exe = Executor::new(dev.get_nr_ios());
+    let exe = smol::LocalExecutor::new();
+    let mut f_vec = Vec::new();
     let q_rc = Rc::new(UblkQueue::new(0, &dev).unwrap());
     let buf_size = dev.dev_info.max_io_buf_bytes as usize;
 
     for tag in 0..depth as u16 {
         let q = q_rc.clone();
         assert!(q.get_io_buf_addr(tag) == std::ptr::null_mut());
-        exe.spawn(tag as u16, async move {
+        f_vec.push(exe.spawn(async move {
             let mut buffer: Vec<u8> = vec![0; buf_size];
             let addr = buffer.as_mut_ptr();
             let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
@@ -87,19 +89,18 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
                 res = handle_io(&q, tag, addr, buf_addr);
                 cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
             }
-        });
+        }));
+        exe.try_tick();
     }
     ctrl.configure_queue(&dev, 0, unsafe { libc::gettid() })
         .unwrap();
 
     let (token, buf) = ctrl.submit_start_dev(&dev).unwrap();
-    let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| {
-        let tag = UblkIOCtx::user_data_to_tag(data);
-        exe.wake_with_uring_cqe(tag as u16, &cqe);
-    };
+    let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| ublk_wake_task(data, cqe);
 
     let res = loop {
         let _ = q_rc.flush_and_wake_io_tasks(wake_handler, 0);
+        while exe.try_tick() {}
         let _res = ctrl.poll_start_dev(token);
         match _res {
             Ok(res) => break Ok(res),
@@ -117,7 +118,14 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
     match res {
         Ok(res) if res >= 0 => {
             ctrl.dump();
-            q_rc.wait_and_wake_io_tasks(&exe);
+            loop {
+                while exe.try_tick() {}
+                match q_rc.flush_and_wake_io_tasks(wake_handler, 1) {
+                    Err(_) => break,
+                    _ => {}
+                }
+            }
+            smol::block_on(async { futures::future::join_all(f_vec).await });
         }
         _ => {}
     };

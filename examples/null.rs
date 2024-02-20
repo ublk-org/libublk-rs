@@ -2,7 +2,8 @@ use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::dev_flags::*;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
-use libublk::{ctrl::UblkCtrl, exe::Executor, UblkIORes, UblkSession};
+use libublk::uring_async::ublk_wait_and_handle_ios;
+use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
 use std::rc::Rc;
 
 bitflags! {
@@ -90,12 +91,13 @@ fn __test_add(
         };
         let q_async_handler = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe = Executor::new(dev.get_nr_ios());
+            let exe = smol::LocalExecutor::new();
+            let mut f_vec = Vec::new();
 
             for tag in 0..depth as u16 {
                 let q = q_rc.clone();
 
-                exe.spawn(tag as u16, async move {
+                f_vec.push(exe.spawn(async move {
                     let buf_addr = q.get_io_buf_addr(tag);
                     let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                     let mut res = 0;
@@ -108,9 +110,10 @@ fn __test_add(
                         res = get_io_cmd_result(&q, tag);
                         cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
-                });
+                }));
             }
-            q_rc.wait_and_wake_io_tasks(&exe);
+            ublk_wait_and_handle_ios(&q_rc, &exe);
+            smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
         if aio {

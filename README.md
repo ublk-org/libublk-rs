@@ -39,7 +39,8 @@ by ctrl+C.
 
 ``` rust
 use libublk::dev_flags::*;
-use libublk::{ctrl::UblkCtrl, exe::Executor, io::UblkDev, io::UblkQueue};
+use libublk::uring_async::ublk_wait_and_handle_ios;
+use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkQueue};
 
 fn main() {
     let depth = 64_u32;
@@ -69,7 +70,8 @@ fn main() {
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
     let q_handler = move |qid: u16, dev: &UblkDev| {
         let q_rc = std::rc::Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-        let exe = Executor::new(dev.get_nr_ios());
+        let exe = smol::LocalExecutor::new();
+        let mut f_vec = Vec::new();
 
         // handle_io_cmd() can be .await nested, and support join!() over
         // multiple Future objects from async function/block
@@ -81,7 +83,7 @@ fn main() {
             let q = q_rc.clone();
 
             // spawn background task(coroutine) for handling each io command
-            exe.spawn(tag, async move {
+            f_vec.push(exe.spawn(async move {
                 let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
                 let mut result = 0;
                 let addr = std::ptr::null_mut();
@@ -96,10 +98,11 @@ fn main() {
                     result = handle_io_cmd(&q, tag).await;
                     cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                 }
-            });
+            }));
         }
 
-        q_rc.wait_and_wake_io_tasks(&exe);
+        ublk_wait_and_handle_ios(&q_rc, &exe);
+        smol::block_on(async { futures::future::join_all(f_vec).await });
     };
 
     // Now start this ublk target
