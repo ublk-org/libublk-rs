@@ -29,16 +29,8 @@ pub mod dev_flags {
     /// use async/.await
     pub const UBLK_DEV_F_ASYNC: u32 = 1u32 << 3;
 
-    /// don't preallocate io buffer, target code has to allocate
-    /// IO buffer, and often work with ASYNC and UBLK_F_USER_COPY
-    /// together
-    pub const UBLK_DEV_F_DONT_ALLOC_BUF: u32 = 1u32 << 4;
-
-    pub const UBLK_DEV_F_ALL: u32 = UBLK_DEV_F_COMP_BATCH
-        | UBLK_DEV_F_ADD_DEV
-        | UBLK_DEV_F_RECOVER_DEV
-        | UBLK_DEV_F_ASYNC
-        | UBLK_DEV_F_DONT_ALLOC_BUF;
+    pub const UBLK_DEV_F_ALL: u32 =
+        UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV | UBLK_DEV_F_ASYNC;
 }
 
 /// Ublk Fat completion result
@@ -352,7 +344,7 @@ mod libublk {
             .name("null")
             .depth(16_u32)
             .nr_queues(2_u32)
-            .dev_flags(UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 

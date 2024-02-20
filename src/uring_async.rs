@@ -139,4 +139,5 @@ pub fn ublk_wait_and_handle_ios(q: &UblkQueue, exe: &smol::LocalExecutor) {
             _ => {}
         }
     }
+    q.unregister_io_bufs();
 }

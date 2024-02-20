@@ -64,11 +64,7 @@ fn __test_add(
             .nr_queues(nr_queues)
             .io_buf_bytes(buf_size)
             .ctrl_flags(ctrl_flags)
-            .dev_flags(
-                UBLK_DEV_F_ADD_DEV
-                    | if aio { UBLK_DEV_F_ASYNC } else { 0 }
-                    | UBLK_DEV_F_DONT_ALLOC_BUF,
-            )
+            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
@@ -125,7 +121,6 @@ fn __test_add(
                         res = get_io_cmd_result(&q, tag);
                         cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
-                    q.unregister_io_buf(tag);
                 }));
             }
             ublk_wait_and_handle_ios(&q_rc, &exe);

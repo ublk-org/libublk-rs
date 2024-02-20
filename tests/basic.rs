@@ -98,10 +98,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(
-            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF,
-            null_handle_queue,
-        );
+        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_handle_queue);
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -127,7 +124,7 @@ mod integration {
         }
 
         __test_ublk_null(
-            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF | UBLK_DEV_F_COMP_BATCH,
+            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_COMP_BATCH,
             null_handle_queue_batch,
         );
     }
@@ -153,7 +150,7 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC | UBLK_DEV_F_DONT_ALLOC_BUF;
+        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC;
         let depth = 64_u16;
         let sess = libublk::UblkSessionBuilder::default()
             .name("null")
@@ -207,7 +204,6 @@ mod integration {
                             (*guard).done += 1;
                         }
                     }
-                    q.unregister_io_buf(tag);
                 }));
             }
 
@@ -298,7 +294,7 @@ mod integration {
         let size = 32_u64 << 20;
         let buf = libublk::ublk_alloc_buf(size as usize, 4096);
         let dev_addr = buf as u64;
-        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF;
+        let dev_flags = UBLK_DEV_F_ADD_DEV;
         let sess = libublk::UblkSessionBuilder::default()
             .name("ramdisk")
             .id(-1)
@@ -364,10 +360,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(
-            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_DONT_ALLOC_BUF,
-            null_queue_mut_io,
-        );
+        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_queue_mut_io);
     }
 
     /// run examples/ramdisk recovery test

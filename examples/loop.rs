@@ -314,11 +314,7 @@ fn __test_add(
             .nr_queues(nr_queues)
             .depth(depth)
             .io_buf_bytes(buf_sz)
-            .dev_flags(
-                UBLK_DEV_F_ADD_DEV
-                    | UBLK_DEV_F_DONT_ALLOC_BUF
-                    | if aio { UBLK_DEV_F_ASYNC } else { 0 },
-            )
+            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
             .build()
             .unwrap();
 
@@ -352,7 +348,6 @@ fn __test_add(
                         };
                         cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
-                    q.unregister_io_buf(tag);
                 }));
             }
             ublk_wait_and_handle_ios(&q_rc, &exe);
