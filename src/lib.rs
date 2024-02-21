@@ -354,9 +354,8 @@ mod libublk {
             Ok(0)
         };
         let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let q_fn = move |qid: u16, _dev: &UblkDev| {
-            let q = UblkQueue::new(qid, _dev).unwrap();
-            let bufs_rc = Rc::new(q.alloc_io_bufs(true));
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
 
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
@@ -368,7 +367,10 @@ mod libublk {
                 q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
-            q.submit_fetch_commands(Some(&bufs))
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .regiser_io_bufs(Some(&bufs))
+                .submit_fetch_commands(Some(&bufs))
                 .wait_and_handle_io(io_handler);
         };
 

@@ -75,8 +75,7 @@ fn __test_add(
         let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
         // queue level logic
         let q_sync_handler = move |qid: u16, dev: &UblkDev| {
-            let q = UblkQueue::new(qid, dev).unwrap();
-            let bufs_rc = Rc::new(q.alloc_io_bufs(true));
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
 
             // logic for io handling
@@ -90,7 +89,10 @@ fn __test_add(
                 handle_io_cmd(q, tag, buf_addr);
             };
 
-            q.submit_fetch_commands(if user_copy { None } else { Some(&bufs) })
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .regiser_io_bufs(if user_copy { None } else { Some(&bufs) })
+                .submit_fetch_commands(if user_copy { None } else { Some(&bufs) })
                 .wait_and_handle_io(io_handler);
         };
         let q_async_handler = move |qid: u16, dev: &UblkDev| {

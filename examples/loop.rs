@@ -355,8 +355,7 @@ fn __test_add(
         };
 
         let q_sync_fn = move |qid: u16, dev: &UblkDev| {
-            let q = UblkQueue::new(qid, dev).unwrap();
-            let bufs_rc = Rc::new(q.alloc_io_bufs(true));
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
             let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
                 let bufs = bufs_rc.clone();
@@ -364,7 +363,10 @@ fn __test_add(
                 lo_handle_io_cmd_sync(q, tag, io, bufs[tag as usize].as_mut_ptr());
             };
 
-            q.submit_fetch_commands(Some(&bufs))
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .regiser_io_bufs(Some(&bufs))
+                .submit_fetch_commands(Some(&bufs))
                 .wait_and_handle_io(lo_io_handler);
         };
 
