@@ -26,11 +26,8 @@ pub mod dev_flags {
     /// tell UblkCtrl that we are recovering one old device
     pub const UBLK_DEV_F_RECOVER_DEV: u32 = 1u32 << 2;
 
-    /// use async/.await
-    pub const UBLK_DEV_F_ASYNC: u32 = 1u32 << 3;
-
     pub const UBLK_DEV_F_ALL: u32 =
-        UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV | UBLK_DEV_F_ASYNC;
+        UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV;
 }
 
 /// Ublk Fat completion result

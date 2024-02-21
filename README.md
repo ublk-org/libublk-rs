@@ -49,7 +49,7 @@ fn main() {
         .depth(depth)
         .nr_queues(2_u32)
         .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
-        .dev_flags(UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC)
+        .dev_flags(UBLK_DEV_F_ADD_DEV)
         .build()
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| {
