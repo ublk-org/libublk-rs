@@ -292,8 +292,8 @@ mod integration {
         }
 
         let size = 32_u64 << 20;
-        let buf = libublk::ublk_alloc_buf(size as usize, 4096);
-        let dev_addr = buf as u64;
+        let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
+        let dev_addr = buf.as_mut_ptr() as u64;
         let dev_flags = UBLK_DEV_F_ADD_DEV;
         let sess = libublk::UblkSessionBuilder::default()
             .name("ramdisk")
@@ -331,7 +331,6 @@ mod integration {
             __test_ublk_ramdisk(dev_id, dev_flags);
         })
         .unwrap();
-        libublk::ublk_dealloc_buf(buf, size as usize, 4096);
     }
 
     /// make FnMut closure for IO handling

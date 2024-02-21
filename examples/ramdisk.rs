@@ -11,7 +11,7 @@ use libublk::uring_async::ublk_wake_task;
 use libublk::{ctrl::UblkCtrl, UblkError};
 use std::rc::Rc;
 
-fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: u64) -> i32 {
+fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
     let off = (iod.start_sector << 9) as u64;
     let bytes = (iod.nr_sectors << 9) as i32;
@@ -21,13 +21,13 @@ fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: u64) -> i32 {
         libublk::sys::UBLK_IO_OP_READ => unsafe {
             libc::memcpy(
                 buf_addr as *mut libc::c_void,
-                (start + off) as *mut libc::c_void,
+                start.wrapping_add(off.try_into().unwrap()) as *mut libc::c_void,
                 bytes as usize,
             );
         },
         libublk::sys::UBLK_IO_OP_WRITE => unsafe {
             libc::memcpy(
-                (start + off) as *mut libc::c_void,
+                start.wrapping_add(off.try_into().unwrap()) as *mut libc::c_void,
                 buf_addr as *mut libc::c_void,
                 bytes as usize,
             );
@@ -42,7 +42,7 @@ fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: u64) -> i32 {
 
 ///run this ramdisk ublk daemon completely in single context with
 ///async control command, no need Rust async any more
-fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
+fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     let dev_flags = if for_add {
         UBLK_DEV_F_ADD_DEV
     } else {
@@ -165,11 +165,9 @@ fn test_add(recover: usize) {
 
                 ctrl.start_user_recover().unwrap();
             }
-            let buf = libublk::ublk_alloc_buf(size as usize, 4096);
 
-            rd_add_dev(dev_id, buf as u64, size, recover == 0);
-
-            libublk::ublk_dealloc_buf(buf, size as usize, 4096);
+            let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
+            rd_add_dev(dev_id, buf.as_mut_ptr(), size, recover == 0);
         }
         Err(_) => panic!(),
     }
