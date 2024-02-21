@@ -38,26 +38,10 @@ run. And the device will be deleted after terminating this process
 by ctrl+C.
 
 ``` rust
-use libublk::dev_flags::*;
-use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkQueue};
 
 fn main() {
-    let depth = 64_u32;
-    let sess = libublk::UblkSessionBuilder::default()
-        .name("async_null")
-        .depth(depth)
-        .nr_queues(2_u32)
-        .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
-        .dev_flags(UBLK_DEV_F_ADD_DEV)
-        .build()
-        .unwrap();
-    let tgt_init = |dev: &mut UblkDev| {
-        dev.set_default_params(250_u64 << 30);
-        Ok(0)
-    };
-
-    // kill created ublk device for handling "ctrl + c"
+    // Kill ublk device by handling "Ctrl + c"
     let g_dev_id = std::sync::Arc::new(std::sync::Mutex::new(-1));
     let dev_id_sig = g_dev_id.clone();
     let _ = ctrlc::set_handler(move || {
@@ -67,52 +51,69 @@ fn main() {
         }
     });
 
+    // Create ublk device
+    let sess = libublk::UblkSessionBuilder::default()
+        .name("async_null")
+        .depth(64_u32)
+        .nr_queues(2_u32)
+        .dev_flags(libublk::dev_flags::UBLK_DEV_F_ADD_DEV)
+        .build()
+        .unwrap();
+    let tgt_init = |dev: &mut UblkDev| {
+        dev.set_default_params(250_u64 << 30);
+        Ok(0)
+    };
     let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+
+    // Queue handler implements whole IO logic
     let q_handler = move |qid: u16, dev: &UblkDev| {
         let q_rc = std::rc::Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
         let exe = smol::LocalExecutor::new();
         let mut f_vec = Vec::new();
 
-        // handle_io_cmd() can be .await nested, and support join!() over
-        // multiple Future objects from async function/block
+        // async/.await IO handling
         async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
             (q.get_iod(tag).nr_sectors << 9) as i32
         }
 
-        for tag in 0..depth as u16 {
+        for tag in 0..dev.dev_info.queue_depth {
             let q = q_rc.clone();
+            let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
 
-            // spawn background task(coroutine) for handling each io command
             f_vec.push(exe.spawn(async move {
+                // IO buffer for exchange data with /dev/ublkbN
+                let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
                 let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
-                let mut result = 0;
-                let addr = std::ptr::null_mut();
+                let mut res = 0;
+
+                // Register IO buffer, so that buffer pages can be discarded
+                // when queue becomes idle
+                q.register_io_buf(tag, &buf);
                 loop {
-                    if q.submit_io_cmd(tag, cmd_op, addr, result).await
-                        == libublk::sys::UBLK_IO_RES_ABORT
-                    {
+                    // Complete previous command with result and re-submit
+                    // IO command for fetching new IO request from /dev/ublkbN
+                    res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+                    if res == libublk::sys::UBLK_IO_RES_ABORT {
                         break;
                     }
 
-                    // io_uring async is preferred
-                    result = handle_io_cmd(&q, tag).await;
+                    // Handle this incoming IO command
+                    res = handle_io_cmd(&q, tag).await;
                     cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                 }
             }));
         }
 
-        ublk_wait_and_handle_ios(&q_rc, &exe);
+        // Drive smol executor, won't exit until queue is dead
+        libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exe);
         smol::block_on(async { futures::future::join_all(f_vec).await });
     };
 
     // Now start this ublk target
     let dev_id_wh = g_dev_id.clone();
     sess.run_target(&mut ctrl, &dev, q_handler, move |dev_id| {
-        let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-        d_ctrl.dump();
-
-        let mut guard = dev_id_wh.lock().unwrap();
-        *guard = dev_id;
+        UblkCtrl::new_simple(dev_id, 0).unwrap().dump();
+        *dev_id_wh.lock().unwrap() = dev_id;
     })
     .unwrap();
 }
