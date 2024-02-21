@@ -47,7 +47,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: u64, size: u64, for_add: bool) {
         UBLK_DEV_F_ADD_DEV
     } else {
         UBLK_DEV_F_RECOVER_DEV
-    } | UBLK_DEV_F_ASYNC;
+    };
 
     let depth = 128_u16;
     let sess = libublk::UblkSessionBuilder::default()

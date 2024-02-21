@@ -150,7 +150,7 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        let dev_flags = UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC;
+        let dev_flags = UBLK_DEV_F_ADD_DEV;
         let depth = 64_u16;
         let sess = libublk::UblkSessionBuilder::default()
             .name("null")

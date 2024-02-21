@@ -314,7 +314,7 @@ fn __test_add(
             .nr_queues(nr_queues)
             .depth(depth)
             .io_buf_bytes(buf_sz)
-            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 

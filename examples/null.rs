@@ -64,7 +64,7 @@ fn __test_add(
             .nr_queues(nr_queues)
             .io_buf_bytes(buf_size)
             .ctrl_flags(ctrl_flags)
-            .dev_flags(UBLK_DEV_F_ADD_DEV | if aio { UBLK_DEV_F_ASYNC } else { 0 })
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
