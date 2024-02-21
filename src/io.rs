@@ -288,6 +288,19 @@ impl UblkDev {
         log::info!("dev {} deinitialized", id);
     }
 
+    /// Allocate IoBufs for one queue
+    pub fn alloc_queue_io_bufs(&self) -> Vec<IoBuf<u8>> {
+        let depth = self.dev_info.queue_depth;
+        let bytes = self.dev_info.max_io_buf_bytes as usize;
+        let mut bvec = Vec::with_capacity(depth as usize);
+
+        for _ in 0..depth {
+            bvec.push(IoBuf::<u8>::new(bytes));
+        }
+
+        bvec
+    }
+
     pub fn set_default_params(&mut self, dev_size: u64) {
         let info = self.dev_info;
 
@@ -588,20 +601,15 @@ impl UblkQueue<'_> {
         }
     }
 
-    /// Allocate IoBuf for each io command slot
-    pub fn alloc_io_bufs(&self, register: bool) -> Vec<IoBuf<u8>> {
-        let mut bvec = Vec::with_capacity(self.q_depth as usize);
-
-        for tag in 0..self.q_depth {
-            let buf = IoBuf::<u8>::new(self.dev.dev_info.max_io_buf_bytes as usize);
-
-            if register {
-                self.register_io_buf(tag.try_into().unwrap(), &buf);
+    /// Register Io buffers
+    pub fn regiser_io_bufs(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
+        if let Some(b) = bufs {
+            for tag in 0..self.q_depth {
+                self.register_io_buf(tag.try_into().unwrap(), &b[tag as usize]);
             }
-            bvec.push(buf);
         }
 
-        bvec
+        self
     }
 
     #[inline(always)]
