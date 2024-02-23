@@ -861,7 +861,7 @@ impl UblkCtrl {
         Self::new(id, 0, 0, 0, 0, 0, dev_flags)
     }
 
-    pub fn get_dev_flags(&self) -> u32 {
+    pub(crate) fn get_dev_flags(&self) -> u32 {
         self.get_inner().dev_flags
     }
 
