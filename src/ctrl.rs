@@ -288,7 +288,7 @@ impl UblkCtrlInner {
             if res.is_err() {
                 eprintln!("device reload json failed");
             }
-            dev.get_info()?;
+            dev.read_dev_info()?;
         }
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
@@ -511,7 +511,7 @@ impl UblkCtrlInner {
         Ok(features)
     }
 
-    fn __get_info(&mut self) -> Result<i32, UblkError> {
+    fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_DEV_INFO,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
@@ -523,7 +523,7 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
-    fn __get_info2(&mut self) -> Result<i32, UblkError> {
+    fn __read_dev_info2(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_DEV_INFO2,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
@@ -535,13 +535,11 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
-    /// Retrieving device info from ublk driver
-    ///
-    fn get_info(&mut self) -> Result<i32, UblkError> {
-        let res = self.__get_info2();
+    fn read_dev_info(&mut self) -> Result<i32, UblkError> {
+        let res = self.__read_dev_info2();
 
         if res.is_err() {
-            self.__get_info()
+            self.__read_dev_info()
         } else {
             res
         }
@@ -642,7 +640,7 @@ impl UblkCtrlInner {
     }
 
     fn prep_start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        self.get_info()?;
+        self.read_dev_info()?;
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
             return Ok(0);
         }
@@ -968,7 +966,7 @@ impl UblkCtrl {
             ..Default::default()
         };
 
-        if ctrl.get_info().is_err() {
+        if ctrl.read_dev_info().is_err() {
             error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
             return;
         }
@@ -1047,8 +1045,8 @@ impl UblkCtrl {
 
     /// Retrieving device info from ublk driver
     ///
-    pub fn get_info(&self) -> Result<i32, UblkError> {
-        self.get_inner_mut().get_info()
+    pub fn read_dev_info(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().read_dev_info()
     }
 
     /// Kill this device

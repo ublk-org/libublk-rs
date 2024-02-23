@@ -387,7 +387,7 @@ mod integration {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(unit as u64));
 
-                ctrl.get_info().unwrap();
+                ctrl.read_dev_info().unwrap();
                 if ctrl.dev_info().state == state {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                     break;
