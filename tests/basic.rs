@@ -13,7 +13,7 @@ mod integration {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    fn run_ublk_disk_sanity_test(ctrl: &mut UblkCtrl, dev_flags: u32) {
+    fn run_ublk_disk_sanity_test(ctrl: &UblkCtrl, dev_flags: u32) {
         use std::os::unix::fs::PermissionsExt;
         let dev_path = ctrl.get_cdev_path();
 
@@ -63,15 +63,15 @@ mod integration {
             Ok(0)
         };
 
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, _dev: &UblkDev| {
             q_handler(qid, _dev);
         };
 
-        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
-            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
+            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
 
-            run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
+            run_ublk_disk_sanity_test(&ctrl, dev_flags);
             read_ublk_disk(dev_id);
 
             ctrl.kill_dev().unwrap();
@@ -169,7 +169,7 @@ mod integration {
         let dev_data = Arc::new(Mutex::new(DevData { done: 0 }));
         let wh_dev_data = dev_data.clone();
 
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
         let q_fn = move |qid: u16, dev: &UblkDev| {
@@ -212,11 +212,11 @@ mod integration {
         };
 
         // kick off our targets
-        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
-            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
+            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
 
             // run sanity and disk IO test after ublk disk is ready
-            run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
+            run_ublk_disk_sanity_test(&ctrl, dev_flags);
             read_ublk_disk(dev_id);
 
             {
@@ -267,10 +267,10 @@ mod integration {
         }
 
         fn __test_ublk_ramdisk(dev_id: i32, dev_flags: u32) {
-            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
             let dev_path = ctrl.get_bdev_path();
 
-            run_ublk_disk_sanity_test(&mut ctrl, dev_flags);
+            run_ublk_disk_sanity_test(&ctrl, dev_flags);
 
             //format as ext4 and mount over the created ublk-ramdisk
             {
@@ -308,7 +308,7 @@ mod integration {
             Ok(0)
         };
 
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
@@ -327,7 +327,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
+        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
             __test_ublk_ramdisk(dev_id, dev_flags);
         })
         .unwrap();
@@ -381,14 +381,14 @@ mod integration {
             }
         }
 
-        fn ublk_state_wait_until(ctrl: &mut UblkCtrl, state: u16, timeout: u32) {
+        fn ublk_state_wait_until(ctrl: &UblkCtrl, state: u16, timeout: u32) {
             let mut count = 0;
             let unit = 100_u32;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(unit as u64));
 
                 ctrl.get_info().unwrap();
-                if ctrl.dev_info.state == state {
+                if ctrl.dev_info().state == state {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                     break;
                 }
@@ -433,8 +433,8 @@ mod integration {
         }
         assert!(tid != 0);
 
-        let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
-        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
+        let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
 
         //ublk block device should be observed now
         let dev_path = ctrl.get_bdev_path();
@@ -446,7 +446,7 @@ mod integration {
         }
 
         //wait device becomes quiesced
-        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_QUIESCED as u16, 6000);
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_QUIESCED as u16, 6000);
 
         let file = std::fs::File::create(tmpfile.path()).unwrap();
         //recover device
@@ -458,7 +458,7 @@ mod integration {
         cmd.wait().unwrap();
         //let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
         //println!("{}", buf);
-        ublk_state_wait_until(&mut ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
         ctrl.del_dev().unwrap();
     }
 }

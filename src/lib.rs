@@ -190,7 +190,7 @@ impl UblkSession {
     where
         T: FnOnce(&mut io::UblkDev) -> Result<i32, UblkError>,
     {
-        let mut ctrl = ctrl::UblkCtrl::new(
+        let ctrl = ctrl::UblkCtrl::new(
             self.id,
             self.nr_queues,
             self.depth,
@@ -200,14 +200,14 @@ impl UblkSession {
             self.dev_flags,
         )?;
 
-        let dev = Arc::new(io::UblkDev::new(self.name.clone(), tgt_fn, &mut ctrl)?);
+        let dev = Arc::new(io::UblkDev::new(self.name.clone(), tgt_fn, &ctrl)?);
 
         Ok((ctrl, dev))
     }
 
     fn create_queue_handlers<Q>(
         &self,
-        ctrl: &mut ctrl::UblkCtrl,
+        ctrl: &ctrl::UblkCtrl,
         dev: &Arc<io::UblkDev>,
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
@@ -279,7 +279,7 @@ impl UblkSession {
     /// io handler, such as setup async/await for handling io command.
     pub fn run_target<Q, W>(
         &self,
-        ctrl: &mut ctrl::UblkCtrl,
+        ctrl: &ctrl::UblkCtrl,
         dev: &Arc<io::UblkDev>,
         q_fn: Q,
         device_fn: W,
@@ -350,7 +350,7 @@ mod libublk {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(0)
         };
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
@@ -371,7 +371,7 @@ mod libublk {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&mut ctrl, &dev, q_fn, move |dev_id| {
+        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
             w_fn(dev_id);
         })
         .unwrap();
@@ -380,7 +380,9 @@ mod libublk {
         let bdev = ctrl.get_bdev_path();
         assert!(Path::new(&bdev).exists() == false);
 
-        ctrl.get_cdev_path()
+        let cpath = ctrl.get_cdev_path();
+
+        cpath
     }
 
     /// Covers basic ublk device creation and destroying by UblkSession
@@ -388,7 +390,7 @@ mod libublk {
     #[test]
     fn test_ublk_session() {
         let cdev = __test_ublk_session(|dev_id| {
-            let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
 
             assert!(ctrl.get_target_data_from_json().is_some());
             ctrl.kill_dev().unwrap();

@@ -71,7 +71,7 @@ fn __test_add(
             dev.set_default_params(250_u64 << 30);
             Ok(0)
         };
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
         // queue level logic
         let q_sync_handler = move |qid: u16, dev: &UblkDev| {
@@ -131,8 +131,8 @@ fn __test_add(
 
         if aio {
             // Now start this ublk target
-            sess.run_target(&mut ctrl, &dev, q_async_handler, move |dev_id| {
-                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            sess.run_target(&ctrl, &dev, q_async_handler, move |dev_id| {
+                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
                 if oneshot {
                     d_ctrl.kill_dev().unwrap();
@@ -140,8 +140,8 @@ fn __test_add(
             })
             .unwrap();
         } else {
-            sess.run_target(&mut ctrl, &dev, q_sync_handler, move |dev_id| {
-                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            sess.run_target(&ctrl, &dev, q_sync_handler, move |dev_id| {
+                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
                 if oneshot {
                     d_ctrl.kill_dev().unwrap();
