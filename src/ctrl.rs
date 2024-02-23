@@ -785,6 +785,18 @@ impl UblkCtrl {
     const CDEV_PATH: &'static str = "/dev/ublkc";
     const BDEV_PATH: &'static str = "/dev/ublkb";
 
+    fn get_inner(&self) -> std::sync::RwLockReadGuard<UblkCtrlInner> {
+        self.inner.read().unwrap()
+    }
+
+    fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<UblkCtrlInner> {
+        self.inner.write().unwrap()
+    }
+
+    pub(crate) fn get_dev_flags(&self) -> u32 {
+        self.get_inner().dev_flags
+    }
+
     /// New one ublk control device
     ///
     /// # Arguments:
@@ -823,16 +835,17 @@ impl UblkCtrl {
         Ok(UblkCtrl { inner })
     }
 
+    /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
+    /// and it can't be done for adding device
+    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
+        assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
+        assert!(id >= 0);
+        Self::new(id, 0, 0, 0, 0, 0, dev_flags)
+    }
+
+    /// Return current device info
     pub fn dev_info(&self) -> sys::ublksrv_ctrl_dev_info {
         self.get_inner().dev_info
-    }
-
-    fn get_inner(&self) -> std::sync::RwLockReadGuard<UblkCtrlInner> {
-        self.inner.read().unwrap()
-    }
-
-    fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<UblkCtrlInner> {
-        self.inner.write().unwrap()
     }
 
     // Return ublk_driver's features
@@ -851,18 +864,6 @@ impl UblkCtrl {
     /// Return ublk block device path
     pub fn get_bdev_path(&self) -> String {
         format!("{}{}", Self::BDEV_PATH, self.get_inner().dev_info.dev_id)
-    }
-
-    /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
-    /// and it can't be done for adding device
-    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
-        assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
-        assert!(id >= 0);
-        Self::new(id, 0, 0, 0, 0, 0, dev_flags)
-    }
-
-    pub(crate) fn get_dev_flags(&self) -> u32 {
-        self.get_inner().dev_flags
     }
 
     /// Get queue's pthread id from exported json file for this device
@@ -1015,24 +1016,6 @@ impl UblkCtrl {
         self.get_inner().run_path()
     }
 
-    /// Remove this device and its exported json file
-    ///
-    /// Called when the user wants to remove one device really
-    ///
-    /// Be careful, this interface may cause deadlock if the
-    /// for-add control device is live, and it is always safe
-    /// to kill device via .kill_dev().
-    ///
-    pub fn del_dev(&self) -> Result<i32, UblkError> {
-        let mut ctrl = self.get_inner_mut();
-
-        ctrl.del()?;
-        if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path()).map_err(UblkError::OtherIOError)?;
-        }
-        Ok(0)
-    }
-
     /// Retrieving supported UBLK FEATURES from ublk driver
     ///
     /// Supported since linux kernel v6.5
@@ -1047,18 +1030,6 @@ impl UblkCtrl {
     ///
     pub fn read_dev_info(&self) -> Result<i32, UblkError> {
         self.get_inner_mut().read_dev_info()
-    }
-
-    /// Kill this device
-    ///
-    /// Preferred method for target code to stop & delete device,
-    /// which is safe and can avoid deadlock.
-    ///
-    /// But device may not be really removed yet, and the device ID
-    /// can still be in-use after kill_dev() returns.
-    ///
-    pub fn kill_dev(&self) -> Result<i32, UblkError> {
-        self.get_inner_mut().stop()
     }
 
     /// Retrieve this device's parameter from ublk driver by
@@ -1197,6 +1168,36 @@ impl UblkCtrl {
             fs::remove_file(rp).map_err(UblkError::OtherIOError)?;
         }
         ctrl.stop()
+    }
+
+    /// Kill this device
+    ///
+    /// Preferred method for target code to stop & delete device,
+    /// which is safe and can avoid deadlock.
+    ///
+    /// But device may not be really removed yet, and the device ID
+    /// can still be in-use after kill_dev() returns.
+    ///
+    pub fn kill_dev(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().stop()
+    }
+
+    /// Remove this device and its exported json file
+    ///
+    /// Called when the user wants to remove one device really
+    ///
+    /// Be careful, this interface may cause deadlock if the
+    /// for-add control device is live, and it is always safe
+    /// to kill device via .kill_dev().
+    ///
+    pub fn del_dev(&self) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+
+        ctrl.del()?;
+        if Path::new(&ctrl.run_path()).exists() {
+            fs::remove_file(ctrl.run_path()).map_err(UblkError::OtherIOError)?;
+        }
+        Ok(0)
     }
 }
 
