@@ -319,7 +319,7 @@ fn __test_add(
             .unwrap();
 
         let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, split);
-        let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = smol::LocalExecutor::new();
@@ -371,8 +371,8 @@ fn __test_add(
         };
 
         if aio {
-            sess.run_target(&mut ctrl, &dev, q_async_fn, move |dev_id| {
-                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            sess.run_target(&ctrl, &dev, q_async_fn, move |dev_id| {
+                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
 
                 if oneshot {
@@ -381,8 +381,8 @@ fn __test_add(
             })
             .unwrap();
         } else {
-            sess.run_target(&mut ctrl, &dev, q_sync_fn, move |dev_id| {
-                let mut d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+            sess.run_target(&ctrl, &dev, q_sync_fn, move |dev_id| {
+                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
                 d_ctrl.dump();
                 if oneshot {
                     d_ctrl.kill_dev().unwrap();

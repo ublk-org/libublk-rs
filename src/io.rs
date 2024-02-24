@@ -229,11 +229,11 @@ impl UblkDev {
     /// ublk device is abstraction for target, and prepare for setting
     /// up target. Any target private data can be defined in the data
     /// structure which implements UblkTgtImpl.
-    pub fn new<F>(tgt_name: String, ops: F, ctrl: &mut UblkCtrl) -> Result<UblkDev, UblkError>
+    pub fn new<F>(tgt_name: String, ops: F, ctrl: &UblkCtrl) -> Result<UblkDev, UblkError>
     where
         F: FnOnce(&mut UblkDev) -> Result<i32, UblkError>,
     {
-        let info = ctrl.dev_info;
+        let info = ctrl.dev_info();
         let mut tgt = UblkTgt {
             tgt_type: tgt_name,
             sq_depth: info.queue_depth,

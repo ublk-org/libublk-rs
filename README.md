@@ -63,7 +63,7 @@ fn main() {
         dev.set_default_params(250_u64 << 30);
         Ok(0)
     };
-    let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+    let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 
     // Queue handler implements whole IO logic
     let q_handler = move |qid: u16, dev: &UblkDev| {
@@ -111,7 +111,7 @@ fn main() {
 
     // Now start this ublk target
     let dev_id_wh = g_dev_id.clone();
-    sess.run_target(&mut ctrl, &dev, q_handler, move |dev_id| {
+    sess.run_target(&ctrl, &dev, q_handler, move |dev_id| {
         UblkCtrl::new_simple(dev_id, 0).unwrap().dump();
         *dev_id_wh.lock().unwrap() = dev_id;
     })

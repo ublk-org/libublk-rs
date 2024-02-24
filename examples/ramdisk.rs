@@ -64,7 +64,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
         dev.set_default_params(size);
         Ok(0)
     };
-    let (mut ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+    let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
 
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
@@ -134,7 +134,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     let _ = ctrl.stop_dev(&dev);
 }
 
-fn rd_get_device_size(ctrl: &mut UblkCtrl) -> u64 {
+fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {
     if let Ok(tgt) = ctrl.get_target_from_json() {
         tgt.dev_size
     } else {
@@ -160,8 +160,8 @@ fn test_add(recover: usize) {
 
             if recover > 0 {
                 assert!(dev_id >= 0);
-                let mut ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                size = rd_get_device_size(&mut ctrl);
+                let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                size = rd_get_device_size(&ctrl);
 
                 ctrl.start_user_recover().unwrap();
             }
@@ -176,7 +176,7 @@ fn test_add(recover: usize) {
 fn test_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let mut ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
+    let ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
 
     ctrl.del_dev().unwrap();
 }

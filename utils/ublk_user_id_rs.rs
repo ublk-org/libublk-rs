@@ -7,7 +7,7 @@ fn main() {
         match s[5..].parse::<i32>() {
             Ok(id) => match libublk::ctrl::UblkCtrl::new_simple(id, 0) {
                 Ok(ctrl) => {
-                    let dinfo = &ctrl.dev_info;
+                    let dinfo = ctrl.dev_info();
                     if (dinfo.flags & libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64) != 0 {
                         println!("{}:{}", dinfo.owner_uid, dinfo.owner_gid);
                     }

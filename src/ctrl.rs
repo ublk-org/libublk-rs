@@ -5,6 +5,7 @@ use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::RwLock;
 use std::{
     fs,
     io::{Read, Write},
@@ -76,7 +77,7 @@ struct UblkCtrlCmdData {
 }
 
 impl UblkCtrlCmdData {
-    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrl) -> u64 {
+    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> u64 {
         // handle GET_DEV_INFO2 always with dev_path attached
         if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
             && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
@@ -123,7 +124,7 @@ impl UblkCtrlCmdData {
         addr
     }
 
-    fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrl, buf: u64) {
+    fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner, buf: u64) {
         if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
             && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
         {
@@ -163,10 +164,14 @@ struct QueueAffinityJson {
 ///
 /// 3) exporting device as json file
 pub struct UblkCtrl {
+    inner: RwLock<UblkCtrlInner>,
+}
+
+struct UblkCtrlInner {
     file: fs::File,
-    pub dev_info: sys::ublksrv_ctrl_dev_info,
+    dev_info: sys::ublksrv_ctrl_dev_info,
     json: serde_json::Value,
-    pub features: Option<u64>,
+    features: Option<u64>,
 
     /// global flags, shared with UblkDev and UblkQueue
     dev_flags: u32,
@@ -178,11 +183,11 @@ pub struct UblkCtrl {
 
 impl AsRawFd for UblkCtrl {
     fn as_raw_fd(&self) -> RawFd {
-        self.ring.as_raw_fd()
+        self.get_inner_mut().ring.as_raw_fd()
     }
 }
 
-impl Drop for UblkCtrl {
+impl Drop for UblkCtrlInner {
     fn drop(&mut self) {
         let id = self.dev_info.dev_id;
         trace!("ctrl: device {} dropped", id);
@@ -195,30 +200,9 @@ impl Drop for UblkCtrl {
     }
 }
 
-impl UblkCtrl {
-    /// char device and block device name may change according to system policy,
-    /// such udev may rename it in its own namespaces.
-    const CDEV_PATH: &'static str = "/dev/ublkc";
-    const BDEV_PATH: &'static str = "/dev/ublkb";
-
-    /// New one ublk control device
-    ///
-    /// # Arguments:
-    ///
-    /// * `id`: device id, or let driver allocate one if -1 is passed
-    /// * `nr_queues`: how many hw queues allocated for this device
-    /// * `depth`: each hw queue's depth
-    /// * `io_buf_bytes`: max buf size for each IO
-    /// * `flags`: flags for setting ublk device
-    /// * `for_add`: is for adding new device
-    /// * `dev_flags`: global flags as userspace side feature, will be
-    ///     shared with UblkDev and UblkQueue
-    ///
-    /// ublk control device is for sending command to driver, and maintain
-    /// device exported json file, dump, or any misc management task.
-    ///
+impl UblkCtrlInner {
     #[allow(clippy::uninit_vec)]
-    pub fn new(
+    fn new(
         id: i32,
         nr_queues: u32,
         depth: u32,
@@ -226,7 +210,7 @@ impl UblkCtrl {
         flags: u64,
         tgt_flags: u64,
         dev_flags: u32,
-    ) -> Result<UblkCtrl, UblkError> {
+    ) -> Result<UblkCtrlInner, UblkError> {
         if !Path::new(CTRL_PATH).exists() {
             eprintln!("Please run `modprobe ublk_drv` first");
             return Err(UblkError::OtherError(-libc::ENOENT));
@@ -272,7 +256,7 @@ impl UblkCtrl {
             .open(CTRL_PATH)
             .map_err(UblkError::OtherIOError)?;
 
-        let mut dev = UblkCtrl {
+        let mut dev = UblkCtrlInner {
             file: fd,
             dev_info: info,
             json: serde_json::json!({}),
@@ -304,41 +288,19 @@ impl UblkCtrl {
             if res.is_err() {
                 eprintln!("device reload json failed");
             }
-            dev.get_info()?;
+            dev.read_dev_info()?;
         }
         trace!("ctrl: device {} created", dev.dev_info.dev_id);
 
         Ok(dev)
     }
 
-    // Return ublk_driver's features
-    //
-    // Target code may need to query driver features runtime, so
-    // cache it inside device
-    pub fn get_driver_features(&self) -> Option<u64> {
-        self.features
-    }
-
     fn is_unprivileged(&self) -> bool {
         (self.dev_info.flags & (super::sys::UBLK_F_UNPRIVILEGED_DEV as u64)) != 0
     }
 
-    /// Return ublk char device path
-    pub fn get_cdev_path(&self) -> String {
-        format!("{}{}", Self::CDEV_PATH, self.dev_info.dev_id)
-    }
-
-    /// Return ublk block device path
-    pub fn get_bdev_path(&self) -> String {
-        format!("{}{}", Self::BDEV_PATH, self.dev_info.dev_id)
-    }
-
-    /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
-    /// and it can't be done for adding device
-    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
-        assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
-        assert!(id >= 0);
-        Self::new(id, 0, 0, 0, 0, 0, dev_flags)
+    fn get_cdev_path(&self) -> String {
+        format!("{}{}", UblkCtrl::CDEV_PATH, self.dev_info.dev_id)
     }
 
     fn for_add_dev(&self) -> bool {
@@ -347,10 +309,6 @@ impl UblkCtrl {
 
     fn for_recover_dev(&self) -> bool {
         (self.dev_flags & dev_flags::UBLK_DEV_F_RECOVER_DEV) != 0
-    }
-
-    pub fn get_dev_flags(&self) -> u32 {
-        self.dev_flags
     }
 
     fn dev_state_desc(&self) -> String {
@@ -362,95 +320,8 @@ impl UblkCtrl {
         }
     }
 
-    /// Get queue's pthread id from exported json file for this device
-    ///
-    /// # Arguments:
-    ///
-    /// * `qid`: queue id
-    ///
-    pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
-        let queues = &self.json["queues"];
-        let queue = &queues[qid.to_string()];
-        let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
-
-        if let Ok(p) = this_queue {
-            Ok(p.tid as i32)
-        } else {
-            Err(UblkError::OtherError(-libc::EEXIST))
-        }
-    }
-
-    /// Get target flags from exported json file for this device
-    ///
-    pub fn get_target_flags_from_json(&self) -> Result<u32, UblkError> {
-        let __tgt_flags = &self.json["target_flags"];
-        let tgt_flags: Result<u32, _> = serde_json::from_value(__tgt_flags.clone());
-
-        if let Ok(flags) = tgt_flags {
-            Ok(flags)
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
-    }
-
-    /// Get target from exported json file for this device
-    ///
-    pub fn get_target_from_json(&self) -> Result<super::io::UblkTgt, UblkError> {
-        let tgt_val = &self.json["target"];
-        let tgt: Result<super::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
-        if let Ok(p) = tgt {
-            Ok(p)
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
-    }
-
-    // Return target json data
-    //
-    // Should only be called after device is started, otherwise target data
-    // won't be serialized out, and this API returns None
-    pub fn get_target_data_from_json(&self) -> Option<&serde_json::Value> {
-        let val = &self.json["target_data"];
-        if !val.is_null() {
-            Some(&val)
-        } else {
-            None
-        }
-    }
-
-    /// Get target type from exported json file for this device
-    ///
-    pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
-        if let Ok(tgt) = self.get_target_from_json() {
-            Ok(tgt.tgt_type)
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
-    }
-
     fn store_queue_tid(&mut self, qid: u16, tid: i32) {
         self.queue_tids[qid as usize] = tid;
-    }
-
-    /// Configure queue affinity and record queue tid
-    ///
-    /// # Arguments:
-    ///
-    /// * `qid`: queue id
-    /// * `tid`: tid of the queue's pthread context
-    /// * `pthread_id`: pthread handle for setting affinity
-    ///
-    /// Note: this method has to be called in queue daemon context
-    pub fn configure_queue(&mut self, dev: &UblkDev, qid: u16, tid: i32) -> Result<i32, UblkError> {
-        self.store_queue_tid(qid, tid);
-
-        self.nr_queues_configured += 1;
-
-        if self.nr_queues_configured == self.dev_info.nr_hw_queues {
-            self.build_json(dev)?;
-        }
-
-        Ok(0)
     }
 
     fn dump_from_json(&self) {
@@ -495,61 +366,9 @@ impl UblkCtrl {
         println!("\ttarget_data {}", &json_value["target_data"]);
     }
 
-    /// Dump this device info
-    ///
-    /// The 1st part is from UblkCtrl.dev_info, and the 2nd part is
-    /// retrieved from device's exported json file
-    pub fn dump(&mut self) {
-        let mut p = sys::ublk_params {
-            ..Default::default()
-        };
-
-        if self.get_info().is_err() {
-            error!("Dump dev {} failed\n", self.dev_info.dev_id);
-            return;
-        }
-
-        if self.get_params(&mut p).is_err() {
-            error!("Dump dev {} failed\n", self.dev_info.dev_id);
-            return;
-        }
-
-        let info = &self.dev_info;
-        println!(
-            "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
-            info.dev_id,
-            info.nr_hw_queues,
-            info.queue_depth,
-            1 << p.basic.logical_bs_shift,
-            p.basic.dev_sectors
-        );
-        println!(
-            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}",
-            info.max_io_buf_bytes,
-            info.ublksrv_pid,
-            info.flags,
-            self.dev_state_desc()
-        );
-        println!(
-            "\tublkc: {}:{} ublkb: {}:{} owner: {}:{}",
-            p.devt.char_major,
-            p.devt.char_minor,
-            p.devt.disk_major,
-            p.devt.disk_minor,
-            info.owner_uid,
-            info.owner_gid
-        );
-
-        self.dump_from_json();
-    }
-
-    pub fn run_dir() -> String {
-        format!("{}/ublk", std::env::temp_dir().display())
-    }
-
     /// Returned path of this device's exported json file
     ///
-    pub fn run_path(&self) -> String {
+    fn run_path(&self) -> String {
         format!("{}/{:04}.json", UblkCtrl::run_dir(), self.dev_info.dev_id)
     }
 
@@ -677,22 +496,6 @@ impl UblkCtrl {
         self.ublk_ctrl_cmd(&data)
     }
 
-    /// Remove this device and its exported json file
-    ///
-    /// Called when the user wants to remove one device really
-    ///
-    /// Be careful, this interface may cause deadlock if the
-    /// for-add control device is live, and it is always safe
-    /// to kill device via .kill_dev().
-    ///
-    pub fn del_dev(&mut self) -> Result<i32, UblkError> {
-        self.del()?;
-        if Path::new(&self.run_path()).exists() {
-            fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
-        }
-        Ok(0)
-    }
-
     fn __get_features(&mut self) -> Result<u64, UblkError> {
         let features = 0_u64;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
@@ -708,17 +511,7 @@ impl UblkCtrl {
         Ok(features)
     }
 
-    /// Retrieving supported UBLK FEATURES from ublk driver
-    ///
-    /// Supported since linux kernel v6.5
-    pub fn get_features() -> Option<u64> {
-        match Self::new(-1, 0, 0, 0, 0, 0, 0) {
-            Ok(ctrl) => ctrl.get_driver_features(),
-            _ => None,
-        }
-    }
-
-    fn __get_info(&mut self) -> Result<i32, UblkError> {
+    fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_DEV_INFO,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
@@ -730,7 +523,7 @@ impl UblkCtrl {
         self.ublk_ctrl_cmd(&data)
     }
 
-    fn __get_info2(&mut self) -> Result<i32, UblkError> {
+    fn __read_dev_info2(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_DEV_INFO2,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
@@ -742,13 +535,11 @@ impl UblkCtrl {
         self.ublk_ctrl_cmd(&data)
     }
 
-    /// Retrieving device info from ublk driver
-    ///
-    pub fn get_info(&mut self) -> Result<i32, UblkError> {
-        let res = self.__get_info2();
+    fn read_dev_info(&mut self) -> Result<i32, UblkError> {
+        let res = self.__read_dev_info2();
 
         if res.is_err() {
-            self.__get_info()
+            self.__read_dev_info()
         } else {
             res
         }
@@ -778,23 +569,11 @@ impl UblkCtrl {
         self.ublk_ctrl_cmd(&data)
     }
 
-    /// Kill this device
-    ///
-    /// Preferred method for target code to stop & delete device,
-    /// which is safe and can avoid deadlock.
-    ///
-    /// But device may not be really removed yet, and the device ID
-    /// can still be in-use after kill_dev() returns.
-    ///
-    pub fn kill_dev(&mut self) -> Result<i32, UblkError> {
-        self.stop()
-    }
-
     /// Retrieve this device's parameter from ublk driver by
     /// sending command
     ///
     /// Can't pass params by reference(&mut), why?
-    pub fn get_params(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
+    fn get_params(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         params.len = core::mem::size_of::<sys::ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_PARAMS,
@@ -811,7 +590,7 @@ impl UblkCtrl {
     ///
     /// Note: device parameter has to send to driver before starting
     /// this device
-    pub fn set_params(&mut self, params: &sys::ublk_params) -> Result<i32, UblkError> {
+    fn set_params(&mut self, params: &sys::ublk_params) -> Result<i32, UblkError> {
         let mut p = *params;
 
         p.len = core::mem::size_of::<sys::ublk_params>() as u32;
@@ -826,13 +605,7 @@ impl UblkCtrl {
         self.ublk_ctrl_cmd(&data)
     }
 
-    /// Retrieving the specified queue's affinity from ublk driver
-    ///
-    pub fn get_queue_affinity(
-        &mut self,
-        q: u32,
-        bm: &mut UblkQueueAffinity,
-    ) -> Result<i32, UblkError> {
+    fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: sys::UBLK_CMD_GET_QUEUE_AFFINITY,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA | CTRL_CMD_BUF_READ,
@@ -853,27 +626,6 @@ impl UblkCtrl {
         self.ublk_ctrl_cmd(&data)
     }
 
-    /// Start user recover for this device
-    ///
-    pub fn start_user_recover(&mut self) -> Result<i32, UblkError> {
-        let mut count = 0u32;
-        let unit = 100_u32;
-
-        loop {
-            let res = self.__start_user_recover();
-            if let Ok(r) = res {
-                if r == -libc::EBUSY {
-                    std::thread::sleep(std::time::Duration::from_millis(unit as u64));
-                    count += unit;
-                    if count < 30000 {
-                        continue;
-                    }
-                }
-            }
-            return res;
-        }
-    }
-
     /// End user recover for this device, do similar thing done in start_dev()
     ///
     fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
@@ -888,7 +640,7 @@ impl UblkCtrl {
     }
 
     fn prep_start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        self.get_info()?;
+        self.read_dev_info()?;
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
             return Ok(0);
         }
@@ -903,96 +655,6 @@ impl UblkCtrl {
         };
 
         Ok(0)
-    }
-
-    /// Start ublk device
-    ///
-    /// # Arguments:
-    ///
-    /// * `dev`: ublk device
-    ///
-    /// Send parameter to driver, and flush json to storage, finally
-    /// send START command
-    ///
-    pub fn start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        self.prep_start_dev(dev)?;
-
-        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
-            self.start(unsafe { libc::getpid() as i32 })
-        } else if self.for_recover_dev() {
-            self.end_user_recover(unsafe { libc::getpid() as i32 })
-        } else {
-            Err(crate::UblkError::OtherError(-libc::EINVAL))
-        }
-    }
-
-    /// submit starting of ublk device from queue daemon context
-    ///
-    /// # Arguments:
-    ///
-    /// * `dev`: ublk device
-    ///
-    /// Send parameter to driver, and flush json to storage, finally
-    /// submit START command
-    ///
-    /// When ublk driver handles START_DEV, ublk IO starts to come from
-    /// this kernel code path, such as, reading partition table, so we
-    /// have make io handler working before sending START_DEV to kernel
-    ///
-    /// This kind of usage should be avoided as far as possible, and it
-    /// is suggested to start device in one standalone & one-shot context.
-    ///
-    /// Temporary buffer is returned, and the buffer has to be freed after
-    /// start_dev is done.
-    ///
-    /// TODO: convert control path into async/.await. It shouldn't be hard,
-    /// everything can be done in one background task, and block_on() can
-    /// be added for this purpose. The main trouble is that almost every
-    /// methods of UblkCtrl need to be switched to async, and still not
-    /// confident for this kind of big change. The main use case is to
-    /// run everything(control & io) in single thread context.
-    ///
-    pub fn submit_start_dev(
-        &mut self,
-        dev: &UblkDev,
-    ) -> Result<(i32, (*mut u8, usize, usize)), UblkError> {
-        let mut data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: if self.for_recover_dev() {
-                sys::UBLK_CMD_END_USER_RECOVERY
-            } else {
-                sys::UBLK_CMD_START_DEV
-            },
-            flags: CTRL_CMD_HAS_DATA,
-            data: unsafe { libc::getpid() as u64 },
-            ..Default::default()
-        };
-
-        self.prep_start_dev(dev)?;
-
-        let old_buf = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_ctrl_cmd(&mut data, 0)?;
-
-        Ok((token, (old_buf as *mut u8, CTRL_UBLKC_PATH_MAX, 8)))
-    }
-
-    // poll the submitted start_dev
-    pub fn poll_start_dev(&mut self, token: i32) -> Result<i32, UblkError> {
-        self.poll_cmd(token)
-    }
-
-    /// Stop ublk device
-    ///
-    /// # Arguments:
-    ///
-    /// * `_dev`: ublk device
-    ///
-    /// Remove json export, and send stop command to control device
-    ///
-    pub fn stop_dev(&mut self, _dev: &UblkDev) -> Result<i32, UblkError> {
-        if self.for_add_dev() && Path::new(&self.run_path()).exists() {
-            fs::remove_file(self.run_path()).map_err(UblkError::OtherIOError)?;
-        }
-        self.stop()
     }
 
     fn set_path_permission(path: &Path, mode: u32) -> Result<i32, UblkError> {
@@ -1117,6 +779,428 @@ impl UblkCtrl {
     }
 }
 
+impl UblkCtrl {
+    /// char device and block device name may change according to system policy,
+    /// such udev may rename it in its own namespaces.
+    const CDEV_PATH: &'static str = "/dev/ublkc";
+    const BDEV_PATH: &'static str = "/dev/ublkb";
+
+    fn get_inner(&self) -> std::sync::RwLockReadGuard<UblkCtrlInner> {
+        self.inner.read().unwrap()
+    }
+
+    fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<UblkCtrlInner> {
+        self.inner.write().unwrap()
+    }
+
+    pub(crate) fn get_dev_flags(&self) -> u32 {
+        self.get_inner().dev_flags
+    }
+
+    /// New one ublk control device
+    ///
+    /// # Arguments:
+    ///
+    /// * `id`: device id, or let driver allocate one if -1 is passed
+    /// * `nr_queues`: how many hw queues allocated for this device
+    /// * `depth`: each hw queue's depth
+    /// * `io_buf_bytes`: max buf size for each IO
+    /// * `flags`: flags for setting ublk device
+    /// * `for_add`: is for adding new device
+    /// * `dev_flags`: global flags as userspace side feature, will be
+    ///     shared with UblkDev and UblkQueue
+    ///
+    /// ublk control device is for sending command to driver, and maintain
+    /// device exported json file, dump, or any misc management task.
+    ///
+    pub fn new(
+        id: i32,
+        nr_queues: u32,
+        depth: u32,
+        io_buf_bytes: u32,
+        flags: u64,
+        tgt_flags: u64,
+        dev_flags: u32,
+    ) -> Result<UblkCtrl, UblkError> {
+        let inner = RwLock::new(UblkCtrlInner::new(
+            id,
+            nr_queues,
+            depth,
+            io_buf_bytes,
+            flags,
+            tgt_flags,
+            dev_flags,
+        )?);
+
+        Ok(UblkCtrl { inner })
+    }
+
+    /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
+    /// and it can't be done for adding device
+    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
+        assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
+        assert!(id >= 0);
+        Self::new(id, 0, 0, 0, 0, 0, dev_flags)
+    }
+
+    /// Return current device info
+    pub fn dev_info(&self) -> sys::ublksrv_ctrl_dev_info {
+        self.get_inner().dev_info
+    }
+
+    // Return ublk_driver's features
+    //
+    // Target code may need to query driver features runtime, so
+    // cache it inside device
+    pub fn get_driver_features(&self) -> Option<u64> {
+        self.get_inner().features
+    }
+
+    /// Return ublk char device path
+    pub fn get_cdev_path(&self) -> String {
+        self.get_inner().get_cdev_path()
+    }
+
+    /// Return ublk block device path
+    pub fn get_bdev_path(&self) -> String {
+        format!("{}{}", Self::BDEV_PATH, self.get_inner().dev_info.dev_id)
+    }
+
+    /// Get queue's pthread id from exported json file for this device
+    ///
+    /// # Arguments:
+    ///
+    /// * `qid`: queue id
+    ///
+    pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
+        let ctrl = self.get_inner_mut();
+        let queues = &ctrl.json["queues"];
+        let queue = &queues[qid.to_string()];
+        let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
+
+        if let Ok(p) = this_queue {
+            Ok(p.tid as i32)
+        } else {
+            Err(UblkError::OtherError(-libc::EEXIST))
+        }
+    }
+
+    /// Get target flags from exported json file for this device
+    ///
+    pub fn get_target_flags_from_json(&self) -> Result<u32, UblkError> {
+        let ctrl = self.get_inner_mut();
+        let __tgt_flags = &ctrl.json["target_flags"];
+        let tgt_flags: Result<u32, _> = serde_json::from_value(__tgt_flags.clone());
+
+        if let Ok(flags) = tgt_flags {
+            Ok(flags)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Get target from exported json file for this device
+    ///
+    pub fn get_target_from_json(&self) -> Result<super::io::UblkTgt, UblkError> {
+        let tgt_val = &self.get_inner().json["target"];
+        let tgt: Result<super::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
+        if let Ok(p) = tgt {
+            Ok(p)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    // Return target json data
+    //
+    // Should only be called after device is started, otherwise target data
+    // won't be serialized out, and this API returns None
+    pub fn get_target_data_from_json(&self) -> Option<serde_json::Value> {
+        let val = &self.get_inner().json["target_data"];
+        if !val.is_null() {
+            Some(val.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get target type from exported json file for this device
+    ///
+    pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
+        if let Ok(tgt) = self.get_target_from_json() {
+            Ok(tgt.tgt_type)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Configure queue affinity and record queue tid
+    ///
+    /// # Arguments:
+    ///
+    /// * `qid`: queue id
+    /// * `tid`: tid of the queue's pthread context
+    /// * `pthread_id`: pthread handle for setting affinity
+    ///
+    /// Note: this method has to be called in queue daemon context
+    pub fn configure_queue(&self, dev: &UblkDev, qid: u16, tid: i32) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+
+        ctrl.store_queue_tid(qid, tid);
+
+        ctrl.nr_queues_configured += 1;
+
+        if ctrl.nr_queues_configured == ctrl.dev_info.nr_hw_queues {
+            ctrl.build_json(dev)?;
+        }
+
+        Ok(0)
+    }
+
+    /// Dump this device info
+    ///
+    /// The 1st part is from UblkCtrl.dev_info, and the 2nd part is
+    /// retrieved from device's exported json file
+    pub fn dump(&self) {
+        let mut ctrl = self.get_inner_mut();
+        let mut p = sys::ublk_params {
+            ..Default::default()
+        };
+
+        if ctrl.read_dev_info().is_err() {
+            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
+            return;
+        }
+
+        if ctrl.get_params(&mut p).is_err() {
+            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
+            return;
+        }
+
+        let info = &ctrl.dev_info;
+        println!(
+            "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
+            info.dev_id,
+            info.nr_hw_queues,
+            info.queue_depth,
+            1 << p.basic.logical_bs_shift,
+            p.basic.dev_sectors
+        );
+        println!(
+            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}",
+            info.max_io_buf_bytes,
+            info.ublksrv_pid,
+            info.flags,
+            ctrl.dev_state_desc()
+        );
+        println!(
+            "\tublkc: {}:{} ublkb: {}:{} owner: {}:{}",
+            p.devt.char_major,
+            p.devt.char_minor,
+            p.devt.disk_major,
+            p.devt.disk_minor,
+            info.owner_uid,
+            info.owner_gid
+        );
+
+        ctrl.dump_from_json();
+    }
+
+    pub fn run_dir() -> String {
+        format!("{}/ublk", std::env::temp_dir().display())
+    }
+
+    /// Returned path of this device's exported json file
+    ///
+    pub fn run_path(&self) -> String {
+        self.get_inner().run_path()
+    }
+
+    /// Retrieving supported UBLK FEATURES from ublk driver
+    ///
+    /// Supported since linux kernel v6.5
+    pub fn get_features() -> Option<u64> {
+        match Self::new(-1, 0, 0, 0, 0, 0, 0) {
+            Ok(ctrl) => ctrl.get_driver_features(),
+            _ => None,
+        }
+    }
+
+    /// Retrieving device info from ublk driver
+    ///
+    pub fn read_dev_info(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().read_dev_info()
+    }
+
+    /// Retrieve this device's parameter from ublk driver by
+    /// sending command
+    ///
+    /// Can't pass params by reference(&mut), why?
+    pub fn get_params(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
+        self.get_inner_mut().get_params(params)
+    }
+
+    /// Send this device's parameter to ublk driver
+    ///
+    /// Note: device parameter has to send to driver before starting
+    /// this device
+    pub fn set_params(&self, params: &sys::ublk_params) -> Result<i32, UblkError> {
+        self.get_inner_mut().set_params(params)
+    }
+
+    /// Retrieving the specified queue's affinity from ublk driver
+    ///
+    pub fn get_queue_affinity(&self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
+        self.get_inner_mut().get_queue_affinity(q, bm)
+    }
+
+    /// Start user recover for this device
+    ///
+    pub fn start_user_recover(&self) -> Result<i32, UblkError> {
+        let mut count = 0u32;
+        let unit = 100_u32;
+
+        loop {
+            let res = self.get_inner_mut().__start_user_recover();
+            if let Ok(r) = res {
+                if r == -libc::EBUSY {
+                    std::thread::sleep(std::time::Duration::from_millis(unit as u64));
+                    count += unit;
+                    if count < 30000 {
+                        continue;
+                    }
+                }
+            }
+            return res;
+        }
+    }
+
+    /// Start ublk device
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: ublk device
+    ///
+    /// Send parameter to driver, and flush json to storage, finally
+    /// send START command
+    ///
+    pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+        ctrl.prep_start_dev(dev)?;
+
+        if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            ctrl.start(unsafe { libc::getpid() as i32 })
+        } else if ctrl.for_recover_dev() {
+            ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
+        } else {
+            Err(crate::UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// submit starting of ublk device from queue daemon context
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: ublk device
+    ///
+    /// Send parameter to driver, and flush json to storage, finally
+    /// submit START command
+    ///
+    /// When ublk driver handles START_DEV, ublk IO starts to come from
+    /// this kernel code path, such as, reading partition table, so we
+    /// have make io handler working before sending START_DEV to kernel
+    ///
+    /// This kind of usage should be avoided as far as possible, and it
+    /// is suggested to start device in one standalone & one-shot context.
+    ///
+    /// Temporary buffer is returned, and the buffer has to be freed after
+    /// start_dev is done.
+    ///
+    /// TODO: convert control path into async/.await. It shouldn't be hard,
+    /// everything can be done in one background task, and block_on() can
+    /// be added for this purpose. The main trouble is that almost every
+    /// methods of UblkCtrl need to be switched to async, and still not
+    /// confident for this kind of big change. The main use case is to
+    /// run everything(control & io) in single thread context.
+    ///
+    pub fn submit_start_dev(
+        &self,
+        dev: &UblkDev,
+    ) -> Result<(i32, (*mut u8, usize, usize)), UblkError> {
+        let mut ctrl = self.get_inner_mut();
+        let mut data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: if ctrl.for_recover_dev() {
+                sys::UBLK_CMD_END_USER_RECOVERY
+            } else {
+                sys::UBLK_CMD_START_DEV
+            },
+            flags: CTRL_CMD_HAS_DATA,
+            data: unsafe { libc::getpid() as u64 },
+            ..Default::default()
+        };
+
+        ctrl.prep_start_dev(dev)?;
+
+        let old_buf = data.prep_un_privileged_dev_path(&ctrl);
+        let token = ctrl.ublk_submit_ctrl_cmd(&mut data, 0)?;
+
+        Ok((token, (old_buf as *mut u8, CTRL_UBLKC_PATH_MAX, 8)))
+    }
+
+    // poll the submitted start_dev
+    pub fn poll_start_dev(&self, token: i32) -> Result<i32, UblkError> {
+        self.get_inner_mut().poll_cmd(token)
+    }
+
+    /// Stop ublk device
+    ///
+    /// # Arguments:
+    ///
+    /// * `_dev`: ublk device
+    ///
+    /// Remove json export, and send stop command to control device
+    ///
+    pub fn stop_dev(&self, _dev: &UblkDev) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+        let rp = ctrl.run_path();
+
+        if ctrl.for_add_dev() && Path::new(&rp).exists() {
+            fs::remove_file(rp).map_err(UblkError::OtherIOError)?;
+        }
+        ctrl.stop()
+    }
+
+    /// Kill this device
+    ///
+    /// Preferred method for target code to stop & delete device,
+    /// which is safe and can avoid deadlock.
+    ///
+    /// But device may not be really removed yet, and the device ID
+    /// can still be in-use after kill_dev() returns.
+    ///
+    pub fn kill_dev(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().stop()
+    }
+
+    /// Remove this device and its exported json file
+    ///
+    /// Called when the user wants to remove one device really
+    ///
+    /// Be careful, this interface may cause deadlock if the
+    /// for-add control device is live, and it is always safe
+    /// to kill device via .kill_dev().
+    ///
+    pub fn del_dev(&self) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+
+        ctrl.del()?;
+        if Path::new(&ctrl.run_path()).exists() {
+            fs::remove_file(ctrl.run_path()).map_err(UblkError::OtherIOError)?;
+        }
+        Ok(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::dev_flags::*;
@@ -1179,6 +1263,6 @@ mod tests {
         assert!(ctrl.get_target_data_from_json().is_none());
         assert!(dev.get_target_json().is_some());
         assert!(dev.dev_info.ublksrv_flags == 0xbeef as u64);
-        assert!(ctrl.dev_info.ublksrv_flags == 0xbeef as u64);
+        assert!(ctrl.dev_info().ublksrv_flags == 0xbeef as u64);
     }
 }
