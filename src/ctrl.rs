@@ -1154,13 +1154,9 @@ impl UblkCtrl {
 
     /// Stop ublk device
     ///
-    /// # Arguments:
-    ///
-    /// * `_dev`: ublk device
-    ///
     /// Remove json export, and send stop command to control device
     ///
-    pub fn stop_dev(&self, _dev: &UblkDev) -> Result<i32, UblkError> {
+    pub fn stop_dev(&self) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
         let rp = ctrl.run_path();
 

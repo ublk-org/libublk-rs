@@ -297,7 +297,7 @@ impl UblkSession {
 
         //device may be deleted from another context, so it is normal
         //to see -ENOENT failure here
-        let _ = ctrl.stop_dev(dev);
+        let _ = ctrl.stop_dev();
 
         Ok(0)
     }
