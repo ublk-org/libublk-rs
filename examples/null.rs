@@ -71,8 +71,8 @@ fn __test_add(
             dev.set_default_params(250_u64 << 30);
             Ok(0)
         };
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+        let ctrl = sess.create_ctrl_dev().unwrap();
+        let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
         // queue level logic
         let q_sync_handler = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
@@ -138,9 +138,11 @@ fn __test_add(
 
         // Now start this ublk target
         if aio {
-            sess.run_target(&ctrl, &dev, q_async_handler, wh).unwrap();
+            sess.run_target(&ctrl, tgt_init, q_async_handler, wh)
+                .unwrap();
         } else {
-            sess.run_target(&ctrl, &dev, q_sync_handler, wh).unwrap();
+            sess.run_target(&ctrl, tgt_init, q_sync_handler, wh)
+                .unwrap();
         }
     }
 }

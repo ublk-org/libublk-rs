@@ -319,7 +319,7 @@ fn __test_add(
             .unwrap();
 
         let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, split);
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = smol::LocalExecutor::new();
@@ -377,9 +377,9 @@ fn __test_add(
             }
         };
         if aio {
-            sess.run_target(&ctrl, &dev, q_async_fn, wh).unwrap();
+            sess.run_target(&ctrl, tgt_init, q_async_fn, wh).unwrap();
         } else {
-            sess.run_target(&ctrl, &dev, q_sync_fn, wh).unwrap();
+            sess.run_target(&ctrl, tgt_init, q_sync_fn, wh).unwrap();
         }
     }
 }

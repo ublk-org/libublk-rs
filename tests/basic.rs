@@ -62,12 +62,12 @@ mod integration {
             Ok(0)
         };
 
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_fn = move |qid: u16, _dev: &UblkDev| {
             q_handler(qid, _dev);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
+        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             run_ublk_disk_sanity_test(ctrl, dev_flags);
             read_ublk_disk(ctrl);
 
@@ -166,7 +166,7 @@ mod integration {
         let dev_data = Arc::new(Mutex::new(DevData { done: 0 }));
         let wh_dev_data = dev_data.clone();
 
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let ctrl = sess.create_ctrl_dev().unwrap();
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
         let q_fn = move |qid: u16, dev: &UblkDev| {
@@ -209,7 +209,7 @@ mod integration {
         };
 
         // kick off our targets
-        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
+        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             // run sanity and disk IO test after ublk disk is ready
             run_ublk_disk_sanity_test(ctrl, dev_flags);
             read_ublk_disk(ctrl);
@@ -302,7 +302,7 @@ mod integration {
             Ok(0)
         };
 
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
@@ -321,7 +321,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
+        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             __test_ublk_ramdisk(ctrl, dev_flags);
         })
         .unwrap();

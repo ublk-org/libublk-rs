@@ -1257,7 +1257,8 @@ mod tests {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(0)
         };
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let ctrl = sess.create_ctrl_dev().unwrap();
+        let dev = UblkDev::new(sess.name(), tgt_init, &ctrl).unwrap();
 
         //not built & flushed out yet
         assert!(ctrl.get_target_data_from_json().is_none());

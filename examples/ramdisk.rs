@@ -10,6 +10,7 @@ use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_wake_task;
 use libublk::{ctrl::UblkCtrl, UblkError};
 use std::rc::Rc;
+use std::sync::Arc;
 
 fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
@@ -64,7 +65,8 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
         dev.set_default_params(size);
         Ok(0)
     };
-    let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+    let ctrl = sess.create_ctrl_dev().unwrap();
+    let dev = Arc::new(UblkDev::new(sess.name(), tgt_init, &ctrl).unwrap());
 
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();

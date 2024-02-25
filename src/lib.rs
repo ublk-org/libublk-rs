@@ -160,6 +160,9 @@ pub struct UblkSession {
 }
 
 impl UblkSession {
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
     // iterator over each ublk device ID
     pub fn for_each_dev_id<T>(ops: T)
     where
@@ -183,14 +186,8 @@ impl UblkSession {
 
     /// create one pair of ublk devices, the 1st one is control device(`UblkCtrl`),
     /// and the 2nd one is data device(`UblkDev`)
-    pub fn create_devices<T>(
-        &self,
-        tgt_fn: T,
-    ) -> Result<(ctrl::UblkCtrl, Arc<io::UblkDev>), UblkError>
-    where
-        T: FnOnce(&mut io::UblkDev) -> Result<i32, UblkError>,
-    {
-        let ctrl = ctrl::UblkCtrl::new(
+    pub fn create_ctrl_dev(&self) -> Result<ctrl::UblkCtrl, UblkError> {
+        Ok(ctrl::UblkCtrl::new(
             self.id,
             self.nr_queues,
             self.depth,
@@ -198,11 +195,7 @@ impl UblkSession {
             self.ctrl_flags,
             self.ctrl_target_flags,
             self.dev_flags,
-        )?;
-
-        let dev = Arc::new(io::UblkDev::new(self.name.clone(), tgt_fn, &ctrl)?);
-
-        Ok((ctrl, dev))
+        )?)
     }
 
     fn create_queue_handlers<Q>(
@@ -277,17 +270,19 @@ impl UblkSession {
     /// This one is the preferred interface for creating ublk daemon, and
     /// is friendly for user, such as, user can customize queue setup and
     /// io handler, such as setup async/await for handling io command.
-    pub fn run_target<Q, W>(
+    pub fn run_target<T, Q, W>(
         &self,
         ctrl: &ctrl::UblkCtrl,
-        dev: &Arc<io::UblkDev>,
+        tgt_fn: T,
         q_fn: Q,
         device_fn: W,
     ) -> Result<i32, UblkError>
     where
+        T: FnOnce(&mut io::UblkDev) -> Result<i32, UblkError>,
         Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
         W: FnOnce(&ctrl::UblkCtrl) + Send + Sync + 'static,
     {
+        let dev = &Arc::new(io::UblkDev::new(self.name(), tgt_fn, &ctrl)?);
         let handles = self.create_queue_handlers(ctrl, dev, q_fn);
 
         ctrl.start_dev(dev)?;
@@ -349,7 +344,7 @@ mod libublk {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(0)
         };
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
@@ -370,7 +365,7 @@ mod libublk {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
+        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             w_fn(ctrl);
         })
         .unwrap();

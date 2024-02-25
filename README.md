@@ -24,21 +24,57 @@ Follows one totally working 2-queue ublk-null target which is built over
 libublk 0.1, and each queue depth is 64, and each IO\'s max buffer size
 is 512KB.
 
-To use `libublk` crate, first add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-libublk = "0.2"
-```
-
-Next we can start using `libublk` crate.
-The following is quick introduction for creating one ublk-null target,
-and ublk block device(/dev/ublkbN) will be created after the code is
-run. And the device will be deleted after terminating this process
-by ctrl+C.
+Ublk block device(/dev/ublkbN) is created after the code is run. And the
+device will be deleted after terminating this process by ctrl+C.
 
 ``` rust
 use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkQueue};
+
+// async/.await IO handling
+async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+    (q.get_iod(tag).nr_sectors << 9) as i32
+}
+
+// implement whole ublk IO level protocol
+async fn io_task(q: &UblkQueue<'_>, tag: u16) {
+    // IO buffer for exchange data with /dev/ublkbN
+    let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
+    let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
+    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+    let mut res = 0;
+
+    // Register IO buffer, so that buffer pages can be discarded
+    // when queue becomes idle
+    q.register_io_buf(tag, &buf);
+    loop {
+        // Complete previous command with result and re-submit
+        // IO command for fetching new IO request from /dev/ublkbN
+        res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+        if res == libublk::sys::UBLK_IO_RES_ABORT {
+            break;
+        }
+
+        // Handle this incoming IO command
+        res = handle_io_cmd(&q, tag).await;
+        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+    }
+}
+
+fn q_fn(qid: u16, dev: &UblkDev) {
+    let q_rc = std::rc::Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+    let exe = smol::LocalExecutor::new();
+    let mut f_vec = Vec::new();
+
+    for tag in 0..dev.dev_info.queue_depth {
+        let q = q_rc.clone();
+
+        f_vec.push(exe.spawn(async move { io_task(&q, tag).await }));
+    }
+
+    // Drive smol executor, won't exit until queue is dead
+    libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exe);
+    smol::block_on(async { futures::future::join_all(f_vec).await });
+}
 
 fn main() {
     // Create ublk device
@@ -53,66 +89,24 @@ fn main() {
         dev.set_default_params(250_u64 << 30);
         Ok(0)
     };
-    let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-
-    // Queue handler implements whole IO logic
-    let q_handler = move |qid: u16, dev: &UblkDev| {
-        let q_rc = std::rc::Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-        let exe = smol::LocalExecutor::new();
-        let mut f_vec = Vec::new();
-
-        // async/.await IO handling
-        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
-            (q.get_iod(tag).nr_sectors << 9) as i32
-        }
-
-        for tag in 0..dev.dev_info.queue_depth {
-            let q = q_rc.clone();
-            let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
-
-            f_vec.push(exe.spawn(async move {
-                // IO buffer for exchange data with /dev/ublkbN
-                let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
-                let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
-                let mut res = 0;
-
-                // Register IO buffer, so that buffer pages can be discarded
-                // when queue becomes idle
-                q.register_io_buf(tag, &buf);
-                loop {
-                    // Complete previous command with result and re-submit
-                    // IO command for fetching new IO request from /dev/ublkbN
-                    res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
-                    if res == libublk::sys::UBLK_IO_RES_ABORT {
-                        break;
-                    }
-
-                    // Handle this incoming IO command
-                    res = handle_io_cmd(&q, tag).await;
-                    cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
-                }
-            }));
-        }
-
-        // Drive smol executor, won't exit until queue is dead
-        libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exe);
-        smol::block_on(async { futures::future::join_all(f_vec).await });
-    };
-
-    let ctrl_a = std::sync::Arc::new(ctrl);
+    let ctrl = std::sync::Arc::new(sess.create_ctrl_dev().unwrap());
 
     // Kill ublk device by handling "Ctrl + c"
-    let ctrl_clone = ctrl_a.clone();
+    let ctrl_sig = ctrl.clone();
     let _ = ctrlc::set_handler(move || {
-        ctrl_clone.kill_dev().unwrap();
+        ctrl_sig.kill_dev().unwrap();
     });
 
     // Now start this ublk target
-    sess.run_target(&ctrl_a.clone(), &dev, q_handler, move |ctrl: &UblkCtrl| {
-        ctrl.dump();
+    sess.run_target(&ctrl, tgt_init, q_fn, |dev: &UblkCtrl| {
+        dev.dump();
     })
     .unwrap();
-    drop(dev);
+
+    // Usually device is deleted automatically when `ctrl` drops, but
+    // here `ctrl` is leaked by the global sig handler closure actually,
+    // so we have to delete it explicitly
+    ctrl.del_dev().unwrap();
 }
 ```
 
