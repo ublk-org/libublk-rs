@@ -36,8 +36,7 @@ mod integration {
         assert!((permissions.mode() & 0o777) == 0o700);
     }
 
-    fn read_ublk_disk(dev_id: i32) {
-        let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+    fn read_ublk_disk(ctrl: &UblkCtrl) {
         let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
         let if_dev = format!("if={}", &dev_path);
@@ -68,11 +67,9 @@ mod integration {
             q_handler(qid, _dev);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-
-            run_ublk_disk_sanity_test(&ctrl, dev_flags);
-            read_ublk_disk(dev_id);
+        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl);
 
             ctrl.kill_dev().unwrap();
         })
@@ -212,12 +209,10 @@ mod integration {
         };
 
         // kick off our targets
-        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-
+        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
             // run sanity and disk IO test after ublk disk is ready
-            run_ublk_disk_sanity_test(&ctrl, dev_flags);
-            read_ublk_disk(dev_id);
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl);
 
             {
                 let guard = wh_dev_data.lock().unwrap();
@@ -266,8 +261,7 @@ mod integration {
             q.complete_io_cmd(tag, buf_addr, res);
         }
 
-        fn __test_ublk_ramdisk(dev_id: i32, dev_flags: u32) {
-            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+        fn __test_ublk_ramdisk(ctrl: &UblkCtrl, dev_flags: u32) {
             let dev_path = ctrl.get_bdev_path();
 
             run_ublk_disk_sanity_test(&ctrl, dev_flags);
@@ -327,8 +321,8 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
-            __test_ublk_ramdisk(dev_id, dev_flags);
+        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
+            __test_ublk_ramdisk(ctrl, dev_flags);
         })
         .unwrap();
     }

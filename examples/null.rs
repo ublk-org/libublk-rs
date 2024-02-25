@@ -129,25 +129,18 @@ fn __test_add(
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
+        let wh = move |d_ctrl: &UblkCtrl| {
+            d_ctrl.dump();
+            if oneshot {
+                d_ctrl.kill_dev().unwrap();
+            }
+        };
+
+        // Now start this ublk target
         if aio {
-            // Now start this ublk target
-            sess.run_target(&ctrl, &dev, q_async_handler, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            sess.run_target(&ctrl, &dev, q_async_handler, wh).unwrap();
         } else {
-            sess.run_target(&ctrl, &dev, q_sync_handler, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            sess.run_target(&ctrl, &dev, q_sync_handler, wh).unwrap();
         }
     }
 }

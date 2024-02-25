@@ -41,16 +41,6 @@ by ctrl+C.
 use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkQueue};
 
 fn main() {
-    // Kill ublk device by handling "Ctrl + c"
-    let g_dev_id = std::sync::Arc::new(std::sync::Mutex::new(-1));
-    let dev_id_sig = g_dev_id.clone();
-    let _ = ctrlc::set_handler(move || {
-        let dev_id = *dev_id_sig.lock().unwrap();
-        if dev_id >= 0 {
-            UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
-        }
-    });
-
     // Create ublk device
     let sess = libublk::UblkSessionBuilder::default()
         .name("async_null")
@@ -109,13 +99,20 @@ fn main() {
         smol::block_on(async { futures::future::join_all(f_vec).await });
     };
 
+    let ctrl_a = std::sync::Arc::new(ctrl);
+
+    // Kill ublk device by handling "Ctrl + c"
+    let ctrl_clone = ctrl_a.clone();
+    let _ = ctrlc::set_handler(move || {
+        ctrl_clone.kill_dev().unwrap();
+    });
+
     // Now start this ublk target
-    let dev_id_wh = g_dev_id.clone();
-    sess.run_target(&ctrl, &dev, q_handler, move |dev_id| {
-        UblkCtrl::new_simple(dev_id, 0).unwrap().dump();
-        *dev_id_wh.lock().unwrap() = dev_id;
+    sess.run_target(&ctrl_a.clone(), &dev, q_handler, move |ctrl: &UblkCtrl| {
+        ctrl.dump();
     })
     .unwrap();
+    drop(dev);
 }
 ```
 

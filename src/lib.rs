@@ -286,14 +286,13 @@ impl UblkSession {
     ) -> Result<i32, UblkError>
     where
         Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
-        W: FnOnce(i32) + Send + Sync + 'static,
+        W: FnOnce(&ctrl::UblkCtrl) + Send + Sync + 'static,
     {
         let handles = self.create_queue_handlers(ctrl, dev, q_fn);
-        let dev_id = dev.dev_info.dev_id as i32;
 
         ctrl.start_dev(dev)?;
 
-        device_fn(dev_id);
+        device_fn(ctrl);
 
         for qh in handles {
             qh.join().unwrap_or_else(|_| {
@@ -335,7 +334,7 @@ mod libublk {
 
     fn __test_ublk_session<T>(w_fn: T) -> String
     where
-        T: Fn(i32) + Send + Sync + Clone + 'static,
+        T: Fn(&UblkCtrl) + Send + Sync + Clone + 'static,
     {
         let sess = UblkSessionBuilder::default()
             .name("null")
@@ -371,8 +370,8 @@ mod libublk {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
-            w_fn(dev_id);
+        sess.run_target(&ctrl, &dev, q_fn, move |ctrl: &UblkCtrl| {
+            w_fn(ctrl);
         })
         .unwrap();
 
@@ -389,9 +388,7 @@ mod libublk {
     /// APIs
     #[test]
     fn test_ublk_session() {
-        let cdev = __test_ublk_session(|dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-
+        let cdev = __test_ublk_session(|ctrl: &UblkCtrl| {
             assert!(ctrl.get_target_data_from_json().is_some());
             ctrl.kill_dev().unwrap();
         });
@@ -405,9 +402,9 @@ mod libublk {
     fn test_ublk_for_each_dev_id() {
         // Create one ublk device
         let handle = std::thread::spawn(|| {
-            let cdev = __test_ublk_session(|dev_id| {
+            let cdev = __test_ublk_session(|ctrl: &UblkCtrl| {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
-                UblkCtrl::new_simple(dev_id, 0).unwrap().kill_dev().unwrap();
+                ctrl.kill_dev().unwrap();
             });
             // could be too strict because of udev
             assert!(Path::new(&cdev).exists() == false);

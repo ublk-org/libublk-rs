@@ -370,25 +370,16 @@ fn __test_add(
                 .wait_and_handle_io(lo_io_handler);
         };
 
+        let wh = move |d_ctrl: &UblkCtrl| {
+            d_ctrl.dump();
+            if oneshot {
+                d_ctrl.kill_dev().unwrap();
+            }
+        };
         if aio {
-            sess.run_target(&ctrl, &dev, q_async_fn, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            sess.run_target(&ctrl, &dev, q_async_fn, wh).unwrap();
         } else {
-            sess.run_target(&ctrl, &dev, q_sync_fn, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            sess.run_target(&ctrl, &dev, q_sync_fn, wh).unwrap();
         }
     }
 }
