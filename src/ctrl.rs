@@ -6,7 +6,7 @@ use derive_setters::*;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, RwLock};
 use std::{
     fs,
@@ -254,12 +254,6 @@ struct UblkCtrlInner {
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
     ring: IoUring<squeue::Entry128>,
-}
-
-impl AsRawFd for UblkCtrl {
-    fn as_raw_fd(&self) -> RawFd {
-        self.get_inner_mut().ring.as_raw_fd()
-    }
 }
 
 impl Drop for UblkCtrlInner {
