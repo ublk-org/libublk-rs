@@ -57,11 +57,11 @@ fn __test_add(
     let aio = flags.intersects(NullFlags::ASYNC);
     let oneshot = flags.intersects(NullFlags::ONESHOT);
     {
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
             .name("example_null")
             .id(id)
-            .depth(depth)
-            .nr_queues(nr_queues)
+            .depth(depth.try_into().unwrap())
+            .nr_queues(nr_queues.try_into().unwrap())
             .io_buf_bytes(buf_size)
             .ctrl_flags(ctrl_flags)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
@@ -71,7 +71,6 @@ fn __test_add(
             dev.set_default_params(250_u64 << 30);
             Ok(0)
         };
-        let ctrl = sess.create_ctrl_dev().unwrap();
         let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
         // queue level logic
         let q_sync_handler = move |qid: u16, dev: &UblkDev| {

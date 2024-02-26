@@ -5,8 +5,7 @@ mod integration {
     use libublk::helpers::IoBuf;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     use libublk::uring_async::ublk_wait_and_handle_ios;
-    use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
-    use libublk::{sys, UblkSessionBuilder};
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkError, UblkIORes};
     use std::env;
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -49,12 +48,11 @@ mod integration {
     }
 
     fn __test_ublk_null(dev_flags: u32, q_handler: fn(u16, &UblkDev)) {
-        let sess = UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("null")
-            .depth(64_u32)
-            .nr_queues(2_u32)
+            .nr_queues(2)
             .dev_flags(dev_flags)
-            .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_COPY.into())
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
@@ -62,7 +60,6 @@ mod integration {
             Ok(0)
         };
 
-        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_fn = move |qid: u16, _dev: &UblkDev| {
             q_handler(qid, _dev);
         };
@@ -149,9 +146,9 @@ mod integration {
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
         let dev_flags = UBLK_DEV_F_ADD_DEV;
         let depth = 64_u16;
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("null")
-            .nr_queues(2_u16)
+            .nr_queues(2)
             .depth(depth)
             .id(-1)
             .dev_flags(dev_flags)
@@ -166,7 +163,6 @@ mod integration {
         let dev_data = Arc::new(Mutex::new(DevData { done: 0 }));
         let wh_dev_data = dev_data.clone();
 
-        let ctrl = sess.create_ctrl_dev().unwrap();
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
         let q_fn = move |qid: u16, dev: &UblkDev| {
@@ -289,11 +285,11 @@ mod integration {
         let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
         let dev_addr = buf.as_mut_ptr() as u64;
         let dev_flags = UBLK_DEV_F_ADD_DEV;
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("ramdisk")
             .id(-1)
-            .nr_queues(1_u16)
-            .depth(128_u16)
+            .nr_queues(1)
+            .depth(128)
             .dev_flags(dev_flags)
             .build()
             .unwrap();
@@ -302,7 +298,6 @@ mod integration {
             Ok(0)
         };
 
-        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();

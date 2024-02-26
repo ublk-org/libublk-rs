@@ -28,7 +28,7 @@ Ublk block device(/dev/ublkbN) is created after the code is run. And the
 device will be deleted after terminating this process by ctrl+C.
 
 ``` rust
-use libublk::{ctrl::UblkCtrl, io::UblkDev, io::UblkQueue};
+use libublk::{ctrl::UblkCtrlBuilder, io::UblkDev, io::UblkQueue};
 
 // async/.await IO handling
 async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
@@ -78,29 +78,32 @@ fn q_fn(qid: u16, dev: &UblkDev) {
 
 fn main() {
     // Create ublk device
-    let sess = libublk::UblkSessionBuilder::default()
-        .name("async_null")
-        .depth(64_u32)
-        .nr_queues(2_u32)
-        .dev_flags(libublk::dev_flags::UBLK_DEV_F_ADD_DEV)
-        .build()
-        .unwrap();
-    let tgt_init = |dev: &mut UblkDev| {
-        dev.set_default_params(250_u64 << 30);
-        Ok(0)
-    };
-    let ctrl = std::sync::Arc::new(sess.create_ctrl_dev().unwrap());
-
-    // Kill ublk device by handling "Ctrl + c"
+    let ctrl = std::sync::Arc::new(
+        UblkCtrlBuilder::default()
+            .name("async_null")
+            .nr_queues(2)
+            .dev_flags(libublk::dev_flags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap(),
+    );
+    // Kill ublk device by handling "Ctrl + C"
     let ctrl_sig = ctrl.clone();
     let _ = ctrlc::set_handler(move || {
         ctrl_sig.kill_dev().unwrap();
     });
 
     // Now start this ublk target
-    ctrl.run_target(tgt_init, q_fn, |dev: &UblkCtrl| {
-        dev.dump();
-    })
+    ctrl.run_target(
+        // target initialization
+        |dev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(0)
+        },
+        // queue IO logic
+        |tag, dev| q_fn(tag, dev),
+        // dump device after it is started
+        |dev| dev.dump(),
+    )
     .unwrap();
 
     // Usually device is deleted automatically when `ctrl` drops, but

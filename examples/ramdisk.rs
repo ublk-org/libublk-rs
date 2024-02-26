@@ -51,7 +51,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     };
 
     let depth = 128_u16;
-    let sess = libublk::UblkSessionBuilder::default()
+    let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name("example_ramdisk")
         .id(dev_id)
         .nr_queues(1_u16)
@@ -65,8 +65,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
         dev.set_default_params(size);
         Ok(0)
     };
-    let ctrl = sess.create_ctrl_dev().unwrap();
-    let dev = Arc::new(UblkDev::new(sess.name(), tgt_init, &ctrl).unwrap());
+    let dev = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
 
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();

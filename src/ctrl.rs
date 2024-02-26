@@ -1,6 +1,7 @@
 use super::io::{UblkDev, UblkTgt};
 use super::{dev_flags, sys, UblkError};
 use bitmaps::Bitmap;
+use derive_setters::*;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
@@ -151,6 +152,78 @@ struct QueueAffinityJson {
     affinity: Vec<u32>,
     qid: u32,
     tid: u32,
+}
+
+/// UblkSession: build one new ublk control device or recover the old one.
+///
+/// High level API.
+///
+/// One limit is that IO handling closure doesn't support FnMut, and low
+/// level API doesn't have such limit.
+///
+#[derive(Setters, Debug, PartialEq, Eq)]
+pub struct UblkCtrlBuilder<'a> {
+    /// target type, such as null, loop, ramdisk, or nbd,...
+    name: &'a str,
+
+    /// device id: -1 can only be used for adding one new device,
+    /// and ublk driver will allocate one new ID for the created device;
+    /// otherwise, we are asking driver to create or recover or list
+    /// one device with specified ID
+    id: i32,
+
+    /// how many queues
+    nr_queues: u16,
+
+    /// each queue's IO depth
+    depth: u16,
+
+    /// max size of each IO buffer size, which will be converted to
+    /// block layer's queue limit of max hw sectors
+    io_buf_bytes: u32,
+
+    /// passed to ublk driver via `sys::ublksrv_ctrl_dev_info.flags`,
+    /// usually for adding or recovering device
+    ctrl_flags: u64,
+
+    /// store target flags in `sys::ublksrv_ctrl_dev_info.ublksrv_flags`,
+    /// which is immutable in the whole device lifetime
+    ctrl_target_flags: u64,
+
+    /// libublk feature flags: UBLK_DEV_F_*
+    dev_flags: u32,
+}
+
+impl Default for UblkCtrlBuilder<'_> {
+    fn default() -> Self {
+        UblkCtrlBuilder {
+            name: "none",
+            id: -1,
+            nr_queues: 1,
+            depth: 64,
+            io_buf_bytes: 524288,
+            ctrl_flags: 0,
+            ctrl_target_flags: 0,
+            dev_flags: 0,
+        }
+    }
+}
+
+impl UblkCtrlBuilder<'_> {
+    /// create one pair of ublk devices, the 1st one is control device(`UblkCtrl`),
+    /// and the 2nd one is data device(`UblkDev`)
+    pub fn build(self) -> Result<UblkCtrl, UblkError> {
+        Ok(UblkCtrl::new(
+            Some(self.name.to_string()),
+            self.id,
+            self.nr_queues.into(),
+            self.depth.into(),
+            self.io_buf_bytes,
+            self.ctrl_flags,
+            self.ctrl_target_flags,
+            self.dev_flags,
+        )?)
+    }
 }
 
 /// ublk control device
@@ -1331,8 +1404,8 @@ impl UblkCtrl {
 #[cfg(test)]
 mod tests {
     use super::dev_flags::*;
+    use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
-    use crate::UblkSessionBuilder;
     use crate::{ctrl::UblkCtrl, UblkIORes};
     use std::cell::Cell;
     use std::path::Path;
@@ -1378,7 +1451,7 @@ mod tests {
 
     #[test]
     fn test_ublk_target_json() {
-        let sess = UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .ctrl_target_flags(0xbeef as u64)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
@@ -1390,8 +1463,7 @@ mod tests {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(0)
         };
-        let ctrl = sess.create_ctrl_dev().unwrap();
-        let dev = UblkDev::new(sess.name(), tgt_init, &ctrl).unwrap();
+        let dev = UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
 
         //not built & flushed out yet
         assert!(ctrl.get_target_data_from_json().is_none());
@@ -1404,10 +1476,10 @@ mod tests {
     where
         T: Fn(&UblkCtrl) + Send + Sync + Clone + 'static,
     {
-        let sess = UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("null")
-            .depth(16_u32)
-            .nr_queues(2_u32)
+            .depth(16_u16)
+            .nr_queues(2_u16)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
@@ -1417,7 +1489,6 @@ mod tests {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(0)
         };
-        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();

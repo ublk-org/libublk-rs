@@ -307,19 +307,18 @@ fn __test_add(
             direct_io: 1,
             back_file_path: backing_file.clone(),
         };
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
             .name("example_loop")
             .id(id)
             .ctrl_flags(ctrl_flags)
-            .nr_queues(nr_queues)
-            .depth(depth)
+            .nr_queues(nr_queues.try_into().unwrap())
+            .depth(depth.try_into().unwrap())
             .io_buf_bytes(buf_sz)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
         let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, split);
-        let ctrl = sess.create_ctrl_dev().unwrap();
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = smol::LocalExecutor::new();
