@@ -4,7 +4,7 @@ use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
+use libublk::{ctrl::UblkCtrl, UblkIORes};
 use std::rc::Rc;
 
 bitflags! {
@@ -285,7 +285,7 @@ fn main() {
                 .unwrap_or(-1);
             UblkCtrl::new_simple(id, 0).unwrap().del_dev().unwrap();
         }
-        Some(("list", _add_matches)) => UblkSession::for_each_dev_id(|dev_id| {
+        Some(("list", _add_matches)) => UblkCtrl::for_each_dev_id(|dev_id| {
             UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();
         }),
         _ => {

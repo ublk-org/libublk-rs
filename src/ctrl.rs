@@ -1305,13 +1305,38 @@ impl UblkCtrl {
 
         Ok(0)
     }
+
+    // iterator over each ublk device ID
+    pub fn for_each_dev_id<T>(ops: T)
+    where
+        T: Fn(u32) + Clone + 'static,
+    {
+        if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
+            for entry in entries.flatten() {
+                let f = entry.path();
+                if f.is_file() {
+                    if let Some(file_stem) = f.file_stem() {
+                        if let Some(stem) = file_stem.to_str() {
+                            if let Ok(num) = stem.parse::<u32>() {
+                                ops(num);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::dev_flags::*;
-    use crate::{ctrl::UblkCtrl, io::UblkDev, UblkSessionBuilder};
+    use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use crate::UblkSessionBuilder;
+    use crate::{ctrl::UblkCtrl, UblkIORes};
+    use std::cell::Cell;
     use std::path::Path;
+    use std::rc::Rc;
 
     #[test]
     fn test_ublk_get_features() {
@@ -1373,5 +1398,101 @@ mod tests {
         assert!(dev.get_target_json().is_some());
         assert!(dev.dev_info.ublksrv_flags == 0xbeef as u64);
         assert!(ctrl.dev_info().ublksrv_flags == 0xbeef as u64);
+    }
+
+    fn __test_ublk_session<T>(w_fn: T) -> String
+    where
+        T: Fn(&UblkCtrl) + Send + Sync + Clone + 'static,
+    {
+        let sess = UblkSessionBuilder::default()
+            .name("null")
+            .depth(16_u32)
+            .nr_queues(2_u32)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            dev.set_target_json(serde_json::json!({"null": "test_data" }));
+            Ok(0)
+        };
+        let ctrl = sess.create_ctrl_dev().unwrap();
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+            let bufs = bufs_rc.clone();
+
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = (iod.nr_sectors << 9) as i32;
+                let bufs = bufs_rc.clone();
+                let buf_addr = bufs[tag as usize].as_mut_ptr();
+
+                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+            };
+
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .regiser_io_bufs(Some(&bufs))
+                .submit_fetch_commands(Some(&bufs))
+                .wait_and_handle_io(io_handler);
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            w_fn(ctrl);
+        })
+        .unwrap();
+
+        // could be too strict because of udev
+        let bdev = ctrl.get_bdev_path();
+        assert!(Path::new(&bdev).exists() == false);
+
+        let cpath = ctrl.get_cdev_path();
+
+        cpath
+    }
+
+    /// Covers basic ublk device creation and destroying by UblkSession
+    /// APIs
+    #[test]
+    fn test_ublk_session() {
+        let cdev = __test_ublk_session(|ctrl: &UblkCtrl| {
+            assert!(ctrl.get_target_data_from_json().is_some());
+            ctrl.kill_dev().unwrap();
+        });
+
+        // could be too strict because of udev
+        assert!(Path::new(&cdev).exists() == false);
+    }
+    /// test for_each_dev_id
+    #[test]
+    fn test_ublk_for_each_dev_id() {
+        // Create one ublk device
+        let handle = std::thread::spawn(|| {
+            let cdev = __test_ublk_session(|ctrl: &UblkCtrl| {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                ctrl.kill_dev().unwrap();
+            });
+            // could be too strict because of udev
+            assert!(Path::new(&cdev).exists() == false);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let cnt_arc = Rc::new(Cell::new(0));
+        let cnt = cnt_arc.clone();
+
+        //count all existed ublk devices
+        UblkCtrl::for_each_dev_id(move |dev_id| {
+            let ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
+            cnt.set(cnt.get() + 1);
+
+            let dev_path = ctrl.get_cdev_path();
+            assert!(Path::new(&dev_path).exists() == true);
+        });
+
+        // we created one
+        assert!(cnt_arc.get() > 0);
+
+        handle.join().unwrap();
     }
 }
