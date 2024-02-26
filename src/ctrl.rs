@@ -486,7 +486,7 @@ impl UblkCtrlInner {
 
     fn ublk_submit_cmd(
         &mut self,
-        data: &mut UblkCtrlCmdData,
+        data: &UblkCtrlCmdData,
         to_wait: usize,
     ) -> Result<u64, UblkError> {
         let fd = self.file.as_raw_fd();
@@ -541,7 +541,7 @@ impl UblkCtrlInner {
         let to_wait = 1;
 
         let old_buf = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_cmd(&mut data, to_wait)?;
+        let token = self.ublk_submit_cmd(&data, to_wait)?;
         let res = self.poll_cmd(token);
 
         data.unprep_un_privileged_dev_path(self, old_buf);
