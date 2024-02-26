@@ -1,5 +1,5 @@
 use crate::io::UblkQueue;
-use io_uring::cqueue;
+use io_uring::{cqueue, squeue, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
 use std::{
@@ -91,6 +91,16 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
     })
 }
 
+fn ublk_try_reap_cqe<S: squeue::EntryMarker>(
+    ring: &mut IoUring<S>,
+    nr_waits: usize,
+) -> Option<cqueue::Entry> {
+    match ring.submit_and_wait(nr_waits) {
+        Err(_) => None,
+        _ => ring.completion().next(),
+    }
+}
+
 /// Run one task in this local Executor until the task is finished
 pub fn ublk_run_task<T>(
     q: &UblkQueue,
@@ -98,25 +108,16 @@ pub fn ublk_run_task<T>(
     task: &smol::Task<T>,
     nr_waits: usize,
 ) {
-    while exe.try_tick() {}
     while !task.is_finished() {
-        match q.q_ring.borrow().submit_and_wait(nr_waits) {
-            Err(_) => break,
-            _ => {}
-        }
-        let cqe = {
-            match q.q_ring.borrow_mut().completion().next() {
-                None => {
-                    exe.try_tick();
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-                Some(r) => r,
+        let entry = ublk_try_reap_cqe(&mut q.q_ring.borrow_mut(), nr_waits);
+
+        match entry {
+            Some(cqe) => {
+                ublk_wake_task(cqe.user_data(), &cqe);
+                while exe.try_tick() {}
             }
-        };
-        let user_data = cqe.user_data();
-        ublk_wake_task(user_data, &cqe);
-        while exe.try_tick() {}
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
     }
 }
 
