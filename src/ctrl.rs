@@ -453,7 +453,7 @@ impl UblkCtrlInner {
         fd: i32,
         dev_id: u32,
         data: &UblkCtrlCmdData,
-        token: i32,
+        token: u64,
     ) -> squeue::Entry128 {
         let cmd = sys::ublksrv_ctrl_cmd {
             addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
@@ -481,14 +481,14 @@ impl UblkCtrlInner {
         opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
             .cmd(unsafe { c_cmd.buf })
             .build()
-            .user_data(token as u64)
+            .user_data(token)
     }
 
     fn ublk_submit_cmd(
         &mut self,
         data: &mut UblkCtrlCmdData,
         to_wait: usize,
-    ) -> Result<i32, UblkError> {
+    ) -> Result<u64, UblkError> {
         let fd = self.file.as_raw_fd();
         let dev_id = self.dev_info.dev_id;
 
@@ -497,7 +497,7 @@ impl UblkCtrlInner {
         let token = {
             self.cmd_token += 1;
             self.cmd_token
-        };
+        } as u64;
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
         unsafe {
@@ -518,13 +518,13 @@ impl UblkCtrlInner {
     /// Note: so far, we only support to poll at most one-inflight
     /// command, and the use case is for supporting to run start_dev
     /// in queue io handling context
-    fn poll_cmd(&mut self, token: i32) -> Result<i32, UblkError> {
+    fn poll_cmd(&mut self, token: u64) -> Result<i32, UblkError> {
         if self.ring.completion().is_empty() {
             return Err(UblkError::UringIOError(-libc::EAGAIN));
         }
 
         let cqe = self.ring.completion().next().expect("cqueue is empty");
-        if cqe.user_data() != token as u64 {
+        if cqe.user_data() != token {
             return Err(UblkError::UringIOError(-libc::EAGAIN));
         }
 
@@ -1213,7 +1213,7 @@ impl UblkCtrl {
     pub fn submit_start_dev(
         &self,
         dev: &UblkDev,
-    ) -> Result<(i32, (*mut u8, usize, usize)), UblkError> {
+    ) -> Result<(u64, (*mut u8, usize, usize)), UblkError> {
         let mut ctrl = self.get_inner_mut();
         let mut data: UblkCtrlCmdData = UblkCtrlCmdData {
             cmd_op: if ctrl.for_recover_dev() {
@@ -1235,7 +1235,7 @@ impl UblkCtrl {
     }
 
     // poll the submitted start_dev
-    pub fn poll_start_dev(&self, token: i32) -> Result<i32, UblkError> {
+    pub fn poll_start_dev(&self, token: u64) -> Result<i32, UblkError> {
         self.get_inner_mut().poll_cmd(token)
     }
 
