@@ -1,4 +1,4 @@
-use io_uring::cqueue;
+use libublk::ctrl::UblkCtrl;
 ///! # Example of ramdisk
 ///
 /// Serves for covering recovery test[`test_ublk_ramdisk_recovery`],
@@ -7,10 +7,9 @@ use io_uring::cqueue;
 use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::ublk_wake_task;
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::uring_async::ublk_run_ctrl_task;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
@@ -51,15 +50,17 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     };
 
     let depth = 128_u16;
-    let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
-        .name("example_ramdisk")
-        .id(dev_id)
-        .nr_queues(1_u16)
-        .depth(depth)
-        .dev_flags(dev_flags)
-        .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
-        .build()
-        .unwrap();
+    let ctrl = Rc::new(
+        libublk::ctrl::UblkCtrlBuilder::default()
+            .name("example_ramdisk")
+            .id(dev_id)
+            .nr_queues(1_u16)
+            .depth(depth)
+            .dev_flags(dev_flags)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
+            .build()
+            .unwrap(),
+    );
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
@@ -67,6 +68,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     };
     let dev = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
 
+    let ctrl_exe = smol::LocalExecutor::new();
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
     let q_rc = Rc::new(UblkQueue::new(0, &dev).unwrap());
@@ -96,40 +98,27 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     ctrl.configure_queue(&dev, 0, unsafe { libc::gettid() })
         .unwrap();
 
-    let (token, buf) = ctrl.submit_start_dev(&dev).unwrap();
-    let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| ublk_wake_task(data, cqe);
+    let res = Rc::new(Mutex::new(0));
+    let ctrl_clone = ctrl.clone();
+    let dev_clone = dev.clone();
+    let res_clone = res.clone();
 
-    let res = loop {
-        let _ = q_rc.flush_and_wake_io_tasks(wake_handler, 0);
-        while exe.try_tick() {}
-        let _res = ctrl.poll_start_dev(token);
-        match _res {
-            Ok(res) => break Ok(res),
-            Err(UblkError::UringIOError(res)) => {
-                if res != -libc::EAGAIN {
-                    break Err(UblkError::UringIOError(res));
-                }
-            }
-            Err(r) => break Err(r),
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-    libublk::ublk_dealloc_buf(buf.0, buf.1, buf.2);
+    let task = ctrl_exe.spawn(async move {
+        let r = ctrl_clone.start_dev_async(&dev_clone).await;
 
-    match res {
-        Ok(res) if res >= 0 => {
-            ctrl.dump();
-            loop {
-                while exe.try_tick() {}
-                match q_rc.flush_and_wake_io_tasks(wake_handler, 1) {
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
-            smol::block_on(async { futures::future::join_all(f_vec).await });
-        }
-        _ => {}
-    };
+        let mut guard = res_clone.lock().unwrap();
+        *guard = r.unwrap();
+    });
+    ublk_run_ctrl_task(&ctrl_exe, &q_rc, &exe, &task);
+
+    if *res.lock().unwrap() >= 0 {
+        ctrl.dump();
+        libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exe);
+        smol::block_on(async { futures::future::join_all(f_vec).await });
+    } else {
+        eprintln!("device can't be started");
+    }
+
     //device may be deleted from another context, so it is normal
     //to see -ENOENT failure here
     let _ = ctrl.stop_dev();

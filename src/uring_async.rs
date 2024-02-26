@@ -1,4 +1,5 @@
 use crate::io::UblkQueue;
+use crate::UblkError;
 use io_uring::{cqueue, squeue, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
@@ -101,6 +102,20 @@ fn ublk_try_reap_cqe<S: squeue::EntryMarker>(
     }
 }
 
+fn ublk_process_queue_io(
+    q: &UblkQueue,
+    exe: &smol::LocalExecutor,
+    nr_waits: usize,
+) -> Result<i32, UblkError> {
+    let res = q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits);
+
+    if res.is_ok() {
+        while exe.try_tick() {}
+    }
+
+    res
+}
+
 /// Run one task in this local Executor until the task is finished
 pub fn ublk_run_task<T>(
     q: &UblkQueue,
@@ -109,14 +124,46 @@ pub fn ublk_run_task<T>(
     nr_waits: usize,
 ) {
     while !task.is_finished() {
-        let entry = ublk_try_reap_cqe(&mut q.q_ring.borrow_mut(), nr_waits);
+        let res = ublk_process_queue_io(q, exe, nr_waits);
 
-        match entry {
-            Some(cqe) => {
-                ublk_wake_task(cqe.user_data(), &cqe);
-                while exe.try_tick() {}
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        let wait = match res {
+            Ok(nr) if nr > 0 => false,
+            _ => false,
+        };
+        if wait {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// Run one task in this local Executor until the task is finished
+pub fn ublk_run_ctrl_task<T>(
+    ctrl_exe: &smol::LocalExecutor,
+    q: &UblkQueue,
+    q_exe: &smol::LocalExecutor,
+    task: &smol::Task<T>,
+) {
+    ctrl_exe.try_tick();
+    while !task.is_finished() {
+        let mut q_idle = false;
+        let mut ctrl_idle = false;
+
+        if ublk_process_queue_io(q, q_exe, 0).unwrap() == 0 {
+            q_idle = true;
+        }
+
+        let entry =
+            crate::ctrl::CTRL_URING.with(|refcell| ublk_try_reap_cqe(&mut refcell.borrow_mut(), 0));
+        if let Some(cqe) = entry {
+            ublk_wake_task(cqe.user_data(), &cqe);
+            while ctrl_exe.try_tick() {}
+        } else {
+            ctrl_idle = true;
+        }
+
+        // Fixme: switch to poll on the two FDs
+        if q_idle && ctrl_idle {
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
