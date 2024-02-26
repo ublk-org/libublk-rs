@@ -98,7 +98,7 @@ fn main() {
     });
 
     // Now start this ublk target
-    sess.run_target(&ctrl, tgt_init, q_fn, |dev: &UblkCtrl| {
+    ctrl.run_target(tgt_init, q_fn, |dev: &UblkCtrl| {
         dev.dump();
     })
     .unwrap();

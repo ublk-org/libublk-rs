@@ -138,11 +138,9 @@ fn __test_add(
 
         // Now start this ublk target
         if aio {
-            sess.run_target(&ctrl, tgt_init, q_async_handler, wh)
-                .unwrap();
+            ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
         } else {
-            sess.run_target(&ctrl, tgt_init, q_sync_handler, wh)
-                .unwrap();
+            ctrl.run_target(tgt_init, q_sync_handler, wh).unwrap();
         }
     }
 }

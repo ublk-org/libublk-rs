@@ -7,7 +7,6 @@
 
 use log::error;
 use std::alloc::{alloc, dealloc, Layout};
-use std::sync::Arc;
 
 pub mod ctrl;
 pub mod helpers;
@@ -198,110 +197,6 @@ impl UblkSession {
             self.dev_flags,
         )?)
     }
-
-    fn create_queue_handlers<Q>(
-        &self,
-        ctrl: &ctrl::UblkCtrl,
-        dev: &Arc<io::UblkDev>,
-        q_fn: Q,
-    ) -> Vec<std::thread::JoinHandle<()>>
-    where
-        Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
-    {
-        use std::sync::mpsc;
-
-        let mut q_threads = Vec::new();
-        let nr_queues = dev.dev_info.nr_hw_queues;
-
-        let (tx, rx) = mpsc::channel();
-
-        for q in 0..nr_queues {
-            let _dev = Arc::clone(dev);
-            let _tx = tx.clone();
-
-            let mut affinity = ctrl::UblkQueueAffinity::new();
-            ctrl.get_queue_affinity(q as u32, &mut affinity).unwrap();
-            let mut _q_fn = q_fn.clone();
-
-            q_threads.push(std::thread::spawn(move || {
-                //setup pthread affinity first, so that any allocation may
-                //be affine to cpu/memory
-                unsafe {
-                    libc::pthread_setaffinity_np(
-                        libc::pthread_self(),
-                        affinity.buf_len(),
-                        affinity.addr() as *const libc::cpu_set_t,
-                    );
-                }
-                _tx.send((q, unsafe { libc::gettid() })).unwrap();
-
-                unsafe {
-                    const PR_SET_IO_FLUSHER: i32 = 57; //include/uapi/linux/prctl.h
-                    libc::prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
-                };
-
-                _q_fn(q, &_dev);
-            }));
-        }
-
-        for _q in 0..nr_queues {
-            let (qid, tid) = rx.recv().unwrap();
-            if ctrl.configure_queue(dev, qid, tid).is_err() {
-                println!(
-                    "create_queue_handler: configure queue failed for {}-{}",
-                    dev.dev_info.dev_id, qid
-                );
-            }
-        }
-
-        q_threads
-    }
-
-    /// Run ublk daemon and kick off the ublk device, and `/dev/ublkbN` will be
-    /// created and visible to userspace.
-    ///
-    /// # Arguments:
-    ///
-    /// * `ctrl`: UblkCtrl device reference
-    /// * `dev`: UblkDev device reference
-    /// * `q_fn`: queue handler for setting up the queue and its handler
-    /// * `device_fn`: handler called after device is started, run in current
-    ///     context
-    ///
-    /// This one is the preferred interface for creating ublk daemon, and
-    /// is friendly for user, such as, user can customize queue setup and
-    /// io handler, such as setup async/await for handling io command.
-    pub fn run_target<T, Q, W>(
-        &self,
-        ctrl: &ctrl::UblkCtrl,
-        tgt_fn: T,
-        q_fn: Q,
-        device_fn: W,
-    ) -> Result<i32, UblkError>
-    where
-        T: FnOnce(&mut io::UblkDev) -> Result<i32, UblkError>,
-        Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
-        W: FnOnce(&ctrl::UblkCtrl) + Send + Sync + 'static,
-    {
-        let dev = &Arc::new(io::UblkDev::new(ctrl.get_name(), tgt_fn, &ctrl)?);
-        let handles = self.create_queue_handlers(ctrl, dev, q_fn);
-
-        ctrl.start_dev(dev)?;
-
-        device_fn(ctrl);
-
-        for qh in handles {
-            qh.join().unwrap_or_else(|_| {
-                eprintln!("dev-{} join queue thread failed", dev.dev_info.dev_id)
-            });
-        }
-
-        //device may be deleted from another context, so it is normal
-        //to see -ENOENT failure here
-        let _ = ctrl.stop_dev();
-
-        Ok(0)
-    }
 }
 
 #[cfg(test)]
@@ -366,7 +261,7 @@ mod libublk {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             w_fn(ctrl);
         })
         .unwrap();

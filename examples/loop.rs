@@ -377,9 +377,9 @@ fn __test_add(
             }
         };
         if aio {
-            sess.run_target(&ctrl, tgt_init, q_async_fn, wh).unwrap();
+            ctrl.run_target(tgt_init, q_async_fn, wh).unwrap();
         } else {
-            sess.run_target(&ctrl, tgt_init, q_sync_fn, wh).unwrap();
+            ctrl.run_target(tgt_init, q_sync_fn, wh).unwrap();
         }
     }
 }

@@ -67,7 +67,7 @@ mod integration {
             q_handler(qid, _dev);
         };
 
-        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             run_ublk_disk_sanity_test(ctrl, dev_flags);
             read_ublk_disk(ctrl);
 
@@ -209,7 +209,7 @@ mod integration {
         };
 
         // kick off our targets
-        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             // run sanity and disk IO test after ublk disk is ready
             run_ublk_disk_sanity_test(ctrl, dev_flags);
             read_ublk_disk(ctrl);
@@ -321,7 +321,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&ctrl, tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             __test_ublk_ramdisk(ctrl, dev_flags);
         })
         .unwrap();
