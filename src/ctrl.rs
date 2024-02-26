@@ -3,9 +3,10 @@ use super::uring_async::UblkUringOpFuture;
 use super::{dev_flags, sys, UblkError};
 use bitmaps::Bitmap;
 use derive_setters::*;
-use io_uring::{cqueue, opcode, squeue, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, RwLock};
 use std::{
@@ -17,6 +18,12 @@ use std::{
 const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
+
+std::thread_local! {
+    pub(crate) static CTRL_URING: RefCell<IoUring::<squeue::Entry128>> =
+        RefCell::new(IoUring::<squeue::Entry128>::builder()
+            .build(16).unwrap());
+}
 
 /// Ublk per-queue CPU affinity
 ///
@@ -253,7 +260,6 @@ struct UblkCtrlInner {
     cmd_token: i32,
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
-    ring: IoUring<squeue::Entry128>,
 }
 
 impl Drop for UblkCtrlInner {
@@ -307,9 +313,6 @@ impl UblkCtrlInner {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
-        let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
-            .build(16)
-            .map_err(UblkError::OtherIOError)?;
         let info = sys::ublksrv_ctrl_dev_info {
             nr_hw_queues: nr_queues as u16,
             queue_depth: depth as u16,
@@ -331,7 +334,6 @@ impl UblkCtrlInner {
             file: fd,
             dev_info: info,
             json: serde_json::json!({}),
-            ring,
             cmd_token: 0,
             queue_tids: {
                 let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
@@ -486,11 +488,9 @@ impl UblkCtrlInner {
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
 
         unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .map_err(UblkError::UringPushError)
-                .unwrap();
+            CTRL_URING.with(|refcell| {
+                refcell.borrow_mut().submission().push(&sqe).unwrap();
+            })
         }
         f
     }
@@ -511,16 +511,21 @@ impl UblkCtrlInner {
         } as u64;
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
-        unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .map_err(UblkError::UringPushError)?;
-        }
-        self.ring
-            .submit_and_wait(to_wait)
-            .map_err(UblkError::UringSubmissionError)?;
+        CTRL_URING.with(|refcell| {
+            let mut r = refcell.borrow_mut();
 
+            loop {
+                let res = unsafe { r.submission().push(&sqe) };
+                match res {
+                    Ok(_) => break,
+                    Err(_) => {
+                        log::debug!("ublk_submit_cmd: flush and retry");
+                        r.submit_and_wait(0).unwrap();
+                    }
+                }
+            }
+            r.submit_and_wait(to_wait).unwrap();
+        });
         Ok(token)
     }
 
@@ -530,21 +535,25 @@ impl UblkCtrlInner {
     /// command, and the use case is for supporting to run start_dev
     /// in queue io handling context
     fn poll_cmd(&mut self, token: u64) -> Result<i32, UblkError> {
-        if self.ring.completion().is_empty() {
-            return Err(UblkError::UringIOError(-libc::EAGAIN));
-        }
+        CTRL_URING.with(|refcell| {
+            let mut r = refcell.borrow_mut();
 
-        let cqe = self.ring.completion().next().expect("cqueue is empty");
-        if cqe.user_data() != token {
-            return Err(UblkError::UringIOError(-libc::EAGAIN));
-        }
-
-        let res: i32 = cqe.result();
-        if res == 0 || res == -libc::EBUSY {
-            Ok(res)
-        } else {
-            Err(UblkError::UringIOError(res))
-        }
+            if r.completion().is_empty() {
+                Err(UblkError::UringIOError(-libc::EAGAIN))
+            } else {
+                let cqe = r.completion().next().expect("cqueue is empty");
+                if cqe.user_data() != token {
+                    Err(UblkError::UringIOError(-libc::EAGAIN))
+                } else {
+                    let res: i32 = cqe.result();
+                    if res == 0 || res == -libc::EBUSY {
+                        Ok(res)
+                    } else {
+                        Err(UblkError::UringIOError(res))
+                    }
+                }
+            }
+        })
     }
 
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
