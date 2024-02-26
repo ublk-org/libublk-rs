@@ -188,6 +188,7 @@ impl UblkSession {
     /// and the 2nd one is data device(`UblkDev`)
     pub fn create_ctrl_dev(&self) -> Result<ctrl::UblkCtrl, UblkError> {
         Ok(ctrl::UblkCtrl::new(
+            Some(self.name.clone()),
             self.id,
             self.nr_queues,
             self.depth,
@@ -282,7 +283,7 @@ impl UblkSession {
         Q: FnOnce(u16, &io::UblkDev) + Send + Sync + Clone + 'static,
         W: FnOnce(&ctrl::UblkCtrl) + Send + Sync + 'static,
     {
-        let dev = &Arc::new(io::UblkDev::new(self.name(), tgt_fn, &ctrl)?);
+        let dev = &Arc::new(io::UblkDev::new(ctrl.get_name(), tgt_fn, &ctrl)?);
         let handles = self.create_queue_handlers(ctrl, dev, q_fn);
 
         ctrl.start_dev(dev)?;

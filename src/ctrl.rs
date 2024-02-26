@@ -168,6 +168,7 @@ pub struct UblkCtrl {
 }
 
 struct UblkCtrlInner {
+    name: Option<String>,
     file: fs::File,
     dev_info: sys::ublksrv_ctrl_dev_info,
     json: serde_json::Value,
@@ -203,6 +204,7 @@ impl Drop for UblkCtrlInner {
 impl UblkCtrlInner {
     #[allow(clippy::uninit_vec)]
     fn new(
+        name: Option<String>,
         id: i32,
         nr_queues: u32,
         depth: u32,
@@ -257,6 +259,7 @@ impl UblkCtrlInner {
             .map_err(UblkError::OtherIOError)?;
 
         let mut dev = UblkCtrlInner {
+            name,
             file: fd,
             dev_info: info,
             json: serde_json::json!({}),
@@ -793,6 +796,15 @@ impl UblkCtrl {
         self.inner.write().unwrap()
     }
 
+    pub fn get_name(&self) -> String {
+        let inner = self.get_inner();
+
+        match &inner.name {
+            Some(name) => name.clone(),
+            None => "none".to_string(),
+        }
+    }
+
     pub(crate) fn get_dev_flags(&self) -> u32 {
         self.get_inner().dev_flags
     }
@@ -814,6 +826,7 @@ impl UblkCtrl {
     /// device exported json file, dump, or any misc management task.
     ///
     pub fn new(
+        name: Option<String>,
         id: i32,
         nr_queues: u32,
         depth: u32,
@@ -823,6 +836,7 @@ impl UblkCtrl {
         dev_flags: u32,
     ) -> Result<UblkCtrl, UblkError> {
         let inner = RwLock::new(UblkCtrlInner::new(
+            name,
             id,
             nr_queues,
             depth,
@@ -840,7 +854,7 @@ impl UblkCtrl {
     pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
         assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
         assert!(id >= 0);
-        Self::new(id, 0, 0, 0, 0, 0, dev_flags)
+        Self::new(None, id, 0, 0, 0, 0, 0, dev_flags)
     }
 
     /// Return current device info
@@ -1020,7 +1034,7 @@ impl UblkCtrl {
     ///
     /// Supported since linux kernel v6.5
     pub fn get_features() -> Option<u64> {
-        match Self::new(-1, 0, 0, 0, 0, 0, 0) {
+        match Self::new(None, -1, 0, 0, 0, 0, 0, 0) {
             Ok(ctrl) => ctrl.get_driver_features(),
             _ => None,
         }
@@ -1213,7 +1227,8 @@ mod tests {
 
     #[test]
     fn test_add_ctrl_dev() {
-        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, 0, UBLK_DEV_F_ADD_DEV).unwrap();
+        let ctrl =
+            UblkCtrl::new(None, -1, 1, 64, 512_u32 * 1024, 0, 0, UBLK_DEV_F_ADD_DEV).unwrap();
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1224,6 +1239,7 @@ mod tests {
     #[test]
     fn test_add_un_privileted_ublk() {
         let ctrl = UblkCtrl::new(
+            None,
             -1,
             1,
             64,
