@@ -1,11 +1,12 @@
 use super::io::{UblkDev, UblkTgt};
 use super::{dev_flags, sys, UblkError};
 use bitmaps::Bitmap;
+use derive_setters::*;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::{
     fs,
     io::{Read, Write},
@@ -153,6 +154,78 @@ struct QueueAffinityJson {
     tid: u32,
 }
 
+/// UblkSession: build one new ublk control device or recover the old one.
+///
+/// High level API.
+///
+/// One limit is that IO handling closure doesn't support FnMut, and low
+/// level API doesn't have such limit.
+///
+#[derive(Setters, Debug, PartialEq, Eq)]
+pub struct UblkCtrlBuilder<'a> {
+    /// target type, such as null, loop, ramdisk, or nbd,...
+    name: &'a str,
+
+    /// device id: -1 can only be used for adding one new device,
+    /// and ublk driver will allocate one new ID for the created device;
+    /// otherwise, we are asking driver to create or recover or list
+    /// one device with specified ID
+    id: i32,
+
+    /// how many queues
+    nr_queues: u16,
+
+    /// each queue's IO depth
+    depth: u16,
+
+    /// max size of each IO buffer size, which will be converted to
+    /// block layer's queue limit of max hw sectors
+    io_buf_bytes: u32,
+
+    /// passed to ublk driver via `sys::ublksrv_ctrl_dev_info.flags`,
+    /// usually for adding or recovering device
+    ctrl_flags: u64,
+
+    /// store target flags in `sys::ublksrv_ctrl_dev_info.ublksrv_flags`,
+    /// which is immutable in the whole device lifetime
+    ctrl_target_flags: u64,
+
+    /// libublk feature flags: UBLK_DEV_F_*
+    dev_flags: u32,
+}
+
+impl Default for UblkCtrlBuilder<'_> {
+    fn default() -> Self {
+        UblkCtrlBuilder {
+            name: "none",
+            id: -1,
+            nr_queues: 1,
+            depth: 64,
+            io_buf_bytes: 524288,
+            ctrl_flags: 0,
+            ctrl_target_flags: 0,
+            dev_flags: 0,
+        }
+    }
+}
+
+impl UblkCtrlBuilder<'_> {
+    /// create one pair of ublk devices, the 1st one is control device(`UblkCtrl`),
+    /// and the 2nd one is data device(`UblkDev`)
+    pub fn build(self) -> Result<UblkCtrl, UblkError> {
+        Ok(UblkCtrl::new(
+            Some(self.name.to_string()),
+            self.id,
+            self.nr_queues.into(),
+            self.depth.into(),
+            self.io_buf_bytes,
+            self.ctrl_flags,
+            self.ctrl_target_flags,
+            self.dev_flags,
+        )?)
+    }
+}
+
 /// ublk control device
 ///
 /// Responsible for controlling ublk device:
@@ -168,6 +241,7 @@ pub struct UblkCtrl {
 }
 
 struct UblkCtrlInner {
+    name: Option<String>,
     file: fs::File,
     dev_info: sys::ublksrv_ctrl_dev_info,
     json: serde_json::Value,
@@ -203,6 +277,7 @@ impl Drop for UblkCtrlInner {
 impl UblkCtrlInner {
     #[allow(clippy::uninit_vec)]
     fn new(
+        name: Option<String>,
         id: i32,
         nr_queues: u32,
         depth: u32,
@@ -257,6 +332,7 @@ impl UblkCtrlInner {
             .map_err(UblkError::OtherIOError)?;
 
         let mut dev = UblkCtrlInner {
+            name,
             file: fd,
             dev_info: info,
             json: serde_json::json!({}),
@@ -793,6 +869,15 @@ impl UblkCtrl {
         self.inner.write().unwrap()
     }
 
+    pub fn get_name(&self) -> String {
+        let inner = self.get_inner();
+
+        match &inner.name {
+            Some(name) => name.clone(),
+            None => "none".to_string(),
+        }
+    }
+
     pub(crate) fn get_dev_flags(&self) -> u32 {
         self.get_inner().dev_flags
     }
@@ -814,6 +899,7 @@ impl UblkCtrl {
     /// device exported json file, dump, or any misc management task.
     ///
     pub fn new(
+        name: Option<String>,
         id: i32,
         nr_queues: u32,
         depth: u32,
@@ -823,6 +909,7 @@ impl UblkCtrl {
         dev_flags: u32,
     ) -> Result<UblkCtrl, UblkError> {
         let inner = RwLock::new(UblkCtrlInner::new(
+            name,
             id,
             nr_queues,
             depth,
@@ -840,7 +927,7 @@ impl UblkCtrl {
     pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
         assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
         assert!(id >= 0);
-        Self::new(id, 0, 0, 0, 0, 0, dev_flags)
+        Self::new(None, id, 0, 0, 0, 0, 0, dev_flags)
     }
 
     /// Return current device info
@@ -1020,7 +1107,7 @@ impl UblkCtrl {
     ///
     /// Supported since linux kernel v6.5
     pub fn get_features() -> Option<u64> {
-        match Self::new(-1, 0, 0, 0, 0, 0, 0) {
+        match Self::new(None, -1, 0, 0, 0, 0, 0, 0) {
             Ok(ctrl) => ctrl.get_driver_features(),
             _ => None,
         }
@@ -1154,13 +1241,9 @@ impl UblkCtrl {
 
     /// Stop ublk device
     ///
-    /// # Arguments:
-    ///
-    /// * `_dev`: ublk device
-    ///
     /// Remove json export, and send stop command to control device
     ///
-    pub fn stop_dev(&self, _dev: &UblkDev) -> Result<i32, UblkError> {
+    pub fn stop_dev(&self) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
         let rp = ctrl.run_path();
 
@@ -1199,13 +1282,134 @@ impl UblkCtrl {
         }
         Ok(0)
     }
+
+    fn create_queue_handlers<Q>(
+        &self,
+        dev: &Arc<UblkDev>,
+        q_fn: Q,
+    ) -> Vec<std::thread::JoinHandle<()>>
+    where
+        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+    {
+        use std::sync::mpsc;
+
+        let mut q_threads = Vec::new();
+        let nr_queues = dev.dev_info.nr_hw_queues;
+
+        let (tx, rx) = mpsc::channel();
+
+        for q in 0..nr_queues {
+            let _dev = Arc::clone(dev);
+            let _tx = tx.clone();
+
+            let mut affinity = UblkQueueAffinity::new();
+            self.get_queue_affinity(q as u32, &mut affinity).unwrap();
+            let mut _q_fn = q_fn.clone();
+
+            q_threads.push(std::thread::spawn(move || {
+                //setup pthread affinity first, so that any allocation may
+                //be affine to cpu/memory
+                unsafe {
+                    libc::pthread_setaffinity_np(
+                        libc::pthread_self(),
+                        affinity.buf_len(),
+                        affinity.addr() as *const libc::cpu_set_t,
+                    );
+                }
+                _tx.send((q, unsafe { libc::gettid() })).unwrap();
+
+                unsafe {
+                    const PR_SET_IO_FLUSHER: i32 = 57; //include/uapi/linux/prctl.h
+                    libc::prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
+                };
+
+                _q_fn(q, &_dev);
+            }));
+        }
+
+        for _q in 0..nr_queues {
+            let (qid, tid) = rx.recv().unwrap();
+            if self.configure_queue(dev, qid, tid).is_err() {
+                println!(
+                    "create_queue_handler: configure queue failed for {}-{}",
+                    dev.dev_info.dev_id, qid
+                );
+            }
+        }
+
+        q_threads
+    }
+
+    /// Run ublk daemon and kick off the ublk device, and `/dev/ublkbN` will be
+    /// created and visible to userspace.
+    ///
+    /// # Arguments:
+    ///
+    /// * `tgt_fn`: target initialization handler
+    /// * `q_fn`: queue handler for setting up the queue and its handler
+    /// * `device_fn`: handler called after device is started, run in current
+    ///     context
+    ///
+    /// This one is the preferred interface for creating ublk daemon, and
+    /// is friendly for user, such as, user can customize queue setup and
+    /// io handler, such as setup async/await for handling io command.
+    pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<i32, UblkError>
+    where
+        T: FnOnce(&mut UblkDev) -> Result<i32, UblkError>,
+        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
+    {
+        let dev = &Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
+        let handles = self.create_queue_handlers(dev, q_fn);
+
+        self.start_dev(dev)?;
+
+        device_fn(self);
+
+        for qh in handles {
+            qh.join().unwrap_or_else(|_| {
+                eprintln!("dev-{} join queue thread failed", dev.dev_info.dev_id)
+            });
+        }
+
+        //device may be deleted from another context, so it is normal
+        //to see -ENOENT failure here
+        let _ = self.stop_dev();
+
+        Ok(0)
+    }
+
+    // iterator over each ublk device ID
+    pub fn for_each_dev_id<T>(ops: T)
+    where
+        T: Fn(u32) + Clone + 'static,
+    {
+        if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
+            for entry in entries.flatten() {
+                let f = entry.path();
+                if f.is_file() {
+                    if let Some(file_stem) = f.file_stem() {
+                        if let Some(stem) = file_stem.to_str() {
+                            if let Ok(num) = stem.parse::<u32>() {
+                                ops(num);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::dev_flags::*;
-    use crate::{ctrl::UblkCtrl, io::UblkDev, UblkSessionBuilder};
+    use crate::ctrl::UblkCtrlBuilder;
+    use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use crate::{ctrl::UblkCtrl, UblkIORes};
+    use std::cell::Cell;
     use std::path::Path;
+    use std::rc::Rc;
 
     #[test]
     fn test_ublk_get_features() {
@@ -1217,7 +1421,8 @@ mod tests {
 
     #[test]
     fn test_add_ctrl_dev() {
-        let ctrl = UblkCtrl::new(-1, 1, 64, 512_u32 * 1024, 0, 0, UBLK_DEV_F_ADD_DEV).unwrap();
+        let ctrl =
+            UblkCtrl::new(None, -1, 1, 64, 512_u32 * 1024, 0, 0, UBLK_DEV_F_ADD_DEV).unwrap();
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1228,6 +1433,7 @@ mod tests {
     #[test]
     fn test_add_un_privileted_ublk() {
         let ctrl = UblkCtrl::new(
+            None,
             -1,
             1,
             64,
@@ -1245,7 +1451,7 @@ mod tests {
 
     #[test]
     fn test_ublk_target_json() {
-        let sess = UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .ctrl_target_flags(0xbeef as u64)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
@@ -1257,12 +1463,107 @@ mod tests {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(0)
         };
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+        let dev = UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
 
         //not built & flushed out yet
         assert!(ctrl.get_target_data_from_json().is_none());
         assert!(dev.get_target_json().is_some());
         assert!(dev.dev_info.ublksrv_flags == 0xbeef as u64);
         assert!(ctrl.dev_info().ublksrv_flags == 0xbeef as u64);
+    }
+
+    fn __test_ublk_session<T>(w_fn: T) -> String
+    where
+        T: Fn(&UblkCtrl) + Send + Sync + Clone + 'static,
+    {
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .depth(16_u16)
+            .nr_queues(2_u16)
+            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            dev.set_target_json(serde_json::json!({"null": "test_data" }));
+            Ok(0)
+        };
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+            let bufs = bufs_rc.clone();
+
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = (iod.nr_sectors << 9) as i32;
+                let bufs = bufs_rc.clone();
+                let buf_addr = bufs[tag as usize].as_mut_ptr();
+
+                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+            };
+
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .regiser_io_bufs(Some(&bufs))
+                .submit_fetch_commands(Some(&bufs))
+                .wait_and_handle_io(io_handler);
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            w_fn(ctrl);
+        })
+        .unwrap();
+
+        // could be too strict because of udev
+        let bdev = ctrl.get_bdev_path();
+        assert!(Path::new(&bdev).exists() == false);
+
+        let cpath = ctrl.get_cdev_path();
+
+        cpath
+    }
+
+    /// Covers basic ublk device creation and destroying by UblkSession
+    /// APIs
+    #[test]
+    fn test_ublk_session() {
+        let cdev = __test_ublk_session(|ctrl: &UblkCtrl| {
+            assert!(ctrl.get_target_data_from_json().is_some());
+            ctrl.kill_dev().unwrap();
+        });
+
+        // could be too strict because of udev
+        assert!(Path::new(&cdev).exists() == false);
+    }
+    /// test for_each_dev_id
+    #[test]
+    fn test_ublk_for_each_dev_id() {
+        // Create one ublk device
+        let handle = std::thread::spawn(|| {
+            let cdev = __test_ublk_session(|ctrl: &UblkCtrl| {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                ctrl.kill_dev().unwrap();
+            });
+            // could be too strict because of udev
+            assert!(Path::new(&cdev).exists() == false);
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let cnt_arc = Rc::new(Cell::new(0));
+        let cnt = cnt_arc.clone();
+
+        //count all existed ublk devices
+        UblkCtrl::for_each_dev_id(move |dev_id| {
+            let ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
+            cnt.set(cnt.get() + 1);
+
+            let dev_path = ctrl.get_cdev_path();
+            assert!(Path::new(&dev_path).exists() == true);
+        });
+
+        // we created one
+        assert!(cnt_arc.get() > 0);
+
+        handle.join().unwrap();
     }
 }

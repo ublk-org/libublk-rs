@@ -5,8 +5,7 @@ mod integration {
     use libublk::helpers::IoBuf;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     use libublk::uring_async::ublk_wait_and_handle_ios;
-    use libublk::{ctrl::UblkCtrl, UblkError, UblkIORes};
-    use libublk::{sys, UblkSessionBuilder};
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkError, UblkIORes};
     use std::env;
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -36,8 +35,7 @@ mod integration {
         assert!((permissions.mode() & 0o777) == 0o700);
     }
 
-    fn read_ublk_disk(dev_id: i32) {
-        let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+    fn read_ublk_disk(ctrl: &UblkCtrl) {
         let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
         let if_dev = format!("if={}", &dev_path);
@@ -50,12 +48,11 @@ mod integration {
     }
 
     fn __test_ublk_null(dev_flags: u32, q_handler: fn(u16, &UblkDev)) {
-        let sess = UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("null")
-            .depth(64_u32)
-            .nr_queues(2_u32)
+            .nr_queues(2)
             .dev_flags(dev_flags)
-            .ctrl_flags(libublk::sys::UBLK_F_USER_COPY)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_COPY.into())
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
@@ -63,16 +60,13 @@ mod integration {
             Ok(0)
         };
 
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, _dev: &UblkDev| {
             q_handler(qid, _dev);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-
-            run_ublk_disk_sanity_test(&ctrl, dev_flags);
-            read_ublk_disk(dev_id);
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl);
 
             ctrl.kill_dev().unwrap();
         })
@@ -152,9 +146,9 @@ mod integration {
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
         let dev_flags = UBLK_DEV_F_ADD_DEV;
         let depth = 64_u16;
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("null")
-            .nr_queues(2_u16)
+            .nr_queues(2)
             .depth(depth)
             .id(-1)
             .dev_flags(dev_flags)
@@ -169,7 +163,6 @@ mod integration {
         let dev_data = Arc::new(Mutex::new(DevData { done: 0 }));
         let wh_dev_data = dev_data.clone();
 
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
         let q_fn = move |qid: u16, dev: &UblkDev| {
@@ -212,12 +205,10 @@ mod integration {
         };
 
         // kick off our targets
-        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             // run sanity and disk IO test after ublk disk is ready
-            run_ublk_disk_sanity_test(&ctrl, dev_flags);
-            read_ublk_disk(dev_id);
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl);
 
             {
                 let guard = wh_dev_data.lock().unwrap();
@@ -266,8 +257,7 @@ mod integration {
             q.complete_io_cmd(tag, buf_addr, res);
         }
 
-        fn __test_ublk_ramdisk(dev_id: i32, dev_flags: u32) {
-            let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+        fn __test_ublk_ramdisk(ctrl: &UblkCtrl, dev_flags: u32) {
             let dev_path = ctrl.get_bdev_path();
 
             run_ublk_disk_sanity_test(&ctrl, dev_flags);
@@ -295,11 +285,11 @@ mod integration {
         let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
         let dev_addr = buf.as_mut_ptr() as u64;
         let dev_flags = UBLK_DEV_F_ADD_DEV;
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = UblkCtrlBuilder::default()
             .name("ramdisk")
             .id(-1)
-            .nr_queues(1_u16)
-            .depth(128_u16)
+            .nr_queues(1)
+            .depth(128)
             .dev_flags(dev_flags)
             .build()
             .unwrap();
@@ -308,7 +298,6 @@ mod integration {
             Ok(0)
         };
 
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
@@ -327,8 +316,8 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         };
 
-        sess.run_target(&ctrl, &dev, q_fn, move |dev_id| {
-            __test_ublk_ramdisk(dev_id, dev_flags);
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            __test_ublk_ramdisk(ctrl, dev_flags);
         })
         .unwrap();
     }

@@ -10,6 +10,7 @@ use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_wake_task;
 use libublk::{ctrl::UblkCtrl, UblkError};
 use std::rc::Rc;
+use std::sync::Arc;
 
 fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
@@ -50,7 +51,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     };
 
     let depth = 128_u16;
-    let sess = libublk::UblkSessionBuilder::default()
+    let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name("example_ramdisk")
         .id(dev_id)
         .nr_queues(1_u16)
@@ -64,7 +65,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
         dev.set_default_params(size);
         Ok(0)
     };
-    let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
+    let dev = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
 
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
@@ -131,7 +132,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     };
     //device may be deleted from another context, so it is normal
     //to see -ENOENT failure here
-    let _ = ctrl.stop_dev(&dev);
+    let _ = ctrl.stop_dev();
 }
 
 fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {

@@ -4,7 +4,7 @@ use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, UblkIORes, UblkSession};
+use libublk::{ctrl::UblkCtrl, UblkIORes};
 use std::rc::Rc;
 
 bitflags! {
@@ -57,11 +57,11 @@ fn __test_add(
     let aio = flags.intersects(NullFlags::ASYNC);
     let oneshot = flags.intersects(NullFlags::ONESHOT);
     {
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
             .name("example_null")
             .id(id)
-            .depth(depth)
-            .nr_queues(nr_queues)
+            .depth(depth.try_into().unwrap())
+            .nr_queues(nr_queues.try_into().unwrap())
             .io_buf_bytes(buf_size)
             .ctrl_flags(ctrl_flags)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
@@ -71,8 +71,7 @@ fn __test_add(
             dev.set_default_params(250_u64 << 30);
             Ok(0)
         };
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
-        let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+        let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
         // queue level logic
         let q_sync_handler = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
@@ -129,25 +128,18 @@ fn __test_add(
             smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
+        let wh = move |d_ctrl: &UblkCtrl| {
+            d_ctrl.dump();
+            if oneshot {
+                d_ctrl.kill_dev().unwrap();
+            }
+        };
+
+        // Now start this ublk target
         if aio {
-            // Now start this ublk target
-            sess.run_target(&ctrl, &dev, q_async_handler, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
         } else {
-            sess.run_target(&ctrl, &dev, q_sync_handler, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            ctrl.run_target(tgt_init, q_sync_handler, wh).unwrap();
         }
     }
 }
@@ -292,7 +284,7 @@ fn main() {
                 .unwrap_or(-1);
             UblkCtrl::new_simple(id, 0).unwrap().del_dev().unwrap();
         }
-        Some(("list", _add_matches)) => UblkSession::for_each_dev_id(|dev_id| {
+        Some(("list", _add_matches)) => UblkCtrl::for_each_dev_id(|dev_id| {
             UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();
         }),
         _ => {

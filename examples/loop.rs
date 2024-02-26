@@ -7,7 +7,7 @@ use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes, UblkSession};
+use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
@@ -307,19 +307,18 @@ fn __test_add(
             direct_io: 1,
             back_file_path: backing_file.clone(),
         };
-        let sess = libublk::UblkSessionBuilder::default()
+        let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
             .name("example_loop")
             .id(id)
             .ctrl_flags(ctrl_flags)
-            .nr_queues(nr_queues)
-            .depth(depth)
+            .nr_queues(nr_queues.try_into().unwrap())
+            .depth(depth.try_into().unwrap())
             .io_buf_bytes(buf_sz)
             .dev_flags(UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
         let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, split);
-        let (ctrl, dev) = sess.create_devices(tgt_init).unwrap();
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = smol::LocalExecutor::new();
@@ -370,25 +369,16 @@ fn __test_add(
                 .wait_and_handle_io(lo_io_handler);
         };
 
+        let wh = move |d_ctrl: &UblkCtrl| {
+            d_ctrl.dump();
+            if oneshot {
+                d_ctrl.kill_dev().unwrap();
+            }
+        };
         if aio {
-            sess.run_target(&ctrl, &dev, q_async_fn, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            ctrl.run_target(tgt_init, q_async_fn, wh).unwrap();
         } else {
-            sess.run_target(&ctrl, &dev, q_sync_fn, move |dev_id| {
-                let d_ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
-                d_ctrl.dump();
-                if oneshot {
-                    d_ctrl.kill_dev().unwrap();
-                }
-            })
-            .unwrap();
+            ctrl.run_target(tgt_init, q_sync_fn, wh).unwrap();
         }
     }
 }
@@ -550,7 +540,7 @@ fn main() {
                 .unwrap_or(-1);
             UblkCtrl::new_simple(id, 0).unwrap().del_dev().unwrap();
         }
-        Some(("list", _add_matches)) => UblkSession::for_each_dev_id(|dev_id| {
+        Some(("list", _add_matches)) => UblkCtrl::for_each_dev_id(|dev_id| {
             UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();
         }),
         _ => {
