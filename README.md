@@ -113,19 +113,6 @@ fn main() {
 }
 ```
 
-With Rust async/.await, each io command is handled in one standalone io task.
-Both io command submission and its handling can be written via .await, it looks
-like sync programming, but everything is run in async actually. .await can
-be nested inside handle_io_cmd(), futures::join!() is supported too.
-
-Device wide data can be shared in each queue/io handler by
-Arc::new(Mutex::new(Data)) and the queue handler closure supports Clone(),
-see [`test_ublk_null_async():tests/basic.rs`](tests/basic.rs)
-
-Queue wide data is per-thread and can be shared in io handler by
-Rc() & RefCell().
-
-
  * [`examples/loop.rs`](examples/loop.rs): real example using async/await & io_uring.
 
 
