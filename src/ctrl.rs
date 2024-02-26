@@ -484,7 +484,7 @@ impl UblkCtrlInner {
             .user_data(token as u64)
     }
 
-    fn ublk_submit_ctrl_cmd(
+    fn ublk_submit_cmd(
         &mut self,
         data: &mut UblkCtrlCmdData,
         to_wait: usize,
@@ -541,7 +541,7 @@ impl UblkCtrlInner {
         let to_wait = 1;
 
         let old_buf = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_ctrl_cmd(&mut data, to_wait)?;
+        let token = self.ublk_submit_cmd(&mut data, to_wait)?;
         let res = self.poll_cmd(token);
 
         data.unprep_un_privileged_dev_path(self, old_buf);
@@ -1229,7 +1229,7 @@ impl UblkCtrl {
         ctrl.prep_start_dev(dev)?;
 
         let old_buf = data.prep_un_privileged_dev_path(&ctrl);
-        let token = ctrl.ublk_submit_ctrl_cmd(&mut data, 0)?;
+        let token = ctrl.ublk_submit_cmd(&mut data, 0)?;
 
         Ok((token, (old_buf as *mut u8, CTRL_UBLKC_PATH_MAX, 8)))
     }
