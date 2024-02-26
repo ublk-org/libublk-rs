@@ -1,4 +1,5 @@
 use super::io::{UblkDev, UblkTgt};
+use super::uring_async::UblkUringOpFuture;
 use super::{dev_flags, sys, UblkError};
 use bitmaps::Bitmap;
 use derive_setters::*;
@@ -484,6 +485,22 @@ impl UblkCtrlInner {
             .user_data(token)
     }
 
+    fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> UblkUringOpFuture {
+        let fd = self.file.as_raw_fd();
+        let dev_id = self.dev_info.dev_id;
+        let f = UblkUringOpFuture::new(0);
+        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&sqe)
+                .map_err(UblkError::UringPushError)
+                .unwrap();
+        }
+        f
+    }
+
     fn ublk_submit_cmd(
         &mut self,
         data: &UblkCtrlCmdData,
@@ -534,6 +551,17 @@ impl UblkCtrlInner {
         } else {
             Err(UblkError::UringIOError(res))
         }
+    }
+
+    async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        let mut data = *data;
+
+        let old_buf = data.prep_un_privileged_dev_path(self);
+        let res = self.ublk_submit_cmd_async(&mut data).await;
+
+        data.unprep_un_privileged_dev_path(self, old_buf);
+
+        Ok(res)
     }
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
@@ -634,6 +662,19 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
+    /// Start this device by sending command to ublk driver
+    ///
+    async fn start_async(&mut self, pid: i32) -> Result<i32, UblkError> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_CMD_START_DEV,
+            flags: CTRL_CMD_HAS_DATA,
+            data: pid as u64,
+            ..Default::default()
+        };
+
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
     /// Stop this device by sending command to ublk driver
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
@@ -713,6 +754,19 @@ impl UblkCtrlInner {
         };
 
         self.ublk_ctrl_cmd(&data)
+    }
+
+    /// End user recover for this device, do similar thing done in start_dev()
+    ///
+    async fn end_user_recover_async(&mut self, pid: i32) -> Result<i32, UblkError> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
+            flags: CTRL_CMD_HAS_DATA,
+            data: pid as u64,
+            ..Default::default()
+        };
+
+        self.ublk_ctrl_cmd_async(&data).await
     }
 
     fn prep_start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
@@ -1179,6 +1233,29 @@ impl UblkCtrl {
             ctrl.start(unsafe { libc::getpid() as i32 })
         } else if ctrl.for_recover_dev() {
             ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
+        } else {
+            Err(crate::UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Start ublk device in async/.await
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev`: ublk device
+    ///
+    /// Send parameter to driver, and flush json to storage, finally
+    /// send START command
+    ///
+    pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+        ctrl.prep_start_dev(dev)?;
+
+        if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            ctrl.start_async(unsafe { libc::getpid() as i32 }).await
+        } else if ctrl.for_recover_dev() {
+            ctrl.end_user_recover_async(unsafe { libc::getpid() as i32 })
+                .await
         } else {
             Err(crate::UblkError::OtherError(-libc::EINVAL))
         }
