@@ -7,7 +7,7 @@ use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 /// UblkIOCtx
 ///
@@ -431,6 +431,12 @@ pub struct UblkQueue<'a> {
     /// uring is shared for handling target IO, so has to be
     /// public
     pub q_ring: RefCell<IoUring<squeue::Entry>>,
+}
+
+impl AsRawFd for UblkQueue<'_> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.q_ring.borrow().as_raw_fd()
+    }
 }
 
 impl Drop for UblkQueue<'_> {

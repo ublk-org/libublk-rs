@@ -1,7 +1,9 @@
 use crate::io::UblkQueue;
-use io_uring::cqueue;
+use crate::UblkError;
+use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
+use std::os::fd::AsRawFd;
 use std::{
     future::Future,
     pin::Pin,
@@ -91,6 +93,30 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
     })
 }
 
+fn ublk_try_reap_cqe<S: squeue::EntryMarker>(
+    ring: &mut IoUring<S>,
+    nr_waits: usize,
+) -> Option<cqueue::Entry> {
+    match ring.submit_and_wait(nr_waits) {
+        Err(_) => None,
+        _ => ring.completion().next(),
+    }
+}
+
+fn ublk_process_queue_io(
+    q: &UblkQueue,
+    exe: &smol::LocalExecutor,
+    nr_waits: usize,
+) -> Result<i32, UblkError> {
+    let res = q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits);
+
+    if res.is_ok() {
+        while exe.try_tick() {}
+    }
+
+    res
+}
+
 /// Run one task in this local Executor until the task is finished
 pub fn ublk_run_task<T>(
     q: &UblkQueue,
@@ -98,26 +124,81 @@ pub fn ublk_run_task<T>(
     task: &smol::Task<T>,
     nr_waits: usize,
 ) {
-    while exe.try_tick() {}
     while !task.is_finished() {
-        match q.q_ring.borrow().submit_and_wait(nr_waits) {
-            Err(_) => break,
-            _ => {}
-        }
-        let cqe = {
-            match q.q_ring.borrow_mut().completion().next() {
-                None => {
-                    exe.try_tick();
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-                Some(r) => r,
-            }
+        let res = ublk_process_queue_io(q, exe, nr_waits);
+
+        let wait = match res {
+            Ok(nr) if nr > 0 => false,
+            _ => false,
         };
-        let user_data = cqe.user_data();
-        ublk_wake_task(user_data, &cqe);
-        while exe.try_tick() {}
+        if wait {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
+}
+
+/// Run one task in this local Executor until the task is finished
+pub fn ublk_run_ctrl_task<T>(
+    ctrl_exe: &smol::LocalExecutor,
+    q: &UblkQueue,
+    q_exe: &smol::LocalExecutor,
+    task: &smol::Task<T>,
+) -> Result<(), UblkError> {
+    let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
+        .build(4)
+        .map_err(UblkError::OtherIOError)?;
+    let ctrl_fd = crate::ctrl::CTRL_URING.with(|refcell| refcell.borrow().as_raw_fd());
+    let q_fd = q.as_raw_fd();
+    let mut poll_q = true;
+    let mut poll_ctrl = true;
+
+    while ctrl_exe.try_tick() {}
+    while !task.is_finished() {
+        log::debug!(
+            "poll ring: submit and wait, ctrl_fd {} q_fd {}",
+            ctrl_fd,
+            q_fd
+        );
+
+        if poll_q {
+            let q_e = opcode::PollAdd::new(types::Fd(q_fd), (libc::POLLIN | libc::POLLOUT) as _);
+            let _ = unsafe { pr.submission().push(&q_e.build().user_data(0x01).into()) };
+            poll_q = false;
+        }
+        if poll_ctrl {
+            let ctrl_e =
+                opcode::PollAdd::new(types::Fd(ctrl_fd), (libc::POLLIN | libc::POLLOUT) as _);
+            let _ = unsafe { pr.submission().push(&ctrl_e.build().user_data(0x02).into()) };
+            poll_ctrl = false;
+        }
+
+        pr.submit_and_wait(1).map_err(UblkError::OtherIOError)?;
+        let cqes: Vec<cqueue::Entry> = pr.completion().map(Into::into).collect();
+        for cqe in cqes {
+            if cqe.user_data() == 0x1 {
+                poll_q = true;
+            }
+            if cqe.user_data() == 0x2 {
+                poll_ctrl = true;
+            }
+        }
+
+        ublk_process_queue_io(q, q_exe, 0)?;
+        let entry =
+            crate::ctrl::CTRL_URING.with(|refcell| ublk_try_reap_cqe(&mut refcell.borrow_mut(), 0));
+        if let Some(cqe) = entry {
+            ublk_wake_task(cqe.user_data(), &cqe);
+            while ctrl_exe.try_tick() {}
+        }
+    }
+
+    let nr_waits = 1 + if poll_q { 0 } else { 1 } + if poll_ctrl { 0 } else { 1 };
+    let poll_e = opcode::PollRemove::new(0x05);
+    let _ = unsafe { pr.submission().push(&poll_e.build().user_data(0x05).into()) };
+    pr.submit_and_wait(nr_waits)
+        .map_err(UblkError::OtherIOError)?;
+
+    Ok(())
 }
 
 /// Wait and handle incoming IO command

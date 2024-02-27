@@ -1,4 +1,4 @@
-use io_uring::cqueue;
+use libublk::ctrl::UblkCtrl;
 ///! # Example of ramdisk
 ///
 /// Serves for covering recovery test[`test_ublk_ramdisk_recovery`],
@@ -7,10 +7,9 @@ use io_uring::cqueue;
 use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::ublk_wake_task;
-use libublk::{ctrl::UblkCtrl, UblkError};
+use libublk::uring_async::ublk_run_ctrl_task;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
@@ -41,40 +40,23 @@ fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 
     bytes
 }
 
-///run this ramdisk ublk daemon completely in single context with
-///async control command, no need Rust async any more
-fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
-    let dev_flags = if for_add {
-        UBLK_DEV_F_ADD_DEV
-    } else {
-        UBLK_DEV_F_RECOVER_DEV
-    };
-
-    let depth = 128_u16;
-    let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
-        .name("example_ramdisk")
-        .id(dev_id)
-        .nr_queues(1_u16)
-        .depth(depth)
-        .dev_flags(dev_flags)
-        .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
-        .build()
-        .unwrap();
-
-    let tgt_init = |dev: &mut UblkDev| {
-        dev.set_default_params(size);
-        Ok(0)
-    };
-    let dev = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
-
-    let exe = smol::LocalExecutor::new();
-    let mut f_vec = Vec::new();
+fn queue_fn<'a>(
+    dev: &'a UblkDev,
+    dev_buf_addr: *mut u8,
+) -> (
+    Rc<UblkQueue<'a>>,
+    smol::LocalExecutor<'a>,
+    Vec<smol::Task<()>>,
+) {
     let q_rc = Rc::new(UblkQueue::new(0, &dev).unwrap());
-    let buf_size = dev.dev_info.max_io_buf_bytes as usize;
+    let exe = smol::LocalExecutor::new();
+    let buf_size = q_rc.dev.dev_info.max_io_buf_bytes as usize;
+    let depth = q_rc.dev.dev_info.queue_depth;
+    let mut f_vec = Vec::new();
 
     for tag in 0..depth as u16 {
         let q = q_rc.clone();
-        assert!(q.get_io_buf_addr(tag) == std::ptr::null_mut());
+
         f_vec.push(exe.spawn(async move {
             let buffer = IoBuf::<u8>::new(buf_size);
             let addr = buffer.as_mut_ptr();
@@ -87,52 +69,87 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
                     break;
                 }
 
-                res = handle_io(&q, tag, addr, buf_addr);
+                res = handle_io(&q, tag, addr, dev_buf_addr);
                 cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
             }
         }));
         exe.try_tick();
     }
-    ctrl.configure_queue(&dev, 0, unsafe { libc::gettid() })
-        .unwrap();
 
-    let (token, buf) = ctrl.submit_start_dev(&dev).unwrap();
-    let wake_handler = |data: u64, cqe: &cqueue::Entry, _last: bool| ublk_wake_task(data, cqe);
+    (q_rc, exe, f_vec)
+}
 
-    let res = loop {
-        let _ = q_rc.flush_and_wake_io_tasks(wake_handler, 0);
-        while exe.try_tick() {}
-        let _res = ctrl.poll_start_dev(token);
-        match _res {
-            Ok(res) => break Ok(res),
-            Err(UblkError::UringIOError(res)) => {
-                if res != -libc::EAGAIN {
-                    break Err(UblkError::UringIOError(res));
-                }
-            }
-            Err(r) => break Err(r),
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+fn start_dev_fn(
+    ctrl_rc: &Rc<UblkCtrl>,
+    dev_arc: &Arc<UblkDev>,
+    ctrl_exe: &smol::LocalExecutor,
+    q_rc: &Rc<UblkQueue>,
+    q_exe: &smol::LocalExecutor,
+) -> i32 {
+    let res = Rc::new(Mutex::new(0));
+    let ctrl_clone = ctrl_rc.clone();
+    let dev_clone = dev_arc.clone();
+    let res_clone = res.clone();
+
+    // Start device in one dedicated io task
+    let task = ctrl_exe.spawn(async move {
+        ctrl_clone
+            .configure_queue(&dev_clone, 0, unsafe { libc::gettid() })
+            .unwrap();
+
+        let r = ctrl_clone.start_dev_async(&dev_clone).await;
+
+        let mut guard = res_clone.lock().unwrap();
+        *guard = r.unwrap();
+    });
+    ublk_run_ctrl_task(&ctrl_exe, &q_rc, &q_exe, &task).unwrap();
+
+    let r = *res.lock().unwrap();
+
+    r
+}
+
+///run this ramdisk ublk daemon completely in single context with
+///async control command, no need Rust async any more
+fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
+    let dev_flags = if for_add {
+        UBLK_DEV_F_ADD_DEV
+    } else {
+        UBLK_DEV_F_RECOVER_DEV
     };
-    libublk::ublk_dealloc_buf(buf.0, buf.1, buf.2);
 
-    match res {
-        Ok(res) if res >= 0 => {
-            ctrl.dump();
-            loop {
-                while exe.try_tick() {}
-                match q_rc.flush_and_wake_io_tasks(wake_handler, 1) {
-                    Err(_) => break,
-                    _ => {}
-                }
-            }
-            smol::block_on(async { futures::future::join_all(f_vec).await });
-        }
-        _ => {}
+    let ctrl = Rc::new(
+        libublk::ctrl::UblkCtrlBuilder::default()
+            .name("example_ramdisk")
+            .id(dev_id)
+            .nr_queues(1_u16)
+            .depth(128_u16)
+            .dev_flags(dev_flags)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
+            .build()
+            .unwrap(),
+    );
+
+    let tgt_init = |dev: &mut UblkDev| {
+        dev.set_default_params(size);
+        Ok(0)
     };
-    //device may be deleted from another context, so it is normal
-    //to see -ENOENT failure here
-    let _ = ctrl.stop_dev();
+    let dev = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
+    let ctrl_exe = smol::LocalExecutor::new();
+
+    // spawn async io tasks, and return io task array
+    let (q_rc, exe, f_vec) = queue_fn(&dev, buf_addr);
+
+    // start device by running one async control task
+    let res = start_dev_fn(&ctrl, &dev, &ctrl_exe, &q_rc, &exe);
+
+    if res >= 0 {
+        ctrl.dump();
+        libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exe);
+        smol::block_on(async { futures::future::join_all(f_vec).await });
+    } else {
+        eprintln!("device can't be started");
+    }
 }
 
 fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {
@@ -183,6 +200,10 @@ fn test_del() {
 }
 
 fn main() {
+    env_logger::builder()
+        .format_target(false)
+        .format_timestamp(None)
+        .init();
     if let Some(cmd) = std::env::args().nth(1) {
         match cmd.as_str() {
             "add" => test_add(0),

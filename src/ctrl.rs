@@ -1,11 +1,13 @@
 use super::io::{UblkDev, UblkTgt};
+use super::uring_async::UblkUringOpFuture;
 use super::{dev_flags, sys, UblkError};
 use bitmaps::Bitmap;
 use derive_setters::*;
-use io_uring::{cqueue, opcode, squeue, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::cell::RefCell;
+use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, RwLock};
 use std::{
     fs,
@@ -16,6 +18,12 @@ use std::{
 const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
+
+std::thread_local! {
+    pub(crate) static CTRL_URING: RefCell<IoUring::<squeue::Entry128>> =
+        RefCell::new(IoUring::<squeue::Entry128>::builder()
+            .build(16).unwrap());
+}
 
 /// Ublk per-queue CPU affinity
 ///
@@ -78,15 +86,15 @@ struct UblkCtrlCmdData {
 }
 
 impl UblkCtrlCmdData {
-    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> u64 {
+    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Vec<u8>>) {
         // handle GET_DEV_INFO2 always with dev_path attached
         if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
             && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
         {
-            return 0;
+            return (0, None);
         }
 
-        let buf: *mut u8 = {
+        let (buf, new_buf) = {
             let size = {
                 if self.flags & CTRL_CMD_HAS_BUF != 0 {
                     self.len as usize + CTRL_UBLKC_PATH_MAX
@@ -94,7 +102,9 @@ impl UblkCtrlCmdData {
                     CTRL_UBLKC_PATH_MAX
                 }
             };
-            super::ublk_alloc_buf(size, 8)
+            let mut v = vec![0_u8; size];
+
+            (v.as_mut_ptr(), v)
         };
 
         let path_str = dev.get_cdev_path().to_string();
@@ -122,7 +132,7 @@ impl UblkCtrlCmdData {
         self.dev_path_len = CTRL_UBLKC_PATH_MAX as u16;
         let addr = self.addr;
         self.addr = buf as u64;
-        addr
+        (addr, Some(new_buf))
     }
 
     fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner, buf: u64) {
@@ -143,7 +153,6 @@ impl UblkCtrlCmdData {
                 );
             }
         }
-        super::ublk_dealloc_buf(self.addr as *mut u8, self.len as usize, 8);
     }
 }
 
@@ -252,13 +261,6 @@ struct UblkCtrlInner {
     cmd_token: i32,
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
-    ring: IoUring<squeue::Entry128>,
-}
-
-impl AsRawFd for UblkCtrl {
-    fn as_raw_fd(&self) -> RawFd {
-        self.get_inner_mut().ring.as_raw_fd()
-    }
 }
 
 impl Drop for UblkCtrlInner {
@@ -312,9 +314,6 @@ impl UblkCtrlInner {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
-        let ring = IoUring::<squeue::Entry128, cqueue::Entry>::builder()
-            .build(16)
-            .map_err(UblkError::OtherIOError)?;
         let info = sys::ublksrv_ctrl_dev_info {
             nr_hw_queues: nr_queues as u16,
             queue_depth: depth as u16,
@@ -336,7 +335,6 @@ impl UblkCtrlInner {
             file: fd,
             dev_info: info,
             json: serde_json::json!({}),
-            ring,
             cmd_token: 0,
             queue_tids: {
                 let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
@@ -453,7 +451,7 @@ impl UblkCtrlInner {
         fd: i32,
         dev_id: u32,
         data: &UblkCtrlCmdData,
-        token: i32,
+        token: u64,
     ) -> squeue::Entry128 {
         let cmd = sys::ublksrv_ctrl_cmd {
             addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
@@ -481,14 +479,28 @@ impl UblkCtrlInner {
         opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
             .cmd(unsafe { c_cmd.buf })
             .build()
-            .user_data(token as u64)
+            .user_data(token)
     }
 
-    fn ublk_submit_ctrl_cmd(
+    fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> UblkUringOpFuture {
+        let fd = self.file.as_raw_fd();
+        let dev_id = self.dev_info.dev_id;
+        let f = UblkUringOpFuture::new(0);
+        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
+
+        unsafe {
+            CTRL_URING.with(|refcell| {
+                refcell.borrow_mut().submission().push(&sqe).unwrap();
+            })
+        }
+        f
+    }
+
+    fn ublk_submit_cmd(
         &mut self,
-        data: &mut UblkCtrlCmdData,
+        data: &UblkCtrlCmdData,
         to_wait: usize,
-    ) -> Result<i32, UblkError> {
+    ) -> Result<u64, UblkError> {
         let fd = self.file.as_raw_fd();
         let dev_id = self.dev_info.dev_id;
 
@@ -497,51 +509,68 @@ impl UblkCtrlInner {
         let token = {
             self.cmd_token += 1;
             self.cmd_token
-        };
+        } as u64;
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
-        unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .map_err(UblkError::UringPushError)?;
-        }
-        self.ring
-            .submit_and_wait(to_wait)
-            .map_err(UblkError::UringSubmissionError)?;
+        CTRL_URING.with(|refcell| {
+            let mut r = refcell.borrow_mut();
 
+            loop {
+                let res = unsafe { r.submission().push(&sqe) };
+                match res {
+                    Ok(_) => break,
+                    Err(_) => {
+                        log::debug!("ublk_submit_cmd: flush and retry");
+                        r.submit_and_wait(0).unwrap();
+                    }
+                }
+            }
+            r.submit_and_wait(to_wait).unwrap();
+        });
         Ok(token)
     }
 
-    /// Poll one control command until it is completed
+    /// check one control command and see if it is completed
     ///
-    /// Note: so far, we only support to poll at most one-inflight
-    /// command, and the use case is for supporting to run start_dev
-    /// in queue io handling context
-    fn poll_cmd(&mut self, token: i32) -> Result<i32, UblkError> {
-        if self.ring.completion().is_empty() {
-            return Err(UblkError::UringIOError(-libc::EAGAIN));
-        }
+    fn poll_cmd(&mut self, token: u64) -> Result<i32, UblkError> {
+        CTRL_URING.with(|refcell| {
+            let mut r = refcell.borrow_mut();
 
-        let cqe = self.ring.completion().next().expect("cqueue is empty");
-        if cqe.user_data() != token as u64 {
-            return Err(UblkError::UringIOError(-libc::EAGAIN));
-        }
+            if r.completion().is_empty() {
+                Err(UblkError::UringIOError(-libc::EAGAIN))
+            } else {
+                let cqe = r.completion().next().expect("cqueue is empty");
+                if cqe.user_data() != token {
+                    Err(UblkError::UringIOError(-libc::EAGAIN))
+                } else {
+                    let res: i32 = cqe.result();
+                    if res == 0 || res == -libc::EBUSY {
+                        Ok(res)
+                    } else {
+                        Err(UblkError::UringIOError(res))
+                    }
+                }
+            }
+        })
+    }
 
-        let res: i32 = cqe.result();
-        if res == 0 || res == -libc::EBUSY {
-            Ok(res)
-        } else {
-            Err(UblkError::UringIOError(res))
-        }
+    async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        let mut data = *data;
+
+        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
+        let res = self.ublk_submit_cmd_async(&mut data).await;
+
+        data.unprep_un_privileged_dev_path(self, old_buf);
+
+        Ok(res)
     }
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         let mut data = *data;
         let to_wait = 1;
 
-        let old_buf = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_ctrl_cmd(&mut data, to_wait)?;
+        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
+        let token = self.ublk_submit_cmd(&data, to_wait)?;
         let res = self.poll_cmd(token);
 
         data.unprep_un_privileged_dev_path(self, old_buf);
@@ -634,6 +663,19 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
+    /// Start this device by sending command to ublk driver
+    ///
+    async fn start_async(&mut self, pid: i32) -> Result<i32, UblkError> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_CMD_START_DEV,
+            flags: CTRL_CMD_HAS_DATA,
+            data: pid as u64,
+            ..Default::default()
+        };
+
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
     /// Stop this device by sending command to ublk driver
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
@@ -713,6 +755,19 @@ impl UblkCtrlInner {
         };
 
         self.ublk_ctrl_cmd(&data)
+    }
+
+    /// End user recover for this device, do similar thing done in start_dev()
+    ///
+    async fn end_user_recover_async(&mut self, pid: i32) -> Result<i32, UblkError> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
+            flags: CTRL_CMD_HAS_DATA,
+            data: pid as u64,
+            ..Default::default()
+        };
+
+        self.ublk_ctrl_cmd_async(&data).await
     }
 
     fn prep_start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
@@ -935,10 +990,10 @@ impl UblkCtrl {
         self.get_inner().dev_info
     }
 
-    // Return ublk_driver's features
-    //
-    // Target code may need to query driver features runtime, so
-    // cache it inside device
+    /// Return ublk_driver's features
+    ///
+    /// Target code may need to query driver features runtime, so
+    /// cache it inside device
     pub fn get_driver_features(&self) -> Option<u64> {
         self.get_inner().features
     }
@@ -998,10 +1053,10 @@ impl UblkCtrl {
         }
     }
 
-    // Return target json data
-    //
-    // Should only be called after device is started, otherwise target data
-    // won't be serialized out, and this API returns None
+    /// Return target json data
+    ///
+    /// Should only be called after device is started, otherwise target data
+    /// won't be serialized out, and this API returns None
     pub fn get_target_data_from_json(&self) -> Option<serde_json::Value> {
         let val = &self.get_inner().json["target_data"];
         if !val.is_null() {
@@ -1184,59 +1239,27 @@ impl UblkCtrl {
         }
     }
 
-    /// submit starting of ublk device from queue daemon context
+    /// Start ublk device in async/.await
     ///
     /// # Arguments:
     ///
     /// * `dev`: ublk device
     ///
     /// Send parameter to driver, and flush json to storage, finally
-    /// submit START command
+    /// send START command
     ///
-    /// When ublk driver handles START_DEV, ublk IO starts to come from
-    /// this kernel code path, such as, reading partition table, so we
-    /// have make io handler working before sending START_DEV to kernel
-    ///
-    /// This kind of usage should be avoided as far as possible, and it
-    /// is suggested to start device in one standalone & one-shot context.
-    ///
-    /// Temporary buffer is returned, and the buffer has to be freed after
-    /// start_dev is done.
-    ///
-    /// TODO: convert control path into async/.await. It shouldn't be hard,
-    /// everything can be done in one background task, and block_on() can
-    /// be added for this purpose. The main trouble is that almost every
-    /// methods of UblkCtrl need to be switched to async, and still not
-    /// confident for this kind of big change. The main use case is to
-    /// run everything(control & io) in single thread context.
-    ///
-    pub fn submit_start_dev(
-        &self,
-        dev: &UblkDev,
-    ) -> Result<(i32, (*mut u8, usize, usize)), UblkError> {
+    pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
-        let mut data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: if ctrl.for_recover_dev() {
-                sys::UBLK_CMD_END_USER_RECOVERY
-            } else {
-                sys::UBLK_CMD_START_DEV
-            },
-            flags: CTRL_CMD_HAS_DATA,
-            data: unsafe { libc::getpid() as u64 },
-            ..Default::default()
-        };
-
         ctrl.prep_start_dev(dev)?;
 
-        let old_buf = data.prep_un_privileged_dev_path(&ctrl);
-        let token = ctrl.ublk_submit_ctrl_cmd(&mut data, 0)?;
-
-        Ok((token, (old_buf as *mut u8, CTRL_UBLKC_PATH_MAX, 8)))
-    }
-
-    // poll the submitted start_dev
-    pub fn poll_start_dev(&self, token: i32) -> Result<i32, UblkError> {
-        self.get_inner_mut().poll_cmd(token)
+        if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            ctrl.start_async(unsafe { libc::getpid() as i32 }).await
+        } else if ctrl.for_recover_dev() {
+            ctrl.end_user_recover_async(unsafe { libc::getpid() as i32 })
+                .await
+        } else {
+            Err(crate::UblkError::OtherError(-libc::EINVAL))
+        }
     }
 
     /// Stop ublk device
@@ -1379,7 +1402,7 @@ impl UblkCtrl {
         Ok(0)
     }
 
-    // iterator over each ublk device ID
+    /// Iterator over each ublk device ID
     pub fn for_each_dev_id<T>(ops: T)
     where
         T: Fn(u32) + Clone + 'static,

@@ -6,7 +6,6 @@
 //! `<https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf>`
 
 use log::error;
-use std::alloc::{alloc, dealloc, Layout};
 
 pub mod ctrl;
 pub mod helpers;
@@ -88,22 +87,6 @@ pub enum UblkError {
 
     #[error("other failure")]
     OtherError(i32),
-}
-
-pub fn ublk_alloc_buf(size: usize, align: usize) -> *mut u8 {
-    let layout = match Layout::from_size_align(size, align) {
-        Ok(r) => r,
-        Err(_) => return std::ptr::null_mut(),
-    };
-    unsafe { alloc(layout) }
-}
-
-pub fn ublk_dealloc_buf(ptr: *mut u8, size: usize, align: usize) {
-    let layout = match Layout::from_size_align(size, align) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    unsafe { dealloc(ptr as *mut u8, layout) };
 }
 
 #[cfg(test)]
