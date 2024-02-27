@@ -530,11 +530,8 @@ impl UblkCtrlInner {
         Ok(token)
     }
 
-    /// Poll one control command until it is completed
+    /// check one control command and see if it is completed
     ///
-    /// Note: so far, we only support to poll at most one-inflight
-    /// command, and the use case is for supporting to run start_dev
-    /// in queue io handling context
     fn poll_cmd(&mut self, token: u64) -> Result<i32, UblkError> {
         CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
@@ -993,10 +990,10 @@ impl UblkCtrl {
         self.get_inner().dev_info
     }
 
-    // Return ublk_driver's features
-    //
-    // Target code may need to query driver features runtime, so
-    // cache it inside device
+    /// Return ublk_driver's features
+    ///
+    /// Target code may need to query driver features runtime, so
+    /// cache it inside device
     pub fn get_driver_features(&self) -> Option<u64> {
         self.get_inner().features
     }
@@ -1056,10 +1053,10 @@ impl UblkCtrl {
         }
     }
 
-    // Return target json data
-    //
-    // Should only be called after device is started, otherwise target data
-    // won't be serialized out, and this API returns None
+    /// Return target json data
+    ///
+    /// Should only be called after device is started, otherwise target data
+    /// won't be serialized out, and this API returns None
     pub fn get_target_data_from_json(&self) -> Option<serde_json::Value> {
         let val = &self.get_inner().json["target_data"];
         if !val.is_null() {
@@ -1405,7 +1402,7 @@ impl UblkCtrl {
         Ok(0)
     }
 
-    // iterator over each ublk device ID
+    /// Iterator over each ublk device ID
     pub fn for_each_dev_id<T>(ops: T)
     where
         T: Fn(u32) + Clone + 'static,
