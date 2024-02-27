@@ -1,8 +1,9 @@
 use crate::io::UblkQueue;
 use crate::UblkError;
-use io_uring::{cqueue, squeue, IoUring};
+use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
+use std::os::fd::AsRawFd;
 use std::{
     future::Future,
     pin::Pin,
@@ -142,30 +143,62 @@ pub fn ublk_run_ctrl_task<T>(
     q: &UblkQueue,
     q_exe: &smol::LocalExecutor,
     task: &smol::Task<T>,
-) {
-    ctrl_exe.try_tick();
-    while !task.is_finished() {
-        let mut q_idle = false;
-        let mut ctrl_idle = false;
+) -> Result<(), UblkError> {
+    let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
+        .build(4)
+        .map_err(UblkError::OtherIOError)?;
+    let ctrl_fd = crate::ctrl::CTRL_URING.with(|refcell| refcell.borrow().as_raw_fd());
+    let q_fd = q.as_raw_fd();
+    let mut poll_q = true;
+    let mut poll_ctrl = true;
 
-        if ublk_process_queue_io(q, q_exe, 0).unwrap() == 0 {
-            q_idle = true;
+    while ctrl_exe.try_tick() {}
+    while !task.is_finished() {
+        log::debug!(
+            "poll ring: submit and wait, ctrl_fd {} q_fd {}",
+            ctrl_fd,
+            q_fd
+        );
+
+        if poll_q {
+            let q_e = opcode::PollAdd::new(types::Fd(q_fd), (libc::POLLIN | libc::POLLOUT) as _);
+            let _ = unsafe { pr.submission().push(&q_e.build().user_data(0x01).into()) };
+            poll_q = false;
+        }
+        if poll_ctrl {
+            let ctrl_e =
+                opcode::PollAdd::new(types::Fd(ctrl_fd), (libc::POLLIN | libc::POLLOUT) as _);
+            let _ = unsafe { pr.submission().push(&ctrl_e.build().user_data(0x02).into()) };
+            poll_ctrl = false;
         }
 
+        pr.submit_and_wait(1).map_err(UblkError::OtherIOError)?;
+        let cqes: Vec<cqueue::Entry> = pr.completion().map(Into::into).collect();
+        for cqe in cqes {
+            if cqe.user_data() == 0x1 {
+                poll_q = true;
+            }
+            if cqe.user_data() == 0x2 {
+                poll_ctrl = true;
+            }
+        }
+
+        ublk_process_queue_io(q, q_exe, 0)?;
         let entry =
             crate::ctrl::CTRL_URING.with(|refcell| ublk_try_reap_cqe(&mut refcell.borrow_mut(), 0));
         if let Some(cqe) = entry {
             ublk_wake_task(cqe.user_data(), &cqe);
             while ctrl_exe.try_tick() {}
-        } else {
-            ctrl_idle = true;
-        }
-
-        // Fixme: switch to poll on the two FDs
-        if q_idle && ctrl_idle {
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+
+    let nr_waits = 1 + if poll_q { 0 } else { 1 } + if poll_ctrl { 0 } else { 1 };
+    let poll_e = opcode::PollRemove::new(0x05);
+    let _ = unsafe { pr.submission().push(&poll_e.build().user_data(0x05).into()) };
+    pr.submit_and_wait(nr_waits)
+        .map_err(UblkError::OtherIOError)?;
+
+    Ok(())
 }
 
 /// Wait and handle incoming IO command

@@ -102,7 +102,7 @@ fn start_dev_fn(
         let mut guard = res_clone.lock().unwrap();
         *guard = r.unwrap();
     });
-    ublk_run_ctrl_task(&ctrl_exe, &q_rc, &q_exe, &task);
+    ublk_run_ctrl_task(&ctrl_exe, &q_rc, &q_exe, &task).unwrap();
 
     let r = *res.lock().unwrap();
 
@@ -200,6 +200,10 @@ fn test_del() {
 }
 
 fn main() {
+    env_logger::builder()
+        .format_target(false)
+        .format_timestamp(None)
+        .init();
     if let Some(cmd) = std::env::args().nth(1) {
         match cmd.as_str() {
             "add" => test_add(0),
