@@ -118,10 +118,6 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     } else {
         eprintln!("device can't be started");
     }
-
-    //device may be deleted from another context, so it is normal
-    //to see -ENOENT failure here
-    let _ = ctrl.stop_dev();
 }
 
 fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {
