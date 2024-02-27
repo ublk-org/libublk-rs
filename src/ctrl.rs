@@ -86,15 +86,15 @@ struct UblkCtrlCmdData {
 }
 
 impl UblkCtrlCmdData {
-    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> u64 {
+    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Vec<u8>>) {
         // handle GET_DEV_INFO2 always with dev_path attached
         if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
             && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
         {
-            return 0;
+            return (0, None);
         }
 
-        let buf: *mut u8 = {
+        let (buf, new_buf) = {
             let size = {
                 if self.flags & CTRL_CMD_HAS_BUF != 0 {
                     self.len as usize + CTRL_UBLKC_PATH_MAX
@@ -102,7 +102,9 @@ impl UblkCtrlCmdData {
                     CTRL_UBLKC_PATH_MAX
                 }
             };
-            super::ublk_alloc_buf(size, 8)
+            let mut v = vec![0_u8; size];
+
+            (v.as_mut_ptr(), v)
         };
 
         let path_str = dev.get_cdev_path().to_string();
@@ -130,7 +132,7 @@ impl UblkCtrlCmdData {
         self.dev_path_len = CTRL_UBLKC_PATH_MAX as u16;
         let addr = self.addr;
         self.addr = buf as u64;
-        addr
+        (addr, Some(new_buf))
     }
 
     fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner, buf: u64) {
@@ -151,7 +153,6 @@ impl UblkCtrlCmdData {
                 );
             }
         }
-        super::ublk_dealloc_buf(self.addr as *mut u8, self.len as usize, 8);
     }
 }
 
@@ -559,7 +560,7 @@ impl UblkCtrlInner {
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         let mut data = *data;
 
-        let old_buf = data.prep_un_privileged_dev_path(self);
+        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
         let res = self.ublk_submit_cmd_async(&mut data).await;
 
         data.unprep_un_privileged_dev_path(self, old_buf);
@@ -571,7 +572,7 @@ impl UblkCtrlInner {
         let mut data = *data;
         let to_wait = 1;
 
-        let old_buf = data.prep_un_privileged_dev_path(self);
+        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
         let token = self.ublk_submit_cmd(&data, to_wait)?;
         let res = self.poll_cmd(token);
 
@@ -1262,61 +1263,6 @@ impl UblkCtrl {
         } else {
             Err(crate::UblkError::OtherError(-libc::EINVAL))
         }
-    }
-
-    /// submit starting of ublk device from queue daemon context
-    ///
-    /// # Arguments:
-    ///
-    /// * `dev`: ublk device
-    ///
-    /// Send parameter to driver, and flush json to storage, finally
-    /// submit START command
-    ///
-    /// When ublk driver handles START_DEV, ublk IO starts to come from
-    /// this kernel code path, such as, reading partition table, so we
-    /// have make io handler working before sending START_DEV to kernel
-    ///
-    /// This kind of usage should be avoided as far as possible, and it
-    /// is suggested to start device in one standalone & one-shot context.
-    ///
-    /// Temporary buffer is returned, and the buffer has to be freed after
-    /// start_dev is done.
-    ///
-    /// TODO: convert control path into async/.await. It shouldn't be hard,
-    /// everything can be done in one background task, and block_on() can
-    /// be added for this purpose. The main trouble is that almost every
-    /// methods of UblkCtrl need to be switched to async, and still not
-    /// confident for this kind of big change. The main use case is to
-    /// run everything(control & io) in single thread context.
-    ///
-    pub fn submit_start_dev(
-        &self,
-        dev: &UblkDev,
-    ) -> Result<(u64, (*mut u8, usize, usize)), UblkError> {
-        let mut ctrl = self.get_inner_mut();
-        let mut data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: if ctrl.for_recover_dev() {
-                sys::UBLK_CMD_END_USER_RECOVERY
-            } else {
-                sys::UBLK_CMD_START_DEV
-            },
-            flags: CTRL_CMD_HAS_DATA,
-            data: unsafe { libc::getpid() as u64 },
-            ..Default::default()
-        };
-
-        ctrl.prep_start_dev(dev)?;
-
-        let old_buf = data.prep_un_privileged_dev_path(&ctrl);
-        let token = ctrl.ublk_submit_cmd(&mut data, 0)?;
-
-        Ok((token, (old_buf as *mut u8, CTRL_UBLKC_PATH_MAX, 8)))
-    }
-
-    // poll the submitted start_dev
-    pub fn poll_start_dev(&self, token: u64) -> Result<i32, UblkError> {
-        self.get_inner_mut().poll_cmd(token)
     }
 
     /// Stop ublk device
