@@ -31,7 +31,6 @@ bitflags! {
     struct LoFlags: u32 {
         const ASYNC = 0b00000001;
         const FOREGROUND = 0b00000010;
-        const SPLIT = 0b00000100;
         const ONESHOT = 0b00001000;
     }
 }
@@ -83,7 +82,7 @@ fn lo_file_size(f: &std::fs::File) -> Result<(u64, u8, u8)> {
 }
 
 // setup loop target
-fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, split: bool) -> Result<i32, UblkError> {
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
     trace!("loop: init_tgt {}", dev.dev_info.dev_id);
     if lo.direct_io != 0 {
         unsafe {
@@ -95,10 +94,6 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt, split: bool) -> Result<i32, Ublk
     let nr_fds = tgt.nr_fds;
     tgt.fds[nr_fds as usize] = lo.back_file.as_raw_fd();
     tgt.nr_fds = nr_fds + 1;
-
-    let depth = dev.dev_info.queue_depth;
-    tgt.sq_depth = if split { depth * 2 } else { depth };
-    tgt.cq_depth = if split { depth * 2 } else { depth };
 
     let sz = { lo_file_size(&lo.back_file).unwrap() };
     tgt.dev_size = sz.0;
@@ -174,39 +169,6 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) 
     }
 
     return -libc::EAGAIN;
-}
-
-async fn lo_handle_io_cmd_async_split(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) -> i32 {
-    let iod = q.get_iod(tag);
-    let res = __lo_prep_submit_io_cmd(iod);
-    if res < 0 {
-        return res;
-    }
-
-    let op = iod.op_flags & 0xff;
-    let off = (iod.start_sector << 9) as u64;
-    let bytes = (iod.nr_sectors << 9) as u32;
-
-    if bytes > 4096 {
-        let sqe = __lo_make_io_sqe(op, off, 4096, buf_addr);
-        let sqe2 = __lo_make_io_sqe(
-            op,
-            off + 4096,
-            bytes - 4096,
-            ((buf_addr as u64) + 4096) as *mut u8,
-        );
-
-        let f = q.ublk_submit_sqe(sqe);
-        let f2 = q.ublk_submit_sqe(sqe2);
-        let (res, res2) = futures::join!(f, f2);
-
-        res + res2
-    } else {
-        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
-        let f = q.ublk_submit_sqe(sqe);
-
-        f.await
-    }
 }
 
 fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
@@ -294,7 +256,6 @@ fn __test_add(
     lo_flags: LoFlags,
 ) {
     let aio = lo_flags.intersects(LoFlags::ASYNC);
-    let split = lo_flags.intersects(LoFlags::SPLIT);
     let oneshot = lo_flags.intersects(LoFlags::ONESHOT);
     {
         // LooTgt has to live in the whole device lifetime
@@ -318,7 +279,7 @@ fn __test_add(
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo, split);
+        let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
         let q_async_fn = move |qid: u16, dev: &UblkDev| {
             let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
             let exe = smol::LocalExecutor::new();
@@ -340,11 +301,7 @@ fn __test_add(
                             break;
                         }
 
-                        res = if !split {
-                            lo_handle_io_cmd_async(&q, tag, buf_addr).await
-                        } else {
-                            lo_handle_io_cmd_async_split(&q, tag, buf_addr).await
-                        };
+                        res = lo_handle_io_cmd_async(&q, tag, buf_addr).await;
                         cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
                     }
                 }));
@@ -456,13 +413,6 @@ fn main() {
                         .long("oneshot")
                         .action(ArgAction::SetTrue)
                         .help("create, dump and remove device automatically"),
-                )
-                .arg(
-                    Arg::new("split")
-                        .long("split")
-                        .short('s')
-                        .action(ArgAction::SetTrue)
-                        .help("Split big IO into two small IOs, only for --async"),
                 ),
         )
         .subcommand(
@@ -505,11 +455,6 @@ fn main() {
 
             if add_matches.get_flag("async") {
                 lo_flags |= LoFlags::ASYNC;
-            };
-            if lo_flags.intersects(LoFlags::ASYNC) {
-                if add_matches.get_flag("split") {
-                    lo_flags |= LoFlags::SPLIT;
-                }
             };
             if add_matches.get_flag("foreground") {
                 lo_flags |= LoFlags::FOREGROUND;
