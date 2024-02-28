@@ -291,7 +291,7 @@ fn __test_add(
                 f_vec.push(exe.spawn(async move {
                     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
                     let buf_addr = buf.as_mut_ptr();
-                    let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
+                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
                     let mut res = 0;
 
                     q.register_io_buf(tag, &buf);
@@ -302,7 +302,7 @@ fn __test_add(
                         }
 
                         res = lo_handle_io_cmd_async(&q, tag, buf_addr).await;
-                        cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                     }
                 }));
             }

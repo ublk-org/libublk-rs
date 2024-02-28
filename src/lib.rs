@@ -13,6 +13,7 @@ pub mod io;
 pub mod sys;
 pub mod uring_async;
 
+/// Don't use the top 8 bits, which are reserved for internal uses
 pub mod dev_flags {
     /// feature: support IO batch completion from single IO tag, typical
     /// usecase is to complete IOs from eventfd CQE handler
@@ -23,6 +24,8 @@ pub mod dev_flags {
 
     /// tell UblkCtrl that we are recovering one old device
     pub const UBLK_DEV_F_RECOVER_DEV: u32 = 1u32 << 2;
+
+    pub(crate) const UBLK_DEV_F_INTERNAL_0: u32 = 1u32 << 31;
 
     pub const UBLK_DEV_F_ALL: u32 =
         UBLK_DEV_F_COMP_BATCH | UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_RECOVER_DEV;

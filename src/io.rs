@@ -119,8 +119,9 @@ impl<'a> UblkIOCtx<'a> {
     #[inline(always)]
     #[allow(arithmetic_overflow)]
     pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
-        assert!((op >> 8) == 0 && (tgt_data >> 16) == 0);
+        assert!((tgt_data >> 16) == 0);
 
+        let op = op & 0xff;
         tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
     }
 
@@ -465,12 +466,19 @@ fn round_up(val: u32, rnd: u32) -> u32 {
 
 impl UblkQueue<'_> {
     const UBLK_QUEUE_IDLE_SECS: u32 = 20;
+    const UBLK_QUEUE_IOCTL_ENCODE: u32 = crate::dev_flags::UBLK_DEV_F_INTERNAL_0;
+
     #[inline(always)]
     fn cmd_buf_sz(depth: u32) -> u32 {
         let size = depth * core::mem::size_of::<sys::ublksrv_io_desc>() as u32;
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
 
         round_up(size, page_sz)
+    }
+
+    #[inline(always)]
+    fn is_ioctl_encode(&self) -> bool {
+        (self.flags & Self::UBLK_QUEUE_IOCTL_ENCODE) != 0
     }
 
     /// New one ublk queue
@@ -532,8 +540,15 @@ impl UblkQueue<'_> {
             bufs[i as usize] = std::ptr::null_mut();
         }
 
+        assert!((dev.flags & Self::UBLK_QUEUE_IOCTL_ENCODE) == 0);
+
         let q = UblkQueue {
-            flags: dev.flags,
+            flags: dev.flags
+                | if (dev.dev_info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0 {
+                    Self::UBLK_QUEUE_IOCTL_ENCODE
+                } else {
+                    0
+                },
             q_id,
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
@@ -647,6 +662,12 @@ impl UblkQueue<'_> {
             result: res,
         };
 
+        let cmd_op = if !self.is_ioctl_encode() {
+            cmd_op & 0xff
+        } else {
+            cmd_op
+        };
+
         let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
@@ -667,9 +688,10 @@ impl UblkQueue<'_> {
         state.inc_cmd_inflight();
 
         log::trace!(
-            "{}: (qid {} tag {} cmd_op {}) stopping {}",
+            "{}: (qid {} flags {:x} tag {} cmd_op {}) stopping {}",
             "queue_io_cmd",
             self.q_id,
+            self.flags,
             tag,
             cmd_op,
             state.is_stopping(),
@@ -702,7 +724,7 @@ impl UblkQueue<'_> {
         self.queue_io_cmd(
             r,
             tag,
-            sys::UBLK_IO_COMMIT_AND_FETCH_REQ,
+            sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
             buf_addr,
             io_cmd_result,
         );
@@ -711,7 +733,7 @@ impl UblkQueue<'_> {
     /// Submit one io command.
     ///
     /// When it is called 1st time on this tag, the `cmd_op` has to be
-    /// UBLK_IO_FETCH_REQ, otherwise it is UBLK_IO_COMMIT_AND_FETCH_REQ.
+    /// UBLK_U_IO_FETCH_REQ, otherwise it is UBLK_U_IO_COMMIT_AND_FETCH_REQ.
     ///
     /// UblkUringOpFuture is one Future object, so this function is actually
     /// one async function, and user can get result by submit_io_cmd().await
@@ -776,7 +798,7 @@ impl UblkQueue<'_> {
             self.queue_io_cmd(
                 &mut self.q_ring.borrow_mut(),
                 i as u16,
-                sys::UBLK_IO_FETCH_REQ,
+                sys::UBLK_U_IO_FETCH_REQ,
                 buf_addr as u64,
                 -1,
             );
@@ -789,7 +811,7 @@ impl UblkQueue<'_> {
             self.queue_io_cmd(
                 &mut self.q_ring.borrow_mut(),
                 i as u16,
-                sys::UBLK_IO_FETCH_REQ,
+                sys::UBLK_U_IO_FETCH_REQ,
                 buf_addr,
                 -1,
             );

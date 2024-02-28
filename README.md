@@ -37,7 +37,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16) {
     // IO buffer for exchange data with /dev/ublkbN
     let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
     let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
-    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
     // Register IO buffer, so that buffer pages can be discarded
@@ -53,7 +53,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16) {
 
         // Handle this incoming IO command
         res = handle_io_cmd(&q, tag).await;
-        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
 }
 

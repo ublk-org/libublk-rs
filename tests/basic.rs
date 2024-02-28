@@ -196,7 +196,7 @@ mod integration {
                 let __dev_data = _dev_data.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
+                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
                     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
                     let mut res = 0;
 
@@ -208,7 +208,7 @@ mod integration {
                         }
 
                         res = handle_io_cmd(&q, tag).await;
-                        cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                         {
                             let mut guard = __dev_data.lock().unwrap();
                             (*guard).done += 1;

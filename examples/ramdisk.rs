@@ -60,7 +60,7 @@ fn queue_fn<'a>(
         f_vec.push(exe.spawn(async move {
             let buffer = IoBuf::<u8>::new(buf_size);
             let addr = buffer.as_mut_ptr();
-            let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+            let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
 
             loop {
@@ -70,7 +70,7 @@ fn queue_fn<'a>(
                 }
 
                 res = handle_io(&q, tag, addr, dev_buf_addr);
-                cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
             }
         }));
         exe.try_tick();

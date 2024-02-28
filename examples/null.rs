@@ -103,7 +103,7 @@ fn __test_add(
 
                 f_vec.push(exe.spawn(async move {
                     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-                    let mut cmd_op = libublk::sys::UBLK_IO_FETCH_REQ;
+                    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
                     let mut res = 0;
                     let buf_addr = if user_copy {
                         std::ptr::null_mut()
@@ -119,7 +119,7 @@ fn __test_add(
                         }
 
                         res = get_io_cmd_result(&q, tag);
-                        cmd_op = libublk::sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                     }
                 }));
             }
