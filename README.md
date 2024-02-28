@@ -5,7 +5,7 @@
 
 Rust library for building linux ublk target device, which talks with
 linux `ublk driver`[^1] for exposing standard linux block device,
-meantime all target IO logic can be moved to userspace.
+meantime all target IO logic is implemented in userspace.
 
 Linux kernel 6.0 starts to support ublk covered by config option of
 CONFIG_BLK_DEV_UBLK.
@@ -20,12 +20,9 @@ introduction](https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf)
 
 ## Quick Start
 
-Follows one totally working 2-queue ublk-null target which is built over
-libublk 0.1, and each queue depth is 64, and each IO\'s max buffer size
-is 512KB.
-
-Ublk block device(/dev/ublkbN) is created after the code is run. And the
-device will be deleted after terminating this process by ctrl+C.
+Follows one 2-queue ublk-null target which is built over libublk, ublk block
+device(/dev/ublkbN) is created after the code is run. And the device will be
+deleted after terminating this process by ctrl+C.
 
 ``` rust
 use libublk::{ctrl::UblkCtrlBuilder, io::UblkDev, io::UblkQueue};
@@ -113,8 +110,15 @@ fn main() {
 }
 ```
 
- * [`examples/loop.rs`](examples/loop.rs): real example using async/await & io_uring.
+ * [`examples/loop.rs`](examples/loop.rs): real example using
+   async/await & io_uring.
 
+ * [`examples/ramdisk.rs`](examples/ramdisk.rs): single thread &
+   async/.await for both ctrl and IO, this technique will be extended to
+   create multiple devices from single thread in future
+
+`rublk`[^4] is based on libublk, and supports null, loop, zoned & qcow2 targets so
+far.
 
 ## unprivileged ublk support
 
@@ -171,3 +175,4 @@ Any kinds of contributions are welcome!
 [^1]: <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/block/ublk_drv.c?h=v6.0>
 [^2]: <https://github.com/axboe/fio/blob/master/t/io_uring.c>
 [^3]: <https://github.com/osandov/blktests/blob/master/src/miniublk.c>
+[^4]: <https://github.com/ublk-org/rublk>
