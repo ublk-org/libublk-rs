@@ -2,7 +2,9 @@ use libublk::ctrl::UblkCtrl;
 ///! # Example of ramdisk
 ///
 /// Serves for covering recovery test[`test_ublk_ramdisk_recovery`],
-/// UblkCtrl::start_dev_in_queue() and low level interface example.
+///
+/// Build ramdisk target in single-thread conext, and the same technique
+/// will be extended to create multiple devices in single thread
 ///
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
@@ -79,6 +81,8 @@ fn queue_fn<'a>(
     (q_rc, exe, f_vec)
 }
 
+/// Start device in async IO task, in which both control and io rings
+/// are driven in current context
 fn start_dev_fn(
     ctrl_rc: &Rc<UblkCtrl>,
     dev_arc: &Arc<UblkDev>,
@@ -140,7 +144,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     // spawn async io tasks, and return io task array
     let (q_rc, exe, f_vec) = queue_fn(&dev, buf_addr);
 
-    // start device by running one async control task
+    // start device via async task
     let res = start_dev_fn(&ctrl, &dev, &ctrl_exe, &q_rc, &exe);
 
     if res >= 0 {
