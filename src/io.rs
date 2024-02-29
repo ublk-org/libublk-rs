@@ -527,7 +527,7 @@ impl UblkQueue<'_> {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::MmapError(unsafe { *libc::__errno_location() }));
+            return Err(UblkError::OtherIOError(std::io::Error::last_os_error()));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
@@ -1012,7 +1012,7 @@ impl UblkQueue<'_> {
         #[allow(clippy::collapsible_if)]
         if state.queue_is_done() {
             if self.q_ring.borrow_mut().submission().is_empty() {
-                return Err(UblkError::QueueIsDown(-libc::ENODEV));
+                return Err(UblkError::QueueIsDown);
             }
         }
 

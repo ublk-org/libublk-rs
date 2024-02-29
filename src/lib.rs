@@ -76,11 +76,8 @@ pub enum UblkError {
     #[error("json failure")]
     JsonError(#[from] serde_json::Error),
 
-    #[error("mmap failure")]
-    MmapError(i32),
-
     #[error("queue down failure")]
-    QueueIsDown(i32),
+    QueueIsDown,
 
     #[error("other IO failure")]
     OtherIOError(#[source] std::io::Error),
