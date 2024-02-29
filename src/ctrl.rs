@@ -292,32 +292,6 @@ impl UblkCtrlInner {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrlInner, UblkError> {
-        if !Path::new(CTRL_PATH).exists() {
-            eprintln!("Please run `modprobe ublk_drv` first");
-            return Err(UblkError::OtherError(-libc::ENOENT));
-        }
-
-        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0) {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        if id < 0 && id != -1 {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        if nr_queues > sys::UBLK_MAX_NR_QUEUES {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        if depth > sys::UBLK_MAX_QUEUE_DEPTH {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-        if io_buf_bytes > MAX_BUF_SZ || io_buf_bytes & (page_sz - 1) != 0 {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
         let info = sys::ublksrv_ctrl_dev_info {
             nr_hw_queues: nr_queues as u16,
             queue_depth: depth as u16,
@@ -981,6 +955,16 @@ impl UblkCtrl {
     const CDEV_PATH: &'static str = "/dev/ublkc";
     const BDEV_PATH: &'static str = "/dev/ublkb";
 
+    const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
+        | sys::UBLK_F_URING_CMD_COMP_IN_TASK
+        | sys::UBLK_F_NEED_GET_DATA
+        | sys::UBLK_F_USER_RECOVERY
+        | sys::UBLK_F_USER_RECOVERY_REISSUE
+        | sys::UBLK_F_UNPRIVILEGED_DEV
+        | sys::UBLK_F_CMD_IOCTL_ENCODE
+        | sys::UBLK_F_USER_COPY
+        | sys::UBLK_F_ZONED) as u64;
+
     fn get_inner(&self) -> std::sync::RwLockReadGuard<UblkCtrlInner> {
         self.inner.read().unwrap()
     }
@@ -1028,6 +1012,36 @@ impl UblkCtrl {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
+        if (flags & !Self::UBLK_DRV_F_ALL) != 0 {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if !Path::new(CTRL_PATH).exists() {
+            eprintln!("Please run `modprobe ublk_drv` first");
+            return Err(UblkError::OtherError(-libc::ENOENT));
+        }
+
+        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0) {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if id < 0 && id != -1 {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if nr_queues > sys::UBLK_MAX_NR_QUEUES {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if depth > sys::UBLK_MAX_QUEUE_DEPTH {
+            return Err(UblkError::InvalidVal);
+        }
+
+        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        if io_buf_bytes > MAX_BUF_SZ || io_buf_bytes & (page_sz - 1) != 0 {
+            return Err(UblkError::InvalidVal);
+        }
+
         let inner = RwLock::new(UblkCtrlInner::new(
             name,
             id,

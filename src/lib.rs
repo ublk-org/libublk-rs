@@ -88,6 +88,9 @@ pub enum UblkError {
     #[error("IO Queued")]
     IoQueued(i32),
 
+    #[error("Invalid input")]
+    InvalidVal,
+
     #[error("other failure")]
     OtherError(i32),
 }
