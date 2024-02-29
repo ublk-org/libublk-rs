@@ -524,81 +524,66 @@ impl UblkCtrlInner {
         })
     }
 
-    async fn __ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> i32 {
-        let mut data = *data;
+    fn ublk_ctrl_need_retry(
+        new_data: &mut UblkCtrlCmdData,
+        data: &UblkCtrlCmdData,
+        res: i32,
+    ) -> bool {
+        if res >= 0 || res == -libc::EBUSY {
+            false
+        } else if (data.cmd_op & 0xff) > sys::UBLK_CMD_GET_DEV_INFO2 {
+            // new commands have to be issued via ioctl encoding
+            false
+        } else {
+            *new_data = *data;
+            new_data.cmd_op &= 0xff;
+            true
+        }
+    }
 
-        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
-        let res = self.ublk_submit_cmd_async(&mut data).await;
-
-        data.unprep_un_privileged_dev_path(self, old_buf);
-
-        res
+    fn ublk_err_to_result(res: i32) -> Result<i32, UblkError> {
+        if res >= 0 || res == -libc::EBUSY {
+            Ok(res)
+        } else {
+            Err(UblkError::UringIOError(res))
+        }
     }
 
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let res = self.__ublk_ctrl_cmd_async(data).await;
+        let mut new_data = *data;
+        let mut res: i32 = 0;
 
-        if res >= 0 || res == -libc::EBUSY {
-            Ok(res)
-        } else {
-            let legacy_op = data.cmd_op & 0xff;
+        for _ in 0..2 {
+            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
+            res = self.ublk_submit_cmd_async(&mut new_data).await;
+            new_data.unprep_un_privileged_dev_path(self, old_buf);
 
-            // new commands have to be issued via ioctl encoding
-            if legacy_op > sys::UBLK_CMD_GET_DEV_INFO2 {
-                Err(UblkError::UringIOError(res))
-            } else {
-                let mut new_data = *data;
-
-                // retry one more time with legacy encoding
-                new_data.cmd_op = legacy_op;
-                let res = self.__ublk_ctrl_cmd_async(&new_data).await;
-                if res >= 0 || res == -libc::EBUSY {
-                    Ok(res)
-                } else {
-                    Err(UblkError::UringIOError(res))
-                }
+            trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
+            if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
+                break;
             }
         }
-    }
 
-    fn __ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let mut data = *data;
-        let to_wait = 1;
-
-        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_cmd(&data, to_wait)?;
-        let res = self.poll_cmd(token);
-
-        data.unprep_un_privileged_dev_path(self, old_buf);
-
-        Ok(res)
+        Self::ublk_err_to_result(res)
     }
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let res = self.__ublk_ctrl_cmd(data)?;
+        let mut new_data = *data;
+        let mut res: i32 = 0;
 
-        if res >= 0 || res == -libc::EBUSY {
-            Ok(res)
-        } else {
-            let legacy_op = data.cmd_op & 0xff;
+        for _ in 0..2 {
+            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
+            let token = self.ublk_submit_cmd(&new_data, 1)?;
+            res = self.poll_cmd(token);
+            new_data.unprep_un_privileged_dev_path(self, old_buf);
 
-            // new commands have to be issued via ioctl encoding
-            if legacy_op > sys::UBLK_CMD_GET_DEV_INFO2 {
-                Err(UblkError::UringIOError(res))
-            } else {
-                let mut new_data = *data;
-
-                // retry one more time with legacy encoding for
-                // old kernel without ioctl encoding support
-                new_data.cmd_op = legacy_op;
-                let res = self.__ublk_ctrl_cmd(&new_data)?;
-                if res >= 0 || res == -libc::EBUSY {
-                    Ok(res)
-                } else {
-                    Err(UblkError::UringIOError(res))
-                }
+            trace!("ublk_ctrl_cmd: cmd {:x} res {}", data.cmd_op, res);
+            if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
+                break;
             }
         }
+
+        Self::ublk_err_to_result(res)
     }
 
     fn add(&mut self) -> Result<i32, UblkError> {
