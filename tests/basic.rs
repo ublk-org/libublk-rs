@@ -77,18 +77,26 @@ mod integration {
     #[test]
     fn test_ublk_null() {
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue(qid: u16, _dev: &UblkDev) {
+        fn null_handle_queue(qid: u16, dev: &UblkDev) {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+            let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+            let bufs = bufs_rc.clone();
+
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
-                let buf_addr = std::ptr::null_mut();
 
+                let buf_addr = if user_copy {
+                    std::ptr::null_mut()
+                } else {
+                    bufs[tag as usize].as_mut_ptr()
+                };
                 q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands(None)
+                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
                 .wait_and_handle_io(io_handler);
         }
 
@@ -101,19 +109,28 @@ mod integration {
     fn test_ublk_null_comp_batch() {
         use libublk::UblkFatRes;
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue_batch(qid: u16, _dev: &UblkDev) {
+        fn null_handle_queue_batch(qid: u16, dev: &UblkDev) {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+            let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+            let bufs = bufs_rc.clone();
+
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
-                let buf_addr = std::ptr::null_mut();
+
+                let buf_addr = if user_copy {
+                    std::ptr::null_mut()
+                } else {
+                    bufs[tag as usize].as_mut_ptr()
+                };
 
                 let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)])));
                 q.complete_io_cmd(tag, buf_addr, res);
             };
 
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands(None)
+                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
                 .wait_and_handle_io(io_handler);
         }
 
@@ -179,7 +196,7 @@ mod integration {
                 let __dev_data = _dev_data.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    let mut cmd_op = sys::UBLK_IO_FETCH_REQ;
+                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
                     let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
                     let mut res = 0;
 
@@ -191,7 +208,7 @@ mod integration {
                         }
 
                         res = handle_io_cmd(&q, tag).await;
-                        cmd_op = sys::UBLK_IO_COMMIT_AND_FETCH_REQ;
+                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                         {
                             let mut guard = __dev_data.lock().unwrap();
                             (*guard).done += 1;
@@ -303,7 +320,6 @@ mod integration {
             let bufs = bufs_rc.clone();
 
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                let bufs = bufs_rc.clone();
                 let buf_addr = bufs[tag as usize].as_mut_ptr();
 
                 rd_handle_io(q, tag, _io, buf_addr, dev_addr);
@@ -311,8 +327,8 @@ mod integration {
 
             UblkQueue::new(qid, dev)
                 .unwrap()
-                .regiser_io_bufs(Some(&bufs))
-                .submit_fetch_commands(Some(&bufs))
+                .regiser_io_bufs(Some(&bufs_rc))
+                .submit_fetch_commands(Some(&bufs_rc))
                 .wait_and_handle_io(io_handler);
         };
 
@@ -326,13 +342,16 @@ mod integration {
     #[test]
     fn test_fn_mut_io_closure() {
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_queue_mut_io(qid: u16, _dev: &UblkDev) {
+        fn null_queue_mut_io(qid: u16, dev: &UblkDev) {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+            let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+            let bufs = bufs_rc.clone();
+
             // modify this vector in io handling closure
             let mut q_vec = Vec::<i32>::new();
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
                 let res = Ok(UblkIORes::Result((iod.nr_sectors << 9) as i32));
-                let buf_addr = std::ptr::null_mut();
 
                 {
                     q_vec.push(tag as i32);
@@ -341,12 +360,18 @@ mod integration {
                     }
                 }
 
+                let buf_addr = if user_copy {
+                    std::ptr::null_mut()
+                } else {
+                    let bufs = bufs_rc.clone();
+                    bufs[tag as usize].as_mut_ptr()
+                };
                 q.complete_io_cmd(tag, buf_addr, res);
             };
 
-            UblkQueue::new(qid, _dev)
+            UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands(None)
+                .submit_fetch_commands(if user_copy { None } else { Some(&bufs) })
                 .wait_and_handle_io(io_handler);
         }
 

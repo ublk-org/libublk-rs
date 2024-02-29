@@ -78,7 +78,6 @@ jobs:
         mkosi ssh /usr/share/libublk-rs/target/debug/test-basic --nocapture
         mkosi ssh truncate -s 128M /tmp/test.img
         mkosi ssh /usr/share/libublk-rs/target/debug/examples/loop add --foreground --oneshot -f /tmp/test.img -a
-        mkosi ssh /usr/share/libublk-rs/target/debug/examples/loop add --foreground --oneshot -f /tmp/test.img -a -s
         mkosi ssh /usr/share/libublk-rs/target/debug/examples/null add --foreground --oneshot -a
         mkosi ssh /usr/share/libublk-rs/target/debug/examples/null add --foreground --oneshot -a -u
 

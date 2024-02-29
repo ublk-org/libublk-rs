@@ -88,7 +88,9 @@ struct UblkCtrlCmdData {
 impl UblkCtrlCmdData {
     fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Vec<u8>>) {
         // handle GET_DEV_INFO2 always with dev_path attached
-        if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
+        let cmd_op = self.cmd_op & 0xff;
+
+        if cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
             && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
         {
             return (0, None);
@@ -136,7 +138,9 @@ impl UblkCtrlCmdData {
     }
 
     fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner, buf: u64) {
-        if self.cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
+        let cmd_op = self.cmd_op & 0xff;
+
+        if cmd_op != sys::UBLK_CMD_GET_DEV_INFO2
             && (!dev.is_unprivileged() || (self.flags & CTRL_CMD_NO_NEED_DEV_PATH) != 0)
         {
             return;
@@ -364,7 +368,12 @@ impl UblkCtrlInner {
             }
             dev.read_dev_info()?;
         }
-        trace!("ctrl: device {} created", dev.dev_info.dev_id);
+
+        trace!(
+            "ctrl: device {} flags {:x} created",
+            dev.dev_info.dev_id,
+            dev.dev_flags
+        );
 
         Ok(dev)
     }
@@ -532,29 +541,32 @@ impl UblkCtrlInner {
 
     /// check one control command and see if it is completed
     ///
-    fn poll_cmd(&mut self, token: u64) -> Result<i32, UblkError> {
+    fn poll_cmd(&mut self, token: u64) -> i32 {
         CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
 
             if r.completion().is_empty() {
-                Err(UblkError::UringIOError(-libc::EAGAIN))
+                //Err(UblkError::UringIOError(-libc::EAGAIN))
+                -libc::EAGAIN
             } else {
                 let cqe = r.completion().next().expect("cqueue is empty");
                 if cqe.user_data() != token {
-                    Err(UblkError::UringIOError(-libc::EAGAIN))
+                    //Err(UblkError::UringIOError(-libc::EAGAIN))
+                    -libc::EAGAIN
                 } else {
                     let res: i32 = cqe.result();
                     if res == 0 || res == -libc::EBUSY {
-                        Ok(res)
+                        res
                     } else {
-                        Err(UblkError::UringIOError(res))
+                        //Err(UblkError::UringIOError(res))
+                        res
                     }
                 }
             }
         })
     }
 
-    async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+    async fn __ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> i32 {
         let mut data = *data;
 
         let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
@@ -562,15 +574,41 @@ impl UblkCtrlInner {
 
         data.unprep_un_privileged_dev_path(self, old_buf);
 
-        Ok(res)
+        res
     }
 
-    fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+    async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        let res = self.__ublk_ctrl_cmd_async(data).await;
+
+        if res >= 0 || res == -libc::EBUSY {
+            Ok(res)
+        } else {
+            let legacy_op = data.cmd_op & 0xff;
+
+            // new commands have to be issued via ioctl encoding
+            if legacy_op > sys::UBLK_CMD_GET_DEV_INFO2 {
+                Err(UblkError::UringIOError(res))
+            } else {
+                let mut new_data = *data;
+
+                // retry one more time with legacy encoding
+                new_data.cmd_op = legacy_op;
+                let res = self.__ublk_ctrl_cmd_async(&new_data).await;
+                if res >= 0 || res == -libc::EBUSY {
+                    Ok(res)
+                } else {
+                    Err(UblkError::UringIOError(res))
+                }
+            }
+        }
+    }
+
+    fn __ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> i32 {
         let mut data = *data;
         let to_wait = 1;
 
         let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_cmd(&data, to_wait)?;
+        let token = self.ublk_submit_cmd(&data, to_wait).unwrap();
         let res = self.poll_cmd(token);
 
         data.unprep_un_privileged_dev_path(self, old_buf);
@@ -578,9 +616,36 @@ impl UblkCtrlInner {
         res
     }
 
+    fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        let res = self.__ublk_ctrl_cmd(data);
+
+        if res >= 0 || res == -libc::EBUSY {
+            Ok(res)
+        } else {
+            let legacy_op = data.cmd_op & 0xff;
+
+            // new commands have to be issued via ioctl encoding
+            if legacy_op > sys::UBLK_CMD_GET_DEV_INFO2 {
+                Err(UblkError::UringIOError(res))
+            } else {
+                let mut new_data = *data;
+
+                // retry one more time with legacy encoding for
+                // old kernel without ioctl encoding support
+                new_data.cmd_op = legacy_op;
+                let res = self.__ublk_ctrl_cmd(&new_data);
+                if res >= 0 || res == -libc::EBUSY {
+                    Ok(res)
+                } else {
+                    Err(UblkError::UringIOError(res))
+                }
+            }
+        }
+    }
+
     fn add(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_ADD_DEV,
+            cmd_op: sys::UBLK_U_CMD_ADD_DEV,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_NO_NEED_DEV_PATH,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
             len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
@@ -594,7 +659,7 @@ impl UblkCtrlInner {
     ///
     fn del(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_DEL_DEV,
+            cmd_op: sys::UBLK_U_CMD_DEL_DEV,
             ..Default::default()
         };
 
@@ -618,7 +683,7 @@ impl UblkCtrlInner {
 
     fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_GET_DEV_INFO,
+            cmd_op: sys::UBLK_U_CMD_GET_DEV_INFO,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
             len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
@@ -630,7 +695,7 @@ impl UblkCtrlInner {
 
     fn __read_dev_info2(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_GET_DEV_INFO2,
+            cmd_op: sys::UBLK_U_CMD_GET_DEV_INFO2,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
             addr: std::ptr::addr_of!(self.dev_info) as u64,
             len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
@@ -654,7 +719,7 @@ impl UblkCtrlInner {
     ///
     fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_START_DEV,
+            cmd_op: sys::UBLK_U_CMD_START_DEV,
             flags: CTRL_CMD_HAS_DATA,
             data: pid as u64,
             ..Default::default()
@@ -667,7 +732,7 @@ impl UblkCtrlInner {
     ///
     async fn start_async(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_START_DEV,
+            cmd_op: sys::UBLK_U_CMD_START_DEV,
             flags: CTRL_CMD_HAS_DATA,
             data: pid as u64,
             ..Default::default()
@@ -680,7 +745,7 @@ impl UblkCtrlInner {
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_STOP_DEV,
+            cmd_op: sys::UBLK_U_CMD_STOP_DEV,
             ..Default::default()
         };
 
@@ -694,7 +759,7 @@ impl UblkCtrlInner {
     fn get_params(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         params.len = core::mem::size_of::<sys::ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_GET_PARAMS,
+            cmd_op: sys::UBLK_U_CMD_GET_PARAMS,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
             addr: params as *const sys::ublk_params as u64,
             len: params.len,
@@ -713,7 +778,7 @@ impl UblkCtrlInner {
 
         p.len = core::mem::size_of::<sys::ublk_params>() as u32;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_SET_PARAMS,
+            cmd_op: sys::UBLK_U_CMD_SET_PARAMS,
             flags: CTRL_CMD_HAS_BUF,
             addr: std::ptr::addr_of!(p) as u64,
             len: p.len,
@@ -725,7 +790,7 @@ impl UblkCtrlInner {
 
     fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_GET_QUEUE_AFFINITY,
+            cmd_op: sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
             flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA | CTRL_CMD_BUF_READ,
             addr: bm.addr() as u64,
             data: q as u64,
@@ -737,7 +802,7 @@ impl UblkCtrlInner {
 
     fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_START_USER_RECOVERY,
+            cmd_op: sys::UBLK_U_CMD_START_USER_RECOVERY,
             ..Default::default()
         };
 
@@ -748,7 +813,7 @@ impl UblkCtrlInner {
     ///
     fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
+            cmd_op: sys::UBLK_U_CMD_END_USER_RECOVERY,
             flags: CTRL_CMD_HAS_DATA,
             data: pid as u64,
             ..Default::default()
@@ -761,7 +826,7 @@ impl UblkCtrlInner {
     ///
     async fn end_user_recover_async(&mut self, pid: i32) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_CMD_END_USER_RECOVERY,
+            cmd_op: sys::UBLK_U_CMD_END_USER_RECOVERY,
             flags: CTRL_CMD_HAS_DATA,
             data: pid as u64,
             ..Default::default()
