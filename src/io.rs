@@ -1,7 +1,7 @@
 use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::helpers::IoBuf;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
@@ -206,7 +206,7 @@ pub struct UblkDev {
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
     /// reserved for supporting new features
-    pub flags: u32,
+    pub flags: UblkFlags,
 
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
@@ -420,7 +420,7 @@ impl UblkQueueState {
 ///
 #[allow(dead_code)]
 pub struct UblkQueue<'a> {
-    flags: u32,
+    flags: UblkFlags,
     q_id: u16,
     q_depth: u32,
     io_cmd_buf: u64,
@@ -466,7 +466,7 @@ fn round_up(val: u32, rnd: u32) -> u32 {
 
 impl UblkQueue<'_> {
     const UBLK_QUEUE_IDLE_SECS: u32 = 20;
-    const UBLK_QUEUE_IOCTL_ENCODE: u32 = crate::dev_flags::UBLK_DEV_F_INTERNAL_0;
+    const UBLK_QUEUE_IOCTL_ENCODE: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_0;
 
     #[inline(always)]
     fn cmd_buf_sz(depth: u32) -> u32 {
@@ -478,7 +478,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn is_ioctl_encode(&self) -> bool {
-        (self.flags & Self::UBLK_QUEUE_IOCTL_ENCODE) != 0
+        self.flags.intersects(Self::UBLK_QUEUE_IOCTL_ENCODE)
     }
 
     /// New one ublk queue
@@ -540,14 +540,14 @@ impl UblkQueue<'_> {
             bufs[i as usize] = std::ptr::null_mut();
         }
 
-        assert!((dev.flags & Self::UBLK_QUEUE_IOCTL_ENCODE) == 0);
+        assert!(!dev.flags.intersects(Self::UBLK_QUEUE_IOCTL_ENCODE));
 
         let q = UblkQueue {
             flags: dev.flags
                 | if (dev.dev_info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0 {
                     Self::UBLK_QUEUE_IOCTL_ENCODE
                 } else {
-                    0
+                    UblkFlags::empty()
                 },
             q_id,
             q_depth: depth,
@@ -636,7 +636,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     #[cfg(feature = "fat_complete")]
     fn support_comp_batch(&self) -> bool {
-        self.flags & super::dev_flags::UBLK_DEV_F_COMP_BATCH != 0
+        self.flags.intersects(UblkFlags::UBLK_DEV_F_COMP_BATCH)
     }
 
     #[inline(always)]

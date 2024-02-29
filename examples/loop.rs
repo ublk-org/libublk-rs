@@ -3,11 +3,10 @@ use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
-use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
+use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use log::trace;
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
@@ -275,7 +274,7 @@ fn __test_add(
             .nr_queues(nr_queues.try_into().unwrap())
             .depth(depth.try_into().unwrap())
             .io_buf_bytes(buf_sz)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 

@@ -79,7 +79,7 @@ fn main() {
         UblkCtrlBuilder::default()
             .name("async_null")
             .nr_queues(2)
-            .dev_flags(libublk::dev_flags::UBLK_DEV_F_ADD_DEV)
+            .dev_flags(libublk::UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap(),
     );

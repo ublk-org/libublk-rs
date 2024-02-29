@@ -1,6 +1,6 @@
 use super::io::{UblkDev, UblkTgt};
 use super::uring_async::UblkUringOpFuture;
-use super::{dev_flags, sys, UblkError};
+use super::{sys, UblkError, UblkFlags};
 use bitmaps::Bitmap;
 use derive_setters::*;
 use io_uring::{opcode, squeue, types, IoUring};
@@ -204,7 +204,7 @@ pub struct UblkCtrlBuilder<'a> {
     ctrl_target_flags: u64,
 
     /// libublk feature flags: UBLK_DEV_F_*
-    dev_flags: u32,
+    dev_flags: UblkFlags,
 }
 
 impl Default for UblkCtrlBuilder<'_> {
@@ -217,7 +217,7 @@ impl Default for UblkCtrlBuilder<'_> {
             io_buf_bytes: 524288,
             ctrl_flags: 0,
             ctrl_target_flags: 0,
-            dev_flags: 0,
+            dev_flags: UblkFlags::empty(),
         }
     }
 }
@@ -261,7 +261,7 @@ struct UblkCtrlInner {
     features: Option<u64>,
 
     /// global flags, shared with UblkDev and UblkQueue
-    dev_flags: u32,
+    dev_flags: UblkFlags,
     cmd_token: i32,
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
@@ -290,14 +290,14 @@ impl UblkCtrlInner {
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
-        dev_flags: u32,
+        dev_flags: UblkFlags,
     ) -> Result<UblkCtrlInner, UblkError> {
         if !Path::new(CTRL_PATH).exists() {
             eprintln!("Please run `modprobe ublk_drv` first");
             return Err(UblkError::OtherError(-libc::ENOENT));
         }
 
-        if (dev_flags & !dev_flags::UBLK_DEV_F_ALL) != 0 {
+        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0) {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
@@ -387,11 +387,11 @@ impl UblkCtrlInner {
     }
 
     fn for_add_dev(&self) -> bool {
-        (self.dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) != 0
+        self.dev_flags.intersects(UblkFlags::UBLK_DEV_F_ADD_DEV)
     }
 
     fn for_recover_dev(&self) -> bool {
-        (self.dev_flags & dev_flags::UBLK_DEV_F_RECOVER_DEV) != 0
+        self.dev_flags.intersects(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
     }
 
     fn dev_state_desc(&self) -> String {
@@ -948,7 +948,7 @@ impl UblkCtrlInner {
         let mut json = serde_json::json!({
                     "dev_info": dev.dev_info,
                     "target": dev.tgt,
-                    "target_flags": dev.flags,
+                    "target_flags": dev.flags.bits(),
         });
 
         if let Some(val) = tgt_data {
@@ -998,8 +998,8 @@ impl UblkCtrl {
         }
     }
 
-    pub(crate) fn get_dev_flags(&self) -> u32 {
-        self.get_inner().dev_flags
+    pub(crate) fn get_dev_flags(&self) -> UblkFlags {
+        self.get_inner().dev_flags.clone()
     }
 
     /// New one ublk control device
@@ -1026,7 +1026,7 @@ impl UblkCtrl {
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
-        dev_flags: u32,
+        dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
         let inner = RwLock::new(UblkCtrlInner::new(
             name,
@@ -1046,7 +1046,7 @@ impl UblkCtrl {
     /// and it can't be done for adding device
     pub fn new_simple(id: i32) -> Result<UblkCtrl, UblkError> {
         assert!(id >= 0);
-        Self::new(None, id, 0, 0, 0, 0, 0, 0)
+        Self::new(None, id, 0, 0, 0, 0, 0, UblkFlags::empty())
     }
 
     /// Return current device info
@@ -1226,7 +1226,7 @@ impl UblkCtrl {
     ///
     /// Supported since linux kernel v6.5
     pub fn get_features() -> Option<u64> {
-        match Self::new(None, -1, 0, 0, 0, 0, 0, 0) {
+        match Self::new(None, -1, 0, 0, 0, 0, 0, UblkFlags::empty()) {
             Ok(ctrl) => ctrl.get_driver_features(),
             _ => None,
         }
@@ -1490,10 +1490,9 @@ impl UblkCtrl {
 
 #[cfg(test)]
 mod tests {
-    use super::dev_flags::*;
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
-    use crate::{ctrl::UblkCtrl, UblkIORes};
+    use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
@@ -1508,8 +1507,17 @@ mod tests {
 
     #[test]
     fn test_add_ctrl_dev() {
-        let ctrl =
-            UblkCtrl::new(None, -1, 1, 64, 512_u32 * 1024, 0, 0, UBLK_DEV_F_ADD_DEV).unwrap();
+        let ctrl = UblkCtrl::new(
+            None,
+            -1,
+            1,
+            64,
+            512_u32 * 1024,
+            0,
+            0,
+            UblkFlags::UBLK_DEV_F_ADD_DEV,
+        )
+        .unwrap();
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1527,7 +1535,7 @@ mod tests {
             512_u32 * 1024,
             0,
             crate::sys::UBLK_F_UNPRIVILEGED_DEV as u64,
-            UBLK_DEV_F_ADD_DEV,
+            UblkFlags::UBLK_DEV_F_ADD_DEV,
         )
         .unwrap();
         let dev_path = ctrl.get_cdev_path();
@@ -1541,7 +1549,7 @@ mod tests {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .ctrl_target_flags(0xbeef as u64)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
@@ -1567,7 +1575,7 @@ mod tests {
             .name("null")
             .depth(16_u16)
             .nr_queues(2_u16)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 

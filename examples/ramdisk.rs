@@ -4,10 +4,10 @@ use libublk::ctrl::UblkCtrl;
 /// Serves for covering recovery test[`test_ublk_ramdisk_recovery`],
 /// UblkCtrl::start_dev_in_queue() and low level interface example.
 ///
-use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_run_ctrl_task;
+use libublk::UblkFlags;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -113,9 +113,9 @@ fn start_dev_fn(
 ///async control command, no need Rust async any more
 fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     let dev_flags = if for_add {
-        UBLK_DEV_F_ADD_DEV
+        UblkFlags::UBLK_DEV_F_ADD_DEV
     } else {
-        UBLK_DEV_F_RECOVER_DEV
+        UblkFlags::UBLK_DEV_F_RECOVER_DEV
     };
 
     let ctrl = Rc::new(
