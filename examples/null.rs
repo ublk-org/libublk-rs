@@ -82,7 +82,6 @@ fn __test_add(
                 let buf_addr = if user_copy {
                     std::ptr::null_mut()
                 } else {
-                    let bufs = bufs_rc.clone();
                     bufs[tag as usize].as_mut_ptr()
                 };
                 handle_io_cmd(q, tag, buf_addr);
@@ -90,8 +89,8 @@ fn __test_add(
 
             UblkQueue::new(qid, dev)
                 .unwrap()
-                .regiser_io_bufs(if user_copy { None } else { Some(&bufs) })
-                .submit_fetch_commands(if user_copy { None } else { Some(&bufs) })
+                .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
+                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
                 .wait_and_handle_io(io_handler);
         };
         let q_async_handler = move |qid: u16, dev: &UblkDev| {
