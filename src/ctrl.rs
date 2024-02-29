@@ -494,20 +494,11 @@ impl UblkCtrlInner {
         } as u64;
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
-        CTRL_URING.with(|refcell| {
+        let _ = CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
 
-            loop {
-                let res = unsafe { r.submission().push(&sqe) };
-                match res {
-                    Ok(_) => break,
-                    Err(_) => {
-                        log::debug!("ublk_submit_cmd: flush and retry");
-                        r.submit_and_wait(0).unwrap();
-                    }
-                }
-            }
-            r.submit_and_wait(to_wait).unwrap();
+            unsafe { r.submission().push(&sqe).unwrap() };
+            let _ = r.submit_and_wait(to_wait);
         });
         Ok(token)
     }
@@ -518,24 +509,18 @@ impl UblkCtrlInner {
         CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
 
-            if r.completion().is_empty() {
-                //Err(UblkError::UringIOError(-libc::EAGAIN))
-                -libc::EAGAIN
-            } else {
-                let cqe = r.completion().next().expect("cqueue is empty");
-                if cqe.user_data() != token {
-                    //Err(UblkError::UringIOError(-libc::EAGAIN))
-                    -libc::EAGAIN
-                } else {
-                    let res: i32 = cqe.result();
-                    if res == 0 || res == -libc::EBUSY {
-                        res
+            let res = match r.completion().next() {
+                Some(cqe) => {
+                    if cqe.user_data() != token {
+                        -libc::EAGAIN
                     } else {
-                        //Err(UblkError::UringIOError(res))
-                        res
+                        cqe.result()
                     }
                 }
-            }
+                None => -libc::EAGAIN,
+            };
+
+            res
         })
     }
 
@@ -576,21 +561,21 @@ impl UblkCtrlInner {
         }
     }
 
-    fn __ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> i32 {
+    fn __ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         let mut data = *data;
         let to_wait = 1;
 
         let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_cmd(&data, to_wait).unwrap();
+        let token = self.ublk_submit_cmd(&data, to_wait)?;
         let res = self.poll_cmd(token);
 
         data.unprep_un_privileged_dev_path(self, old_buf);
 
-        res
+        Ok(res)
     }
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let res = self.__ublk_ctrl_cmd(data);
+        let res = self.__ublk_ctrl_cmd(data)?;
 
         if res >= 0 || res == -libc::EBUSY {
             Ok(res)
@@ -606,7 +591,7 @@ impl UblkCtrlInner {
                 // retry one more time with legacy encoding for
                 // old kernel without ioctl encoding support
                 new_data.cmd_op = legacy_op;
-                let res = self.__ublk_ctrl_cmd(&new_data);
+                let res = self.__ublk_ctrl_cmd(&new_data)?;
                 if res >= 0 || res == -libc::EBUSY {
                     Ok(res)
                 } else {
