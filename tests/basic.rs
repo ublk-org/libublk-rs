@@ -447,7 +447,7 @@ mod integration {
         }
         assert!(tid != 0);
 
-        let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
         ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
 
         //ublk block device should be observed now

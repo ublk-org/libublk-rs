@@ -1044,10 +1044,9 @@ impl UblkCtrl {
 
     /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
     /// and it can't be done for adding device
-    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
-        assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
+    pub fn new_simple(id: i32) -> Result<UblkCtrl, UblkError> {
         assert!(id >= 0);
-        Self::new(None, id, 0, 0, 0, 0, 0, dev_flags)
+        Self::new(None, id, 0, 0, 0, 0, 0, 0)
     }
 
     /// Return current device info
@@ -1642,7 +1641,7 @@ mod tests {
 
         //count all existed ublk devices
         UblkCtrl::for_each_dev_id(move |dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
+            let ctrl = UblkCtrl::new_simple(dev_id as i32).unwrap();
             cnt.set(cnt.get() + 1);
 
             let dev_path = ctrl.get_cdev_path();
