@@ -1,6 +1,6 @@
 use super::io::{UblkDev, UblkTgt};
 use super::uring_async::UblkUringOpFuture;
-use super::{dev_flags, sys, UblkError};
+use super::{sys, UblkError, UblkFlags};
 use bitmaps::Bitmap;
 use derive_setters::*;
 use io_uring::{opcode, squeue, types, IoUring};
@@ -19,6 +19,8 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
 
+// per-thread control uring
+//
 std::thread_local! {
     pub(crate) static CTRL_URING: RefCell<IoUring::<squeue::Entry128>> =
         RefCell::new(IoUring::<squeue::Entry128>::builder()
@@ -204,7 +206,7 @@ pub struct UblkCtrlBuilder<'a> {
     ctrl_target_flags: u64,
 
     /// libublk feature flags: UBLK_DEV_F_*
-    dev_flags: u32,
+    dev_flags: UblkFlags,
 }
 
 impl Default for UblkCtrlBuilder<'_> {
@@ -217,7 +219,7 @@ impl Default for UblkCtrlBuilder<'_> {
             io_buf_bytes: 524288,
             ctrl_flags: 0,
             ctrl_target_flags: 0,
-            dev_flags: 0,
+            dev_flags: UblkFlags::empty(),
         }
     }
 }
@@ -261,7 +263,7 @@ struct UblkCtrlInner {
     features: Option<u64>,
 
     /// global flags, shared with UblkDev and UblkQueue
-    dev_flags: u32,
+    dev_flags: UblkFlags,
     cmd_token: i32,
     queue_tids: Vec<i32>,
     nr_queues_configured: u16,
@@ -290,34 +292,8 @@ impl UblkCtrlInner {
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
-        dev_flags: u32,
+        dev_flags: UblkFlags,
     ) -> Result<UblkCtrlInner, UblkError> {
-        if !Path::new(CTRL_PATH).exists() {
-            eprintln!("Please run `modprobe ublk_drv` first");
-            return Err(UblkError::OtherError(-libc::ENOENT));
-        }
-
-        if (dev_flags & !dev_flags::UBLK_DEV_F_ALL) != 0 {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        if id < 0 && id != -1 {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        if nr_queues > sys::UBLK_MAX_NR_QUEUES {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        if depth > sys::UBLK_MAX_QUEUE_DEPTH {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-        if io_buf_bytes > MAX_BUF_SZ || io_buf_bytes & (page_sz - 1) != 0 {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
         let info = sys::ublksrv_ctrl_dev_info {
             nr_hw_queues: nr_queues as u16,
             queue_depth: depth as u16,
@@ -331,8 +307,7 @@ impl UblkCtrlInner {
         let fd = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(CTRL_PATH)
-            .map_err(UblkError::OtherIOError)?;
+            .open(CTRL_PATH)?;
 
         let mut dev = UblkCtrlInner {
             name,
@@ -387,11 +362,11 @@ impl UblkCtrlInner {
     }
 
     fn for_add_dev(&self) -> bool {
-        (self.dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) != 0
+        self.dev_flags.intersects(UblkFlags::UBLK_DEV_F_ADD_DEV)
     }
 
     fn for_recover_dev(&self) -> bool {
-        (self.dev_flags & dev_flags::UBLK_DEV_F_RECOVER_DEV) != 0
+        self.dev_flags.intersects(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
     }
 
     fn dev_state_desc(&self) -> String {
@@ -521,20 +496,11 @@ impl UblkCtrlInner {
         } as u64;
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
-        CTRL_URING.with(|refcell| {
+        let _ = CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
 
-            loop {
-                let res = unsafe { r.submission().push(&sqe) };
-                match res {
-                    Ok(_) => break,
-                    Err(_) => {
-                        log::debug!("ublk_submit_cmd: flush and retry");
-                        r.submit_and_wait(0).unwrap();
-                    }
-                }
-            }
-            r.submit_and_wait(to_wait).unwrap();
+            unsafe { r.submission().push(&sqe).unwrap() };
+            let _ = r.submit_and_wait(to_wait);
         });
         Ok(token)
     }
@@ -545,102 +511,81 @@ impl UblkCtrlInner {
         CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
 
-            if r.completion().is_empty() {
-                //Err(UblkError::UringIOError(-libc::EAGAIN))
-                -libc::EAGAIN
-            } else {
-                let cqe = r.completion().next().expect("cqueue is empty");
-                if cqe.user_data() != token {
-                    //Err(UblkError::UringIOError(-libc::EAGAIN))
-                    -libc::EAGAIN
-                } else {
-                    let res: i32 = cqe.result();
-                    if res == 0 || res == -libc::EBUSY {
-                        res
+            let res = match r.completion().next() {
+                Some(cqe) => {
+                    if cqe.user_data() != token {
+                        -libc::EAGAIN
                     } else {
-                        //Err(UblkError::UringIOError(res))
-                        res
+                        cqe.result()
                     }
                 }
-            }
+                None => -libc::EAGAIN,
+            };
+
+            res
         })
     }
 
-    async fn __ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> i32 {
-        let mut data = *data;
+    fn ublk_ctrl_need_retry(
+        new_data: &mut UblkCtrlCmdData,
+        data: &UblkCtrlCmdData,
+        res: i32,
+    ) -> bool {
+        if res >= 0 || res == -libc::EBUSY {
+            false
+        } else if (data.cmd_op & 0xff) > sys::UBLK_CMD_GET_DEV_INFO2 {
+            // new commands have to be issued via ioctl encoding
+            false
+        } else {
+            *new_data = *data;
+            new_data.cmd_op &= 0xff;
+            true
+        }
+    }
 
-        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
-        let res = self.ublk_submit_cmd_async(&mut data).await;
-
-        data.unprep_un_privileged_dev_path(self, old_buf);
-
-        res
+    fn ublk_err_to_result(res: i32) -> Result<i32, UblkError> {
+        if res >= 0 || res == -libc::EBUSY {
+            Ok(res)
+        } else {
+            Err(UblkError::UringIOError(res))
+        }
     }
 
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let res = self.__ublk_ctrl_cmd_async(data).await;
+        let mut new_data = *data;
+        let mut res: i32 = 0;
 
-        if res >= 0 || res == -libc::EBUSY {
-            Ok(res)
-        } else {
-            let legacy_op = data.cmd_op & 0xff;
+        for _ in 0..2 {
+            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
+            res = self.ublk_submit_cmd_async(&mut new_data).await;
+            new_data.unprep_un_privileged_dev_path(self, old_buf);
 
-            // new commands have to be issued via ioctl encoding
-            if legacy_op > sys::UBLK_CMD_GET_DEV_INFO2 {
-                Err(UblkError::UringIOError(res))
-            } else {
-                let mut new_data = *data;
-
-                // retry one more time with legacy encoding
-                new_data.cmd_op = legacy_op;
-                let res = self.__ublk_ctrl_cmd_async(&new_data).await;
-                if res >= 0 || res == -libc::EBUSY {
-                    Ok(res)
-                } else {
-                    Err(UblkError::UringIOError(res))
-                }
+            trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
+            if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
+                break;
             }
         }
-    }
 
-    fn __ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> i32 {
-        let mut data = *data;
-        let to_wait = 1;
-
-        let (old_buf, _new) = data.prep_un_privileged_dev_path(self);
-        let token = self.ublk_submit_cmd(&data, to_wait).unwrap();
-        let res = self.poll_cmd(token);
-
-        data.unprep_un_privileged_dev_path(self, old_buf);
-
-        res
+        Self::ublk_err_to_result(res)
     }
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
-        let res = self.__ublk_ctrl_cmd(data);
+        let mut new_data = *data;
+        let mut res: i32 = 0;
 
-        if res >= 0 || res == -libc::EBUSY {
-            Ok(res)
-        } else {
-            let legacy_op = data.cmd_op & 0xff;
+        for _ in 0..2 {
+            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
+            let token = self.ublk_submit_cmd(&new_data, 1)?;
+            res = self.poll_cmd(token);
+            new_data.unprep_un_privileged_dev_path(self, old_buf);
 
-            // new commands have to be issued via ioctl encoding
-            if legacy_op > sys::UBLK_CMD_GET_DEV_INFO2 {
-                Err(UblkError::UringIOError(res))
-            } else {
-                let mut new_data = *data;
-
-                // retry one more time with legacy encoding for
-                // old kernel without ioctl encoding support
-                new_data.cmd_op = legacy_op;
-                let res = self.__ublk_ctrl_cmd(&new_data);
-                if res >= 0 || res == -libc::EBUSY {
-                    Ok(res)
-                } else {
-                    Err(UblkError::UringIOError(res))
-                }
+            trace!("ublk_ctrl_cmd: cmd {:x} res {}", data.cmd_op, res);
+            if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
+                break;
             }
         }
+
+        Self::ublk_err_to_result(res)
     }
 
     fn add(&mut self) -> Result<i32, UblkError> {
@@ -856,11 +801,11 @@ impl UblkCtrlInner {
     fn set_path_permission(path: &Path, mode: u32) -> Result<i32, UblkError> {
         use std::os::unix::fs::PermissionsExt;
 
-        let metadata = fs::metadata(path).map_err(UblkError::OtherIOError)?;
+        let metadata = fs::metadata(path)?;
         let mut permissions = metadata.permissions();
 
         permissions.set_mode(mode);
-        fs::set_permissions(path, permissions).map_err(UblkError::OtherIOError)?;
+        fs::set_permissions(path, permissions)?;
 
         Ok(0)
     }
@@ -882,7 +827,7 @@ impl UblkCtrlInner {
 
         if let Some(parent_dir) = json_path.parent() {
             if !Path::new(&parent_dir).exists() {
-                fs::create_dir_all(parent_dir).map_err(UblkError::OtherIOError)?;
+                fs::create_dir_all(parent_dir)?;
 
                 // It is just fine to expose the running parent directory as
                 // 777, and we will make sure every exported running json
@@ -890,16 +835,14 @@ impl UblkCtrlInner {
                 Self::set_path_permission(parent_dir, 0o777)?;
             }
         }
-        let mut run_file = fs::File::create(json_path).map_err(UblkError::OtherIOError)?;
+        let mut run_file = fs::File::create(json_path)?;
 
         // Each exported json file is only visible for the device owner.
         // In future, it can be relaxed, such as allowing group to access,
         // according to ublk use policy
         Self::set_path_permission(json_path, 0o700)?;
 
-        run_file
-            .write_all(self.json.to_string().as_bytes())
-            .map_err(UblkError::OtherIOError)?;
+        run_file.write_all(self.json.to_string().as_bytes())?;
         Ok(0)
     }
 
@@ -948,7 +891,7 @@ impl UblkCtrlInner {
         let mut json = serde_json::json!({
                     "dev_info": dev.dev_info,
                     "target": dev.tgt,
-                    "target_flags": dev.flags,
+                    "target_flags": dev.flags.bits(),
         });
 
         if let Some(val) = tgt_data {
@@ -964,11 +907,10 @@ impl UblkCtrlInner {
     /// Reload json info for this device
     ///
     fn reload_json(&mut self) -> Result<i32, UblkError> {
-        let mut file = fs::File::open(self.run_path()).map_err(UblkError::OtherIOError)?;
+        let mut file = fs::File::open(self.run_path())?;
         let mut json_str = String::new();
 
-        file.read_to_string(&mut json_str)
-            .map_err(UblkError::OtherIOError)?;
+        file.read_to_string(&mut json_str)?;
         self.json = serde_json::from_str(&json_str).map_err(UblkError::JsonError)?;
 
         Ok(0)
@@ -980,6 +922,16 @@ impl UblkCtrl {
     /// such udev may rename it in its own namespaces.
     const CDEV_PATH: &'static str = "/dev/ublkc";
     const BDEV_PATH: &'static str = "/dev/ublkb";
+
+    const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
+        | sys::UBLK_F_URING_CMD_COMP_IN_TASK
+        | sys::UBLK_F_NEED_GET_DATA
+        | sys::UBLK_F_USER_RECOVERY
+        | sys::UBLK_F_USER_RECOVERY_REISSUE
+        | sys::UBLK_F_UNPRIVILEGED_DEV
+        | sys::UBLK_F_CMD_IOCTL_ENCODE
+        | sys::UBLK_F_USER_COPY
+        | sys::UBLK_F_ZONED) as u64;
 
     fn get_inner(&self) -> std::sync::RwLockReadGuard<UblkCtrlInner> {
         self.inner.read().unwrap()
@@ -998,8 +950,8 @@ impl UblkCtrl {
         }
     }
 
-    pub(crate) fn get_dev_flags(&self) -> u32 {
-        self.get_inner().dev_flags
+    pub(crate) fn get_dev_flags(&self) -> UblkFlags {
+        self.get_inner().dev_flags.clone()
     }
 
     /// New one ublk control device
@@ -1026,8 +978,38 @@ impl UblkCtrl {
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
-        dev_flags: u32,
+        dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
+        if (flags & !Self::UBLK_DRV_F_ALL) != 0 {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if !Path::new(CTRL_PATH).exists() {
+            eprintln!("Please run `modprobe ublk_drv` first");
+            return Err(UblkError::OtherError(-libc::ENOENT));
+        }
+
+        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0) {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if id < 0 && id != -1 {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if nr_queues > sys::UBLK_MAX_NR_QUEUES {
+            return Err(UblkError::InvalidVal);
+        }
+
+        if depth > sys::UBLK_MAX_QUEUE_DEPTH {
+            return Err(UblkError::InvalidVal);
+        }
+
+        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        if io_buf_bytes > MAX_BUF_SZ || io_buf_bytes & (page_sz - 1) != 0 {
+            return Err(UblkError::InvalidVal);
+        }
+
         let inner = RwLock::new(UblkCtrlInner::new(
             name,
             id,
@@ -1044,10 +1026,9 @@ impl UblkCtrl {
 
     /// Allocate one simple UblkCtrl device for delelting, listing, recovering,..,
     /// and it can't be done for adding device
-    pub fn new_simple(id: i32, dev_flags: u32) -> Result<UblkCtrl, UblkError> {
-        assert!((dev_flags & dev_flags::UBLK_DEV_F_ADD_DEV) == 0);
+    pub fn new_simple(id: i32) -> Result<UblkCtrl, UblkError> {
         assert!(id >= 0);
-        Self::new(None, id, 0, 0, 0, 0, 0, dev_flags)
+        Self::new(None, id, 0, 0, 0, 0, 0, UblkFlags::empty())
     }
 
     /// Return current device info
@@ -1227,7 +1208,7 @@ impl UblkCtrl {
     ///
     /// Supported since linux kernel v6.5
     pub fn get_features() -> Option<u64> {
-        match Self::new(None, -1, 0, 0, 0, 0, 0, 0) {
+        match Self::new(None, -1, 0, 0, 0, 0, 0, UblkFlags::empty()) {
             Ok(ctrl) => ctrl.get_driver_features(),
             _ => None,
         }
@@ -1336,7 +1317,7 @@ impl UblkCtrl {
         let rp = ctrl.run_path();
 
         if ctrl.for_add_dev() && Path::new(&rp).exists() {
-            fs::remove_file(rp).map_err(UblkError::OtherIOError)?;
+            fs::remove_file(rp)?;
         }
         ctrl.stop()
     }
@@ -1366,7 +1347,7 @@ impl UblkCtrl {
 
         ctrl.del()?;
         if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path()).map_err(UblkError::OtherIOError)?;
+            fs::remove_file(ctrl.run_path())?;
         }
         Ok(0)
     }
@@ -1429,13 +1410,14 @@ impl UblkCtrl {
     }
 
     /// Run ublk daemon and kick off the ublk device, and `/dev/ublkbN` will be
-    /// created and visible to userspace.
+    /// created and exposed to userspace.
     ///
     /// # Arguments:
     ///
     /// * `tgt_fn`: target initialization handler
-    /// * `q_fn`: queue handler for setting up the queue and its handler
-    /// * `device_fn`: handler called after device is started, run in current
+    /// * `q_fn`: queue handler for setting up the queue and its handler,
+    ///     all IO logical is implemented in queue handler
+    /// * `device_fn`: called after device is started, run in current
     ///     context
     ///
     /// This one is the preferred interface for creating ublk daemon, and
@@ -1491,10 +1473,9 @@ impl UblkCtrl {
 
 #[cfg(test)]
 mod tests {
-    use super::dev_flags::*;
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
-    use crate::{ctrl::UblkCtrl, UblkIORes};
+    use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
@@ -1509,8 +1490,17 @@ mod tests {
 
     #[test]
     fn test_add_ctrl_dev() {
-        let ctrl =
-            UblkCtrl::new(None, -1, 1, 64, 512_u32 * 1024, 0, 0, UBLK_DEV_F_ADD_DEV).unwrap();
+        let ctrl = UblkCtrl::new(
+            None,
+            -1,
+            1,
+            64,
+            512_u32 * 1024,
+            0,
+            0,
+            UblkFlags::UBLK_DEV_F_ADD_DEV,
+        )
+        .unwrap();
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1528,7 +1518,7 @@ mod tests {
             512_u32 * 1024,
             0,
             crate::sys::UBLK_F_UNPRIVILEGED_DEV as u64,
-            UBLK_DEV_F_ADD_DEV,
+            UblkFlags::UBLK_DEV_F_ADD_DEV,
         )
         .unwrap();
         let dev_path = ctrl.get_cdev_path();
@@ -1542,7 +1532,7 @@ mod tests {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .ctrl_target_flags(0xbeef as u64)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
@@ -1568,7 +1558,7 @@ mod tests {
             .name("null")
             .depth(16_u16)
             .nr_queues(2_u16)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
@@ -1642,7 +1632,7 @@ mod tests {
 
         //count all existed ublk devices
         UblkCtrl::for_each_dev_id(move |dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
+            let ctrl = UblkCtrl::new_simple(dev_id as i32).unwrap();
             cnt.set(cnt.get() + 1);
 
             let dev_path = ctrl.get_cdev_path();

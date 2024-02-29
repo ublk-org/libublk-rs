@@ -1,24 +1,24 @@
 #[cfg(test)]
 mod integration {
     use io_uring::opcode;
-    use libublk::dev_flags::*;
     use libublk::helpers::IoBuf;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     use libublk::uring_async::ublk_wait_and_handle_ios;
-    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkError, UblkIORes};
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkError, UblkFlags, UblkIORes};
     use std::env;
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    fn run_ublk_disk_sanity_test(ctrl: &UblkCtrl, dev_flags: u32) {
+    fn run_ublk_disk_sanity_test(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
         use std::os::unix::fs::PermissionsExt;
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        assert!(ctrl.get_target_flags_from_json().unwrap() == dev_flags);
+        let tgt_flags = ctrl.get_target_flags_from_json().unwrap();
+        assert!(UblkFlags::from_bits(tgt_flags).unwrap() == dev_flags);
 
         //ublk block device should be observed now
         assert!(Path::new(&dev_path).exists() == true);
@@ -28,9 +28,7 @@ mod integration {
         let json_path = Path::new(&run_path);
         assert!(json_path.exists() == true);
 
-        let metadata = std::fs::metadata(json_path)
-            .map_err(UblkError::OtherIOError)
-            .unwrap();
+        let metadata = std::fs::metadata(json_path).unwrap();
         let permissions = metadata.permissions();
         assert!((permissions.mode() & 0o777) == 0o700);
     }
@@ -47,7 +45,7 @@ mod integration {
         println!("{:?}", Command::new("dd").args(arg_list).output().unwrap());
     }
 
-    fn __test_ublk_null(dev_flags: u32, q_handler: fn(u16, &UblkDev)) {
+    fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &UblkDev)) {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .nr_queues(2)
@@ -100,7 +98,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_handle_queue);
+        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, null_handle_queue);
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
@@ -135,7 +133,7 @@ mod integration {
         }
 
         __test_ublk_null(
-            UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_COMP_BATCH,
+            UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_COMP_BATCH,
             null_handle_queue_batch,
         );
     }
@@ -161,7 +159,7 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        let dev_flags = UBLK_DEV_F_ADD_DEV;
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
         let depth = 64_u16;
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
@@ -274,7 +272,7 @@ mod integration {
             q.complete_io_cmd(tag, buf_addr, res);
         }
 
-        fn __test_ublk_ramdisk(ctrl: &UblkCtrl, dev_flags: u32) {
+        fn __test_ublk_ramdisk(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
             let dev_path = ctrl.get_bdev_path();
 
             run_ublk_disk_sanity_test(&ctrl, dev_flags);
@@ -301,7 +299,7 @@ mod integration {
         let size = 32_u64 << 20;
         let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
         let dev_addr = buf.as_mut_ptr() as u64;
-        let dev_flags = UBLK_DEV_F_ADD_DEV;
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
         let ctrl = UblkCtrlBuilder::default()
             .name("ramdisk")
             .id(-1)
@@ -375,7 +373,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(UBLK_DEV_F_ADD_DEV, null_queue_mut_io);
+        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, null_queue_mut_io);
     }
 
     /// run examples/ramdisk recovery test
@@ -447,7 +445,7 @@ mod integration {
         }
         assert!(tid != 0);
 
-        let ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
         ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
 
         //ublk block device should be observed now

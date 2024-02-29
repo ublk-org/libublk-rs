@@ -1,10 +1,9 @@
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
-use libublk::dev_flags::*;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, UblkIORes};
+use libublk::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
 use std::rc::Rc;
 
 bitflags! {
@@ -31,22 +30,62 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16, buf_addr: *mut u8) {
     q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
 }
 
-fn test_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, flags: NullFlags) {
-    if flags.intersects(NullFlags::FOREGROUND) {
-        __test_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
-    } else {
-        let daemonize = daemonize::Daemonize::new()
-            .stdout(daemonize::Stdio::keep())
-            .stderr(daemonize::Stdio::keep());
+fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
+    let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+    let bufs = bufs_rc.clone();
 
-        match daemonize.start() {
-            Ok(_) => __test_add(id, nr_queues, depth, ctrl_flags, buf_size, flags),
-            _ => panic!(),
-        }
-    }
+    // logic for io handling
+    let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+        let buf_addr = if user_copy {
+            std::ptr::null_mut()
+        } else {
+            bufs[tag as usize].as_mut_ptr()
+        };
+        handle_io_cmd(q, tag, buf_addr);
+    };
+
+    UblkQueue::new(qid, dev)
+        .unwrap()
+        .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
+        .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
+        .wait_and_handle_io(io_handler);
 }
 
-fn __test_add(
+fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
+    let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+    let exe = smol::LocalExecutor::new();
+    let mut f_vec = Vec::new();
+
+    for tag in 0..dev.dev_info.queue_depth as u16 {
+        let q = q_rc.clone();
+
+        f_vec.push(exe.spawn(async move {
+            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
+            let mut res = 0;
+            let buf_addr = if user_copy {
+                std::ptr::null_mut()
+            } else {
+                buf.as_mut_ptr()
+            };
+
+            q.register_io_buf(tag, &buf);
+            loop {
+                let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+                    break;
+                }
+
+                res = get_io_cmd_result(&q, tag);
+                cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            }
+        }));
+    }
+    ublk_wait_and_handle_ios(&q_rc, &exe);
+    smol::block_on(async { futures::future::join_all(f_vec).await });
+}
+
+fn __null_add(
     id: i32,
     nr_queues: u32,
     depth: u32,
@@ -56,89 +95,49 @@ fn __test_add(
 ) {
     let aio = flags.intersects(NullFlags::ASYNC);
     let oneshot = flags.intersects(NullFlags::ONESHOT);
-    {
-        let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
-            .name("example_null")
-            .id(id)
-            .depth(depth.try_into().unwrap())
-            .nr_queues(nr_queues.try_into().unwrap())
-            .io_buf_bytes(buf_size)
-            .ctrl_flags(ctrl_flags)
-            .dev_flags(UBLK_DEV_F_ADD_DEV)
-            .build()
-            .unwrap();
-        let tgt_init = |dev: &mut UblkDev| {
-            dev.set_default_params(250_u64 << 30);
-            Ok(0)
-        };
-        let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
-        // queue level logic
-        let q_sync_handler = move |qid: u16, dev: &UblkDev| {
-            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
-            let bufs = bufs_rc.clone();
+    let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
+        .name("example_null")
+        .id(id)
+        .depth(depth.try_into().unwrap())
+        .nr_queues(nr_queues.try_into().unwrap())
+        .io_buf_bytes(buf_size)
+        .ctrl_flags(ctrl_flags)
+        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+        .build()
+        .unwrap();
+    let tgt_init = |dev: &mut UblkDev| {
+        dev.set_default_params(250_u64 << 30);
+        Ok(0)
+    };
+    let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+    let wh = move |d_ctrl: &UblkCtrl| {
+        d_ctrl.dump();
+        if oneshot {
+            d_ctrl.kill_dev().unwrap();
+        }
+    };
 
-            // logic for io handling
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                let buf_addr = if user_copy {
-                    std::ptr::null_mut()
-                } else {
-                    bufs[tag as usize].as_mut_ptr()
-                };
-                handle_io_cmd(q, tag, buf_addr);
-            };
+    // Now start this ublk target
+    if aio {
+        let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, user_copy);
+        ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
+    } else {
+        let q_sync_handler = move |qid, dev: &_| q_sync_fn(qid, dev, user_copy);
+        ctrl.run_target(tgt_init, q_sync_handler, wh).unwrap();
+    }
+}
 
-            UblkQueue::new(qid, dev)
-                .unwrap()
-                .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
-                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
-                .wait_and_handle_io(io_handler);
-        };
-        let q_async_handler = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe = smol::LocalExecutor::new();
-            let mut f_vec = Vec::new();
+fn null_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32, flags: NullFlags) {
+    if flags.intersects(NullFlags::FOREGROUND) {
+        __null_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
+    } else {
+        let daemonize = daemonize::Daemonize::new()
+            .stdout(daemonize::Stdio::keep())
+            .stderr(daemonize::Stdio::keep());
 
-            for tag in 0..depth as u16 {
-                let q = q_rc.clone();
-
-                f_vec.push(exe.spawn(async move {
-                    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-                    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
-                    let mut res = 0;
-                    let buf_addr = if user_copy {
-                        std::ptr::null_mut()
-                    } else {
-                        buf.as_mut_ptr()
-                    };
-
-                    q.register_io_buf(tag, &buf);
-                    loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
-                        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                            break;
-                        }
-
-                        res = get_io_cmd_result(&q, tag);
-                        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
-                    }
-                }));
-            }
-            ublk_wait_and_handle_ios(&q_rc, &exe);
-            smol::block_on(async { futures::future::join_all(f_vec).await });
-        };
-
-        let wh = move |d_ctrl: &UblkCtrl| {
-            d_ctrl.dump();
-            if oneshot {
-                d_ctrl.kill_dev().unwrap();
-            }
-        };
-
-        // Now start this ublk target
-        if aio {
-            ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
-        } else {
-            ctrl.run_target(tgt_init, q_sync_handler, wh).unwrap();
+        match daemonize.start() {
+            Ok(_) => __null_add(id, nr_queues, depth, ctrl_flags, buf_size, flags),
+            _ => panic!(),
         }
     }
 }
@@ -273,7 +272,7 @@ fn main() {
                 0
             };
 
-            test_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
+            null_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
         }
         Some(("del", add_matches)) => {
             let id = add_matches
@@ -281,10 +280,10 @@ fn main() {
                 .unwrap()
                 .parse::<i32>()
                 .unwrap_or(-1);
-            UblkCtrl::new_simple(id, 0).unwrap().del_dev().unwrap();
+            UblkCtrl::new_simple(id).unwrap().del_dev().unwrap();
         }
         Some(("list", _add_matches)) => UblkCtrl::for_each_dev_id(|dev_id| {
-            UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();
+            UblkCtrl::new_simple(dev_id as i32).unwrap().dump();
         }),
         _ => {
             println!("unsupported command");

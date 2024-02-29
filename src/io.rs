@@ -1,7 +1,7 @@
 use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, sys, UblkError, UblkIORes};
+use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::helpers::IoBuf;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
@@ -206,7 +206,7 @@ pub struct UblkDev {
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
     /// reserved for supporting new features
-    pub flags: u32,
+    pub flags: UblkFlags,
 
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
@@ -420,7 +420,7 @@ impl UblkQueueState {
 ///
 #[allow(dead_code)]
 pub struct UblkQueue<'a> {
-    flags: u32,
+    flags: UblkFlags,
     q_id: u16,
     q_depth: u32,
     io_cmd_buf: u64,
@@ -466,7 +466,7 @@ fn round_up(val: u32, rnd: u32) -> u32 {
 
 impl UblkQueue<'_> {
     const UBLK_QUEUE_IDLE_SECS: u32 = 20;
-    const UBLK_QUEUE_IOCTL_ENCODE: u32 = crate::dev_flags::UBLK_DEV_F_INTERNAL_0;
+    const UBLK_QUEUE_IOCTL_ENCODE: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_0;
 
     #[inline(always)]
     fn cmd_buf_sz(depth: u32) -> u32 {
@@ -478,7 +478,7 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn is_ioctl_encode(&self) -> bool {
-        (self.flags & Self::UBLK_QUEUE_IOCTL_ENCODE) != 0
+        self.flags.intersects(Self::UBLK_QUEUE_IOCTL_ENCODE)
     }
 
     /// New one ublk queue
@@ -499,8 +499,7 @@ impl UblkQueue<'_> {
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth as u32)
             .setup_coop_taskrun()
-            .build(sq_depth as u32)
-            .map_err(UblkError::OtherIOError)?;
+            .build(sq_depth as u32)?;
 
         //todo: apply io_uring flags from tgt.ring_flags
 
@@ -509,8 +508,7 @@ impl UblkQueue<'_> {
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
 
         ring.submitter()
-            .register_files(&tgt.fds[0..tgt.nr_fds as usize])
-            .map_err(UblkError::OtherIOError)?;
+            .register_files(&tgt.fds[0..tgt.nr_fds as usize])?;
 
         let off = sys::UBLKSRV_CMD_BUF_OFFSET as i64
             + q_id as i64
@@ -527,7 +525,7 @@ impl UblkQueue<'_> {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::MmapError(unsafe { *libc::__errno_location() }));
+            return Err(UblkError::IOError(std::io::Error::last_os_error()));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
@@ -540,14 +538,14 @@ impl UblkQueue<'_> {
             bufs[i as usize] = std::ptr::null_mut();
         }
 
-        assert!((dev.flags & Self::UBLK_QUEUE_IOCTL_ENCODE) == 0);
+        assert!(!dev.flags.intersects(Self::UBLK_QUEUE_IOCTL_ENCODE));
 
         let q = UblkQueue {
             flags: dev.flags
                 | if (dev.dev_info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0 {
                     Self::UBLK_QUEUE_IOCTL_ENCODE
                 } else {
-                    0
+                    UblkFlags::empty()
                 },
             q_id,
             q_depth: depth,
@@ -636,7 +634,7 @@ impl UblkQueue<'_> {
     #[inline(always)]
     #[cfg(feature = "fat_complete")]
     fn support_comp_batch(&self) -> bool {
-        self.flags & super::dev_flags::UBLK_DEV_F_COMP_BATCH != 0
+        self.flags.intersects(UblkFlags::UBLK_DEV_F_COMP_BATCH)
     }
 
     #[inline(always)]
@@ -837,7 +835,7 @@ impl UblkQueue<'_> {
             | Err(UblkError::UringIOError(res)) => {
                 self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, res);
             }
-            Err(UblkError::IoQueued(_)) => {}
+            Err(UblkError::UringIoQueued) => {}
             #[cfg(feature = "fat_complete")]
             Ok(UblkIORes::FatRes(fat)) => match fat {
                 UblkFatRes::BatchRes(ios) => {
@@ -1012,7 +1010,7 @@ impl UblkQueue<'_> {
         #[allow(clippy::collapsible_if)]
         if state.queue_is_done() {
             if self.q_ring.borrow_mut().submission().is_empty() {
-                return Err(UblkError::QueueIsDown(-libc::ENODEV));
+                return Err(UblkError::QueueIsDown);
             }
         }
 
@@ -1020,9 +1018,9 @@ impl UblkQueue<'_> {
         let ret = r.submitter().submit_with_args(to_wait, &args);
         match ret {
             Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
-                return Err(UblkError::UringSubmissionTimeout(-libc::ETIME));
+                return Err(UblkError::UringTimeout);
             }
-            Err(err) => return Err(UblkError::UringSubmissionError(err)),
+            Err(err) => return Err(UblkError::IOError(err)),
             Ok(_) => {}
         };
 
@@ -1045,7 +1043,7 @@ impl UblkQueue<'_> {
                 }
                 Ok(nr_cqes)
             }
-            Err(UblkError::UringSubmissionTimeout(_)) => {
+            Err(UblkError::UringTimeout) => {
                 self.enter_queue_idle();
                 Ok(0)
             }
@@ -1083,7 +1081,7 @@ impl UblkQueue<'_> {
     /// same IO closure is called for handling this target IO, which can be
     /// checked by `UblkIOCtx::is_tgt_io()` method. Finally if the coming
     /// target IO completion means the original IO command is done,
-    /// `Ok(UblkIORes::Result)` is returned for moving on, otherwise UblkError::IoQueued(_)
+    /// `Ok(UblkIORes::Result)` is returned for moving on, otherwise UblkError::IoQueued
     /// can be returned and the IO handling closure can continue to submit IO
     /// or whatever for driving its IO logic.
     ///

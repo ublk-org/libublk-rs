@@ -5,7 +5,7 @@ fn main() {
 
     if s.len() >= 6 && (&s[0..5] == "ublkb" || &s[0..5] == "ublkc") {
         match s[5..].parse::<i32>() {
-            Ok(id) => match libublk::ctrl::UblkCtrl::new_simple(id, 0) {
+            Ok(id) => match libublk::ctrl::UblkCtrl::new_simple(id) {
                 Ok(ctrl) => {
                     let dinfo = ctrl.dev_info();
                     if (dinfo.flags & libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64) != 0 {

@@ -2,12 +2,14 @@ use libublk::ctrl::UblkCtrl;
 ///! # Example of ramdisk
 ///
 /// Serves for covering recovery test[`test_ublk_ramdisk_recovery`],
-/// UblkCtrl::start_dev_in_queue() and low level interface example.
 ///
-use libublk::dev_flags::*;
+/// Build ramdisk target in single-thread conext, and the same technique
+/// will be extended to create multiple devices in single thread
+///
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_run_ctrl_task;
+use libublk::UblkFlags;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -79,6 +81,8 @@ fn queue_fn<'a>(
     (q_rc, exe, f_vec)
 }
 
+/// Start device in async IO task, in which both control and io rings
+/// are driven in current context
 fn start_dev_fn(
     ctrl_rc: &Rc<UblkCtrl>,
     dev_arc: &Arc<UblkDev>,
@@ -113,9 +117,9 @@ fn start_dev_fn(
 ///async control command, no need Rust async any more
 fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     let dev_flags = if for_add {
-        UBLK_DEV_F_ADD_DEV
+        UblkFlags::UBLK_DEV_F_ADD_DEV
     } else {
-        UBLK_DEV_F_RECOVER_DEV
+        UblkFlags::UBLK_DEV_F_RECOVER_DEV
     };
 
     let ctrl = Rc::new(
@@ -140,7 +144,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     // spawn async io tasks, and return io task array
     let (q_rc, exe, f_vec) = queue_fn(&dev, buf_addr);
 
-    // start device by running one async control task
+    // start device via async task
     let res = start_dev_fn(&ctrl, &dev, &ctrl_exe, &q_rc, &exe);
 
     if res >= 0 {
@@ -178,7 +182,7 @@ fn test_add(recover: usize) {
 
             if recover > 0 {
                 assert!(dev_id >= 0);
-                let ctrl = UblkCtrl::new_simple(dev_id, 0).unwrap();
+                let ctrl = UblkCtrl::new_simple(dev_id).unwrap();
                 size = rd_get_device_size(&ctrl);
 
                 ctrl.start_user_recover().unwrap();
@@ -194,7 +198,7 @@ fn test_add(recover: usize) {
 fn test_del() {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
-    let ctrl = UblkCtrl::new_simple(dev_id as i32, 0).unwrap();
+    let ctrl = UblkCtrl::new_simple(dev_id as i32).unwrap();
 
     ctrl.del_dev().unwrap();
 }

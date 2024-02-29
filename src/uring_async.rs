@@ -109,10 +109,7 @@ fn ublk_process_queue_io(
     nr_waits: usize,
 ) -> Result<i32, UblkError> {
     let res = q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits);
-
-    if res.is_ok() {
-        while exe.try_tick() {}
-    }
+    while exe.try_tick() {}
 
     res
 }
@@ -144,9 +141,7 @@ pub fn ublk_run_ctrl_task<T>(
     q_exe: &smol::LocalExecutor,
     task: &smol::Task<T>,
 ) -> Result<(), UblkError> {
-    let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder()
-        .build(4)
-        .map_err(UblkError::OtherIOError)?;
+    let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder().build(4)?;
     let ctrl_fd = crate::ctrl::CTRL_URING.with(|refcell| refcell.borrow().as_raw_fd());
     let q_fd = q.as_raw_fd();
     let mut poll_q = true;
@@ -172,7 +167,7 @@ pub fn ublk_run_ctrl_task<T>(
             poll_ctrl = false;
         }
 
-        pr.submit_and_wait(1).map_err(UblkError::OtherIOError)?;
+        pr.submit_and_wait(1)?;
         let cqes: Vec<cqueue::Entry> = pr.completion().map(Into::into).collect();
         for cqe in cqes {
             if cqe.user_data() == 0x1 {
@@ -195,8 +190,7 @@ pub fn ublk_run_ctrl_task<T>(
     let nr_waits = 1 + if poll_q { 0 } else { 1 } + if poll_ctrl { 0 } else { 1 };
     let poll_e = opcode::PollRemove::new(0x05);
     let _ = unsafe { pr.submission().push(&poll_e.build().user_data(0x05).into()) };
-    pr.submit_and_wait(nr_waits)
-        .map_err(UblkError::OtherIOError)?;
+    pr.submit_and_wait(nr_waits)?;
 
     Ok(())
 }
