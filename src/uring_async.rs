@@ -109,10 +109,7 @@ fn ublk_process_queue_io(
     nr_waits: usize,
 ) -> Result<i32, UblkError> {
     let res = q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits);
-
-    if res.is_ok() {
-        while exe.try_tick() {}
-    }
+    while exe.try_tick() {}
 
     res
 }

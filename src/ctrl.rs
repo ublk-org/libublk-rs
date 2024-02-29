@@ -19,6 +19,8 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
 
+// per-thread control uring
+//
 std::thread_local! {
     pub(crate) static CTRL_URING: RefCell<IoUring::<squeue::Entry128>> =
         RefCell::new(IoUring::<squeue::Entry128>::builder()
@@ -1408,13 +1410,14 @@ impl UblkCtrl {
     }
 
     /// Run ublk daemon and kick off the ublk device, and `/dev/ublkbN` will be
-    /// created and visible to userspace.
+    /// created and exposed to userspace.
     ///
     /// # Arguments:
     ///
     /// * `tgt_fn`: target initialization handler
-    /// * `q_fn`: queue handler for setting up the queue and its handler
-    /// * `device_fn`: handler called after device is started, run in current
+    /// * `q_fn`: queue handler for setting up the queue and its handler,
+    ///     all IO logical is implemented in queue handler
+    /// * `device_fn`: called after device is started, run in current
     ///     context
     ///
     /// This one is the preferred interface for creating ublk daemon, and
