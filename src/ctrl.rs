@@ -305,8 +305,7 @@ impl UblkCtrlInner {
         let fd = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(CTRL_PATH)
-            .map_err(UblkError::OtherIOError)?;
+            .open(CTRL_PATH)?;
 
         let mut dev = UblkCtrlInner {
             name,
@@ -830,11 +829,11 @@ impl UblkCtrlInner {
     fn set_path_permission(path: &Path, mode: u32) -> Result<i32, UblkError> {
         use std::os::unix::fs::PermissionsExt;
 
-        let metadata = fs::metadata(path).map_err(UblkError::OtherIOError)?;
+        let metadata = fs::metadata(path)?;
         let mut permissions = metadata.permissions();
 
         permissions.set_mode(mode);
-        fs::set_permissions(path, permissions).map_err(UblkError::OtherIOError)?;
+        fs::set_permissions(path, permissions)?;
 
         Ok(0)
     }
@@ -856,7 +855,7 @@ impl UblkCtrlInner {
 
         if let Some(parent_dir) = json_path.parent() {
             if !Path::new(&parent_dir).exists() {
-                fs::create_dir_all(parent_dir).map_err(UblkError::OtherIOError)?;
+                fs::create_dir_all(parent_dir)?;
 
                 // It is just fine to expose the running parent directory as
                 // 777, and we will make sure every exported running json
@@ -864,16 +863,14 @@ impl UblkCtrlInner {
                 Self::set_path_permission(parent_dir, 0o777)?;
             }
         }
-        let mut run_file = fs::File::create(json_path).map_err(UblkError::OtherIOError)?;
+        let mut run_file = fs::File::create(json_path)?;
 
         // Each exported json file is only visible for the device owner.
         // In future, it can be relaxed, such as allowing group to access,
         // according to ublk use policy
         Self::set_path_permission(json_path, 0o700)?;
 
-        run_file
-            .write_all(self.json.to_string().as_bytes())
-            .map_err(UblkError::OtherIOError)?;
+        run_file.write_all(self.json.to_string().as_bytes())?;
         Ok(0)
     }
 
@@ -938,11 +935,10 @@ impl UblkCtrlInner {
     /// Reload json info for this device
     ///
     fn reload_json(&mut self) -> Result<i32, UblkError> {
-        let mut file = fs::File::open(self.run_path()).map_err(UblkError::OtherIOError)?;
+        let mut file = fs::File::open(self.run_path())?;
         let mut json_str = String::new();
 
-        file.read_to_string(&mut json_str)
-            .map_err(UblkError::OtherIOError)?;
+        file.read_to_string(&mut json_str)?;
         self.json = serde_json::from_str(&json_str).map_err(UblkError::JsonError)?;
 
         Ok(0)
@@ -1349,7 +1345,7 @@ impl UblkCtrl {
         let rp = ctrl.run_path();
 
         if ctrl.for_add_dev() && Path::new(&rp).exists() {
-            fs::remove_file(rp).map_err(UblkError::OtherIOError)?;
+            fs::remove_file(rp)?;
         }
         ctrl.stop()
     }
@@ -1379,7 +1375,7 @@ impl UblkCtrl {
 
         ctrl.del()?;
         if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path()).map_err(UblkError::OtherIOError)?;
+            fs::remove_file(ctrl.run_path())?;
         }
         Ok(0)
     }

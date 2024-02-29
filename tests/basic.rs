@@ -28,9 +28,7 @@ mod integration {
         let json_path = Path::new(&run_path);
         assert!(json_path.exists() == true);
 
-        let metadata = std::fs::metadata(json_path)
-            .map_err(UblkError::OtherIOError)
-            .unwrap();
+        let metadata = std::fs::metadata(json_path).unwrap();
         let permissions = metadata.permissions();
         assert!((permissions.mode() & 0o777) == 0o700);
     }

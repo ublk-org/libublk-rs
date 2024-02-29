@@ -499,8 +499,7 @@ impl UblkQueue<'_> {
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth as u32)
             .setup_coop_taskrun()
-            .build(sq_depth as u32)
-            .map_err(UblkError::OtherIOError)?;
+            .build(sq_depth as u32)?;
 
         //todo: apply io_uring flags from tgt.ring_flags
 
@@ -509,8 +508,7 @@ impl UblkQueue<'_> {
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
 
         ring.submitter()
-            .register_files(&tgt.fds[0..tgt.nr_fds as usize])
-            .map_err(UblkError::OtherIOError)?;
+            .register_files(&tgt.fds[0..tgt.nr_fds as usize])?;
 
         let off = sys::UBLKSRV_CMD_BUF_OFFSET as i64
             + q_id as i64
