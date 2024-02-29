@@ -525,7 +525,7 @@ impl UblkQueue<'_> {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::OtherIOError(std::io::Error::last_os_error()));
+            return Err(UblkError::IOError(std::io::Error::last_os_error()));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
@@ -1020,7 +1020,7 @@ impl UblkQueue<'_> {
             Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
                 return Err(UblkError::UringTimeout);
             }
-            Err(err) => return Err(UblkError::OtherIOError(err)),
+            Err(err) => return Err(UblkError::IOError(err)),
             Ok(_) => {}
         };
 

@@ -77,7 +77,7 @@ pub enum UblkError {
     QueueIsDown,
 
     #[error("other IO failure")]
-    OtherIOError(#[from] std::io::Error),
+    IOError(#[from] std::io::Error),
 
     #[error("Invalid input")]
     InvalidVal,
