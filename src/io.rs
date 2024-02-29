@@ -837,7 +837,7 @@ impl UblkQueue<'_> {
             | Err(UblkError::UringIOError(res)) => {
                 self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, res);
             }
-            Err(UblkError::IoQueued(_)) => {}
+            Err(UblkError::UringIoQueued) => {}
             #[cfg(feature = "fat_complete")]
             Ok(UblkIORes::FatRes(fat)) => match fat {
                 UblkFatRes::BatchRes(ios) => {
@@ -1020,7 +1020,7 @@ impl UblkQueue<'_> {
         let ret = r.submitter().submit_with_args(to_wait, &args);
         match ret {
             Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
-                return Err(UblkError::UringSubmissionTimeout(-libc::ETIME));
+                return Err(UblkError::UringTimeout);
             }
             Err(err) => return Err(UblkError::UringSubmissionError(err)),
             Ok(_) => {}
@@ -1045,7 +1045,7 @@ impl UblkQueue<'_> {
                 }
                 Ok(nr_cqes)
             }
-            Err(UblkError::UringSubmissionTimeout(_)) => {
+            Err(UblkError::UringTimeout) => {
                 self.enter_queue_idle();
                 Ok(0)
             }
@@ -1083,7 +1083,7 @@ impl UblkQueue<'_> {
     /// same IO closure is called for handling this target IO, which can be
     /// checked by `UblkIOCtx::is_tgt_io()` method. Finally if the coming
     /// target IO completion means the original IO command is done,
-    /// `Ok(UblkIORes::Result)` is returned for moving on, otherwise UblkError::IoQueued(_)
+    /// `Ok(UblkIORes::Result)` is returned for moving on, otherwise UblkError::IoQueued
     /// can be returned and the IO handling closure can continue to submit IO
     /// or whatever for driving its IO logic.
     ///

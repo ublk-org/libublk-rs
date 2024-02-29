@@ -65,10 +65,10 @@ pub enum UblkError {
     UringSubmissionError(#[source] std::io::Error),
 
     #[error("uring submission timeout")]
-    UringSubmissionTimeout(i32),
+    UringTimeout,
 
-    #[error("failed to push SQE to uring")]
-    UringPushError(#[from] io_uring::squeue::PushError),
+    #[error("IO Queued")]
+    UringIoQueued,
 
     #[error("io_uring IO failure")]
     UringIOError(i32),
@@ -84,9 +84,6 @@ pub enum UblkError {
 
     #[error("other IO failure")]
     OtherIOError(#[source] std::io::Error),
-
-    #[error("IO Queued")]
-    IoQueued(i32),
 
     #[error("Invalid input")]
     InvalidVal,
