@@ -61,9 +61,6 @@ pub enum UblkIORes {
 
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
-    #[error("failed to read the key file")]
-    UringSubmissionError(#[source] std::io::Error),
-
     #[error("uring submission timeout")]
     UringTimeout,
 
@@ -80,7 +77,7 @@ pub enum UblkError {
     QueueIsDown,
 
     #[error("other IO failure")]
-    OtherIOError(#[source] std::io::Error),
+    OtherIOError(#[from] std::io::Error),
 
     #[error("Invalid input")]
     InvalidVal,
