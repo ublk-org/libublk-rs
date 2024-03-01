@@ -136,9 +136,8 @@ pub fn ublk_run_task<T>(
 
 /// Run one task in this local Executor until the task is finished
 pub fn ublk_run_ctrl_task<T>(
-    ctrl_exe: &smol::LocalExecutor,
+    exe: &smol::LocalExecutor,
     q: &UblkQueue,
-    q_exe: &smol::LocalExecutor,
     task: &smol::Task<T>,
 ) -> Result<(), UblkError> {
     let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder().build(4)?;
@@ -147,7 +146,7 @@ pub fn ublk_run_ctrl_task<T>(
     let mut poll_q = true;
     let mut poll_ctrl = true;
 
-    while ctrl_exe.try_tick() {}
+    while exe.try_tick() {}
     while !task.is_finished() {
         log::debug!(
             "poll ring: submit and wait, ctrl_fd {} q_fd {}",
@@ -178,12 +177,12 @@ pub fn ublk_run_ctrl_task<T>(
             }
         }
 
-        ublk_process_queue_io(q, q_exe, 0)?;
+        ublk_process_queue_io(q, exe, 0)?;
         let entry =
             crate::ctrl::CTRL_URING.with(|refcell| ublk_try_reap_cqe(&mut refcell.borrow_mut(), 0));
         if let Some(cqe) = entry {
             ublk_wake_task(cqe.user_data(), &cqe);
-            while ctrl_exe.try_tick() {}
+            while exe.try_tick() {}
         }
     }
 
