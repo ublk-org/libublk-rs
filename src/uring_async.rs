@@ -124,6 +124,7 @@ pub fn ublk_run_task<T, F>(
 where
     F: Fn(&smol::LocalExecutor) -> Result<(), UblkError>,
 {
+    while exe.try_tick() {}
     while !task.is_finished() {
         handler(exe)?;
     }
