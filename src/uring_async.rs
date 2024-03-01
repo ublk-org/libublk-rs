@@ -11,8 +11,8 @@ use std::{
 };
 
 struct FutureData {
-    pub waker: Option<Waker>,
-    pub result: Option<i32>,
+    waker: Option<Waker>,
+    result: Option<i32>,
 }
 
 std::thread_local! {
@@ -35,7 +35,7 @@ impl UblkUringOpFuture {
                 result: None,
             });
             let user_data = ((key as u32) << 16) as u64 | tgt_io;
-            log::debug!("rublk: new future {:x}", user_data);
+            log::debug!("uring: new future {:x}", user_data);
             UblkUringOpFuture { user_data }
         })
     }
@@ -49,18 +49,18 @@ impl Future for UblkUringOpFuture {
             let key = ((self.user_data & !(1_u64 << 63)) >> 16) as usize;
             match map.get_mut(key) {
                 None => {
-                    log::debug!("rublk: null slab {:x}", self.user_data);
+                    log::debug!("uring: null slab {:x}", self.user_data);
                     Poll::Pending
                 }
                 Some(fd) => match fd.result {
                     Some(result) => {
                         map.remove(key);
-                        log::debug!("rublk: uring io ready userdata {:x} ready", self.user_data);
+                        log::debug!("uring: uring io ready userdata {:x} ready", self.user_data);
                         Poll::Ready(result)
                     }
                     None => {
                         fd.waker = Some(cx.waker().clone());
-                        log::debug!("rublk: uring io pending userdata {:x}", self.user_data);
+                        log::debug!("uring: uring io pending userdata {:x}", self.user_data);
                         Poll::Pending
                     }
                 },
@@ -69,6 +69,7 @@ impl Future for UblkUringOpFuture {
     }
 }
 
+//// Wakeup the pending future/task
 #[inline]
 pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
     MY_SLAB.with(|refcell| {
@@ -129,7 +130,7 @@ where
     Ok(())
 }
 
-/// Run one task in this local Executor until the task is finished
+/// Run one IO task in this local Executor until the task is finished
 pub fn ublk_run_io_task<T>(
     exe: &smol::LocalExecutor,
     task: &smol::Task<T>,
