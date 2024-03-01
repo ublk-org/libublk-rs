@@ -60,16 +60,18 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
             let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
-            let buf_addr = if user_copy {
-                std::ptr::null_mut()
+            let (_buf, buf_addr) = if user_copy {
+                (None, std::ptr::null_mut())
             } else {
-                buf.as_mut_ptr()
+                let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+
+                q.register_io_buf(tag, &buf);
+                let addr = buf.as_mut_ptr();
+                (Some(buf), addr)
             };
 
-            q.register_io_buf(tag, &buf);
             loop {
                 let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
                 if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
