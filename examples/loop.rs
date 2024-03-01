@@ -248,7 +248,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
             }
         }));
     }
-    ublk_wait_and_handle_ios(&q_rc, &exe);
+    ublk_wait_and_handle_ios(&exe, &q_rc);
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 

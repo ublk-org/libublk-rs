@@ -81,7 +81,7 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
             }
         }));
     }
-    ublk_wait_and_handle_ios(&q_rc, &exe);
+    ublk_wait_and_handle_ios(&exe, &q_rc);
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
 

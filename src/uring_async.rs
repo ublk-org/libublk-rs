@@ -104,8 +104,8 @@ fn ublk_try_reap_cqe<S: squeue::EntryMarker>(
 }
 
 fn ublk_process_queue_io(
-    q: &UblkQueue,
     exe: &smol::LocalExecutor,
+    q: &UblkQueue,
     nr_waits: usize,
 ) -> Result<i32, UblkError> {
     let res = q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits);
@@ -115,30 +115,39 @@ fn ublk_process_queue_io(
 }
 
 /// Run one task in this local Executor until the task is finished
-pub fn ublk_run_task<T>(
-    q: &UblkQueue,
+pub fn ublk_run_task<T, F>(
     exe: &smol::LocalExecutor,
     task: &smol::Task<T>,
-    nr_waits: usize,
-) {
+    handler: F,
+) -> Result<(), UblkError>
+where
+    F: Fn(&smol::LocalExecutor) -> Result<(), UblkError>,
+{
     while !task.is_finished() {
-        let res = ublk_process_queue_io(q, exe, nr_waits);
-
-        let wait = match res {
-            Ok(nr) if nr > 0 => false,
-            _ => false,
-        };
-        if wait {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        handler(exe)?;
     }
+    Ok(())
+}
+
+/// Run one task in this local Executor until the task is finished
+pub fn ublk_run_io_task<T>(
+    exe: &smol::LocalExecutor,
+    task: &smol::Task<T>,
+    q: &UblkQueue,
+    nr_waits: usize,
+) -> Result<(), UblkError> {
+    let handler = move |exe: &smol::LocalExecutor| -> Result<(), UblkError> {
+        let _ = ublk_process_queue_io(exe, q, nr_waits)?;
+        Ok(())
+    };
+
+    ublk_run_task(exe, task, handler)
 }
 
 /// Run one task in this local Executor until the task is finished
 pub fn ublk_run_ctrl_task<T>(
-    ctrl_exe: &smol::LocalExecutor,
+    exe: &smol::LocalExecutor,
     q: &UblkQueue,
-    q_exe: &smol::LocalExecutor,
     task: &smol::Task<T>,
 ) -> Result<(), UblkError> {
     let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder().build(4)?;
@@ -147,7 +156,7 @@ pub fn ublk_run_ctrl_task<T>(
     let mut poll_q = true;
     let mut poll_ctrl = true;
 
-    while ctrl_exe.try_tick() {}
+    while exe.try_tick() {}
     while !task.is_finished() {
         log::debug!(
             "poll ring: submit and wait, ctrl_fd {} q_fd {}",
@@ -178,12 +187,12 @@ pub fn ublk_run_ctrl_task<T>(
             }
         }
 
-        ublk_process_queue_io(q, q_exe, 0)?;
+        ublk_process_queue_io(exe, q, 0)?;
         let entry =
             crate::ctrl::CTRL_URING.with(|refcell| ublk_try_reap_cqe(&mut refcell.borrow_mut(), 0));
         if let Some(cqe) = entry {
             ublk_wake_task(cqe.user_data(), &cqe);
-            while ctrl_exe.try_tick() {}
+            while exe.try_tick() {}
         }
     }
 
@@ -206,7 +215,7 @@ pub fn ublk_run_ctrl_task<T>(
 /// Wait and handle any incoming cqe until queue is down.
 ///
 /// This should be the only foreground thing done in queue thread.
-pub fn ublk_wait_and_handle_ios(q: &UblkQueue, exe: &smol::LocalExecutor) {
+pub fn ublk_wait_and_handle_ios(exe: &smol::LocalExecutor, q: &UblkQueue) {
     loop {
         while exe.try_tick() {}
         match q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
