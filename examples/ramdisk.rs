@@ -128,7 +128,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     match res {
         Ok(_) => {
             ctrl.dump();
-            libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exec);
+            libublk::uring_async::ublk_wait_and_handle_ios(&exec, &q_rc);
         }
         _ => eprintln!("device can't be started"),
     }
