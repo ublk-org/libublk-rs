@@ -9,9 +9,9 @@ use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_run_ctrl_task;
-use libublk::UblkFlags;
+use libublk::{UblkError, UblkFlags};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 {
     let iod = q.get_iod(tag);
@@ -67,28 +67,21 @@ fn start_dev_fn(
     ctrl_rc: &Rc<UblkCtrl>,
     dev_arc: &Arc<UblkDev>,
     q: &UblkQueue,
-) -> i32 {
-    let res = Rc::new(Mutex::new(0));
+) -> Result<i32, UblkError> {
     let ctrl_clone = ctrl_rc.clone();
     let dev_clone = dev_arc.clone();
-    let res_clone = res.clone();
 
     // Start device in one dedicated io task
     let task = exe.spawn(async move {
-        ctrl_clone
-            .configure_queue(&dev_clone, 0, unsafe { libc::gettid() })
-            .unwrap();
-
-        let r = ctrl_clone.start_dev_async(&dev_clone).await;
-
-        let mut guard = res_clone.lock().unwrap();
-        *guard = r.unwrap();
+        let r = ctrl_clone.configure_queue(&dev_clone, 0, unsafe { libc::gettid() });
+        if r.is_err() {
+            r
+        } else {
+            ctrl_clone.start_dev_async(&dev_clone).await
+        }
     });
-    ublk_run_ctrl_task(exe, q, &task).unwrap();
-
-    let r = *res.lock().unwrap();
-
-    r
+    ublk_run_ctrl_task(exe, q, &task)?;
+    smol::block_on(task)
 }
 
 ///run this ramdisk ublk daemon completely in single context with
@@ -132,11 +125,12 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
 
     // start device via async task
     let res = start_dev_fn(&exec, &ctrl, &dev_arc, &q_rc);
-    if res >= 0 {
-        ctrl.dump();
-        libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exec);
-    } else {
-        eprintln!("device can't be started");
+    match res {
+        Ok(_) => {
+            ctrl.dump();
+            libublk::uring_async::ublk_wait_and_handle_ios(&q_rc, &exec);
+        }
+        _ => eprintln!("device can't be started"),
     }
     smol::block_on(async { futures::future::join_all(f_vec).await });
 }
