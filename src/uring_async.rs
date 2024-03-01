@@ -115,23 +115,33 @@ fn ublk_process_queue_io(
 }
 
 /// Run one task in this local Executor until the task is finished
-pub fn ublk_run_task<T>(
+pub fn ublk_run_task<T, F>(
     exe: &smol::LocalExecutor,
-    q: &UblkQueue,
     task: &smol::Task<T>,
-    nr_waits: usize,
-) {
+    handler: F,
+) -> Result<(), UblkError>
+where
+    F: Fn(&smol::LocalExecutor) -> Result<(), UblkError>,
+{
     while !task.is_finished() {
-        let res = ublk_process_queue_io(exe, q, nr_waits);
-
-        let wait = match res {
-            Ok(nr) if nr > 0 => false,
-            _ => false,
-        };
-        if wait {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        handler(exe)?;
     }
+    Ok(())
+}
+
+/// Run one task in this local Executor until the task is finished
+pub fn ublk_run_io_task<T>(
+    exe: &smol::LocalExecutor,
+    task: &smol::Task<T>,
+    q: &UblkQueue,
+    nr_waits: usize,
+) -> Result<(), UblkError> {
+    let handler = move |exe: &smol::LocalExecutor| -> Result<(), UblkError> {
+        let _ = ublk_process_queue_io(exe, q, nr_waits)?;
+        Ok(())
+    };
+
+    ublk_run_task(exe, task, handler)
 }
 
 /// Run one task in this local Executor until the task is finished
