@@ -232,7 +232,7 @@ impl UblkDev {
     /// structure which implements UblkTgtImpl.
     pub fn new<F>(tgt_name: String, ops: F, ctrl: &UblkCtrl) -> Result<UblkDev, UblkError>
     where
-        F: FnOnce(&mut UblkDev) -> Result<i32, UblkError>,
+        F: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
     {
         let info = ctrl.dev_info();
         let mut tgt = UblkTgt {

@@ -109,7 +109,7 @@ fn __null_add(
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(250_u64 << 30);
-        Ok(0)
+        Ok(())
     };
     let user_copy = (ctrl.dev_info().flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
     let wh = move |d_ctrl: &UblkCtrl| {

@@ -81,7 +81,7 @@ fn lo_file_size(f: &std::fs::File) -> Result<(u64, u8, u8)> {
 }
 
 // setup loop target
-fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
+fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<(), UblkError> {
     trace!("loop: init_tgt {}", dev.dev_info.dev_id);
     if lo.direct_io != 0 {
         unsafe {
@@ -113,7 +113,7 @@ fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<i32, UblkError> {
     let val = serde_json::json!({"loop": LoJson { back_file_path: lo.back_file_path.clone(), direct_io: 1 } });
     dev.set_target_json(val);
 
-    Ok(0)
+    Ok(())
 }
 
 #[inline]

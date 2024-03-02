@@ -94,7 +94,7 @@ fn main() {
         // target initialization
         |dev| {
             dev.set_default_params(250_u64 << 30);
-            Ok(0)
+            Ok(())
         },
         // queue IO logic
         |tag, dev| q_fn(tag, dev),
