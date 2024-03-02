@@ -796,13 +796,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline]
-    pub fn ublk_submit_sqe_sync(
-        &self,
-        sqe: io_uring::squeue::Entry,
-        user_data: u64,
-    ) -> Result<(), UblkError> {
-        let sqe = sqe.user_data(user_data);
-
+    pub fn ublk_submit_sqe_sync(&self, sqe: io_uring::squeue::Entry) -> Result<(), UblkError> {
         loop {
             let res = unsafe { self.q_ring.borrow_mut().submission().push(&sqe) };
 
