@@ -428,9 +428,10 @@ pub struct UblkQueue<'a> {
     bufs: RefCell<Vec<*mut u8>>,
     state: RefCell<UblkQueueState>,
 
-    /// uring is shared for handling target IO, so has to be
-    /// public
-    pub q_ring: RefCell<IoUring<squeue::Entry>>,
+    // call uring_op() and uring_op_mut() for manipulating
+    // q_ring, and in future it is likely to change to
+    // thread_local variable
+    q_ring: RefCell<IoUring<squeue::Entry>>,
 }
 
 impl AsRawFd for UblkQueue<'_> {
@@ -561,6 +562,26 @@ impl UblkQueue<'_> {
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
         Ok(q)
+    }
+
+    // Manipulate immutable queue uring
+    pub fn uring_op<R, H>(&self, op_handler: H) -> Result<R, UblkError>
+    where
+        H: Fn(&IoUring<squeue::Entry>) -> Result<R, UblkError>,
+    {
+        let uring = self.q_ring.borrow();
+
+        op_handler(&uring)
+    }
+
+    // Manipulate mutable queue uring
+    pub fn uring_op_mut<R, H>(&self, op_handler: H) -> Result<R, UblkError>
+    where
+        H: Fn(&mut IoUring<squeue::Entry>) -> Result<R, UblkError>,
+    {
+        let mut uring = self.q_ring.borrow_mut();
+
+        op_handler(&mut uring)
     }
 
     /// Return queue depth
@@ -1198,5 +1219,50 @@ impl UblkQueue<'_> {
                 Ok(done)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ctrl::UblkCtrlBuilder;
+    use crate::io::{UblkDev, UblkQueue};
+    use crate::{UblkError, UblkFlags};
+    use io_uring::IoUring;
+
+    fn __submit_uring_nop(ring: &mut IoUring<io_uring::squeue::Entry>) -> Result<usize, UblkError> {
+        let nop_e = io_uring::opcode::Nop::new().build().user_data(0x42).into();
+
+        unsafe {
+            let mut queue = ring.submission();
+            queue.push(&nop_e).expect("queue is full");
+        }
+
+        ring.submit_and_wait(1).map_err(UblkError::IOError)
+    }
+
+    #[test]
+    fn test_queue_uring_op() {
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut _| {
+            let q = UblkQueue::new(0, dev)?;
+
+            q.uring_op(|ring: &_| {
+                ring.submitter().unregister_files()?;
+                ring.submitter()
+                    .register_files(&dev.tgt.fds)
+                    .map_err(UblkError::IOError)
+            })?;
+            q.uring_op_mut(|ring: &mut _| -> Result<usize, UblkError> {
+                __submit_uring_nop(ring)
+            })?;
+
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
     }
 }
