@@ -69,7 +69,9 @@ impl Future for UblkUringOpFuture {
     }
 }
 
-//// Wakeup the pending future/task
+/// Wakeup the pending task, which will be marked as runnable
+/// by smol, and the task's future poll() will be run by smol
+/// executor's try_tick()
 #[inline]
 pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
     MY_SLAB.with(|refcell| {
@@ -124,6 +126,7 @@ pub fn ublk_run_task<T, F>(
 where
     F: Fn(&smol::LocalExecutor) -> Result<(), UblkError>,
 {
+    // make sure the spawned task is started by `try_tick()`
     while exe.try_tick() {}
     while !task.is_finished() {
         handler(exe)?;
@@ -146,7 +149,15 @@ pub fn ublk_run_io_task<T>(
     ublk_run_task(exe, task, handler)
 }
 
-/// Run one task in this local Executor until the task is finished
+/// Run one control task in this local Executor until the task is finished,
+/// control task is queued in the thread_local io_uring CTRL_URING.
+///
+/// The current queue is passed in because some control command depends on
+/// IO command, such as START command, so ublk_run_ctrl_task() has to drive
+/// both data and control urings.
+///
+/// Rust isn't friendly for using native poll or epoll, so use one dedicated
+/// uring for polling data and control urings.
 pub fn ublk_run_ctrl_task<T>(
     exe: &smol::LocalExecutor,
     q: &UblkQueue,

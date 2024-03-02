@@ -106,7 +106,7 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
-        Ok(0)
+        Ok(())
     };
     let dev_arc = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
     let dev_clone = dev_arc.clone();

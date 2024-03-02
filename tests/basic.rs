@@ -55,7 +55,7 @@ mod integration {
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
-            Ok(0)
+            Ok(())
         };
 
         let q_fn = move |qid: u16, _dev: &UblkDev| {
@@ -172,7 +172,7 @@ mod integration {
 
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(250_u64 << 30);
-            Ok(0)
+            Ok(())
         };
         // device data is shared among all queue contexts
         let dev_data = Arc::new(Mutex::new(DevData { done: 0 }));
@@ -310,7 +310,7 @@ mod integration {
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
             dev.set_default_params(size);
-            Ok(0)
+            Ok(())
         };
 
         let q_fn = move |qid: u16, dev: &UblkDev| {

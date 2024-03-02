@@ -232,7 +232,7 @@ impl UblkDev {
     /// structure which implements UblkTgtImpl.
     pub fn new<F>(tgt_name: String, ops: F, ctrl: &UblkCtrl) -> Result<UblkDev, UblkError>
     where
-        F: FnOnce(&mut UblkDev) -> Result<i32, UblkError>,
+        F: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
     {
         let info = ctrl.dev_info();
         let mut tgt = UblkTgt {
@@ -418,7 +418,6 @@ impl UblkQueueState {
 ///
 /// So far, each queue is handled by one its own io_uring.
 ///
-#[allow(dead_code)]
 pub struct UblkQueue<'a> {
     flags: UblkFlags,
     q_id: u16,
@@ -429,9 +428,10 @@ pub struct UblkQueue<'a> {
     bufs: RefCell<Vec<*mut u8>>,
     state: RefCell<UblkQueueState>,
 
-    /// uring is shared for handling target IO, so has to be
-    /// public
-    pub q_ring: RefCell<IoUring<squeue::Entry>>,
+    // call uring_op() and uring_op_mut() for manipulating
+    // q_ring, and in future it is likely to change to
+    // thread_local variable
+    q_ring: RefCell<IoUring<squeue::Entry>>,
 }
 
 impl AsRawFd for UblkQueue<'_> {
@@ -564,6 +564,26 @@ impl UblkQueue<'_> {
         Ok(q)
     }
 
+    // Manipulate immutable queue uring
+    pub fn uring_op<R, H>(&self, op_handler: H) -> Result<R, UblkError>
+    where
+        H: Fn(&IoUring<squeue::Entry>) -> Result<R, UblkError>,
+    {
+        let uring = self.q_ring.borrow();
+
+        op_handler(&uring)
+    }
+
+    // Manipulate mutable queue uring
+    pub fn uring_op_mut<R, H>(&self, op_handler: H) -> Result<R, UblkError>
+    where
+        H: Fn(&mut IoUring<squeue::Entry>) -> Result<R, UblkError>,
+    {
+        let mut uring = self.q_ring.borrow_mut();
+
+        op_handler(&mut uring)
+    }
+
     /// Return queue depth
     ///
     /// Queue depth decides the max count of inflight io command
@@ -596,8 +616,7 @@ impl UblkQueue<'_> {
         unsafe { &*iod }
     }
 
-    #[inline(always)]
-    pub fn get_io_buf_addr(&self, tag: u16) -> *mut u8 {
+    fn get_io_buf_addr(&self, tag: u16) -> *mut u8 {
         self.bufs.borrow()[tag as usize]
     }
 
@@ -638,7 +657,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    #[allow(unused_assignments)]
     fn __queue_io_cmd(
         &self,
         r: &mut IoUring<squeue::Entry>,
@@ -777,6 +795,29 @@ impl UblkQueue<'_> {
         f
     }
 
+    #[inline]
+    pub fn ublk_submit_sqe_sync(
+        &self,
+        sqe: io_uring::squeue::Entry,
+        user_data: u64,
+    ) -> Result<(), UblkError> {
+        let sqe = sqe.user_data(user_data);
+
+        loop {
+            let res = unsafe { self.q_ring.borrow_mut().submission().push(&sqe) };
+
+            match res {
+                Ok(_) => break,
+                Err(_) => {
+                    log::debug!("ublk_submit_sqe: flush and retry");
+                    self.q_ring.borrow().submit_and_wait(0)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Submit all commands for fetching IO
     ///
     /// Only called during queue initialization. After queue is setup,
@@ -866,7 +907,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    #[allow(unused_assignments)]
     fn handle_cqe<F>(&self, mut ops: F, e: &UblkIOCtx)
     where
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),
@@ -1143,7 +1183,7 @@ impl UblkQueue<'_> {
     ///
     /// # Arguments:
     ///
-    /// * `exe`: async executor
+    /// * `wake_handler`: handler for wakeup io tasks pending on this uring
     ///
     /// * `to_wait`: passed to io_uring_enter(), wait until `to_wait` events
     /// are available. It won't block in waiting for events if `to_wait` is
@@ -1179,5 +1219,50 @@ impl UblkQueue<'_> {
                 Ok(done)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ctrl::UblkCtrlBuilder;
+    use crate::io::{UblkDev, UblkQueue};
+    use crate::{UblkError, UblkFlags};
+    use io_uring::IoUring;
+
+    fn __submit_uring_nop(ring: &mut IoUring<io_uring::squeue::Entry>) -> Result<usize, UblkError> {
+        let nop_e = io_uring::opcode::Nop::new().build().user_data(0x42).into();
+
+        unsafe {
+            let mut queue = ring.submission();
+            queue.push(&nop_e).expect("queue is full");
+        }
+
+        ring.submit_and_wait(1).map_err(UblkError::IOError)
+    }
+
+    #[test]
+    fn test_queue_uring_op() {
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut _| {
+            let q = UblkQueue::new(0, dev)?;
+
+            q.uring_op(|ring: &_| {
+                ring.submitter().unregister_files()?;
+                ring.submitter()
+                    .register_files(&dev.tgt.fds)
+                    .map_err(UblkError::IOError)
+            })?;
+            q.uring_op_mut(|ring: &mut _| -> Result<usize, UblkError> {
+                __submit_uring_nop(ring)
+            })?;
+
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
     }
 }
