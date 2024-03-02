@@ -596,8 +596,7 @@ impl UblkQueue<'_> {
         unsafe { &*iod }
     }
 
-    #[inline(always)]
-    pub fn get_io_buf_addr(&self, tag: u16) -> *mut u8 {
+    fn get_io_buf_addr(&self, tag: u16) -> *mut u8 {
         self.bufs.borrow()[tag as usize]
     }
 
