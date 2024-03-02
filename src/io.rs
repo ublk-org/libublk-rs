@@ -774,6 +774,29 @@ impl UblkQueue<'_> {
         f
     }
 
+    #[inline]
+    pub fn ublk_submit_sqe_sync(
+        &self,
+        sqe: io_uring::squeue::Entry,
+        user_data: u64,
+    ) -> Result<(), UblkError> {
+        let sqe = sqe.user_data(user_data);
+
+        loop {
+            let res = unsafe { self.q_ring.borrow_mut().submission().push(&sqe) };
+
+            match res {
+                Ok(_) => break,
+                Err(_) => {
+                    log::debug!("ublk_submit_sqe: flush and retry");
+                    self.q_ring.borrow().submit_and_wait(0)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Submit all commands for fetching IO
     ///
     /// Only called during queue initialization. After queue is setup,
@@ -1139,7 +1162,7 @@ impl UblkQueue<'_> {
     ///
     /// # Arguments:
     ///
-    /// * `exe`: async executor
+    /// * `wake_handler`: handler for wakeup io tasks pending on this uring
     ///
     /// * `to_wait`: passed to io_uring_enter(), wait until `to_wait` events
     /// are available. It won't block in waiting for events if `to_wait` is

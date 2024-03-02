@@ -195,14 +195,8 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
-        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr).user_data(data);
-        unsafe {
-            q.q_ring
-                .borrow_mut()
-                .submission()
-                .push(&sqe)
-                .expect("submission fail");
-        }
+        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
+        q.ublk_submit_sqe_sync(sqe, data).unwrap();
     }
 }
 
