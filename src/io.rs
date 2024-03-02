@@ -418,7 +418,6 @@ impl UblkQueueState {
 ///
 /// So far, each queue is handled by one its own io_uring.
 ///
-#[allow(dead_code)]
 pub struct UblkQueue<'a> {
     flags: UblkFlags,
     q_id: u16,
@@ -637,7 +636,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    #[allow(unused_assignments)]
     fn __queue_io_cmd(
         &self,
         r: &mut IoUring<squeue::Entry>,
@@ -865,7 +863,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    #[allow(unused_assignments)]
     fn handle_cqe<F>(&self, mut ops: F, e: &UblkIOCtx)
     where
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),

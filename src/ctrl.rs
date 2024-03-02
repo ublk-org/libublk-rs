@@ -73,15 +73,14 @@ const CTRL_CMD_BUF_READ: u32 = 8;
 /// case of unprivileged ublk, such as get_features(), add_dev().
 const CTRL_CMD_NO_NEED_DEV_PATH: u32 = 16;
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Copy, Clone)]
 struct UblkCtrlCmdData {
     cmd_op: u32,
     flags: u32,
     data: u64,
     dev_path_len: u16,
-    pad: u16,
-    reserved: u32,
+    _pad: u16,
+    _reserved: u32,
 
     addr: u64,
     len: u32,
