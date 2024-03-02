@@ -564,6 +564,16 @@ impl UblkQueue<'_> {
         Ok(q)
     }
 
+    // Return if queue is idle
+    pub fn is_idle(&self) -> bool {
+        self.state.borrow().is_idle()
+    }
+
+    // Return if queue is stopping
+    pub fn is_stopping(&self) -> bool {
+        self.state.borrow().is_stopping()
+    }
+
     // Manipulate immutable queue uring
     pub fn uring_op<R, H>(&self, op_handler: H) -> Result<R, UblkError>
     where
