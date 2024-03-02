@@ -431,7 +431,7 @@ pub struct UblkQueue<'a> {
     // call uring_op() and uring_op_mut() for manipulating
     // q_ring, and in future it is likely to change to
     // thread_local variable
-    q_ring: RefCell<IoUring<squeue::Entry>>,
+    pub(crate) q_ring: RefCell<IoUring<squeue::Entry>>,
 }
 
 impl AsRawFd for UblkQueue<'_> {

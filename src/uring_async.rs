@@ -111,7 +111,20 @@ fn ublk_process_queue_io(
     q: &UblkQueue,
     nr_waits: usize,
 ) -> Result<i32, UblkError> {
-    let res = q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits);
+    let res = if !q.is_stopping() {
+        q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits)
+    } else {
+        let mut r = q.q_ring.borrow_mut();
+
+        match ublk_try_reap_cqe(&mut r, nr_waits) {
+            Some(cqe) => {
+                let user_data = cqe.user_data();
+                ublk_wake_task(user_data, &cqe);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    };
     while exe.try_tick() {}
 
     res
