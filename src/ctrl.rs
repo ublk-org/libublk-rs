@@ -227,7 +227,7 @@ impl UblkCtrlBuilder<'_> {
     /// create one pair of ublk devices, the 1st one is control device(`UblkCtrl`),
     /// and the 2nd one is data device(`UblkDev`)
     pub fn build(self) -> Result<UblkCtrl, UblkError> {
-        Ok(UblkCtrl::new(
+        UblkCtrl::new(
             Some(self.name.to_string()),
             self.id,
             self.nr_queues.into(),
@@ -236,7 +236,7 @@ impl UblkCtrlBuilder<'_> {
             self.ctrl_flags,
             self.ctrl_target_flags,
             self.dev_flags,
-        )?)
+        )
     }
 }
 
@@ -282,6 +282,7 @@ impl Drop for UblkCtrlInner {
 }
 
 impl UblkCtrlInner {
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::uninit_vec)]
     fn new(
         name: Option<String>,
@@ -495,7 +496,7 @@ impl UblkCtrlInner {
         } as u64;
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
-        let _ = CTRL_URING.with(|refcell| {
+        CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
 
             unsafe { r.submission().push(&sqe).unwrap() };
@@ -530,14 +531,19 @@ impl UblkCtrlInner {
         data: &UblkCtrlCmdData,
         res: i32,
     ) -> bool {
-        if res >= 0 || res == -libc::EBUSY {
-            false
-        } else if (data.cmd_op & 0xff) > sys::UBLK_CMD_GET_DEV_INFO2 {
-            // new commands have to be issued via ioctl encoding
+        let legacy_op = data.cmd_op & 0xff;
+
+        // Needn't to retry:
+        //
+        // 1) command is completed successfully
+        //
+        // 2) this is new command which has been issued via ioctl encoding
+        // already
+        if res >= 0 || res == -libc::EBUSY || (legacy_op > sys::UBLK_CMD_GET_DEV_INFO2) {
             false
         } else {
             *new_data = *data;
-            new_data.cmd_op &= 0xff;
+            new_data.cmd_op = legacy_op;
             true
         }
     }
@@ -556,7 +562,7 @@ impl UblkCtrlInner {
 
         for _ in 0..2 {
             let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
-            res = self.ublk_submit_cmd_async(&mut new_data).await;
+            res = self.ublk_submit_cmd_async(&new_data).await;
             new_data.unprep_un_privileged_dev_path(self, old_buf);
 
             trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
@@ -950,7 +956,7 @@ impl UblkCtrl {
     }
 
     pub(crate) fn get_dev_flags(&self) -> UblkFlags {
-        self.get_inner().dev_flags.clone()
+        self.get_inner().dev_flags
     }
 
     /// New one ublk control device
@@ -969,6 +975,7 @@ impl UblkCtrl {
     /// ublk control device is for sending command to driver, and maintain
     /// device exported json file, dump, or any misc management task.
     ///
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: Option<String>,
         id: i32,

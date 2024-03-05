@@ -338,7 +338,7 @@ impl UblkDev {
     /// nr_tasks.
     #[inline]
     pub fn get_nr_ios(&self) -> u16 {
-        self.dev_info.queue_depth + self.tgt.extra_ios as u16
+        self.dev_info.queue_depth + self.tgt.extra_ios
     }
 }
 
@@ -521,7 +521,7 @@ impl UblkQueue<'_> {
                 libc::PROT_READ,
                 libc::MAP_SHARED | libc::MAP_POPULATE,
                 cdev_fd,
-                off as i64,
+                off,
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {

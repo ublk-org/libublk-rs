@@ -84,14 +84,11 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
             cqe.result()
         );
         let data = ((data & !(1_u64 << 63)) >> 16) as usize;
-        match map.get_mut(data) {
-            Some(fd) => {
-                fd.result = Some(cqe.result());
-                if let Some(w) = &fd.waker {
-                    w.clone().wake();
-                }
+        if let Some(fd) = map.get_mut(data) {
+            fd.result = Some(cqe.result());
+            if let Some(w) = &fd.waker {
+                w.wake_by_ref();
             }
-            None => {}
         }
     })
 }
@@ -192,13 +189,13 @@ pub fn ublk_run_ctrl_task<T>(
 
         if poll_q {
             let q_e = opcode::PollAdd::new(types::Fd(q_fd), (libc::POLLIN | libc::POLLOUT) as _);
-            let _ = unsafe { pr.submission().push(&q_e.build().user_data(0x01).into()) };
+            let _ = unsafe { pr.submission().push(&q_e.build().user_data(0x01)) };
             poll_q = false;
         }
         if poll_ctrl {
             let ctrl_e =
                 opcode::PollAdd::new(types::Fd(ctrl_fd), (libc::POLLIN | libc::POLLOUT) as _);
-            let _ = unsafe { pr.submission().push(&ctrl_e.build().user_data(0x02).into()) };
+            let _ = unsafe { pr.submission().push(&ctrl_e.build().user_data(0x02)) };
             poll_ctrl = false;
         }
 
@@ -224,7 +221,7 @@ pub fn ublk_run_ctrl_task<T>(
 
     let nr_waits = 1 + if poll_q { 0 } else { 1 } + if poll_ctrl { 0 } else { 1 };
     let poll_e = opcode::PollRemove::new(0x05);
-    let _ = unsafe { pr.submission().push(&poll_e.build().user_data(0x05).into()) };
+    let _ = unsafe { pr.submission().push(&poll_e.build().user_data(0x05)) };
     pr.submit_and_wait(nr_waits)?;
 
     Ok(())
@@ -244,9 +241,10 @@ pub fn ublk_run_ctrl_task<T>(
 pub fn ublk_wait_and_handle_ios(exe: &smol::LocalExecutor, q: &UblkQueue) {
     loop {
         while exe.try_tick() {}
-        match q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1) {
-            Err(_) => break,
-            _ => {}
+        if q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1)
+            .is_err()
+        {
+            break;
         }
     }
     q.unregister_io_bufs();
