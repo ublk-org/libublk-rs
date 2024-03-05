@@ -35,7 +35,7 @@ impl UblkUringOpFuture {
                 result: None,
             });
             let user_data = ((key as u32) << 16) as u64 | tgt_io;
-            log::debug!("uring: new future {:x}", user_data);
+            log::trace!("uring: new future {:x}", user_data);
             UblkUringOpFuture { user_data }
         })
     }
@@ -49,18 +49,18 @@ impl Future for UblkUringOpFuture {
             let key = ((self.user_data & !(1_u64 << 63)) >> 16) as usize;
             match map.get_mut(key) {
                 None => {
-                    log::debug!("uring: null slab {:x}", self.user_data);
+                    log::trace!("uring: null slab {:x}", self.user_data);
                     Poll::Pending
                 }
                 Some(fd) => match fd.result {
                     Some(result) => {
                         map.remove(key);
-                        log::debug!("uring: uring io ready userdata {:x} ready", self.user_data);
+                        log::trace!("uring: uring io ready userdata {:x} ready", self.user_data);
                         Poll::Ready(result)
                     }
                     None => {
                         fd.waker = Some(cx.waker().clone());
-                        log::debug!("uring: uring io pending userdata {:x}", self.user_data);
+                        log::trace!("uring: uring io pending userdata {:x}", self.user_data);
                         Poll::Pending
                     }
                 },
@@ -77,7 +77,7 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
     MY_SLAB.with(|refcell| {
         let mut map = refcell.borrow_mut();
 
-        log::debug!(
+        log::trace!(
             "ublk_wake_task: data {:x} user_data {:x} result {:x}",
             data,
             cqe.user_data(),

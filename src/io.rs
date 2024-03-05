@@ -1006,7 +1006,7 @@ impl UblkQueue<'_> {
         let empty = self.q_ring.borrow_mut().submission().is_empty();
 
         if empty && state.get_nr_cmd_inflight() == self.q_depth && !state.is_idle() {
-            log::trace!(
+            log::debug!(
                 "dev {} queue {} becomes idle",
                 self.dev.dev_info.dev_id,
                 self.q_id
@@ -1021,7 +1021,7 @@ impl UblkQueue<'_> {
         let idle = { self.state.borrow().is_idle() };
 
         if idle {
-            log::trace!(
+            log::debug!(
                 "dev {} queue {} becomes busy",
                 self.dev.dev_info.dev_id,
                 self.q_id

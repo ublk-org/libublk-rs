@@ -343,7 +343,7 @@ impl UblkCtrlInner {
             dev.read_dev_info()?;
         }
 
-        trace!(
+        log::info!(
             "ctrl: device {} flags {:x} created",
             dev.dev_info.dev_id,
             dev.dev_flags

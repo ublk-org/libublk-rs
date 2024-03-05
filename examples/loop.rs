@@ -7,7 +7,6 @@ use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
-use log::trace;
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -82,7 +81,7 @@ fn lo_file_size(f: &std::fs::File) -> Result<(u64, u8, u8)> {
 
 // setup loop target
 fn lo_init_tgt(dev: &mut UblkDev, lo: &LoopTgt) -> Result<(), UblkError> {
-    trace!("loop: init_tgt {}", dev.dev_info.dev_id);
+    log::info!("loop: init_tgt {}", dev.dev_info.dev_id);
     if lo.direct_io != 0 {
         unsafe {
             libc::fcntl(lo.back_file.as_raw_fd(), libc::F_SETFL, libc::O_DIRECT);
