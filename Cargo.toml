@@ -41,7 +41,6 @@ serde_json = "1.0.79"
 bitmaps = "3.2.0"
 log = {version = "0.4", features = ["release_max_level_off"]}
 thiserror = "1.0.43"
-derive_builder = "0.12"
 futures = "0.3"
 env_logger = "0.9"
 smol = "1.3.0"
