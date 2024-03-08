@@ -235,67 +235,63 @@ mod integration {
         .unwrap();
     }
 
-    /// make one ublk-ramdisk and test:
-    /// - if /dev/ublkbN can be created successfully
-    /// - if yes, then test format/mount/umount over this ublk-ramdisk
-    #[test]
-    fn test_ublk_ramdisk() {
-        fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, buf_addr: *mut u8, start: u64) {
-            let iod = q.get_iod(tag);
-            let off = (iod.start_sector << 9) as u64;
-            let bytes = (iod.nr_sectors << 9) as u32;
-            let op = iod.op_flags & 0xff;
+    fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, buf_addr: *mut u8, start: u64) {
+        let iod = q.get_iod(tag);
+        let off = (iod.start_sector << 9) as u64;
+        let bytes = (iod.nr_sectors << 9) as u32;
+        let op = iod.op_flags & 0xff;
 
-            match op {
-                sys::UBLK_IO_OP_FLUSH => {}
-                sys::UBLK_IO_OP_READ => unsafe {
-                    libc::memcpy(
-                        buf_addr as *mut libc::c_void,
-                        (start + off) as *mut libc::c_void,
-                        bytes as usize,
-                    );
-                },
-                sys::UBLK_IO_OP_WRITE => unsafe {
-                    libc::memcpy(
-                        (start + off) as *mut libc::c_void,
-                        buf_addr as *mut libc::c_void,
-                        bytes as usize,
-                    );
-                },
-                _ => {
-                    q.complete_io_cmd(tag, buf_addr, Err(UblkError::OtherError(-libc::EINVAL)));
-                    return;
-                }
+        match op {
+            sys::UBLK_IO_OP_FLUSH => {}
+            sys::UBLK_IO_OP_READ => unsafe {
+                libc::memcpy(
+                    buf_addr as *mut libc::c_void,
+                    (start + off) as *mut libc::c_void,
+                    bytes as usize,
+                );
+            },
+            sys::UBLK_IO_OP_WRITE => unsafe {
+                libc::memcpy(
+                    (start + off) as *mut libc::c_void,
+                    buf_addr as *mut libc::c_void,
+                    bytes as usize,
+                );
+            },
+            _ => {
+                q.complete_io_cmd(tag, buf_addr, Err(UblkError::OtherError(-libc::EINVAL)));
+                return;
             }
-
-            let res = Ok(UblkIORes::Result(bytes as i32));
-            q.complete_io_cmd(tag, buf_addr, res);
         }
 
-        fn __test_ublk_ramdisk(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
-            let dev_path = ctrl.get_bdev_path();
+        let res = Ok(UblkIORes::Result(bytes as i32));
+        q.complete_io_cmd(tag, buf_addr, res);
+    }
 
-            run_ublk_disk_sanity_test(&ctrl, dev_flags);
+    fn ublk_ramdisk_tester(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
+        let dev_path = ctrl.get_bdev_path();
 
-            //format as ext4 and mount over the created ublk-ramdisk
-            {
-                let ext4_options = block_utils::Filesystem::Ext4 {
-                    inode_size: 512,
-                    stride: Some(2),
-                    stripe_width: None,
-                    reserved_blocks_percentage: 10,
-                };
-                block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
+        run_ublk_disk_sanity_test(&ctrl, dev_flags);
 
-                let tmp_dir = tempfile::TempDir::new().unwrap();
-                let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
+        //format as ext4 and mount over the created ublk-ramdisk
+        {
+            let ext4_options = block_utils::Filesystem::Ext4 {
+                inode_size: 512,
+                stride: Some(2),
+                stripe_width: None,
+                reserved_blocks_percentage: 10,
+            };
+            block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
 
-                block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
-                block_utils::unmount_device(tmp_dir.path()).unwrap();
-            }
-            ctrl.kill_dev().unwrap();
+            let tmp_dir = tempfile::TempDir::new().unwrap();
+            let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
+
+            block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
+            block_utils::unmount_device(tmp_dir.path()).unwrap();
         }
+        ctrl.kill_dev().unwrap();
+    }
 
+    fn __test_ublk_ramdisk() {
         let size = 32_u64 << 20;
         let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
         let dev_addr = buf.as_mut_ptr() as u64;
@@ -331,9 +327,17 @@ mod integration {
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
-            __test_ublk_ramdisk(ctrl, dev_flags);
+            ublk_ramdisk_tester(ctrl, dev_flags);
         })
         .unwrap();
+    }
+
+    /// make one ublk-ramdisk and test:
+    /// - if /dev/ublkbN can be created successfully
+    /// - if yes, then test format/mount/umount over this ublk-ramdisk
+    #[test]
+    fn test_ublk_ramdisk() {
+        __test_ublk_ramdisk();
     }
 
     /// make FnMut closure for IO handling
