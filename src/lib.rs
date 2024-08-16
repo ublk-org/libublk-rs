@@ -27,6 +27,9 @@ bitflags! {
         /// tell UblkCtrl that we are recovering one old device
         const UBLK_DEV_F_RECOVER_DEV = 0b00000100;
 
+        /// tell UblkCtrl that we are deleted in async
+        const UBLK_DEV_F_DEL_DEV_ASYNC = 0b00001000;
+
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
     }
 }

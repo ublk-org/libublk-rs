@@ -609,7 +609,14 @@ impl UblkCtrlInner {
     ///
     fn del(&mut self) -> Result<i32, UblkError> {
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_DEL_DEV,
+            cmd_op: if self
+                .dev_flags
+                .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
+            {
+                sys::UBLK_U_CMD_DEL_DEV_ASYNC
+            } else {
+                sys::UBLK_U_CMD_DEL_DEV
+            },
             ..Default::default()
         };
 
@@ -1494,8 +1501,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_add_ctrl_dev() {
+    fn __test_add_ctrl_dev(del_async: bool) {
         let ctrl = UblkCtrl::new(
             None,
             -1,
@@ -1504,13 +1510,26 @@ mod tests {
             512_u32 * 1024,
             0,
             0,
-            UblkFlags::UBLK_DEV_F_ADD_DEV,
+            if del_async {
+                UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC
+            } else {
+                UblkFlags::empty()
+            } | UblkFlags::UBLK_DEV_F_ADD_DEV,
         )
         .unwrap();
         let dev_path = ctrl.get_cdev_path();
 
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(Path::new(&dev_path).exists() == true);
+    }
+    #[test]
+    fn test_add_ctrl_dev_del_sync() {
+        __test_add_ctrl_dev(false);
+    }
+
+    #[test]
+    fn test_add_ctrl_dev_del_async() {
+        __test_add_ctrl_dev(true);
     }
 
     /// minimized unprivileged ublk test, may just run in root privilege
