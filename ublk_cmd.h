@@ -184,6 +184,9 @@
  */
 #define UBLK_F_ZONED (1ULL << 8)
 
+/* ublk IO is handled by bpf prog */
+#define UBLK_F_BPF             (1UL << 11)
+
 /* device state */
 #define UBLK_S_DEV_DEAD	0
 #define UBLK_S_DEV_LIVE	1
