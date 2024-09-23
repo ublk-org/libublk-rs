@@ -510,10 +510,11 @@ impl UblkQueue<'_> {
         ring.submitter()
             .register_files(&tgt.fds[0..tgt.nr_fds as usize])?;
 
-        let off = sys::UBLKSRV_CMD_BUF_OFFSET as i64
-            + q_id as i64
+        let off = sys::UBLKSRV_CMD_BUF_OFFSET as libc::off_t
+            + q_id as libc::off_t
                 * ((sys::UBLK_MAX_QUEUE_DEPTH as usize
-                    * core::mem::size_of::<sys::ublksrv_io_desc>()) as i64);
+                    * core::mem::size_of::<sys::ublksrv_io_desc>())
+                    as libc::off_t);
         let io_cmd_buf = unsafe {
             libc::mmap(
                 std::ptr::null_mut::<libc::c_void>(),
