@@ -10,6 +10,7 @@ use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_run_ctrl_task;
 use libublk::{UblkError, UblkFlags};
+use std::io::{Error, ErrorKind};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -84,9 +85,29 @@ fn start_dev_fn(
     smol::block_on(task)
 }
 
+fn write_dev_id(ctrl: &UblkCtrl, efd: i32) -> Result<i32, Error> {
+    // Can't write 0 to eventfd file, otherwise the read() side may
+    // not be waken up
+    let dev_id = ctrl.dev_info().dev_id as u64 + 1;
+    let bytes = dev_id.to_le_bytes();
+
+    nix::unistd::write(efd, &bytes)?;
+    Ok(0)
+}
+
+fn read_dev_id(efd: i32) -> Result<i32, Error> {
+    let mut buffer = [0; 8];
+
+    let bytes_read = nix::unistd::read(efd, &mut buffer)?;
+    if bytes_read == 0 {
+        return Err(Error::new(ErrorKind::InvalidInput, "invalid device id"));
+    }
+    return Ok((i64::from_le_bytes(buffer) - 1) as i32);
+}
+
 ///run this ramdisk ublk daemon completely in single context with
 ///async control command, no need Rust async any more
-fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
+fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool, efd: i32) {
     let dev_flags = if for_add {
         UblkFlags::UBLK_DEV_F_ADD_DEV
     } else {
@@ -127,7 +148,8 @@ fn rd_add_dev(dev_id: i32, buf_addr: *mut u8, size: u64, for_add: bool) {
     let res = start_dev_fn(&exec, &ctrl, &dev_arc, &q_rc);
     match res {
         Ok(_) => {
-            ctrl.dump();
+            write_dev_id(&ctrl, efd).expect("Failed to write dev_id");
+
             libublk::uring_async::ublk_wait_and_handle_ios(&exec, &q_rc);
         }
         _ => eprintln!("device can't be started"),
@@ -151,12 +173,13 @@ fn test_add(recover: usize) {
         .unwrap();
     let s = std::env::args().nth(3).unwrap_or_else(|| "32".to_string());
     let mb = s.parse::<u64>().unwrap();
+    let efd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::empty()).unwrap();
 
     let daemonize = daemonize::Daemonize::new()
-        .stdout(daemonize::Stdio::keep())
-        .stderr(daemonize::Stdio::keep());
-    match daemonize.start() {
-        Ok(_) => {
+        .stdout(daemonize::Stdio::devnull())
+        .stderr(daemonize::Stdio::devnull());
+    match daemonize.execute() {
+        daemonize::Outcome::Child(Ok(_)) => {
             let mut size = (mb << 20) as u64;
 
             if recover > 0 {
@@ -168,9 +191,13 @@ fn test_add(recover: usize) {
             }
 
             let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
-            rd_add_dev(dev_id, buf.as_mut_ptr(), size, recover == 0);
+            rd_add_dev(dev_id, buf.as_mut_ptr(), size, recover == 0, efd);
         }
-        Err(_) => panic!(),
+        daemonize::Outcome::Parent(Ok(_)) => match read_dev_id(efd) {
+            Ok(id) => UblkCtrl::new_simple(id).unwrap().dump(),
+            _ => eprintln!("Failed to add ublk device"),
+        },
+        _ => panic!(),
     }
 }
 
