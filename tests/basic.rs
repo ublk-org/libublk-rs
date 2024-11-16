@@ -6,6 +6,7 @@ mod integration {
     use libublk::uring_async::ublk_wait_and_handle_ios;
     use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkError, UblkFlags, UblkIORes};
     use std::env;
+    use std::io::{BufRead, BufReader};
     use std::path::Path;
     use std::process::{Command, Stdio};
     use std::rc::Rc;
@@ -410,40 +411,34 @@ mod integration {
         }
 
         let tgt_dir = get_curr_bin_dir().unwrap();
-        let tmpfile = tempfile::NamedTempFile::new().unwrap();
-        let file = std::fs::File::create(tmpfile.path()).unwrap();
-
         //println!("top dir: path {:?} {:?}", &tgt_dir, &file);
         let rd_path = tgt_dir.display().to_string() + &"/examples/ramdisk".to_string();
         let mut cmd = Command::new(&rd_path)
             .args(["add", "-1", "32"])
-            .stdout(Stdio::from(file))
+            .stdout(Stdio::piped())
             .spawn()
             .expect("fail to add ublk ramdisk");
-        cmd.wait().unwrap();
-
-        let buf = loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let _buf = std::fs::read_to_string(tmpfile.path()).unwrap();
-
-            if _buf.len() >= 200 {
-                break _buf;
-            }
-        };
-
-        let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
-        let tid_regx = regex::Regex::new(r"queue 0 tid: (\d+)").unwrap();
+        let stdout = cmd.stdout.take().expect("Failed to capture stdout");
+        let _ = cmd.wait().expect("Failed to wait on child");
 
         let mut id = -1_i32;
-        if let Some(c) = id_regx.captures(&buf.as_str()) {
-            id = c.get(1).unwrap().as_str().parse().unwrap();
-        }
-
         let mut tid = 0;
-        if let Some(c) = tid_regx.captures(&buf.as_str()) {
-            tid = c.get(1).unwrap().as_str().parse().unwrap();
+        let id_regx = regex::Regex::new(r"dev id (\d+)").unwrap();
+        let tid_regx = regex::Regex::new(r"queue 0 tid: (\d+)").unwrap();
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(content) => {
+                    if let Some(c) = id_regx.captures(&content.as_str()) {
+                        id = c.get(1).unwrap().as_str().parse().unwrap();
+                    }
+                    if let Some(c) = tid_regx.captures(&content.as_str()) {
+                        tid = c.get(1).unwrap().as_str().parse().unwrap();
+                    }
+                }
+                Err(e) => eprintln!("Error reading line: {}", e), // Handle error
+            }
         }
-        assert!(tid != 0);
+        assert!(tid != 0 && id >= 0);
 
         let ctrl = UblkCtrl::new_simple(id).unwrap();
         ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
@@ -460,16 +455,13 @@ mod integration {
         //wait device becomes quiesced
         ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_QUIESCED as u16, 6000);
 
-        let file = std::fs::File::create(tmpfile.path()).unwrap();
         //recover device
         let mut cmd = Command::new(&rd_path)
             .args(["recover", &id.to_string().as_str()])
-            .stdout(Stdio::from(file))
+            .stdout(Stdio::piped())
             .spawn()
             .expect("fail to recover ramdisk");
-        cmd.wait().unwrap();
-        //let buf = std::fs::read_to_string(tmpfile.path()).unwrap();
-        //println!("{}", buf);
+        cmd.wait().expect("Failed to wait on child");
         ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
         ctrl.del_dev().unwrap();
     }
