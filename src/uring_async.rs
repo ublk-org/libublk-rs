@@ -218,11 +218,7 @@ pub fn ublk_run_ctrl_task<T>(
             while exe.try_tick() {}
         }
     }
-
-    let nr_waits = 1 + if poll_q { 0 } else { 1 } + if poll_ctrl { 0 } else { 1 };
-    let poll_e = opcode::PollRemove::new(0x05);
-    let _ = unsafe { pr.submission().push(&poll_e.build().user_data(0x05)) };
-    pr.submit_and_wait(nr_waits)?;
+    //PollAdd will be canceled automatically
 
     Ok(())
 }
