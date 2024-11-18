@@ -202,12 +202,16 @@ fn test_add(recover: usize) {
     }
 }
 
-fn test_del() {
+fn test_del(async_del: bool) {
     let s = std::env::args().nth(2).unwrap_or_else(|| "0".to_string());
     let dev_id = s.parse::<i32>().unwrap();
     let ctrl = UblkCtrl::new_simple(dev_id as i32).unwrap();
 
-    ctrl.del_dev().unwrap();
+    if !async_del {
+        ctrl.del_dev().expect("fail to del_dev_async");
+    } else {
+        ctrl.del_dev_async().expect("fail to del_dev_async");
+    }
 }
 
 fn main() {
@@ -219,7 +223,8 @@ fn main() {
         match cmd.as_str() {
             "add" => test_add(0),
             "recover" => test_add(1),
-            "del" => test_del(),
+            "del" => test_del(false),
+            "del_async" => test_del(true),
             _ => todo!(),
         }
     }
