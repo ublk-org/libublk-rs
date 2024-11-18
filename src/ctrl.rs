@@ -1511,6 +1511,7 @@ impl UblkCtrl {
 mod tests {
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
     use std::cell::Cell;
     use std::path::Path;
@@ -1569,7 +1570,14 @@ mod tests {
         )
         .unwrap();
 
-        ctrl.del_dev_async().expect("fail to del_dev_async");
+        match ctrl.del_dev_async() {
+            Ok(_res) => {}
+            Err(UblkError::UringIOError(res)) => {
+                /* -ENOSUPP */
+                assert!(res == -524 || res == -libc::EOPNOTSUPP);
+            }
+            _ => assert!(false),
+        }
     }
 
     /// minimized unprivileged ublk test, may just run in root privilege
