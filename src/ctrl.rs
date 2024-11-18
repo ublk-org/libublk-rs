@@ -623,6 +623,17 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
+    /// Remove this device
+    ///
+    fn del_async(&mut self) -> Result<i32, UblkError> {
+        let data: UblkCtrlCmdData = UblkCtrlCmdData {
+            cmd_op: sys::UBLK_U_CMD_DEL_DEV_ASYNC,
+            ..Default::default()
+        };
+
+        self.ublk_ctrl_cmd(&data)
+    }
+
     fn __get_features(&mut self) -> Result<u64, UblkError> {
         let features = 0_u64;
         let data: UblkCtrlCmdData = UblkCtrlCmdData {
@@ -1365,6 +1376,18 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    /// Remove this device and its exported json file in async
+    /// way
+    pub fn del_dev_async(&self) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+
+        ctrl.del_async()?;
+        if Path::new(&ctrl.run_path()).exists() {
+            fs::remove_file(ctrl.run_path())?;
+        }
+        Ok(0)
+    }
+
     fn create_queue_handlers<Q>(
         &self,
         dev: &Arc<UblkDev>,
@@ -1530,6 +1553,23 @@ mod tests {
     #[test]
     fn test_add_ctrl_dev_del_async() {
         __test_add_ctrl_dev(true);
+    }
+
+    #[test]
+    fn test_add_ctrl_dev_del_async2() {
+        let ctrl = UblkCtrl::new(
+            None,
+            -1,
+            1,
+            64,
+            512_u32 * 1024,
+            0,
+            0,
+            UblkFlags::UBLK_DEV_F_ADD_DEV,
+        )
+        .unwrap();
+
+        ctrl.del_dev_async().expect("fail to del_dev_async");
     }
 
     /// minimized unprivileged ublk test, may just run in root privilege
