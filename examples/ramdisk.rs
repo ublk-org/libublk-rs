@@ -35,6 +35,7 @@ fn handle_io(q: &UblkQueue, tag: u16, buf_addr: *mut u8, start: *mut u8) -> i32 
                 bytes as usize,
             );
         },
+        libublk::sys::UBLK_IO_OP_FLUSH => {}
         _ => {
             return -libc::EINVAL;
         }
