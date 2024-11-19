@@ -1,6 +1,6 @@
 [package]
 name = "libublk"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "Library for building linux block device in userspace"
 authors = ["Ming Lei <tom.leiming@gmail.com>"]
