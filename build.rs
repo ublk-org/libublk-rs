@@ -58,12 +58,7 @@ MARK_FIX_753(UBLK_U_CMD_DEL_DEV_ASYNC);
 const int Fix753_UBLK_IO_RES_ABORT = UBLK_IO_RES_ABORT;
     "#;
 
-    #[cfg(not(feature = "overwrite"))]
     let outdir = PathBuf::from(env::var("OUT_DIR").unwrap());
-
-    #[cfg(feature = "overwrite")]
-    let outdir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/sys");
-
     let mut builder = bindgen::Builder::default();
     builder = builder.header_contents("include-file.h", INCLUDE);
 
