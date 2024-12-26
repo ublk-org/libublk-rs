@@ -84,4 +84,4 @@ install_rust_1_81_to_path $DESTDIR/root/
 mkdir -p $DESTDIR/usr/share
 
 create_libublk $SRCDIR $DESTDIR/usr/share/libublk-rs
-create_libublk $SRCDIR $DESTDIR/usr/share/libublk-rs2 --features=fat_complete
+#create_libublk $SRCDIR $DESTDIR/usr/share/libublk-rs2 --features=fat_complete
