@@ -10,6 +10,43 @@
 #
 #
 
+install_rust_1_81_to_path() {
+    local target_dir="$1"
+
+    if [[ -z "$target_dir" ]]; then
+        echo "Usage: install_rust_1_81_to_path <target-directory>"
+        return 1
+    fi
+
+    # Create the target directory if it doesn't exist
+    mkdir -p "$target_dir"
+
+    # Set environment variables for custom installation paths
+    export CARGO_HOME="$target_dir"
+    export RUSTUP_HOME="$target_dir"
+
+    # Remove any system-installed Rust to avoid conflicts
+    dnf remove -y rust
+
+    # Install rustup in non-interactive mode
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+    # Add the custom CARGO_HOME bin directory to PATH for this session
+    export PATH="$CARGO_HOME/bin:$PATH"
+
+    # Install Rust 1.81
+    rustup install 1.81.0
+
+    # Set Rust 1.81 as the default version globally (in the custom path)
+    rustup default 1.81.0
+
+    # Verify the installation
+    if "$CARGO_HOME/bin/rustc" --version | grep -q "1.81.0"; then
+        echo "Rust 1.81.0 has been installed successfully to $target_dir!"
+    else
+        echo "Rust installation failed."
+    fi
+}
 
 create_libublk()
 {
@@ -38,7 +75,10 @@ set -eo pipefail
 
 mkdir -p $DESTDIR/root/
 echo "systemctl restart systemd-networkd" >> $DESTDIR/root/.bash_profile
+echo "export PATH=/root/bin:\$PATH" >> $DESTDIR/root/.bash_profile
 chmod +x $DESTDIR/root/.bash_profile
+
+install_rust_1_81_to_path $DESTDIR/root/
 
 # Copy tests into the dest
 mkdir -p $DESTDIR/usr/share
