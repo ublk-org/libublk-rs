@@ -145,6 +145,10 @@ fn null_add(id: i32, nr_queues: u32, depth: u32, ctrl_flags: u64, buf_size: u32,
 }
 
 fn main() {
+    env_logger::builder()
+        .format_target(false)
+        .format_timestamp(None)
+        .init();
     let matches = Command::new("ublk-null-example")
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -228,7 +232,16 @@ fn main() {
                     .action(ArgAction::Set),
             ),
         )
-        .subcommand(Command::new("list").about("List ublk device"))
+        .subcommand(
+            Command::new("list").about("List ublk device").arg(
+                Arg::new("number")
+                    .short('n')
+                    .long("number")
+                    .default_value("-1")
+                    .help("device id")
+                    .action(ArgAction::Set),
+            ),
+        )
         .get_matches();
 
     match matches.subcommand() {
@@ -284,9 +297,20 @@ fn main() {
                 .unwrap_or(-1);
             UblkCtrl::new_simple(id).unwrap().del_dev().unwrap();
         }
-        Some(("list", _add_matches)) => UblkCtrl::for_each_dev_id(|dev_id| {
-            UblkCtrl::new_simple(dev_id as i32).unwrap().dump();
-        }),
+        Some(("list", add_matches)) => {
+            let dev_id = add_matches
+                .get_one::<String>("number")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap_or(-1);
+            if dev_id >= 0 {
+                UblkCtrl::new_simple(dev_id as i32).unwrap().dump();
+            } else {
+                UblkCtrl::for_each_dev_id(|dev_id| {
+                    UblkCtrl::new_simple(dev_id as i32).unwrap().dump();
+                });
+            }
+        }
         _ => {
             println!("unsupported command");
         }
