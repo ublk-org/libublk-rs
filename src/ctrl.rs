@@ -1219,7 +1219,7 @@ impl UblkCtrl {
     }
 
     pub fn run_dir() -> String {
-        format!("{}/ublk", std::env::temp_dir().display())
+        String::from("/run/ublksrvd")
     }
 
     /// Returned path of this device's exported json file
