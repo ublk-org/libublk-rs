@@ -55,6 +55,8 @@ MARK_FIX_753(UBLK_U_IO_FETCH_REQ);
 MARK_FIX_753(UBLK_U_IO_COMMIT_AND_FETCH_REQ);
 MARK_FIX_753(UBLK_U_IO_NEED_GET_DATA);
 MARK_FIX_753(UBLK_U_CMD_DEL_DEV_ASYNC);
+MARK_FIX_753(UBLK_U_IO_REGISTER_IO_BUF);
+MARK_FIX_753(UBLK_U_IO_UNREGISTER_IO_BUF);
 const int Fix753_UBLK_IO_RES_ABORT = UBLK_IO_RES_ABORT;
     "#;
 
@@ -68,7 +70,10 @@ const int Fix753_UBLK_IO_RES_ABORT = UBLK_IO_RES_ABORT;
         .derive_default(true)
         .generate_comments(true)
         .use_core()
+        .generate_inline_functions(true)
         .allowlist_var("UBLKSRV_.*|UBLK_.*|UBLK_U_.*|Fix753_.*")
+        .allowlist_function("ublk_sqe_addr_to_auto_buf_reg")
+        .allowlist_function("ublk_auto_buf_reg_to_sqe_addr")
         .allowlist_type("ublksrv_.*|ublk_.*")
         .allowlist_var("BLK_ZONE_.*")
         .allowlist_type("blk_zone_.*")
