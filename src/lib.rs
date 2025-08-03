@@ -7,6 +7,7 @@
 
 use bitflags::bitflags;
 
+mod bindings;
 pub mod ctrl;
 pub mod helpers;
 pub mod io;
@@ -31,6 +32,7 @@ bitflags! {
         const UBLK_DEV_F_DEL_DEV_ASYNC = 0b00001000;
 
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
+        const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
     }
 }
 

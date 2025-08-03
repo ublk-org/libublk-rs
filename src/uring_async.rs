@@ -78,7 +78,7 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
         let mut map = refcell.borrow_mut();
 
         log::trace!(
-            "ublk_wake_task: data {:x} user_data {:x} result {:x}",
+            "ublk_wake_task: data {:x} user_data {:x} result {}",
             data,
             cqe.user_data(),
             cqe.result()
