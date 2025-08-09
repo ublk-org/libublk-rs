@@ -492,7 +492,7 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
-    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue, UblkError> {
+    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;

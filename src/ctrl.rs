@@ -956,11 +956,11 @@ impl UblkCtrl {
         | sys::UBLK_F_USER_COPY
         | sys::UBLK_F_ZONED) as u64;
 
-    fn get_inner(&self) -> std::sync::RwLockReadGuard<UblkCtrlInner> {
+    fn get_inner(&self) -> std::sync::RwLockReadGuard<'_, UblkCtrlInner> {
         self.inner.read().unwrap()
     }
 
-    fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<UblkCtrlInner> {
+    fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<'_, UblkCtrlInner> {
         self.inner.write().unwrap()
     }
 
