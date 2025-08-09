@@ -34,7 +34,7 @@ mod integration {
         assert!((permissions.mode() & 0o777) == 0o700);
     }
 
-    fn read_ublk_disk(ctrl: &UblkCtrl) {
+    fn read_ublk_disk(ctrl: &UblkCtrl, success: bool) {
         let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
         let if_dev = format!("if={}", &dev_path);
@@ -43,7 +43,12 @@ mod integration {
         arg_list.push("of=/dev/null".to_string());
         arg_list.push("bs=4096".to_string());
         arg_list.push("count=10k".to_string());
-        println!("{:?}", Command::new("dd").args(arg_list).output().unwrap());
+        let out = Command::new("dd")
+            .args(arg_list)
+            .output()
+            .expect("fail to run dd");
+
+        assert!(out.status.success() == success);
     }
 
     fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &UblkDev)) {
@@ -65,7 +70,7 @@ mod integration {
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             run_ublk_disk_sanity_test(ctrl, dev_flags);
-            read_ublk_disk(ctrl);
+            read_ublk_disk(ctrl, true);
 
             ctrl.kill_dev().unwrap();
         })
@@ -224,7 +229,7 @@ mod integration {
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             // run sanity and disk IO test after ublk disk is ready
             run_ublk_disk_sanity_test(ctrl, dev_flags);
-            read_ublk_disk(ctrl);
+            read_ublk_disk(ctrl, true);
 
             {
                 let guard = wh_dev_data.lock().unwrap();
