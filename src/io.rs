@@ -2,12 +2,49 @@ use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
+use crate::bindings;
 use crate::helpers::IoBuf;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
+
+/// A struct with the same memory layout as `io_uring_sys::io_uring_sqe`.
+/// The definition must match the one in `io-uring-sys` crate.
+/// This is a simplified version for demonstration.
+#[repr(C)]
+pub struct RawSqe {
+    opcode: u8,
+    flags: u8,
+    ioprio: u16,
+    fd: i32,
+    off: u64,
+    pub addr: u64,
+    pub len: u32,
+    pub rw_flags: u32,
+    user_data: u64,
+    pub buf_index: u16,
+    personality: u16,
+    splice_fd_in: i32,
+    __pad2: u32,
+}
+
+#[macro_export]
+macro_rules! override_sqe {
+    ($entry:expr, $field:ident, $value:expr) => {
+        unsafe {
+            let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
+            sqe.$field = $value;
+        }
+    };
+    ($entry:expr, $field:ident, |=, $value:expr) => {
+        unsafe {
+            let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
+            sqe.$field |= $value;
+        }
+    };
+}
 
 /// UblkIOCtx
 ///
@@ -468,6 +505,7 @@ fn round_up(val: u32, rnd: u32) -> u32 {
 impl UblkQueue<'_> {
     const UBLK_QUEUE_IDLE_SECS: u32 = 20;
     const UBLK_QUEUE_IOCTL_ENCODE: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_0;
+    const UBLK_QUEUE_AUTO_BUF_REG: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_1;
 
     #[inline(always)]
     fn cmd_buf_sz(depth: u32) -> u32 {
@@ -475,6 +513,11 @@ impl UblkQueue<'_> {
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
 
         round_up(size, page_sz)
+    }
+
+    #[inline(always)]
+    pub fn support_auto_buf_zc(&self) -> bool {
+        self.flags.intersects(Self::UBLK_QUEUE_AUTO_BUF_REG)
     }
 
     #[inline(always)]
@@ -492,10 +535,16 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
-    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue, UblkError> {
+    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
+
+        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
+            && (dev.dev_info.flags & sys::UBLK_F_USER_COPY as u64) != 0
+        {
+            return Err(UblkError::InvalidVal);
+        }
 
         let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
             .setup_cqsize(cq_depth as u32)
@@ -511,6 +560,10 @@ impl UblkQueue<'_> {
 
         ring.submitter()
             .register_files(&tgt.fds[0..tgt.nr_fds as usize])?;
+
+        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+            ring.submitter().register_buffers_sparse(depth)?;
+        }
 
         let off =
             sys::UBLKSRV_CMD_BUF_OFFSET as libc::off_t + (q_id as libc::off_t) * max_cmd_buf_sz;
@@ -544,6 +597,11 @@ impl UblkQueue<'_> {
             flags: dev.flags
                 | if (dev.dev_info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0 {
                     Self::UBLK_QUEUE_IOCTL_ENCODE
+                } else {
+                    UblkFlags::empty()
+                }
+                | if (dev.dev_info.flags & (sys::UBLK_F_AUTO_BUF_REG as u64)) != 0 {
+                    Self::UBLK_QUEUE_AUTO_BUF_REG
                 } else {
                     UblkFlags::empty()
                 },
@@ -633,17 +691,26 @@ impl UblkQueue<'_> {
     /// Register IO buffer, so that pages in this buffer can
     /// be discarded in case queue becomes idle
     pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
+        if self.support_auto_buf_zc() {
+            return;
+        }
         self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
     }
 
     /// Register IO buffer, so that pages in this buffer can
     /// be discarded in case queue becomes idle
     pub fn unregister_io_buf(&self, tag: u16) {
+        if self.support_auto_buf_zc() {
+            return;
+        }
         self.bufs.borrow_mut()[tag as usize] = std::ptr::null_mut();
     }
 
     /// unregister all io buffers
     pub(crate) fn unregister_io_bufs(&self) {
+        if self.support_auto_buf_zc() {
+            return;
+        }
         for tag in 0..self.q_depth {
             self.unregister_io_buf(tag.try_into().unwrap());
         }
@@ -651,9 +718,11 @@ impl UblkQueue<'_> {
 
     /// Register Io buffers
     pub fn regiser_io_bufs(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
-        if let Some(b) = bufs {
-            for tag in 0..self.q_depth {
-                self.register_io_buf(tag.try_into().unwrap(), &b[tag as usize]);
+        if !self.support_auto_buf_zc() {
+            if let Some(b) = bufs {
+                for tag in 0..self.q_depth {
+                    self.register_io_buf(tag.try_into().unwrap(), &b[tag as usize]);
+                }
             }
         }
 
@@ -673,6 +742,7 @@ impl UblkQueue<'_> {
         tag: u16,
         cmd_op: u32,
         buf_addr: u64,
+        sqe_addr: Option<u64>,
         user_data: u64,
         res: i32,
     ) -> i32 {
@@ -694,10 +764,14 @@ impl UblkQueue<'_> {
             cmd_op
         };
 
-        let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+        let mut sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
+        if let Some(auto_buf_addr) = sqe_addr {
+            assert!(self.support_auto_buf_zc());
+            override_sqe!(&mut sqe, addr, auto_buf_addr);
+        }
 
         loop {
             let res = unsafe { r.submission().push(&sqe) };
@@ -714,13 +788,15 @@ impl UblkQueue<'_> {
         state.inc_cmd_inflight();
 
         log::trace!(
-            "{}: (qid {} flags {:x} tag {} cmd_op {}) stopping {}",
+            "{}: (qid {} flags {:x} tag {} cmd_op {}) stopping {} buf_addr {:x}/{:x}",
             "queue_io_cmd",
             self.q_id,
             self.flags,
             tag,
             cmd_op,
             state.is_stopping(),
+            io_cmd.addr,
+            buf_addr,
         );
 
         1
@@ -736,7 +812,7 @@ impl UblkQueue<'_> {
         res: i32,
     ) -> i32 {
         let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
-        self.__queue_io_cmd(r, tag, cmd_op, buf_addr, data, res)
+        self.__queue_io_cmd(r, tag, cmd_op, buf_addr, None, data, res)
     }
 
     #[inline(always)]
@@ -780,7 +856,38 @@ impl UblkQueue<'_> {
         let f = UblkUringOpFuture::new(0);
         let user_data = f.user_data | (tag as u64);
         let mut r = self.q_ring.borrow_mut();
-        self.__queue_io_cmd(&mut r, tag, cmd_op, buf_addr as u64, user_data, result);
+        self.__queue_io_cmd(
+            &mut r,
+            tag,
+            cmd_op,
+            buf_addr as u64,
+            None,
+            user_data,
+            result,
+        );
+
+        f
+    }
+
+    /// Submit io command with auto buffer registration support
+    ///
+    /// For UBLK_F_AUTO_BUF_REG, the buffer index and flags are passed via buf_reg_data.
+    /// When auto buffer registration is enabled, buf_addr should be set to the encoded
+    /// auto buffer registration data instead of the actual buffer address.
+    #[inline]
+    pub fn submit_io_cmd_with_auto_buf_reg(
+        &self,
+        tag: u16,
+        cmd_op: u32,
+        buf_reg_data: &sys::ublk_auto_buf_reg,
+        result: i32,
+    ) -> UblkUringOpFuture {
+        let auto_buf_addr = Some(bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data));
+
+        let f = UblkUringOpFuture::new(0);
+        let user_data = f.user_data | (tag as u64);
+        let mut r = self.q_ring.borrow_mut();
+        self.__queue_io_cmd(&mut r, tag, cmd_op, 0, auto_buf_addr, user_data, result);
 
         f
     }
@@ -820,6 +927,59 @@ impl UblkQueue<'_> {
         }
 
         Ok(())
+    }
+
+    fn submit_reg_unreg_io_buf(&self, op: u32, tag: u16, buf_index: u16) -> UblkUringOpFuture {
+        let f = UblkUringOpFuture::new(0);
+        let user_data = f.user_data | (tag as u64);
+        let mut r = self.q_ring.borrow_mut();
+
+        let io_cmd = sys::ublksrv_io_cmd {
+            tag,
+            addr: buf_index as u64,
+            q_id: self.q_id,
+            result: 0,
+        };
+
+        let cmd_op = if !self.is_ioctl_encode() {
+            op & 0xff
+        } else {
+            op
+        };
+
+        let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+            .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
+            .build()
+            .user_data(user_data);
+
+        loop {
+            let res = unsafe { r.submission().push(&sqe) };
+            match res {
+                Ok(_) => break,
+                Err(_) => {
+                    log::debug!("submit_register_io_buf: flush and retry");
+                    r.submit_and_wait(0).unwrap();
+                }
+            }
+        }
+
+        f
+    }
+    /// Submit manual buffer registration command
+    ///
+    /// Used when UBLK_F_AUTO_BUF_REG is enabled but auto registration fails
+    /// and UBLK_AUTO_BUF_REG_FALLBACK was used.
+    #[inline]
+    pub fn submit_register_io_buf(&self, tag: u16, buf_index: u16) -> UblkUringOpFuture {
+        self.submit_reg_unreg_io_buf(sys::UBLK_U_IO_REGISTER_IO_BUF, tag, buf_index)
+    }
+
+    /// Submit manual buffer unregistration command
+    ///
+    /// Used when UBLK_F_AUTO_BUF_REG is enabled to manually unregister buffers.
+    #[inline]
+    pub fn submit_unregister_io_buf(&self, tag: u16, buf_index: u16) -> UblkUringOpFuture {
+        self.submit_reg_unreg_io_buf(sys::UBLK_U_IO_UNREGISTER_IO_BUF, tag, buf_index)
     }
 
     /// Submit all commands for fetching IO

@@ -3,6 +3,7 @@ mod integration {
     use io_uring::opcode;
     use libublk::helpers::IoBuf;
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use libublk::override_sqe;
     use libublk::uring_async::ublk_wait_and_handle_ios;
     use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkError, UblkFlags, UblkIORes};
     use std::env;
@@ -34,7 +35,7 @@ mod integration {
         assert!((permissions.mode() & 0o777) == 0o700);
     }
 
-    fn read_ublk_disk(ctrl: &UblkCtrl) {
+    fn read_ublk_disk(ctrl: &UblkCtrl, success: bool) {
         let dev_path = ctrl.get_bdev_path();
         let mut arg_list: Vec<String> = Vec::new();
         let if_dev = format!("if={}", &dev_path);
@@ -43,7 +44,12 @@ mod integration {
         arg_list.push("of=/dev/null".to_string());
         arg_list.push("bs=4096".to_string());
         arg_list.push("count=10k".to_string());
-        println!("{:?}", Command::new("dd").args(arg_list).output().unwrap());
+        let out = Command::new("dd")
+            .args(arg_list)
+            .output()
+            .expect("fail to run dd");
+
+        assert!(out.status.success() == success);
     }
 
     fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &UblkDev)) {
@@ -65,7 +71,7 @@ mod integration {
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             run_ublk_disk_sanity_test(ctrl, dev_flags);
-            read_ublk_disk(ctrl);
+            read_ublk_disk(ctrl, true);
 
             ctrl.kill_dev().unwrap();
         })
@@ -224,7 +230,7 @@ mod integration {
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             // run sanity and disk IO test after ublk disk is ready
             run_ublk_disk_sanity_test(ctrl, dev_flags);
-            read_ublk_disk(ctrl);
+            read_ublk_disk(ctrl, true);
 
             {
                 let guard = wh_dev_data.lock().unwrap();
@@ -234,6 +240,123 @@ mod integration {
             ctrl.kill_dev().unwrap();
         })
         .unwrap();
+    }
+
+    fn __test_ublk_null_zc(bad_buf_idx: bool, fallback: bool) {
+        const IORING_NOP_INJECT_RESULT: u32 = 1u32 << 0;
+        const IORING_NOP_FIXED_BUFFER: u32 = 1u32 << 3;
+        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+            let iod = q.get_iod(tag);
+            let bytes = (iod.nr_sectors << 9) as i32;
+
+            let mut sqe = opcode::Nop::new()
+                .build()
+                .flags(io_uring::squeue::Flags::FIXED_FILE);
+            override_sqe!(
+                &mut sqe,
+                rw_flags,
+                |=,
+                IORING_NOP_FIXED_BUFFER | IORING_NOP_INJECT_RESULT
+            );
+            override_sqe!(&mut sqe, len, bytes as u32);
+            override_sqe!(&mut sqe, buf_index, tag);
+
+            let res = q.ublk_submit_sqe(sqe).await;
+            res
+        }
+
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let depth = 64_u16;
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(2)
+            .depth(depth)
+            .id(-1)
+            .dev_flags(dev_flags)
+            .ctrl_flags((sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_SUPPORT_ZERO_COPY) as u64)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+
+        // queue handler supports Clone(), so will be cloned in each
+        // queue pthread context
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+            let exe = smol::LocalExecutor::new();
+            let mut f_vec = Vec::new();
+
+            for tag in 0..depth {
+                let q = q_rc.clone();
+
+                f_vec.push(exe.spawn(async move {
+                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
+                    let mut res = 0;
+                    let buf_index = if !bad_buf_idx { tag } else { depth + 1 };
+
+                    // Create auto buffer registration data with fallback support
+                    let auto_buf_reg = sys::ublk_auto_buf_reg {
+                        index: buf_index,
+                        flags: if fallback {
+                            sys::UBLK_AUTO_BUF_REG_FALLBACK as u8
+                        } else {
+                            0
+                        },
+                        ..Default::default()
+                    };
+
+                    loop {
+                        let cmd_res = q
+                            .submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &auto_buf_reg, res)
+                            .await;
+                        if cmd_res == sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        res = handle_io_cmd(&q, tag).await;
+                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                }));
+            }
+
+            ublk_wait_and_handle_ios(&exe, &q_rc);
+            smol::block_on(async { futures::future::join_all(f_vec).await });
+        };
+
+        // kick off our targets
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            let success = fallback || !bad_buf_idx;
+
+            // run sanity and disk IO test after ublk disk is ready
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl, success);
+
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_ublk_null_zc() {
+        __test_ublk_null_zc(false, false);
+    }
+
+    #[test]
+    fn test_ublk_null_zc_bad_idx_fallback() {
+        __test_ublk_null_zc(true, true);
+    }
+
+    #[test]
+    fn test_ublk_null_zc_fallback() {
+        __test_ublk_null_zc(false, true);
+    }
+
+    #[test]
+    fn test_ublk_null_zc_bad_idx_no_fallback() {
+        __test_ublk_null_zc(true, false); //io failure in case that bad buf idx and no fallback
     }
 
     fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, buf_addr: *mut u8, start: u64) {
