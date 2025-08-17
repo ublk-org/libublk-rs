@@ -31,6 +31,10 @@ bitflags! {
         /// tell UblkCtrl that we are deleted in async
         const UBLK_DEV_F_DEL_DEV_ASYNC = 0b00001000;
 
+        /// enable single CPU affinity optimization: select one random CPU
+        /// from queue's affinity instead of setting all CPUs
+        const UBLK_DEV_F_SINGLE_CPU_AFFINITY = 0b00010000;
+
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
     }
