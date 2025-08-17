@@ -592,4 +592,109 @@ mod integration {
         ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
         ctrl.del_dev().unwrap();
     }
+
+    /// Test UBLK_DEV_F_SINGLE_CPU_AFFINITY integration
+    #[test]
+    fn test_ublk_single_cpu_affinity() {
+        fn verify_single_cpu_affinity(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
+            // Verify the device was created with the expected flags
+            let tgt_flags = ctrl.get_target_flags_from_json().unwrap();
+            assert!(UblkFlags::from_bits(tgt_flags).unwrap() == dev_flags);
+
+            // Read the JSON file to check queue affinities
+            let run_path = ctrl.run_path();
+            let json_path = Path::new(&run_path);
+            assert!(json_path.exists() == true, "JSON file should exist");
+
+            let json_content = std::fs::read_to_string(json_path)
+                .expect("Should be able to read JSON file");
+            let json: serde_json::Value = serde_json::from_str(&json_content)
+                .expect("Should be able to parse JSON");
+
+            // Check that queues section exists
+            let queues = json.get("queues")
+                .expect("JSON should have queues section");
+
+            // Verify each queue has exactly one CPU in its affinity
+            for qid in 0..2u16 {
+                let queue_info = queues.get(qid.to_string())
+                    .expect(&format!("Queue {} should exist in JSON", qid));
+                
+                let affinity = queue_info.get("affinity")
+                    .expect(&format!("Queue {} should have affinity field", qid));
+                
+                let affinity_array = affinity.as_array()
+                    .expect(&format!("Queue {} affinity should be an array", qid));
+
+                assert_eq!(
+                    affinity_array.len(), 1,
+                    "Queue {} should have exactly 1 CPU in affinity when UBLK_DEV_F_SINGLE_CPU_AFFINITY is set, got {}",
+                    qid, affinity_array.len()
+                );
+
+                let cpu_id = affinity_array[0].as_u64()
+                    .expect(&format!("Queue {} affinity should contain valid CPU ID", qid));
+                
+                println!("Queue {} is bound to CPU {}", qid, cpu_id);
+            }
+
+            println!("✓ Single CPU affinity verification passed - each queue bound to exactly one CPU");
+        }
+
+        fn single_cpu_null_handle_queue(qid: u16, dev: &UblkDev) {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+            let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+            let bufs = bufs_rc.clone();
+
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = (iod.nr_sectors << 9) as i32;
+
+                let buf_addr = if user_copy {
+                    std::ptr::null_mut()
+                } else {
+                    bufs[tag as usize].as_mut_ptr()
+                };
+                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+            };
+
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
+                .wait_and_handle_io(io_handler);
+        }
+
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY;
+        
+        let ctrl = UblkCtrlBuilder::default()
+            .name("single_cpu_null")
+            .nr_queues(2)
+            .dev_flags(dev_flags)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_COPY.into())
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            single_cpu_null_handle_queue(qid, dev);
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            // Run basic sanity tests
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            
+            // Verify single CPU affinity behavior
+            verify_single_cpu_affinity(ctrl, dev_flags);
+            
+            // Test that the device works normally
+            read_ublk_disk(ctrl, true);
+
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
 }
