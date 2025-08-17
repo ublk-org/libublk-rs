@@ -1582,7 +1582,7 @@ impl UblkCtrl {
 
 #[cfg(test)]
 mod tests {
-    use crate::ctrl::UblkCtrlBuilder;
+    use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
@@ -1789,5 +1789,61 @@ mod tests {
         assert!(cnt_arc.get() > 0);
 
         handle.join().unwrap();
+    }
+
+    /// Test UBLK_DEV_F_SINGLE_CPU_AFFINITY feature
+    #[test]
+    fn test_single_cpu_affinity() {
+        // Test 1: Verify the flag is properly defined and can be used
+        let single_cpu_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY;
+        let normal_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        
+        assert!(single_cpu_flags.contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
+        assert!(!normal_flags.contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
+
+        // Test 2: Create control devices with and without the flag
+        let ctrl_with_flag = UblkCtrlBuilder::default()
+            .name("test_single_cpu")
+            .depth(16_u16)
+            .nr_queues(2_u16)
+            .dev_flags(single_cpu_flags)
+            .build()
+            .unwrap();
+
+        let ctrl_without_flag = UblkCtrlBuilder::default()
+            .name("test_normal")
+            .depth(16_u16)
+            .nr_queues(2_u16)
+            .dev_flags(normal_flags)
+            .build()
+            .unwrap();
+
+        // Test 3: Verify flag is stored correctly in the control device
+        assert!(ctrl_with_flag.get_dev_flags().contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
+        assert!(!ctrl_without_flag.get_dev_flags().contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
+
+        // Test 4: Test UblkQueueAffinity helper methods
+        let test_affinity = UblkQueueAffinity::from_single_cpu(3);
+        let bits = test_affinity.to_bits_vec();
+        assert_eq!(bits.len(), 1, "Single CPU affinity should contain exactly one CPU");
+        assert_eq!(bits[0], 3, "Single CPU affinity should contain CPU 3");
+
+        // Test 5: Test random CPU selection (create an affinity with multiple CPUs and verify selection)
+        let mut multi_cpu_affinity = UblkQueueAffinity::new();
+        multi_cpu_affinity.set_cpu(1);
+        multi_cpu_affinity.set_cpu(3);
+        multi_cpu_affinity.set_cpu(5);
+        
+        let selected_cpu = multi_cpu_affinity.get_random_cpu();
+        assert!(selected_cpu.is_some(), "Should be able to select a CPU from multi-CPU affinity");
+        
+        let cpu = selected_cpu.unwrap();
+        assert!(cpu == 1 || cpu == 3 || cpu == 5, "Selected CPU should be one of the available CPUs (1, 3, or 5), got {}", cpu);
+
+        println!("✓ Single CPU affinity feature tests passed");
+        println!("  - Flag definition and usage: PASS");
+        println!("  - Control device flag storage: PASS");
+        println!("  - Single CPU affinity creation: PASS");
+        println!("  - Random CPU selection: PASS (selected CPU {})", cpu);
     }
 }
