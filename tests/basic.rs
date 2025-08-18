@@ -606,24 +606,26 @@ mod integration {
             let json_path = Path::new(&run_path);
             assert!(json_path.exists() == true, "JSON file should exist");
 
-            let json_content = std::fs::read_to_string(json_path)
-                .expect("Should be able to read JSON file");
-            let json: serde_json::Value = serde_json::from_str(&json_content)
-                .expect("Should be able to parse JSON");
+            let json_content =
+                std::fs::read_to_string(json_path).expect("Should be able to read JSON file");
+            let json: serde_json::Value =
+                serde_json::from_str(&json_content).expect("Should be able to parse JSON");
 
             // Check that queues section exists
-            let queues = json.get("queues")
-                .expect("JSON should have queues section");
+            let queues = json.get("queues").expect("JSON should have queues section");
 
             // Verify each queue has exactly one CPU in its affinity
             for qid in 0..2u16 {
-                let queue_info = queues.get(qid.to_string())
+                let queue_info = queues
+                    .get(qid.to_string())
                     .expect(&format!("Queue {} should exist in JSON", qid));
-                
-                let affinity = queue_info.get("affinity")
+
+                let affinity = queue_info
+                    .get("affinity")
                     .expect(&format!("Queue {} should have affinity field", qid));
-                
-                let affinity_array = affinity.as_array()
+
+                let affinity_array = affinity
+                    .as_array()
                     .expect(&format!("Queue {} affinity should be an array", qid));
 
                 assert_eq!(
@@ -632,13 +634,17 @@ mod integration {
                     qid, affinity_array.len()
                 );
 
-                let cpu_id = affinity_array[0].as_u64()
-                    .expect(&format!("Queue {} affinity should contain valid CPU ID", qid));
-                
+                let cpu_id = affinity_array[0].as_u64().expect(&format!(
+                    "Queue {} affinity should contain valid CPU ID",
+                    qid
+                ));
+
                 println!("Queue {} is bound to CPU {}", qid, cpu_id);
             }
 
-            println!("✓ Single CPU affinity verification passed - each queue bound to exactly one CPU");
+            println!(
+                "✓ Single CPU affinity verification passed - each queue bound to exactly one CPU"
+            );
         }
 
         fn single_cpu_null_handle_queue(qid: u16, dev: &UblkDev) {
@@ -665,7 +671,7 @@ mod integration {
         }
 
         let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY;
-        
+
         let ctrl = UblkCtrlBuilder::default()
             .name("single_cpu_null")
             .nr_queues(2)
@@ -686,15 +692,97 @@ mod integration {
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             // Run basic sanity tests
             run_ublk_disk_sanity_test(ctrl, dev_flags);
-            
+
             // Verify single CPU affinity behavior
             verify_single_cpu_affinity(ctrl, dev_flags);
-            
+
             // Test that the device works normally
             read_ublk_disk(ctrl, true);
 
             ctrl.kill_dev().unwrap();
         })
         .unwrap();
+    }
+
+    /// Common helper function for testing non-async auto buffer registration APIs
+    fn __test_ublk_null_sync_auto_buf_reg(test_name: &str, use_fallback: bool) {
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let depth = 64_u16;
+        let ctrl = UblkCtrlBuilder::default()
+            .name(test_name)
+            .nr_queues(1)
+            .depth(depth)
+            .id(-1)
+            .dev_flags(dev_flags)
+            .ctrl_flags((sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_SUPPORT_ZERO_COPY) as u64)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            // Create auto buffer registration data for each tag
+            let mut buf_reg_data_list = Vec::with_capacity(depth as usize);
+            let flags = if use_fallback {
+                sys::UBLK_AUTO_BUF_REG_FALLBACK as u8
+            } else {
+                0
+            };
+
+            for tag in 0..depth {
+                buf_reg_data_list.push(sys::ublk_auto_buf_reg {
+                    index: tag,
+                    flags,
+                    ..Default::default()
+                });
+            }
+
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = (iod.nr_sectors << 9) as i32;
+
+                // Create auto buffer registration data for completion
+                let auto_buf_reg = sys::ublk_auto_buf_reg {
+                    index: tag,
+                    flags,
+                    ..Default::default()
+                };
+
+                // Use the new complete_io_cmd_with_auto_buf_reg API
+                q.complete_io_cmd_with_auto_buf_reg(
+                    tag,
+                    &auto_buf_reg,
+                    Ok(UblkIORes::Result(bytes)),
+                );
+            };
+
+            // Use the new submit_fetch_commands_with_auto_buf_reg API
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .submit_fetch_commands_with_auto_buf_reg(&buf_reg_data_list)
+                .wait_and_handle_io(io_handler);
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl, true);
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
+    /// Test the new non-async auto buffer registration APIs
+    #[test]
+    fn test_ublk_null_sync_auto_buf_reg() {
+        __test_ublk_null_sync_auto_buf_reg("null_sync_auto_buf", false);
+    }
+
+    /// Test the new non-async auto buffer registration APIs with fallback
+    #[test]
+    fn test_ublk_null_sync_auto_buf_reg_fallback() {
+        __test_ublk_null_sync_auto_buf_reg("null_sync_auto_buf_fallback", true);
     }
 }
