@@ -1008,6 +1008,45 @@ impl UblkQueue<'_> {
         }
         self
     }
+
+    /// Submit all commands for fetching IO with auto buffer registration
+    ///
+    /// # Arguments:
+    ///
+    /// * `buf_reg_data_list`: Array of auto buffer registration data for each tag
+    ///
+    /// This method supports zero-copy operations when UBLK_F_AUTO_BUF_REG is enabled.
+    /// Each buffer is automatically registered using the provided registration data.
+    /// Only called during queue initialization. After queue is setup,
+    /// COMMIT_AND_FETCH_REQ command is used for both committing io command
+    /// result and fetching new incoming IO.
+    pub fn submit_fetch_commands_with_auto_buf_reg(
+        self, 
+        buf_reg_data_list: &[sys::ublk_auto_buf_reg]
+    ) -> Self {
+        assert!(self.support_auto_buf_zc(), "Auto buffer registration not supported");
+        assert!(
+            buf_reg_data_list.len() >= self.q_depth as usize,
+            "Buffer registration data list too short"
+        );
+
+        for i in 0..self.q_depth {
+            let buf_reg_data = &buf_reg_data_list[i as usize];
+            let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
+            let data = UblkIOCtx::build_user_data(i as u16, sys::UBLK_U_IO_FETCH_REQ, 0, false);
+            
+            self.__queue_io_cmd(
+                &mut self.q_ring.borrow_mut(),
+                i as u16,
+                sys::UBLK_U_IO_FETCH_REQ,
+                0,
+                Some(auto_buf_addr),
+                data,
+                -1,
+            );
+        }
+        self
+    }
     fn __submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as u16) as u64;
@@ -1052,6 +1091,73 @@ impl UblkQueue<'_> {
                 }
                 UblkFatRes::ZonedAppendRes((res, lba)) => {
                     self.commit_and_queue_io_cmd(r, tag, lba, res);
+                }
+            },
+            _ => {}
+        };
+    }
+
+    #[inline(always)]
+    fn commit_and_queue_io_cmd_with_auto_buf_reg(
+        &self,
+        r: &mut IoUring<squeue::Entry>,
+        tag: u16,
+        buf_reg_data: &sys::ublk_auto_buf_reg,
+        io_cmd_result: i32,
+    ) {
+        let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
+        let data = UblkIOCtx::build_user_data(tag, sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ, 0, false);
+        self.__queue_io_cmd(
+            r,
+            tag,
+            sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
+            0,
+            Some(auto_buf_addr),
+            data,
+            io_cmd_result,
+        );
+    }
+
+    /// Complete one io command with auto buffer registration
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io command tag
+    /// * `buf_reg_data`: auto buffer registration data containing buffer index and flags
+    /// * `res`: io command result
+    ///
+    /// This method supports zero-copy operations when UBLK_F_AUTO_BUF_REG is enabled.
+    /// The buffer is automatically registered using the provided registration data.
+    /// When calling this API, target code has to make sure that q_ring won't be borrowed.
+    #[inline]
+    pub fn complete_io_cmd_with_auto_buf_reg(
+        &self,
+        tag: u16,
+        buf_reg_data: &sys::ublk_auto_buf_reg,
+        res: Result<UblkIORes, UblkError>,
+    ) {
+        let r = &mut self.q_ring.borrow_mut();
+
+        match res {
+            Ok(UblkIORes::Result(res))
+            | Err(UblkError::OtherError(res))
+            | Err(UblkError::UringIOError(res)) => {
+                self.commit_and_queue_io_cmd_with_auto_buf_reg(r, tag, buf_reg_data, res);
+            }
+            Err(UblkError::UringIoQueued) => {}
+            #[cfg(feature = "fat_complete")]
+            Ok(UblkIORes::FatRes(fat)) => match fat {
+                UblkFatRes::BatchRes(ios) => {
+                    assert!(self.support_comp_batch());
+                    for item in ios {
+                        let tag = item.0;
+                        self.commit_and_queue_io_cmd_with_auto_buf_reg(r, tag, buf_reg_data, item.1);
+                    }
+                }
+                UblkFatRes::ZonedAppendRes((res, lba)) => {
+                    let mut buf_reg_data_for_zoned = *buf_reg_data;
+                    buf_reg_data_for_zoned.index = (lba & 0xffff) as u16;
+                    self.commit_and_queue_io_cmd_with_auto_buf_reg(r, tag, &buf_reg_data_for_zoned, res);
                 }
             },
             _ => {}
