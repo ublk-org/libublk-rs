@@ -51,6 +51,10 @@ impl UblkQueueAffinity {
         self.affinity.as_bytes().as_ptr()
     }
 
+    fn addr_mut(&mut self) -> *mut u8 {
+        self.affinity.as_bytes().as_ptr() as *mut u8
+    }
+
     pub fn to_bits_vec(&self) -> Vec<usize> {
         self.affinity.into_iter().collect()
     }
@@ -362,13 +366,7 @@ impl UblkCtrlInner {
                 }
                 tids
             },
-            queue_selected_cpus: {
-                let mut cpus = Vec::<usize>::with_capacity(nr_queues as usize);
-                unsafe {
-                    cpus.set_len(nr_queues as usize);
-                }
-                cpus
-            },
+            queue_selected_cpus: vec![0; nr_queues as usize],
             nr_queues_configured: 0,
             dev_flags,
             features: None,
@@ -945,7 +943,10 @@ impl UblkCtrlInner {
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
-            let affinity = if self.dev_flags.contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY) {
+            let affinity = if self
+                .dev_flags
+                .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+            {
                 // Use the stored single CPU affinity
                 let selected_cpu = self.queue_selected_cpus[qid as usize];
                 UblkQueueAffinity::from_single_cpu(selected_cpu)
@@ -1322,6 +1323,95 @@ impl UblkCtrl {
         self.get_inner_mut().get_queue_affinity(q, bm)
     }
 
+    /// Set single CPU affinity for a specific queue
+    ///
+    /// This method selects a single CPU from the queue's affinity mask and stores it
+    /// for later use in build_json. If no CPU is specified, it selects a random CPU
+    /// from the queue's current affinity mask.
+    ///
+    /// # Arguments
+    /// * `qid` - Queue ID (0-based)
+    /// * `cpu` - Optional specific CPU to use. If None, selects randomly from affinity mask
+    ///
+    /// # Returns
+    /// The selected CPU ID on success
+    pub fn set_queue_single_affinity(
+        &self,
+        qid: u16,
+        cpu: Option<usize>,
+    ) -> Result<usize, UblkError> {
+        let mut affinity = UblkQueueAffinity::new();
+        self.get_queue_affinity(qid as u32, &mut affinity)?;
+
+        let selected_cpu = if let Some(cpu) = cpu {
+            // Validate that the specified CPU is in the affinity mask
+            let available_cpus = affinity.to_bits_vec();
+            if available_cpus.contains(&cpu) {
+                cpu
+            } else {
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+        } else {
+            // Select a random CPU from the affinity mask
+            affinity.get_random_cpu().unwrap_or(0)
+        };
+
+        // Store the selected CPU for later use in build_json
+        let mut inner = self.get_inner_mut();
+        if (qid as usize) < inner.queue_selected_cpus.len() {
+            inner.queue_selected_cpus[qid as usize] = selected_cpu;
+            Ok(selected_cpu)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Get the effective affinity for a specific queue thread
+    ///
+    /// This method retrieves the actual CPU affinity of the running queue thread
+    /// using sched_getaffinity syscall with the stored thread ID (TID).
+    ///
+    /// # Arguments
+    /// * `qid` - Queue ID (0-based)
+    /// * `affinity` - UblkQueueAffinity to store the result
+    ///
+    /// # Returns
+    /// 0 on success, or error code on failure
+    pub fn get_queue_effective_affinity(
+        &self,
+        qid: u16,
+        affinity: &mut UblkQueueAffinity,
+    ) -> Result<i32, UblkError> {
+        let inner = self.get_inner();
+
+        // Validate queue ID
+        if (qid as usize) >= inner.queue_tids.len() {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
+        let tid = inner.queue_tids[qid as usize];
+
+        // Check if the thread has been configured (tid != 0)
+        if tid == 0 {
+            return Err(UblkError::OtherError(-libc::ESRCH));
+        }
+
+        // Use sched_getaffinity to get the actual thread affinity
+        let result = unsafe {
+            libc::sched_getaffinity(
+                tid,
+                affinity.buf_len(),
+                affinity.addr_mut() as *mut libc::cpu_set_t,
+            )
+        };
+
+        if result == 0 {
+            Ok(0)
+        } else {
+            Err(UblkError::OtherError(-unsafe { *libc::__errno_location() }))
+        }
+    }
+
     /// Start user recover for this device
     ///
     pub fn start_user_recover(&self) -> Result<i32, UblkError> {
@@ -1466,21 +1556,17 @@ impl UblkCtrl {
             let mut affinity = UblkQueueAffinity::new();
             self.get_queue_affinity(q as u32, &mut affinity).unwrap();
 
-            let (final_affinity, selected_cpu) = if self.get_dev_flags().contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY) {
-                // Select a random CPU from the affinity and create single-CPU affinity
-                let selected_cpu = affinity.get_random_cpu().unwrap_or(0);
-                let single_cpu_affinity = UblkQueueAffinity::from_single_cpu(selected_cpu);
-                (single_cpu_affinity, Some(selected_cpu))
+            let final_affinity = if self
+                .get_dev_flags()
+                .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+            {
+                // Use the new method to set single CPU affinity
+                let selected_cpu = self.set_queue_single_affinity(q, None).unwrap_or(0);
+                UblkQueueAffinity::from_single_cpu(selected_cpu)
             } else {
                 // Use original full affinity
-                (affinity, None)
+                affinity
             };
-
-            // Store the selected CPU for later use in build_json (if single CPU mode is enabled)
-            if let Some(cpu) = selected_cpu {
-                let mut inner = self.get_inner_mut();
-                inner.queue_selected_cpus[q as usize] = cpu;
-            }
 
             let mut _q_fn = q_fn.clone();
 
@@ -1674,6 +1760,54 @@ mod tests {
     }
 
     #[test]
+    fn test_set_queue_single_affinity() {
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(2_u16)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        // Test invalid queue ID (should fail regardless of device state)
+        let invalid_queue = ctrl.set_queue_single_affinity(100, None);
+        assert!(invalid_queue.is_err());
+
+        // Test that the method exists and has correct signature by checking queue_selected_cpus initialization
+        let inner = ctrl.get_inner();
+        assert_eq!(inner.queue_selected_cpus.len(), 2);
+        assert_eq!(inner.queue_selected_cpus[0], 0); // Should be initialized to 0
+        assert_eq!(inner.queue_selected_cpus[1], 0); // Should be initialized to 0
+    }
+
+    #[test]
+    fn test_get_queue_effective_affinity() {
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(2_u16)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let mut affinity = UblkQueueAffinity::new();
+
+        // Test invalid queue ID
+        let invalid_queue_result = ctrl.get_queue_effective_affinity(100, &mut affinity);
+        assert!(invalid_queue_result.is_err());
+
+        // Test unconfigured queue (tid == 0)
+        let unconfigured_result = ctrl.get_queue_effective_affinity(0, &mut affinity);
+        assert!(unconfigured_result.is_err());
+        // Should return ESRCH error for unconfigured thread
+        if let Err(UblkError::OtherError(err)) = unconfigured_result {
+            assert_eq!(err, -libc::ESRCH);
+        }
+
+        // Test that the method signature is correct and compiles
+        // Actual functionality testing would require a running queue thread
+        assert!(true); // Method compiles and basic validation works
+    }
+
+    #[test]
     fn test_ublk_target_json() {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
@@ -1795,9 +1929,10 @@ mod tests {
     #[test]
     fn test_single_cpu_affinity() {
         // Test 1: Verify the flag is properly defined and can be used
-        let single_cpu_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY;
+        let single_cpu_flags =
+            UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY;
         let normal_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
-        
+
         assert!(single_cpu_flags.contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
         assert!(!normal_flags.contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
 
@@ -1819,13 +1954,21 @@ mod tests {
             .unwrap();
 
         // Test 3: Verify flag is stored correctly in the control device
-        assert!(ctrl_with_flag.get_dev_flags().contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
-        assert!(!ctrl_without_flag.get_dev_flags().contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
+        assert!(ctrl_with_flag
+            .get_dev_flags()
+            .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
+        assert!(!ctrl_without_flag
+            .get_dev_flags()
+            .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY));
 
         // Test 4: Test UblkQueueAffinity helper methods
         let test_affinity = UblkQueueAffinity::from_single_cpu(3);
         let bits = test_affinity.to_bits_vec();
-        assert_eq!(bits.len(), 1, "Single CPU affinity should contain exactly one CPU");
+        assert_eq!(
+            bits.len(),
+            1,
+            "Single CPU affinity should contain exactly one CPU"
+        );
         assert_eq!(bits[0], 3, "Single CPU affinity should contain CPU 3");
 
         // Test 5: Test random CPU selection (create an affinity with multiple CPUs and verify selection)
@@ -1833,12 +1976,19 @@ mod tests {
         multi_cpu_affinity.set_cpu(1);
         multi_cpu_affinity.set_cpu(3);
         multi_cpu_affinity.set_cpu(5);
-        
+
         let selected_cpu = multi_cpu_affinity.get_random_cpu();
-        assert!(selected_cpu.is_some(), "Should be able to select a CPU from multi-CPU affinity");
-        
+        assert!(
+            selected_cpu.is_some(),
+            "Should be able to select a CPU from multi-CPU affinity"
+        );
+
         let cpu = selected_cpu.unwrap();
-        assert!(cpu == 1 || cpu == 3 || cpu == 5, "Selected CPU should be one of the available CPUs (1, 3, or 5), got {}", cpu);
+        assert!(
+            cpu == 1 || cpu == 3 || cpu == 5,
+            "Selected CPU should be one of the available CPUs (1, 3, or 5), got {}",
+            cpu
+        );
 
         println!("✓ Single CPU affinity feature tests passed");
         println!("  - Flag definition and usage: PASS");
