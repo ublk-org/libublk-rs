@@ -34,7 +34,7 @@ anyhow = "1.0.66"
 
 [dependencies]
 libc = "0.2"
-io-uring = {version="=0.7.4", features = ["bindgen", "overwrite"]}
+io-uring = {version="=0.7.6"}
 serde = {version = "1.0.99", features = ["derive"]}
 serde_json = "1.0.79"
 bitmaps = "3.2.0"
