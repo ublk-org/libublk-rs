@@ -27,5 +27,5 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-multilib
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }} && rustup target add ${{ matrix.target }}
-      - run: cargo build --verbose --target ${{ matrix.target }}
-      - run: cargo build --features=fat_complete --verbose --target ${{ matrix.target }}
+      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --verbose --target ${{ matrix.target }}
+      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --features=fat_complete --verbose --target ${{ matrix.target }}
