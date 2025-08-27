@@ -415,16 +415,16 @@ mod integration {
         ctrl.kill_dev().unwrap();
     }
 
-    fn __test_ublk_ramdisk() {
+    fn __test_ublk_ramdisk(dev_flags: UblkFlags) {
         let size = 32_u64 << 20;
         let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
         let dev_addr = buf.as_mut_ptr() as u64;
-        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let depth = 128;
         let ctrl = UblkCtrlBuilder::default()
             .name("ramdisk")
             .id(-1)
             .nr_queues(1)
-            .depth(128)
+            .depth(depth)
             .dev_flags(dev_flags)
             .build()
             .unwrap();
@@ -436,6 +436,22 @@ mod integration {
         let q_fn = move |qid: u16, dev: &UblkDev| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
+
+            let mlock_enabled = dev.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
+            if mlock_enabled {
+                let mlocked_count = bufs
+                    .iter()
+                    .take(depth.into())
+                    .filter(|buf| buf.is_mlocked())
+                    .count();
+                assert!(mlocked_count == depth as usize);
+                println!(
+                    "Queue {} (sync): mlock feature enabled, {}/{} buffers successfully mlocked",
+                    qid,
+                    mlocked_count,
+                    bufs.len()
+                );
+            }
 
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let buf_addr = bufs[tag as usize].as_mut_ptr();
@@ -461,7 +477,7 @@ mod integration {
     /// - if yes, then test format/mount/umount over this ublk-ramdisk
     #[test]
     fn test_ublk_ramdisk() {
-        __test_ublk_ramdisk();
+        __test_ublk_ramdisk(UblkFlags::UBLK_DEV_F_ADD_DEV);
     }
 
     /// make FnMut closure for IO handling
@@ -784,5 +800,70 @@ mod integration {
     #[test]
     fn test_ublk_null_sync_auto_buf_reg_fallback() {
         __test_ublk_null_sync_auto_buf_reg("null_sync_auto_buf_fallback", true);
+    }
+
+    /// Test mlock IO buffer feature
+    #[test]
+    fn test_ublk_null_mlock_io_buffer() {
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER;
+        __test_ublk_ramdisk(dev_flags);
+    }
+
+    /// Test mlock IO buffer feature incompatibility with other features
+    #[test]
+    fn test_ublk_mlock_incompatibility() {
+        // Test incompatibility with UBLK_F_USER_COPY
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER;
+        let result = UblkCtrlBuilder::default()
+            .name("mlock_incompatible")
+            .nr_queues(1)
+            .dev_flags(dev_flags)
+            .ctrl_flags(sys::UBLK_F_USER_COPY as u64)
+            .build();
+        assert!(
+            result.is_err(),
+            "Should fail when mlock is combined with UBLK_F_USER_COPY"
+        );
+
+        // Test incompatibility with UBLK_F_AUTO_BUF_REG
+        let result = UblkCtrlBuilder::default()
+            .name("mlock_incompatible")
+            .nr_queues(1)
+            .dev_flags(dev_flags)
+            .ctrl_flags(sys::UBLK_F_AUTO_BUF_REG as u64)
+            .build();
+        assert!(
+            result.is_err(),
+            "Should fail when mlock is combined with UBLK_F_AUTO_BUF_REG"
+        );
+
+        // Test incompatibility with UBLK_F_SUPPORT_ZERO_COPY
+        let result = UblkCtrlBuilder::default()
+            .name("mlock_incompatible")
+            .nr_queues(1)
+            .dev_flags(dev_flags)
+            .ctrl_flags(sys::UBLK_F_SUPPORT_ZERO_COPY as u64)
+            .build();
+        assert!(
+            result.is_err(),
+            "Should fail when mlock is combined with UBLK_F_SUPPORT_ZERO_COPY"
+        );
+    }
+
+    /// Test IoBuf mlock functionality directly
+    #[test]
+    fn test_iobuf_mlock() {
+        // Test regular IoBuf doesn't have mlock
+        let buf_regular = IoBuf::<u8>::new(4096);
+        assert!(
+            !buf_regular.is_mlocked(),
+            "Regular IoBuf should not be mlocked"
+        );
+
+        // Test IoBuf with mlock
+        let buf_mlock = IoBuf::<u8>::new_with_mlock(4096);
+        // Note: mlock may fail due to permissions, but the method should still work
+        // In CI or without CAP_IPC_LOCK, this might return false
+        println!("Buffer mlock status: {}", buf_mlock.is_mlocked());
     }
 }

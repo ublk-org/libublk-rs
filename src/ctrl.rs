@@ -1074,6 +1074,17 @@ impl UblkCtrl {
             return Err(UblkError::InvalidVal);
         }
 
+        // Check mlock feature compatibility
+        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
+            // mlock feature is incompatible with certain other features
+            if (flags & sys::UBLK_F_USER_COPY as u64) != 0
+                || (flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
+                || (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
+            {
+                return Err(UblkError::InvalidVal);
+            }
+        }
+
         if id < 0 && id != -1 {
             return Err(UblkError::InvalidVal);
         }

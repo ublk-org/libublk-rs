@@ -30,6 +30,7 @@ bitflags! {
         const ASYNC = 0b00000001;
         const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00001000;
+        const MLOCK = 0b00010000;
     }
 }
 
@@ -266,6 +267,12 @@ fn __loop_add(
         direct_io: 1,
         back_file_path: backing_file.clone(),
     };
+    let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV
+        | if lo_flags.intersects(LoFlags::MLOCK) {
+            UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER
+        } else {
+            UblkFlags::empty()
+        };
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name("example_loop")
         .id(id)
@@ -273,7 +280,7 @@ fn __loop_add(
         .nr_queues(nr_queues.try_into().unwrap())
         .depth(depth)
         .io_buf_bytes(buf_sz)
-        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+        .dev_flags(dev_flags)
         .build()
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| lo_init_tgt(dev, &lo);
@@ -333,6 +340,10 @@ fn loop_add(
 }
 
 fn main() {
+    env_logger::builder()
+        .format_target(false)
+        .format_timestamp(None)
+        .init();
     let matches = Command::new("ublk-loop-example")
         .subcommand_required(true)
         .arg_required_else_help(true)
@@ -405,6 +416,13 @@ fn main() {
                         .long("oneshot")
                         .action(ArgAction::SetTrue)
                         .help("create, dump and remove device automatically"),
+                )
+                .arg(
+                    Arg::new("mlock_io_buffer")
+                        .long("mlock-io-buffer")
+                        .short('m')
+                        .action(ArgAction::SetTrue)
+                        .help("enable UBLK_DEV_F_MLOCK_IO_BUFFER to lock IO buffers in memory"),
                 ),
         )
         .subcommand(
@@ -454,6 +472,9 @@ fn main() {
             if add_matches.get_flag("oneshot") {
                 lo_flags |= LoFlags::ONESHOT;
             };
+            if add_matches.get_flag("mlock_io_buffer") {
+                lo_flags |= LoFlags::MLOCK;
+            }
             let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
                 libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64
             } else {

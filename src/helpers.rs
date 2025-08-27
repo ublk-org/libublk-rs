@@ -9,6 +9,7 @@ pub fn type_of_this<T>(_: &T) -> String {
 pub struct IoBuf<T> {
     ptr: *mut T,
     size: usize,
+    mlocked: bool,
 }
 
 // Users of IoBuf has to deal with Send & Sync
@@ -22,7 +23,40 @@ impl<T> IoBuf<T> {
 
         assert!(size != 0);
 
-        IoBuf { ptr, size }
+        IoBuf {
+            ptr,
+            size,
+            mlocked: false,
+        }
+    }
+
+    pub fn new_with_mlock(size: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
+        let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
+
+        assert!(size != 0);
+
+        let mut buf = IoBuf {
+            ptr,
+            size,
+            mlocked: false,
+        };
+
+        // Attempt to mlock the buffer
+        let mlock_result = unsafe { libc::mlock(ptr as *const libc::c_void, size) };
+
+        if mlock_result == 0 {
+            buf.mlocked = true;
+        }
+        // Note: We don't fail if mlock fails, as it might be due to permissions
+        // or system limits. The caller can check with is_mlocked().
+
+        buf
+    }
+
+    /// Check if the buffer is currently locked in memory
+    pub fn is_mlocked(&self) -> bool {
+        self.mlocked
     }
 
     /// how many elements in this buffer
@@ -82,6 +116,13 @@ impl<T> DerefMut for IoBuf<T> {
 /// Free buffer with same alloc layout
 impl<T> Drop for IoBuf<T> {
     fn drop(&mut self) {
+        // munlock the buffer if it was mlocked
+        if self.mlocked {
+            unsafe {
+                libc::munlock(self.ptr as *const libc::c_void, self.size);
+            }
+        }
+
         let layout = std::alloc::Layout::from_size_align(self.size, 4096).unwrap();
         unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout) };
     }
