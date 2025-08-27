@@ -35,6 +35,11 @@ bitflags! {
         /// from queue's affinity instead of setting all CPUs
         const UBLK_DEV_F_SINGLE_CPU_AFFINITY = 0b00010000;
 
+        /// enable mlock for io buffers: lock user IO buffer pages in memory
+        /// to prevent swapping. Requires CAP_IPC_LOCK capability.
+        /// It is required for ublk to be used as swap disk
+        const UBLK_DEV_F_MLOCK_IO_BUFFER = 0b00100000;
+
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
     }

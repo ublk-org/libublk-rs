@@ -332,8 +332,14 @@ impl UblkDev {
         let bytes = self.dev_info.max_io_buf_bytes as usize;
         let mut bvec = Vec::with_capacity(depth as usize);
 
+        let use_mlock = self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
+
         for _ in 0..depth {
-            bvec.push(IoBuf::<u8>::new(bytes));
+            if use_mlock {
+                bvec.push(IoBuf::<u8>::new_with_mlock(bytes));
+            } else {
+                bvec.push(IoBuf::<u8>::new(bytes));
+            }
         }
 
         bvec
@@ -1021,10 +1027,13 @@ impl UblkQueue<'_> {
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO.
     pub fn submit_fetch_commands_with_auto_buf_reg(
-        self, 
-        buf_reg_data_list: &[sys::ublk_auto_buf_reg]
+        self,
+        buf_reg_data_list: &[sys::ublk_auto_buf_reg],
     ) -> Self {
-        assert!(self.support_auto_buf_zc(), "Auto buffer registration not supported");
+        assert!(
+            self.support_auto_buf_zc(),
+            "Auto buffer registration not supported"
+        );
         assert!(
             buf_reg_data_list.len() >= self.q_depth as usize,
             "Buffer registration data list too short"
@@ -1034,7 +1043,7 @@ impl UblkQueue<'_> {
             let buf_reg_data = &buf_reg_data_list[i as usize];
             let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
             let data = UblkIOCtx::build_user_data(i as u16, sys::UBLK_U_IO_FETCH_REQ, 0, false);
-            
+
             self.__queue_io_cmd(
                 &mut self.q_ring.borrow_mut(),
                 i as u16,
@@ -1151,13 +1160,23 @@ impl UblkQueue<'_> {
                     assert!(self.support_comp_batch());
                     for item in ios {
                         let tag = item.0;
-                        self.commit_and_queue_io_cmd_with_auto_buf_reg(r, tag, buf_reg_data, item.1);
+                        self.commit_and_queue_io_cmd_with_auto_buf_reg(
+                            r,
+                            tag,
+                            buf_reg_data,
+                            item.1,
+                        );
                     }
                 }
                 UblkFatRes::ZonedAppendRes((res, lba)) => {
                     let mut buf_reg_data_for_zoned = *buf_reg_data;
                     buf_reg_data_for_zoned.index = (lba & 0xffff) as u16;
-                    self.commit_and_queue_io_cmd_with_auto_buf_reg(r, tag, &buf_reg_data_for_zoned, res);
+                    self.commit_and_queue_io_cmd_with_auto_buf_reg(
+                        r,
+                        tag,
+                        &buf_reg_data_for_zoned,
+                        res,
+                    );
                 }
             },
             _ => {}
@@ -1271,7 +1290,15 @@ impl UblkQueue<'_> {
         let mut state = self.state.borrow_mut();
         let empty = self.q_ring.borrow_mut().submission().is_empty();
 
-        if empty && state.get_nr_cmd_inflight() == self.q_depth && !state.is_idle() {
+        // don't enter idle if mlock buffers is enabled
+        if !self
+            .dev
+            .flags
+            .intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER)
+            && empty
+            && state.get_nr_cmd_inflight() == self.q_depth
+            && !state.is_idle()
+        {
             log::debug!(
                 "dev {} queue {} becomes idle",
                 self.dev.dev_info.dev_id,
