@@ -82,6 +82,82 @@ impl<T> IoBuf<T> {
             std::ptr::write_bytes(self.as_mut_ptr(), 0, self.len());
         }
     }
+
+    /// Get a safe immutable slice reference to the buffer contents.
+    /// 
+    /// This method provides safe slice access by leveraging the existing Deref
+    /// implementation, eliminating the need for unsafe raw pointer operations.
+    /// The returned slice is guaranteed to be valid for the lifetime of the IoBuf.
+    /// 
+    /// # Safety Benefits
+    /// - Bounds checking through slice operations
+    /// - Compile-time lifetime verification
+    /// - No manual pointer arithmetic required
+    /// - Rust's memory safety guarantees apply
+    pub fn as_slice(&self) -> &[T] {
+        &*self
+    }
+
+    /// Get a safe mutable slice reference to the buffer contents.
+    /// 
+    /// This method provides safe mutable slice access by leveraging the existing
+    /// DerefMut implementation, eliminating the need for unsafe raw pointer operations.
+    /// The returned slice is guaranteed to be valid for the lifetime of the IoBuf.
+    /// 
+    /// # Safety Benefits
+    /// - Bounds checking through slice operations  
+    /// - Compile-time lifetime verification
+    /// - No manual pointer arithmetic required
+    /// - Rust's memory safety guarantees apply
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut *self
+    }
+
+    /// Get a safe immutable subslice of the buffer.
+    /// 
+    /// This method provides safe access to a portion of the buffer by leveraging
+    /// the existing Deref implementation and standard slice indexing. This eliminates
+    /// the need for unsafe pointer arithmetic and provides automatic bounds checking.
+    /// 
+    /// # Arguments
+    /// * `range` - A range specifying the subslice bounds (e.g., `0..10`, `5..`, `..20`)
+    /// 
+    /// # Panics
+    /// Panics if the range is out of bounds, following standard slice behavior.
+    /// 
+    /// # Safety Benefits
+    /// - Automatic bounds checking
+    /// - No unsafe pointer operations
+    /// - Leverages Rust's slice safety guarantees
+    pub fn subslice<R>(&self, range: R) -> &[T]
+    where
+        R: std::slice::SliceIndex<[T], Output = [T]>,
+    {
+        &self[range]
+    }
+
+    /// Get a safe mutable subslice of the buffer.
+    /// 
+    /// This method provides safe mutable access to a portion of the buffer by leveraging
+    /// the existing DerefMut implementation and standard slice indexing. This eliminates
+    /// the need for unsafe pointer arithmetic and provides automatic bounds checking.
+    /// 
+    /// # Arguments
+    /// * `range` - A range specifying the subslice bounds (e.g., `0..10`, `5..`, `..20`)
+    /// 
+    /// # Panics
+    /// Panics if the range is out of bounds, following standard slice behavior.
+    /// 
+    /// # Safety Benefits
+    /// - Automatic bounds checking
+    /// - No unsafe pointer operations  
+    /// - Leverages Rust's slice safety guarantees
+    pub fn subslice_mut<R>(&mut self, range: R) -> &mut [T]
+    where
+        R: std::slice::SliceIndex<[T], Output = [T]>,
+    {
+        &mut self[range]
+    }
 }
 
 impl<T> std::fmt::Debug for IoBuf<T> {
