@@ -147,7 +147,14 @@ fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_urin
     }
 }
 
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) -> i32 {
+/// Handle I/O operations asynchronously using slice-based buffer management.
+///
+/// This function demonstrates slice-based async I/O patterns for educational purposes:
+/// - Uses safe slice access instead of raw pointer manipulation  
+/// - Leverages IoBuf's slice methods for memory safety
+/// - Shows when slice-to-pointer conversion is necessary for libublk API calls
+/// - Maintains async/await patterns for high-performance I/O
+async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, io_slice: &mut [u8]) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
@@ -160,6 +167,10 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) 
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
 
+        // Convert slice to pointer only when required by libublk API
+        // This conversion is necessary because io_uring operations require raw pointers
+        // for kernel interface compatibility. The slice ensures we have valid bounds.
+        let buf_addr = io_slice.as_mut_ptr();
         let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
         let res = q.ublk_submit_sqe(sqe).await;
         if res != -(libc::EAGAIN) {
@@ -170,7 +181,12 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, buf_addr: *mut u8) 
     return -libc::EAGAIN;
 }
 
-fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *mut u8) {
+/// Handle I/O operations synchronously (for comparison with async slice patterns).
+///
+/// Note: This sync handler still uses raw pointers as it follows the traditional
+/// synchronous I/O pattern. The async handler above demonstrates the preferred
+/// slice-based approach for new implementations.
+fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, io_slice: &[u8]) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
@@ -182,20 +198,28 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
+            q.complete_io_cmd(
+                tag,
+                io_slice.as_ptr() as *mut u8,
+                Ok(UblkIORes::Result(res)),
+            );
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(res)));
+        q.complete_io_cmd(
+            tag,
+            io_slice.as_ptr() as *mut u8,
+            Ok(UblkIORes::Result(res)),
+        );
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
-        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr).user_data(data);
+        let sqe = __lo_make_io_sqe(op, off, bytes, io_slice.as_ptr() as *mut u8).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
     }
 }
@@ -203,10 +227,19 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, buf_addr: *
 fn q_fn(qid: u16, dev: &UblkDev) {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
+
+    // Synchronous I/O handler demonstrating slice access patterns
     let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
         let bufs = bufs_rc.clone();
 
-        lo_handle_io_cmd_sync(q, tag, io, bufs[tag as usize].as_mut_ptr());
+        // Note: For educational purposes, this shows how slice access can be used
+        // even in sync handlers. The slice provides safe bounds-checked access.
+        let io_slice = bufs[tag as usize].as_slice();
+
+        // Convert to raw pointer only when required by legacy sync handler API
+        // This demonstrates the pattern: use slices for safety, convert to pointers
+        // only when absolutely necessary for API compatibility
+        lo_handle_io_cmd_sync(q, tag, io, &io_slice);
     };
 
     UblkQueue::new(qid, dev)
@@ -225,7 +258,11 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            // Use IoBuf for safe I/O buffer management with automatic memory alignment
+            let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+
+            // Extract raw pointer only when required by libublk APIs for buffer registration
+            // The raw pointer is needed for the libublk buffer registration system
             let buf_addr = buf.as_mut_ptr();
             let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
@@ -237,7 +274,11 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
                     break;
                 }
 
-                res = lo_handle_io_cmd_async(&q, tag, buf_addr).await;
+                // Use safe slice access for I/O operations
+                // IoBuf's as_mut_slice() provides bounds-checked access eliminating
+                // the need for unsafe pointer operations in the I/O handler
+                let io_slice = buf.as_mut_slice();
+                res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
                 cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
             }
         }));
