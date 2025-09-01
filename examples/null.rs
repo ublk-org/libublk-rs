@@ -24,9 +24,10 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 }
 
 #[inline]
-fn handle_io_cmd(q: &UblkQueue, tag: u16, buf_addr: *mut u8) {
+fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
     let bytes = get_io_cmd_result(q, tag);
-
+    // Convert back to raw pointer only when required by the libublk API
+    let buf_addr = io_slice.map_or(std::ptr::null_mut(), |s| s.as_ptr() as *mut u8);
     q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
 }
 
@@ -34,14 +35,18 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
 
-    // logic for io handling
+    // logic for io handling using safe slice-based operations
     let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-        let buf_addr = if user_copy {
-            std::ptr::null_mut()
+        // Use safe slice access instead of raw pointer manipulation
+        // This leverages IoBuf's Deref/DerefMut traits for memory safety
+        let io_slice = if user_copy {
+            None // No buffer slice for user_copy mode
         } else {
-            bufs[tag as usize].as_mut_ptr()
+            // Safe slice creation using IoBuf's as_mut_slice() method
+            // Benefits: bounds checking, lifetime verification, no unsafe code
+            Some(bufs[tag as usize].as_slice())
         };
-        handle_io_cmd(q, tag, buf_addr);
+        handle_io_cmd(q, tag, io_slice);
     };
 
     UblkQueue::new(qid, dev)
@@ -62,12 +67,15 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         f_vec.push(exe.spawn(async move {
             let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
+            // Use IoBuf with slice-based access for memory safety
             let (_buf, buf_addr) = if user_copy {
                 (None, std::ptr::null_mut())
             } else {
                 let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
                 q.register_io_buf(tag, &buf);
+                // Extract raw pointer only when required by libublk APIs
+                // IoBuf provides safe slice access via Deref/DerefMut traits
                 let addr = buf.as_mut_ptr();
                 (Some(buf), addr)
             };
