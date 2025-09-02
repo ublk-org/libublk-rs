@@ -1266,6 +1266,86 @@ impl UblkQueue<'_> {
         }
         self
     }
+
+    /// Submit all commands for fetching IO using unified buffer descriptor list
+    ///
+    /// # Arguments:
+    ///
+    /// * `buf_desc_list`: unified buffer descriptor list supporting both traditional and zero-copy operations
+    ///
+    /// # Returns:
+    ///
+    /// * `Ok(Self)` - Queue instance for method chaining
+    /// * `Err(UblkError)` - Error if buffer descriptor list is incompatible with device capabilities
+    ///
+    /// This unified method provides a single API for submitting fetch commands with both
+    /// buffer slice lists and auto buffer registration lists. It dispatches to the appropriate
+    /// existing method based on the buffer descriptor list variant while maintaining zero-cost
+    /// abstraction principles.
+    ///
+    /// # Buffer Descriptor List Compatibility:
+    ///
+    /// * `BufDescList::Slices` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
+    /// * `BufDescList::AutoRegs` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
+    ///
+    /// Only called during queue initialization. After queue is setup,
+    /// COMMIT_AND_FETCH_REQ command is used for both committing io command
+    /// result and fetching new incoming IO.
+    ///
+    /// # Usage Example:
+    ///
+    /// ```no_run
+    /// # use libublk::io::{BufDescList, UblkQueue};
+    /// # use libublk::helpers::IoBuf;
+    /// # use libublk::sys;
+    /// # fn example(queue: UblkQueue) -> Result<UblkQueue, libublk::UblkError> {
+    /// // For traditional buffer operations
+    /// let mut bufs = Vec::new();
+    /// for _ in 0..queue.get_depth() {
+    ///     bufs.push(IoBuf::<u8>::new(4096));
+    /// }
+    /// let slice_list = BufDescList::Slices(Some(&bufs));
+    /// let queue = queue.submit_fetch_commands_unified(slice_list)?;
+    ///
+    /// // For zero-copy operations
+    /// let auto_regs: Vec<sys::ublk_auto_buf_reg> = (0..queue.get_depth())
+    ///     .map(|i| sys::ublk_auto_buf_reg {
+    ///         index: i as u16,
+    ///         flags: 0,
+    ///         reserved0: 0,
+    ///         reserved1: 0,
+    ///     })
+    ///     .collect();
+    /// let auto_list = BufDescList::AutoRegs(&auto_regs);
+    /// let queue = queue.submit_fetch_commands_unified(auto_list)?;
+    /// # Ok(queue)
+    /// # }
+    /// ```
+    #[inline]
+    pub fn submit_fetch_commands_unified(
+        self,
+        buf_desc_list: BufDescList,
+    ) -> Result<Self, UblkError> {
+        // Validate and dispatch based on buffer descriptor list variant
+        let result = match buf_desc_list {
+            BufDescList::Slices(slice_opt) => {
+                // Dispatch to existing submit_fetch_commands method
+                Ok(self.submit_fetch_commands(slice_opt))
+            }
+            BufDescList::AutoRegs(auto_reg_slice) => {
+                // AutoReg operations require UBLK_F_AUTO_BUF_REG
+                if (self.dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0 {
+                    return Err(UblkError::OtherError(-libc::ENOTSUP));
+                }
+
+                // Dispatch to existing submit_fetch_commands_with_auto_buf_reg method
+                Ok(self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice))
+            }
+        };
+
+        result
+    }
+
     fn __submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as u16) as u64;

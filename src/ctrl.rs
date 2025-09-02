@@ -1859,6 +1859,7 @@ mod tests {
             Ok(())
         };
         let q_fn = move |qid: u16, dev: &UblkDev| {
+            use crate::BufDescList;
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
 
@@ -1874,7 +1875,7 @@ mod tests {
             UblkQueue::new(qid, dev)
                 .unwrap()
                 .regiser_io_bufs(Some(&bufs))
-                .submit_fetch_commands(Some(&bufs))
+                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap()
                 .wait_and_handle_io(io_handler);
         };
 

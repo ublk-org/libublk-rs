@@ -1,7 +1,7 @@
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, BufDescList};
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, UblkFlags, UblkIORes, BufDesc};
 use std::rc::Rc;
@@ -60,7 +60,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
-        .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
+        .submit_fetch_commands_unified(BufDescList::Slices(if user_copy { None } else { Some(&bufs_rc) })).unwrap()
         .wait_and_handle_io(io_handler);
 }
 

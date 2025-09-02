@@ -4,7 +4,7 @@ use clap::{Arg, ArgAction, Command};
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, BufDescList};
 use libublk::uring_async::ublk_wait_and_handle_ios;
 use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes, BufDesc};
 use serde::Serialize;
@@ -245,7 +245,7 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands(Some(&bufs))
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap()
         .wait_and_handle_io(lo_io_handler);
 }
 
