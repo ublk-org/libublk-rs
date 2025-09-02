@@ -359,7 +359,6 @@ mod integration {
         __test_ublk_null_zc(true, false); //io failure in case that bad buf idx and no fallback
     }
 
-
     fn ublk_ramdisk_tester(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
         let dev_path = ctrl.get_bdev_path();
 
@@ -385,12 +384,22 @@ mod integration {
     }
 
     fn __test_ublk_ramdisk(dev_flags: UblkFlags) {
-        // async function to handle individual I/O commands
-        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16, dev_addr: u64, buf_addr: *mut u8) -> i32 {
+        // async function to handle individual I/O commands using slice operations for safe buffer access
+        async fn handle_io_cmd(
+            q: &UblkQueue<'_>,
+            tag: u16,
+            ramdisk_addr: usize,
+            io_buf: &mut [u8],
+        ) -> i32 {
             let iod = q.get_iod(tag);
-            let off = (iod.start_sector << 9) as u64;
-            let bytes = (iod.nr_sectors << 9) as u32;
+            let off = (iod.start_sector << 9) as usize;
+            let bytes = (iod.nr_sectors << 9) as usize;
             let op = iod.op_flags & 0xff;
+
+            // Ensure we don't read/write beyond buffer boundaries
+            if bytes > io_buf.len() {
+                return -libc::EINVAL;
+            }
 
             match op {
                 sys::UBLK_IO_OP_FLUSH => {
@@ -398,24 +407,22 @@ mod integration {
                     bytes as i32
                 }
                 sys::UBLK_IO_OP_READ => {
-                    // For read operations, copy data from ramdisk to buffer
+                    // For read operations, copy data from ramdisk to I/O buffer using safe slice operations
+                    // Create a safe slice from the ramdisk memory for the read operation
                     unsafe {
-                        libc::memcpy(
-                            buf_addr as *mut libc::c_void,
-                            (dev_addr + off) as *mut libc::c_void,
-                            bytes as usize,
-                        );
+                        let ramdisk_slice =
+                            std::slice::from_raw_parts((ramdisk_addr + off) as *const u8, bytes);
+                        io_buf[..bytes].copy_from_slice(ramdisk_slice);
                     }
                     bytes as i32
                 }
                 sys::UBLK_IO_OP_WRITE => {
-                    // For write operations, copy data from buffer to ramdisk
+                    // For write operations, copy data from I/O buffer to ramdisk using safe slice operations
+                    // Create a safe slice from the ramdisk memory for the write operation
                     unsafe {
-                        libc::memcpy(
-                            (dev_addr + off) as *mut libc::c_void,
-                            buf_addr as *mut libc::c_void,
-                            bytes as usize,
-                        );
+                        let ramdisk_slice =
+                            std::slice::from_raw_parts_mut((ramdisk_addr + off) as *mut u8, bytes);
+                        ramdisk_slice.copy_from_slice(&io_buf[..bytes]);
                     }
                     bytes as i32
                 }
@@ -427,8 +434,8 @@ mod integration {
         }
 
         let size = 32_u64 << 20;
-        let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
-        let dev_addr = buf.as_mut_ptr() as u64;
+        let ramdisk_buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
+        let ramdisk_addr = ramdisk_buf.as_mut_ptr() as usize;
         let depth = 128;
         let ctrl = UblkCtrlBuilder::default()
             .name("ramdisk")
@@ -471,7 +478,7 @@ mod integration {
 
                 f_vec.push(exe.spawn(async move {
                     let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
-                    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+                    let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
                     let mut res = 0;
 
                     q.register_io_buf(tag, &buf);
@@ -481,7 +488,7 @@ mod integration {
                             break;
                         }
 
-                        res = handle_io_cmd(&q, tag, dev_addr, buf.as_mut_ptr()).await;
+                        res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
                         cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
                     }
                 }));
