@@ -28,6 +28,77 @@ pub enum BufDesc<'a> {
     AutoReg(sys::ublk_auto_buf_reg),
 }
 
+impl<'a> BufDesc<'a> {
+    /// Validate buffer descriptor compatibility with device capabilities
+    ///
+    /// # Arguments
+    ///
+    /// * `device_flags`: Device flags from `dev_info.flags`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the buffer descriptor is compatible with device capabilities
+    /// * `Err(UblkError::OtherError(-libc::ENOTSUP))` if the buffer type is not supported
+    /// * `Err(UblkError::OtherError(-libc::EINVAL))` if the configuration is invalid
+    ///
+    /// # Validation Rules
+    ///
+    /// * `BufDesc::Slice` requires either no special flags or `UBLK_F_USER_COPY`
+    /// * `BufDesc::AutoReg` requires `UBLK_F_AUTO_BUF_REG` to be enabled
+    /// * `UBLK_F_AUTO_BUF_REG` and `UBLK_F_USER_COPY` cannot be used together
+    #[inline]
+    pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
+        let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+        let has_user_copy = (device_flags & sys::UBLK_F_USER_COPY as u64) != 0;
+
+        // Check for invalid flag combination
+        if has_auto_buf_reg && has_user_copy {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
+        match self {
+            BufDesc::Slice(_) => {
+                // Slice operations are compatible with:
+                // 1. No special flags (traditional buffer management)
+                // 2. UBLK_F_USER_COPY (kernel handles copying)
+                // They are NOT compatible with UBLK_F_AUTO_BUF_REG alone
+                if has_auto_buf_reg && !has_user_copy {
+                    Err(UblkError::OtherError(-libc::ENOTSUP))
+                } else {
+                    Ok(())
+                }
+            }
+            BufDesc::AutoReg(_) => {
+                // AutoReg operations require UBLK_F_AUTO_BUF_REG
+                if has_auto_buf_reg {
+                    Ok(())
+                } else {
+                    Err(UblkError::OtherError(-libc::ENOTSUP))
+                }
+            }
+        }
+    }
+
+    /// Create a BufDesc from an IoBuf for migration compatibility
+    ///
+    /// # Arguments
+    ///
+    /// * `io_buf`: Reference to an IoBuf instance
+    ///
+    /// # Returns
+    ///
+    /// A `BufDesc::Slice` containing a reference to the IoBuf's data
+    ///
+    /// This helper method facilitates migration from existing IoBuf-based code
+    /// to the new unified buffer descriptor system while maintaining zero-cost
+    /// abstraction principles.
+    #[inline]
+    pub fn from_io_buf(io_buf: &'a IoBuf<u8>) -> Self {
+        BufDesc::Slice(io_buf.as_slice())
+    }
+
+}
+
 #[derive(Debug)]
 pub enum BufDescList<'a> {
     /// List of IoBuf for traditional buffer management
@@ -1579,8 +1650,8 @@ impl UblkQueue<'_> {
 #[cfg(test)]
 mod tests {
     use crate::ctrl::UblkCtrlBuilder;
-    use crate::io::{UblkDev, UblkQueue};
-    use crate::{UblkError, UblkFlags};
+    use crate::io::{BufDesc, UblkDev, UblkQueue};
+    use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
 
     fn __submit_uring_nop(ring: &mut IoUring<io_uring::squeue::Entry>) -> Result<usize, UblkError> {
@@ -1618,5 +1689,68 @@ mod tests {
         };
 
         UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+    }
+
+    #[test]
+    fn test_buf_desc_validation() {
+        let buffer = [0u8; 1024];
+        let slice_desc = BufDesc::Slice(&buffer);
+        let auto_reg_desc = BufDesc::AutoReg(sys::ublk_auto_buf_reg {
+            index: 0,
+            flags: 0,
+            reserved0: 0,
+            reserved1: 0,
+        });
+
+        // Test with no special flags (traditional buffer management)
+        let no_flags = 0u64;
+        assert!(slice_desc.validate_compatibility(no_flags).is_ok());
+        assert!(auto_reg_desc.validate_compatibility(no_flags).is_err());
+
+        // Test with UBLK_F_USER_COPY
+        let user_copy_flags = sys::UBLK_F_USER_COPY as u64;
+        assert!(slice_desc.validate_compatibility(user_copy_flags).is_ok());
+        assert!(auto_reg_desc.validate_compatibility(user_copy_flags).is_err());
+
+        // Test with UBLK_F_AUTO_BUF_REG
+        let auto_buf_reg_flags = sys::UBLK_F_AUTO_BUF_REG as u64;
+        assert!(slice_desc.validate_compatibility(auto_buf_reg_flags).is_err());
+        assert!(auto_reg_desc.validate_compatibility(auto_buf_reg_flags).is_ok());
+
+        // Test invalid combination of both flags
+        let invalid_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
+        assert!(slice_desc.validate_compatibility(invalid_flags).is_err());
+        assert!(auto_reg_desc.validate_compatibility(invalid_flags).is_err());
+
+        // Verify specific error codes
+        match slice_desc.validate_compatibility(auto_buf_reg_flags) {
+            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::ENOTSUP),
+            _ => panic!("Expected ENOTSUP error"),
+        }
+
+        match slice_desc.validate_compatibility(invalid_flags) {
+            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::EINVAL),
+            _ => panic!("Expected EINVAL error"),
+        }
+    }
+
+    #[test]
+    fn test_buf_desc_helpers() {
+        use crate::helpers::IoBuf;
+
+        let buffer = [0u8; 1024];
+        let _slice_desc = BufDesc::Slice(&buffer);
+
+        // Test AutoReg variant
+        let _auto_reg_desc = BufDesc::AutoReg(sys::ublk_auto_buf_reg {
+            index: 0,
+            flags: 0,
+            reserved0: 0,
+            reserved1: 0,
+        });
+
+        // Test from_io_buf helper
+        let io_buf = IoBuf::<u8>::new(512);
+        let _desc_from_io_buf = BufDesc::from_io_buf(&io_buf);
     }
 }
