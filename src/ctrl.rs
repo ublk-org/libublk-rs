@@ -1869,13 +1869,15 @@ mod tests {
                 let bufs = bufs_rc.clone();
                 let buf_addr = bufs[tag as usize].as_mut_ptr();
 
+                #[allow(deprecated)]
                 q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
             UblkQueue::new(qid, dev)
                 .unwrap()
                 .regiser_io_bufs(Some(&bufs))
-                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap()
+                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
+                .unwrap()
                 .wait_and_handle_io(io_handler);
         };
 

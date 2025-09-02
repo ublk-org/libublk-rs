@@ -1021,6 +1021,8 @@ impl UblkQueue<'_> {
 
     /// Submit one io command.
     ///
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_cmd_unified`] instead.
+    ///
     /// When it is called 1st time on this tag, the `cmd_op` has to be
     /// UBLK_U_IO_FETCH_REQ, otherwise it is UBLK_U_IO_COMMIT_AND_FETCH_REQ.
     ///
@@ -1032,6 +1034,7 @@ impl UblkQueue<'_> {
     ///
     /// In case of zoned, `buf_addr` can be the returned LBA for zone append
     /// command.
+    #[deprecated(since = "0.8.0", note = "Use `submit_io_cmd_unified` instead")]
     #[inline]
     pub fn submit_io_cmd(
         &self,
@@ -1058,9 +1061,12 @@ impl UblkQueue<'_> {
 
     /// Submit io command with auto buffer registration support
     ///
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_cmd_unified`] instead.
+    ///
     /// For UBLK_F_AUTO_BUF_REG, the buffer index and flags are passed via buf_reg_data.
     /// When auto buffer registration is enabled, buf_addr should be set to the encoded
     /// auto buffer registration data instead of the actual buffer address.
+    #[deprecated(since = "0.8.0", note = "Use `submit_io_cmd_unified` instead")]
     #[inline]
     pub fn submit_io_cmd_with_auto_buf_reg(
         &self,
@@ -1152,19 +1158,23 @@ impl UblkQueue<'_> {
                 } else {
                     slice.as_ptr() as *mut u8
                 };
+                #[allow(deprecated)]
                 self.submit_io_cmd(tag, cmd_op, buf_addr, result)
             }
             BufDesc::AutoReg(buf_reg_data) => {
                 // For auto buffer registration, use the specialized method
+                #[allow(deprecated)]
                 self.submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &buf_reg_data, result)
             }
             BufDesc::ZonedAppendLba(lba) => {
                 // For zoned append LBA, pass the LBA value as the buffer address
+                #[allow(deprecated)]
                 self.submit_io_cmd(tag, cmd_op, lba as *mut u8, result)
             }
             BufDesc::RawAddress(addr) => {
                 // For raw address operations, use the address directly
                 // SAFETY: The caller is responsible for ensuring the address is valid
+                #[allow(deprecated)]
                 self.submit_io_cmd(tag, cmd_op, addr as *mut u8, result)
             }
         };
@@ -1264,9 +1274,12 @@ impl UblkQueue<'_> {
 
     /// Submit all commands for fetching IO
     ///
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_fetch_commands_unified`] instead.
+    ///
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
+    #[deprecated(since = "0.8.0", note = "Use `submit_fetch_commands_unified` instead")]
     pub fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
         for i in 0..self.q_depth {
             let buf_addr = match bufs {
@@ -1291,6 +1304,8 @@ impl UblkQueue<'_> {
 
     /// Submit all commands for fetching IO with auto buffer registration
     ///
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_fetch_commands_unified`] instead.
+    ///
     /// # Arguments:
     ///
     /// * `buf_reg_data_list`: Array of auto buffer registration data for each tag
@@ -1300,6 +1315,7 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO.
+    #[deprecated(since = "0.8.0", note = "Use `submit_fetch_commands_unified` instead")]
     pub fn submit_fetch_commands_with_auto_buf_reg(
         self,
         buf_reg_data_list: &[sys::ublk_auto_buf_reg],
@@ -1394,6 +1410,7 @@ impl UblkQueue<'_> {
         let result = match buf_desc_list {
             BufDescList::Slices(slice_opt) => {
                 // Dispatch to existing submit_fetch_commands method
+                #[allow(deprecated)]
                 Ok(self.submit_fetch_commands(slice_opt))
             }
             BufDescList::AutoRegs(auto_reg_slice) => {
@@ -1403,6 +1420,7 @@ impl UblkQueue<'_> {
                 }
 
                 // Dispatch to existing submit_fetch_commands_with_auto_buf_reg method
+                #[allow(deprecated)]
                 Ok(self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice))
             }
         };
@@ -1425,6 +1443,8 @@ impl UblkQueue<'_> {
 
     /// Complete one io command
     ///
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::complete_io_cmd_unified`] instead.
+    ///
     /// # Arguments:
     ///
     /// * `tag`: io command tag
@@ -1432,6 +1452,7 @@ impl UblkQueue<'_> {
     ///
     /// When calling this API, target code has to make sure that q_ring
     /// won't be borrowed.
+    #[deprecated(since = "0.8.0", note = "Use `complete_io_cmd_unified` instead")]
     #[inline]
     pub fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
         let r = &mut self.q_ring.borrow_mut();
@@ -1483,6 +1504,8 @@ impl UblkQueue<'_> {
 
     /// Complete one io command with auto buffer registration
     ///
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::complete_io_cmd_unified`] instead.
+    ///
     /// # Arguments:
     ///
     /// * `tag`: io command tag
@@ -1492,6 +1515,7 @@ impl UblkQueue<'_> {
     /// This method supports zero-copy operations when UBLK_F_AUTO_BUF_REG is enabled.
     /// The buffer is automatically registered using the provided registration data.
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
+    #[deprecated(since = "0.8.0", note = "Use `complete_io_cmd_unified` instead")]
     #[inline]
     pub fn complete_io_cmd_with_auto_buf_reg(
         &self,
@@ -1586,22 +1610,26 @@ impl UblkQueue<'_> {
                 } else {
                     slice.as_ptr() as *mut u8
                 };
+                #[allow(deprecated)]
                 self.complete_io_cmd(tag, buf_addr, res);
                 Ok(())
             }
             BufDesc::AutoReg(buf_reg_data) => {
                 // For auto buffer registration, use the specialized method
+                #[allow(deprecated)]
                 self.complete_io_cmd_with_auto_buf_reg(tag, &buf_reg_data, res);
                 Ok(())
             }
             BufDesc::ZonedAppendLba(lba) => {
                 // For zoned append LBA, pass the LBA value as the buffer address
+                #[allow(deprecated)]
                 self.complete_io_cmd(tag, lba as *mut u8, res);
                 Ok(())
             }
             BufDesc::RawAddress(addr) => {
                 // For raw address operations, use the address directly
                 // SAFETY: The caller is responsible for ensuring the address is valid
+                #[allow(deprecated)]
                 self.complete_io_cmd(tag, addr as *mut u8, res);
                 Ok(())
             }
@@ -2023,8 +2051,12 @@ mod tests {
         // Test RawAddress variant (should be compatible with all configurations)
         let raw_addr_desc = BufDesc::RawAddress(buffer.as_ptr());
         assert!(raw_addr_desc.validate_compatibility(no_flags).is_ok());
-        assert!(raw_addr_desc.validate_compatibility(user_copy_flags).is_ok());
-        assert!(raw_addr_desc.validate_compatibility(auto_buf_reg_flags).is_ok());
+        assert!(raw_addr_desc
+            .validate_compatibility(user_copy_flags)
+            .is_ok());
+        assert!(raw_addr_desc
+            .validate_compatibility(auto_buf_reg_flags)
+            .is_ok());
 
         // Test invalid combination of both flags
         let invalid_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
@@ -2061,7 +2093,7 @@ mod tests {
         // Test from_io_buf helper
         let io_buf = IoBuf::<u8>::new(512);
         let _desc_from_io_buf = BufDesc::from_io_buf(&io_buf);
-        
+
         // Test RawAddress variant
         let _raw_addr_desc = BufDesc::RawAddress(buffer.as_ptr());
     }
