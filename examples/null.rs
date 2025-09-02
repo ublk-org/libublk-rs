@@ -3,7 +3,7 @@ use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, UblkFlags, UblkIORes, BufDesc};
 use std::rc::Rc;
 
 bitflags! {
@@ -26,9 +26,17 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 #[inline]
 fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
     let bytes = get_io_cmd_result(q, tag);
-    // Convert back to raw pointer only when required by the libublk API
-    let buf_addr = io_slice.map_or(std::ptr::null_mut(), |s| s.as_ptr() as *mut u8);
-    q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+    
+    // Use unified buffer API - choose appropriate buffer descriptor based on mode
+    let buf_desc = if let Some(slice) = io_slice {
+        BufDesc::Slice(slice)
+    } else {
+        // For user_copy mode, create an empty slice since no buffer is needed
+        BufDesc::Slice(&[])
+    };
+    
+    q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+        .unwrap();
 }
 
 fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {

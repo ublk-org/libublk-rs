@@ -6,7 +6,7 @@ use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes, BufDesc};
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -198,22 +198,22 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, io_slice: &
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd(
+            q.complete_io_cmd_unified(
                 tag,
-                io_slice.as_ptr() as *mut u8,
+                BufDesc::Slice(io_slice),
                 Ok(UblkIORes::Result(res)),
-            );
+            ).unwrap();
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd(
+        q.complete_io_cmd_unified(
             tag,
-            io_slice.as_ptr() as *mut u8,
+            BufDesc::Slice(io_slice),
             Ok(UblkIORes::Result(res)),
-        );
+        ).unwrap();
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
