@@ -26,6 +26,13 @@ pub enum BufDesc<'a> {
     /// access userspace buffers without copying. Requires devices with
     /// `UBLK_F_AUTO_BUF_REG` enabled for optimal performance.
     AutoReg(sys::ublk_auto_buf_reg),
+
+    /// Zoned append LBA for zoned storage operations
+    ///
+    /// Contains a zoned append LBA value for `UBLK_F_ZONED` devices.
+    /// Only used for zone append operations and passed through the `addr` field
+    /// of `ublksrv_io_desc` when using `submit_io_cmd_unified()` or `complete_io_cmd_unified()`.
+    ZonedAppendLba(u64),
 }
 
 impl<'a> BufDesc<'a> {
@@ -45,11 +52,13 @@ impl<'a> BufDesc<'a> {
     ///
     /// * `BufDesc::Slice` requires either no special flags or `UBLK_F_USER_COPY`
     /// * `BufDesc::AutoReg` requires `UBLK_F_AUTO_BUF_REG` to be enabled
+    /// * `BufDesc::ZonedAppendLba` requires `UBLK_F_ZONED` to be enabled
     /// * `UBLK_F_AUTO_BUF_REG` and `UBLK_F_USER_COPY` cannot be used together
     #[inline]
     pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
         let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
         let has_user_copy = (device_flags & sys::UBLK_F_USER_COPY as u64) != 0;
+        let has_zoned = (device_flags & sys::UBLK_F_ZONED as u64) != 0;
 
         // Check for invalid flag combination
         if has_auto_buf_reg && has_user_copy {
@@ -71,6 +80,14 @@ impl<'a> BufDesc<'a> {
             BufDesc::AutoReg(_) => {
                 // AutoReg operations require UBLK_F_AUTO_BUF_REG
                 if has_auto_buf_reg {
+                    Ok(())
+                } else {
+                    Err(UblkError::OtherError(-libc::ENOTSUP))
+                }
+            }
+            BufDesc::ZonedAppendLba(_) => {
+                // ZonedAppendLba operations require UBLK_F_ZONED
+                if has_zoned {
                     Ok(())
                 } else {
                     Err(UblkError::OtherError(-libc::ENOTSUP))
@@ -1103,6 +1120,10 @@ impl UblkQueue<'_> {
                 // For auto buffer registration, use the specialized method
                 self.submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &buf_reg_data, result)
             }
+            BufDesc::ZonedAppendLba(lba) => {
+                // For zoned append LBA, pass the LBA value as the buffer address
+                self.submit_io_cmd(tag, cmd_op, lba as *mut u8, result)
+            }
         };
 
         Ok(future)
@@ -1527,6 +1548,11 @@ impl UblkQueue<'_> {
             BufDesc::AutoReg(buf_reg_data) => {
                 // For auto buffer registration, use the specialized method
                 self.complete_io_cmd_with_auto_buf_reg(tag, &buf_reg_data, res);
+                Ok(())
+            }
+            BufDesc::ZonedAppendLba(lba) => {
+                // For zoned append LBA, pass the LBA value as the buffer address
+                self.complete_io_cmd(tag, lba as *mut u8, res);
                 Ok(())
             }
         }
