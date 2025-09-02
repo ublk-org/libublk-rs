@@ -2,10 +2,10 @@
 mod integration {
     use io_uring::opcode;
     use libublk::helpers::IoBuf;
-    use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
     use libublk::override_sqe;
     use libublk::uring_async::ublk_wait_and_handle_ios;
-    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkFlags, UblkIORes};
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkFlags, UblkIORes};
     use std::env;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -91,17 +91,23 @@ mod integration {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
 
-                let buf_addr = if user_copy {
-                    std::ptr::null_mut()
+                let buf_desc = if user_copy {
+                    BufDesc::Slice(&[]) // Empty slice for user_copy mode
                 } else {
-                    bufs[tag as usize].as_mut_ptr()
+                    BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+                    .unwrap();
             };
 
             UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
+                .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
+                    None
+                } else {
+                    Some(&bufs_rc)
+                }))
+                .unwrap()
                 .wait_and_handle_io(io_handler);
         }
 
@@ -123,19 +129,24 @@ mod integration {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
 
-                let buf_addr = if user_copy {
-                    std::ptr::null_mut()
+                let buf_desc = if user_copy {
+                    BufDesc::Slice(&[]) // Empty slice for user_copy mode
                 } else {
-                    bufs[tag as usize].as_mut_ptr()
+                    BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
 
                 let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)])));
-                q.complete_io_cmd(tag, buf_addr, res);
+                q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
             };
 
             UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
+                .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
+                    None
+                } else {
+                    Some(&bufs_rc)
+                }))
+                .unwrap()
                 .wait_and_handle_io(io_handler);
         }
 
@@ -207,7 +218,10 @@ mod integration {
 
                     q.register_io_buf(tag, &buf);
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+                        let cmd_res = q
+                            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
+                            .unwrap()
+                            .await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -310,7 +324,8 @@ mod integration {
 
                     loop {
                         let cmd_res = q
-                            .submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &auto_buf_reg, res)
+                            .submit_io_cmd_unified(tag, cmd_op, BufDesc::AutoReg(auto_buf_reg), res)
+                            .unwrap()
                             .await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
@@ -483,7 +498,10 @@ mod integration {
 
                     q.register_io_buf(tag, &buf);
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+                        let cmd_res = q
+                            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
+                            .unwrap()
+                            .await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -534,18 +552,22 @@ mod integration {
                     }
                 }
 
-                let buf_addr = if user_copy {
-                    std::ptr::null_mut()
+                let buf_desc = if user_copy {
+                    BufDesc::Slice(&[]) // Empty slice for user_copy mode
                 } else {
-                    let bufs = bufs_rc.clone();
-                    bufs[tag as usize].as_mut_ptr()
+                    BufDesc::Slice(bufs_rc[tag as usize].as_slice())
                 };
-                q.complete_io_cmd(tag, buf_addr, res);
+                q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
             };
 
             UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands(if user_copy { None } else { Some(&bufs) })
+                .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
+                    None
+                } else {
+                    Some(&bufs)
+                }))
+                .unwrap()
                 .wait_and_handle_io(io_handler);
         }
 
@@ -704,17 +726,23 @@ mod integration {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
 
-                let buf_addr = if user_copy {
-                    std::ptr::null_mut()
+                let buf_desc = if user_copy {
+                    BufDesc::Slice(&[]) // Empty slice for user_copy mode
                 } else {
-                    bufs[tag as usize].as_mut_ptr()
+                    BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+                    .unwrap();
             };
 
             UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
+                .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
+                    None
+                } else {
+                    Some(&bufs_rc)
+                }))
+                .unwrap()
                 .wait_and_handle_io(io_handler);
         }
 
@@ -799,18 +827,19 @@ mod integration {
                     ..Default::default()
                 };
 
-                // Use the new complete_io_cmd_with_auto_buf_reg API
-                q.complete_io_cmd_with_auto_buf_reg(
+                // Use the unified complete_io_cmd_unified API with auto buffer registration
+                q.complete_io_cmd_unified(
                     tag,
-                    &auto_buf_reg,
+                    BufDesc::AutoReg(auto_buf_reg),
                     Ok(UblkIORes::Result(bytes)),
-                );
+                )
+                .unwrap();
             };
 
-            // Use the new submit_fetch_commands_with_auto_buf_reg API
             UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands_with_auto_buf_reg(&buf_reg_data_list)
+                .submit_fetch_commands_unified(BufDescList::AutoRegs(&buf_reg_data_list))
+                .unwrap()
                 .wait_and_handle_io(io_handler);
         };
 

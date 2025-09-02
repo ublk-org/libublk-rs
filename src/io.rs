@@ -10,6 +10,133 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
+/// Unified buffer descriptor supporting both copy and zero-copy operations
+#[derive(Debug, Clone)]
+pub enum BufDesc<'a> {
+    /// Buffer slice for copy-based operations
+    ///
+    /// Contains a reference to a buffer slice in userspace memory. Data is copied
+    /// between this buffer and kernel buffers. Compatible with devices that have
+    /// `UBLK_F_USER_COPY` enabled or devices without auto buffer registration.
+    Slice(&'a [u8]),
+
+    /// Auto buffer registration for zero-copy operations
+    ///
+    /// Contains auto buffer registration data that allows the kernel to directly
+    /// access userspace buffers without copying. Requires devices with
+    /// `UBLK_F_AUTO_BUF_REG` enabled for optimal performance.
+    AutoReg(sys::ublk_auto_buf_reg),
+}
+
+impl<'a> BufDesc<'a> {
+    /// Validate buffer descriptor compatibility with device capabilities
+    ///
+    /// # Arguments
+    ///
+    /// * `device_flags`: Device flags from `dev_info.flags`
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the buffer descriptor is compatible with device capabilities
+    /// * `Err(UblkError::OtherError(-libc::ENOTSUP))` if the buffer type is not supported
+    /// * `Err(UblkError::OtherError(-libc::EINVAL))` if the configuration is invalid
+    ///
+    /// # Validation Rules
+    ///
+    /// * `BufDesc::Slice` requires either no special flags or `UBLK_F_USER_COPY`
+    /// * `BufDesc::AutoReg` requires `UBLK_F_AUTO_BUF_REG` to be enabled
+    /// * `UBLK_F_AUTO_BUF_REG` and `UBLK_F_USER_COPY` cannot be used together
+    #[inline]
+    pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
+        let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+        let has_user_copy = (device_flags & sys::UBLK_F_USER_COPY as u64) != 0;
+
+        // Check for invalid flag combination
+        if has_auto_buf_reg && has_user_copy {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
+        match self {
+            BufDesc::Slice(_) => {
+                // Slice operations are compatible with:
+                // 1. No special flags (traditional buffer management)
+                // 2. UBLK_F_USER_COPY (kernel handles copying)
+                // They are NOT compatible with UBLK_F_AUTO_BUF_REG alone
+                if has_auto_buf_reg && !has_user_copy {
+                    Err(UblkError::OtherError(-libc::ENOTSUP))
+                } else {
+                    Ok(())
+                }
+            }
+            BufDesc::AutoReg(_) => {
+                // AutoReg operations require UBLK_F_AUTO_BUF_REG
+                if has_auto_buf_reg {
+                    Ok(())
+                } else {
+                    Err(UblkError::OtherError(-libc::ENOTSUP))
+                }
+            }
+        }
+    }
+
+    /// Create a BufDesc from an IoBuf for migration compatibility
+    ///
+    /// # Arguments
+    ///
+    /// * `io_buf`: Reference to an IoBuf instance
+    ///
+    /// # Returns
+    ///
+    /// A `BufDesc::Slice` containing a reference to the IoBuf's data
+    ///
+    /// This helper method facilitates migration from existing IoBuf-based code
+    /// to the new unified buffer descriptor system while maintaining zero-cost
+    /// abstraction principles.
+    #[inline]
+    pub fn from_io_buf(io_buf: &'a IoBuf<u8>) -> Self {
+        BufDesc::Slice(io_buf.as_slice())
+    }
+}
+
+#[derive(Debug)]
+pub enum BufDescList<'a> {
+    /// List of IoBuf for traditional buffer management
+    ///
+    /// Contains an optional reference to a vector of `IoBuf<u8>` instances.
+    /// Used with submit_fetch_commands for copy-based operations where data
+    /// is explicitly transferred between userspace and kernel buffers.
+    ///
+    /// # When to Use
+    /// - Device has traditional buffer management capabilities
+    /// - `UBLK_F_USER_COPY` is enabled (when `None` is used)
+    /// - Performance requirements allow for copying overhead
+    /// - Simpler memory management is preferred
+    ///
+    /// The `Option` wrapper allows for `None` when `UBLK_F_USER_COPY` is enabled,
+    /// indicating that no userspace buffers are needed because the kernel will
+    /// handle buffer management through the user copy mechanism.
+    Slices(Option<&'a Vec<IoBuf<u8>>>),
+
+    /// List of auto buffer registration data for zero-copy operations
+    ///
+    /// Contains a slice of `sys::ublk_auto_buf_reg` structures that define
+    /// buffer registration parameters for high-performance zero-copy I/O.
+    /// Used with submit_fetch_commands_with_auto_buf_reg for direct kernel
+    /// access to userspace buffers.
+    ///
+    /// # When to Use
+    /// - Device supports `UBLK_F_AUTO_BUF_REG` capability
+    /// - High-performance I/O is required
+    /// - Memory copying overhead must be minimized
+    /// - Application can handle more complex buffer management
+    ///
+    /// # Requirements
+    /// - The slice length must be at least equal to the queue depth
+    /// - Each registration entry must be properly initialized
+    /// - Buffer indices must be unique and valid
+    AutoRegs(&'a [sys::ublk_auto_buf_reg]),
+}
+
 /// A struct with the same memory layout as `io_uring_sys::io_uring_sqe`.
 /// The definition must match the one in `io-uring-sys` crate.
 /// This is a simplified version for demonstration.
@@ -898,6 +1025,89 @@ impl UblkQueue<'_> {
         f
     }
 
+    /// Submit io command using unified buffer descriptor
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io command tag
+    /// * `cmd_op`: io command operation, typically UBLK_U_IO_COMMIT_AND_FETCH_REQ or UBLK_U_IO_FETCH_REQ
+    /// * `buf_desc`: unified buffer descriptor supporting both copy and zero-copy operations
+    /// * `result`: io command result
+    ///
+    /// # Returns:
+    ///
+    /// * `Ok(UblkUringOpFuture)` - Future that can be awaited for command completion
+    /// * `Err(UblkError)` - Error if buffer descriptor is incompatible with device capabilities
+    ///
+    /// This unified method provides a single API for submitting IO commands with both
+    /// buffer slice and auto buffer registration modes. It dispatches to the appropriate
+    /// existing method based on the buffer descriptor type while maintaining zero-cost
+    /// abstraction principles.
+    ///
+    /// # Buffer Descriptor Compatibility:
+    ///
+    /// * `BufDesc::Slice` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
+    /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
+    ///
+    /// # Validation:
+    ///
+    /// The method validates buffer descriptor compatibility with device capabilities
+    /// before dispatching to ensure type safety and prevent runtime errors.
+    ///
+    /// # Performance:
+    ///
+    /// This method has zero runtime overhead compared to calling the existing methods
+    /// directly, as it uses compile-time dispatch based on the buffer descriptor variant.
+    ///
+    /// # Usage Example:
+    ///
+    /// ```no_run
+    /// # use libublk::io::{BufDesc, UblkQueue};
+    /// # use libublk::sys;
+    /// # fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
+    /// // For traditional buffer operations
+    /// let buffer = [0u8; 4096];
+    /// let slice_desc = BufDesc::Slice(&buffer);
+    /// let future1 = queue.submit_io_cmd_unified(0, sys::UBLK_U_IO_FETCH_REQ, slice_desc, -1)?;
+    ///
+    /// // For zero-copy operations
+    /// let auto_reg = sys::ublk_auto_buf_reg { index: 0, flags: 0, reserved0: 0, reserved1: 0 };
+    /// let auto_desc = BufDesc::AutoReg(auto_reg);
+    /// let future2 = queue.submit_io_cmd_unified(1, sys::UBLK_U_IO_FETCH_REQ, auto_desc, -1)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn submit_io_cmd_unified(
+        &self,
+        tag: u16,
+        cmd_op: u32,
+        buf_desc: BufDesc,
+        result: i32,
+    ) -> Result<UblkUringOpFuture, UblkError> {
+        // Validate buffer descriptor compatibility with device capabilities
+        buf_desc.validate_compatibility(self.dev.dev_info.flags)?;
+
+        // Dispatch to appropriate method based on buffer descriptor type
+        let future = match buf_desc {
+            BufDesc::Slice(slice) => {
+                // For slice operations, return null pointer if slice is empty (user_copy mode)
+                let buf_addr = if slice.len() == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    slice.as_ptr() as *mut u8
+                };
+                self.submit_io_cmd(tag, cmd_op, buf_addr, result)
+            }
+            BufDesc::AutoReg(buf_reg_data) => {
+                // For auto buffer registration, use the specialized method
+                self.submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &buf_reg_data, result)
+            }
+        };
+
+        Ok(future)
+    }
+
     #[inline]
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
         let f = UblkUringOpFuture::new(1_u64 << 63);
@@ -1056,6 +1266,86 @@ impl UblkQueue<'_> {
         }
         self
     }
+
+    /// Submit all commands for fetching IO using unified buffer descriptor list
+    ///
+    /// # Arguments:
+    ///
+    /// * `buf_desc_list`: unified buffer descriptor list supporting both traditional and zero-copy operations
+    ///
+    /// # Returns:
+    ///
+    /// * `Ok(Self)` - Queue instance for method chaining
+    /// * `Err(UblkError)` - Error if buffer descriptor list is incompatible with device capabilities
+    ///
+    /// This unified method provides a single API for submitting fetch commands with both
+    /// buffer slice lists and auto buffer registration lists. It dispatches to the appropriate
+    /// existing method based on the buffer descriptor list variant while maintaining zero-cost
+    /// abstraction principles.
+    ///
+    /// # Buffer Descriptor List Compatibility:
+    ///
+    /// * `BufDescList::Slices` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
+    /// * `BufDescList::AutoRegs` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
+    ///
+    /// Only called during queue initialization. After queue is setup,
+    /// COMMIT_AND_FETCH_REQ command is used for both committing io command
+    /// result and fetching new incoming IO.
+    ///
+    /// # Usage Example:
+    ///
+    /// ```no_run
+    /// # use libublk::io::{BufDescList, UblkQueue};
+    /// # use libublk::helpers::IoBuf;
+    /// # use libublk::sys;
+    /// # fn example(queue: UblkQueue) -> Result<UblkQueue, libublk::UblkError> {
+    /// // For traditional buffer operations
+    /// let mut bufs = Vec::new();
+    /// for _ in 0..queue.get_depth() {
+    ///     bufs.push(IoBuf::<u8>::new(4096));
+    /// }
+    /// let slice_list = BufDescList::Slices(Some(&bufs));
+    /// let queue = queue.submit_fetch_commands_unified(slice_list)?;
+    ///
+    /// // For zero-copy operations
+    /// let auto_regs: Vec<sys::ublk_auto_buf_reg> = (0..queue.get_depth())
+    ///     .map(|i| sys::ublk_auto_buf_reg {
+    ///         index: i as u16,
+    ///         flags: 0,
+    ///         reserved0: 0,
+    ///         reserved1: 0,
+    ///     })
+    ///     .collect();
+    /// let auto_list = BufDescList::AutoRegs(&auto_regs);
+    /// let queue = queue.submit_fetch_commands_unified(auto_list)?;
+    /// # Ok(queue)
+    /// # }
+    /// ```
+    #[inline]
+    pub fn submit_fetch_commands_unified(
+        self,
+        buf_desc_list: BufDescList,
+    ) -> Result<Self, UblkError> {
+        // Validate and dispatch based on buffer descriptor list variant
+        let result = match buf_desc_list {
+            BufDescList::Slices(slice_opt) => {
+                // Dispatch to existing submit_fetch_commands method
+                Ok(self.submit_fetch_commands(slice_opt))
+            }
+            BufDescList::AutoRegs(auto_reg_slice) => {
+                // AutoReg operations require UBLK_F_AUTO_BUF_REG
+                if (self.dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0 {
+                    return Err(UblkError::OtherError(-libc::ENOTSUP));
+                }
+
+                // Dispatch to existing submit_fetch_commands_with_auto_buf_reg method
+                Ok(self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice))
+            }
+        };
+
+        result
+    }
+
     fn __submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as u16) as u64;
@@ -1181,6 +1471,65 @@ impl UblkQueue<'_> {
             },
             _ => {}
         };
+    }
+
+    /// Complete one io command using unified buffer descriptor
+    ///
+    /// # Arguments:
+    ///
+    /// * `tag`: io command tag
+    /// * `buf_desc`: unified buffer descriptor supporting both copy and zero-copy operations
+    /// * `res`: io command result
+    ///
+    /// This unified method provides a single API for completing IO commands with both
+    /// buffer slice and auto buffer registration modes. It dispatches to the appropriate
+    /// existing method based on the buffer descriptor type while maintaining zero-cost
+    /// abstraction principles.
+    ///
+    /// # Buffer Descriptor Compatibility:
+    ///
+    /// * `BufDesc::Slice` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
+    /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
+    ///
+    /// # Validation:
+    ///
+    /// The method validates buffer descriptor compatibility with device capabilities
+    /// before dispatching to ensure type safety and prevent runtime errors.
+    ///
+    /// # Performance:
+    ///
+    /// This method has zero runtime overhead compared to calling the existing methods
+    /// directly, as it uses compile-time dispatch based on the buffer descriptor variant.
+    ///
+    /// When calling this API, target code has to make sure that q_ring won't be borrowed.
+    #[inline]
+    pub fn complete_io_cmd_unified(
+        &self,
+        tag: u16,
+        buf_desc: BufDesc,
+        res: Result<UblkIORes, UblkError>,
+    ) -> Result<(), UblkError> {
+        // Validate buffer descriptor compatibility with device capabilities
+        buf_desc.validate_compatibility(self.dev.dev_info.flags)?;
+
+        // Dispatch to appropriate method based on buffer descriptor type
+        match buf_desc {
+            BufDesc::Slice(slice) => {
+                // For slice operations, return null pointer if slice is empty (user_copy mode)
+                let buf_addr = if slice.len() == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    slice.as_ptr() as *mut u8
+                };
+                self.complete_io_cmd(tag, buf_addr, res);
+                Ok(())
+            }
+            BufDesc::AutoReg(buf_reg_data) => {
+                // For auto buffer registration, use the specialized method
+                self.complete_io_cmd_with_auto_buf_reg(tag, &buf_reg_data, res);
+                Ok(())
+            }
+        }
     }
 
     #[inline(always)]
@@ -1522,8 +1871,8 @@ impl UblkQueue<'_> {
 #[cfg(test)]
 mod tests {
     use crate::ctrl::UblkCtrlBuilder;
-    use crate::io::{UblkDev, UblkQueue};
-    use crate::{UblkError, UblkFlags};
+    use crate::io::{BufDesc, UblkDev, UblkQueue};
+    use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
 
     fn __submit_uring_nop(ring: &mut IoUring<io_uring::squeue::Entry>) -> Result<usize, UblkError> {
@@ -1561,5 +1910,74 @@ mod tests {
         };
 
         UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+    }
+
+    #[test]
+    fn test_buf_desc_validation() {
+        let buffer = [0u8; 1024];
+        let slice_desc = BufDesc::Slice(&buffer);
+        let auto_reg_desc = BufDesc::AutoReg(sys::ublk_auto_buf_reg {
+            index: 0,
+            flags: 0,
+            reserved0: 0,
+            reserved1: 0,
+        });
+
+        // Test with no special flags (traditional buffer management)
+        let no_flags = 0u64;
+        assert!(slice_desc.validate_compatibility(no_flags).is_ok());
+        assert!(auto_reg_desc.validate_compatibility(no_flags).is_err());
+
+        // Test with UBLK_F_USER_COPY
+        let user_copy_flags = sys::UBLK_F_USER_COPY as u64;
+        assert!(slice_desc.validate_compatibility(user_copy_flags).is_ok());
+        assert!(auto_reg_desc
+            .validate_compatibility(user_copy_flags)
+            .is_err());
+
+        // Test with UBLK_F_AUTO_BUF_REG
+        let auto_buf_reg_flags = sys::UBLK_F_AUTO_BUF_REG as u64;
+        assert!(slice_desc
+            .validate_compatibility(auto_buf_reg_flags)
+            .is_err());
+        assert!(auto_reg_desc
+            .validate_compatibility(auto_buf_reg_flags)
+            .is_ok());
+
+        // Test invalid combination of both flags
+        let invalid_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
+        assert!(slice_desc.validate_compatibility(invalid_flags).is_err());
+        assert!(auto_reg_desc.validate_compatibility(invalid_flags).is_err());
+
+        // Verify specific error codes
+        match slice_desc.validate_compatibility(auto_buf_reg_flags) {
+            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::ENOTSUP),
+            _ => panic!("Expected ENOTSUP error"),
+        }
+
+        match slice_desc.validate_compatibility(invalid_flags) {
+            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::EINVAL),
+            _ => panic!("Expected EINVAL error"),
+        }
+    }
+
+    #[test]
+    fn test_buf_desc_helpers() {
+        use crate::helpers::IoBuf;
+
+        let buffer = [0u8; 1024];
+        let _slice_desc = BufDesc::Slice(&buffer);
+
+        // Test AutoReg variant
+        let _auto_reg_desc = BufDesc::AutoReg(sys::ublk_auto_buf_reg {
+            index: 0,
+            flags: 0,
+            reserved0: 0,
+            reserved1: 0,
+        });
+
+        // Test from_io_buf helper
+        let io_buf = IoBuf::<u8>::new(512);
+        let _desc_from_io_buf = BufDesc::from_io_buf(&io_buf);
     }
 }

@@ -14,6 +14,9 @@ pub mod io;
 pub mod sys;
 pub mod uring_async;
 
+// Re-export important types for unified buffer management
+pub use io::{BufDesc, BufDescList};
+
 bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
     /// UblkFlags: top 8bits are reserved for internal use

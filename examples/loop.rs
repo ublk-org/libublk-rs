@@ -4,9 +4,9 @@ use clap::{Arg, ArgAction, Command};
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, BufDescList};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes, BufDesc};
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -198,22 +198,22 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, io_slice: &
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd(
+            q.complete_io_cmd_unified(
                 tag,
-                io_slice.as_ptr() as *mut u8,
+                BufDesc::Slice(io_slice),
                 Ok(UblkIORes::Result(res)),
-            );
+            ).unwrap();
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd(
+        q.complete_io_cmd_unified(
             tag,
-            io_slice.as_ptr() as *mut u8,
+            BufDesc::Slice(io_slice),
             Ok(UblkIORes::Result(res)),
-        );
+        ).unwrap();
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
@@ -245,7 +245,7 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands(Some(&bufs))
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap()
         .wait_and_handle_io(lo_io_handler);
 }
 
@@ -261,15 +261,13 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
             // Use IoBuf for safe I/O buffer management with automatic memory alignment
             let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
-            // Extract raw pointer only when required by libublk APIs for buffer registration
-            // The raw pointer is needed for the libublk buffer registration system
-            let buf_addr = buf.as_mut_ptr();
+            // No longer need raw pointer since we use the unified API with slices
             let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
 
             q.register_io_buf(tag, &buf);
             loop {
-                let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
                 if cmd_res == sys::UBLK_IO_RES_ABORT {
                     break;
                 }

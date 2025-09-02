@@ -1,9 +1,9 @@
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
+use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, BufDescList};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, UblkFlags, UblkIORes, BufDesc};
 use std::rc::Rc;
 
 bitflags! {
@@ -26,9 +26,17 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 #[inline]
 fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
     let bytes = get_io_cmd_result(q, tag);
-    // Convert back to raw pointer only when required by the libublk API
-    let buf_addr = io_slice.map_or(std::ptr::null_mut(), |s| s.as_ptr() as *mut u8);
-    q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+    
+    // Use unified buffer API - choose appropriate buffer descriptor based on mode
+    let buf_desc = if let Some(slice) = io_slice {
+        BufDesc::Slice(slice)
+    } else {
+        // For user_copy mode, create an empty slice since no buffer is needed
+        BufDesc::Slice(&[])
+    };
+    
+    q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+        .unwrap();
 }
 
 fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
@@ -52,7 +60,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
-        .submit_fetch_commands(if user_copy { None } else { Some(&bufs_rc) })
+        .submit_fetch_commands_unified(BufDescList::Slices(if user_copy { None } else { Some(&bufs_rc) })).unwrap()
         .wait_and_handle_io(io_handler);
 }
 
@@ -68,20 +76,21 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
             let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
             // Use IoBuf with slice-based access for memory safety
-            let (_buf, buf_addr) = if user_copy {
-                (None, std::ptr::null_mut())
+            let _buf = if user_copy {
+                None
             } else {
                 let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-
                 q.register_io_buf(tag, &buf);
-                // Extract raw pointer only when required by libublk APIs
-                // IoBuf provides safe slice access via Deref/DerefMut traits
-                let addr = buf.as_mut_ptr();
-                (Some(buf), addr)
+                Some(buf)
             };
 
             loop {
-                let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                let buf_desc = if user_copy {
+                    BufDesc::Slice(&[])
+                } else {
+                    BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
+                };
+                let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, buf_desc, res).unwrap().await;
                 if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                     break;
                 }
