@@ -14,12 +14,57 @@ use std::os::unix::io::{AsRawFd, RawFd};
 #[derive(Debug, Clone)]
 pub enum BufDesc<'a> {
     /// Buffer slice for copy-based operations
-    /// Used when UBLK_F_USER_COPY is enabled or auto buffer registration is not available
+    ///
+    /// Contains a reference to a buffer slice in userspace memory. Data is copied
+    /// between this buffer and kernel buffers. Compatible with devices that have
+    /// `UBLK_F_USER_COPY` enabled or devices without auto buffer registration.
     Slice(&'a [u8]),
-    
-    /// Auto buffer registration for zero-copy operations  
-    /// Used when UBLK_F_AUTO_BUF_REG is enabled for high-performance scenarios
+
+    /// Auto buffer registration for zero-copy operations
+    ///
+    /// Contains auto buffer registration data that allows the kernel to directly
+    /// access userspace buffers without copying. Requires devices with
+    /// `UBLK_F_AUTO_BUF_REG` enabled for optimal performance.
     AutoReg(sys::ublk_auto_buf_reg),
+}
+
+#[derive(Debug)]
+pub enum BufDescList<'a> {
+    /// List of IoBuf for traditional buffer management
+    ///
+    /// Contains an optional reference to a vector of `IoBuf<u8>` instances.
+    /// Used with submit_fetch_commands for copy-based operations where data
+    /// is explicitly transferred between userspace and kernel buffers.
+    ///
+    /// # When to Use
+    /// - Device has traditional buffer management capabilities
+    /// - `UBLK_F_USER_COPY` is enabled (when `None` is used)
+    /// - Performance requirements allow for copying overhead
+    /// - Simpler memory management is preferred
+    ///
+    /// The `Option` wrapper allows for `None` when `UBLK_F_USER_COPY` is enabled,
+    /// indicating that no userspace buffers are needed because the kernel will
+    /// handle buffer management through the user copy mechanism.
+    Slices(Option<&'a Vec<IoBuf<u8>>>),
+
+    /// List of auto buffer registration data for zero-copy operations
+    ///
+    /// Contains a slice of `sys::ublk_auto_buf_reg` structures that define
+    /// buffer registration parameters for high-performance zero-copy I/O.
+    /// Used with submit_fetch_commands_with_auto_buf_reg for direct kernel
+    /// access to userspace buffers.
+    ///
+    /// # When to Use
+    /// - Device supports `UBLK_F_AUTO_BUF_REG` capability
+    /// - High-performance I/O is required
+    /// - Memory copying overhead must be minimized
+    /// - Application can handle more complex buffer management
+    ///
+    /// # Requirements
+    /// - The slice length must be at least equal to the queue depth
+    /// - Each registration entry must be properly initialized
+    /// - Buffer indices must be unique and valid
+    AutoRegs(&'a [sys::ublk_auto_buf_reg]),
 }
 
 /// A struct with the same memory layout as `io_uring_sys::io_uring_sqe`.
