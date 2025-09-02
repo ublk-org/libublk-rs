@@ -10,6 +10,18 @@ use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
+/// Unified buffer descriptor supporting both copy and zero-copy operations
+#[derive(Debug, Clone)]
+pub enum BufDesc<'a> {
+    /// Buffer slice for copy-based operations
+    /// Used when UBLK_F_USER_COPY is enabled or auto buffer registration is not available
+    Slice(&'a [u8]),
+    
+    /// Auto buffer registration for zero-copy operations  
+    /// Used when UBLK_F_AUTO_BUF_REG is enabled for high-performance scenarios
+    AutoReg(sys::ublk_auto_buf_reg),
+}
+
 /// A struct with the same memory layout as `io_uring_sys::io_uring_sqe`.
 /// The definition must match the one in `io-uring-sys` crate.
 /// This is a simplified version for demonstration.
