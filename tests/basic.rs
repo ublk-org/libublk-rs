@@ -5,7 +5,7 @@ mod integration {
     use libublk::io::{UblkDev, UblkIOCtx, UblkQueue};
     use libublk::override_sqe;
     use libublk::uring_async::ublk_wait_and_handle_ios;
-    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkError, UblkFlags, UblkIORes};
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, UblkFlags, UblkIORes};
     use std::env;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -359,37 +359,6 @@ mod integration {
         __test_ublk_null_zc(true, false); //io failure in case that bad buf idx and no fallback
     }
 
-    fn rd_handle_io(q: &UblkQueue, tag: u16, _io: &UblkIOCtx, buf_addr: *mut u8, start: u64) {
-        let iod = q.get_iod(tag);
-        let off = (iod.start_sector << 9) as u64;
-        let bytes = (iod.nr_sectors << 9) as u32;
-        let op = iod.op_flags & 0xff;
-
-        match op {
-            sys::UBLK_IO_OP_FLUSH => {}
-            sys::UBLK_IO_OP_READ => unsafe {
-                libc::memcpy(
-                    buf_addr as *mut libc::c_void,
-                    (start + off) as *mut libc::c_void,
-                    bytes as usize,
-                );
-            },
-            sys::UBLK_IO_OP_WRITE => unsafe {
-                libc::memcpy(
-                    (start + off) as *mut libc::c_void,
-                    buf_addr as *mut libc::c_void,
-                    bytes as usize,
-                );
-            },
-            _ => {
-                q.complete_io_cmd(tag, buf_addr, Err(UblkError::OtherError(-libc::EINVAL)));
-                return;
-            }
-        }
-
-        let res = Ok(UblkIORes::Result(bytes as i32));
-        q.complete_io_cmd(tag, buf_addr, res);
-    }
 
     fn ublk_ramdisk_tester(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
         let dev_path = ctrl.get_bdev_path();
@@ -416,6 +385,47 @@ mod integration {
     }
 
     fn __test_ublk_ramdisk(dev_flags: UblkFlags) {
+        // async function to handle individual I/O commands
+        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16, dev_addr: u64, buf_addr: *mut u8) -> i32 {
+            let iod = q.get_iod(tag);
+            let off = (iod.start_sector << 9) as u64;
+            let bytes = (iod.nr_sectors << 9) as u32;
+            let op = iod.op_flags & 0xff;
+
+            match op {
+                sys::UBLK_IO_OP_FLUSH => {
+                    // For flush, we just return success
+                    bytes as i32
+                }
+                sys::UBLK_IO_OP_READ => {
+                    // For read operations, copy data from ramdisk to buffer
+                    unsafe {
+                        libc::memcpy(
+                            buf_addr as *mut libc::c_void,
+                            (dev_addr + off) as *mut libc::c_void,
+                            bytes as usize,
+                        );
+                    }
+                    bytes as i32
+                }
+                sys::UBLK_IO_OP_WRITE => {
+                    // For write operations, copy data from buffer to ramdisk
+                    unsafe {
+                        libc::memcpy(
+                            (dev_addr + off) as *mut libc::c_void,
+                            buf_addr as *mut libc::c_void,
+                            bytes as usize,
+                        );
+                    }
+                    bytes as i32
+                }
+                _ => {
+                    // Invalid operation
+                    -libc::EINVAL
+                }
+            }
+        }
+
         let size = 32_u64 << 20;
         let buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
         let dev_addr = buf.as_mut_ptr() as u64;
@@ -434,36 +444,51 @@ mod integration {
         };
 
         let q_fn = move |qid: u16, dev: &UblkDev| {
-            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
-            let bufs = bufs_rc.clone();
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+            let exe = smol::LocalExecutor::new();
+            let mut f_vec = Vec::new();
 
             let mlock_enabled = dev.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
             if mlock_enabled {
-                let mlocked_count = bufs
+                // For async version, we need to allocate buffers to check mlock status
+                let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+                let mlocked_count = bufs_rc
                     .iter()
                     .take(depth.into())
                     .filter(|buf| buf.is_mlocked())
                     .count();
                 assert!(mlocked_count == depth as usize);
                 println!(
-                    "Queue {} (sync): mlock feature enabled, {}/{} buffers successfully mlocked",
+                    "Queue {} (async): mlock feature enabled, {}/{} buffers successfully mlocked",
                     qid,
                     mlocked_count,
-                    bufs.len()
+                    bufs_rc.len()
                 );
             }
 
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                let buf_addr = bufs[tag as usize].as_mut_ptr();
+            for tag in 0..depth {
+                let q = q_rc.clone();
 
-                rd_handle_io(q, tag, _io, buf_addr, dev_addr);
-            };
+                f_vec.push(exe.spawn(async move {
+                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
+                    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+                    let mut res = 0;
 
-            UblkQueue::new(qid, dev)
-                .unwrap()
-                .regiser_io_bufs(Some(&bufs_rc))
-                .submit_fetch_commands(Some(&bufs_rc))
-                .wait_and_handle_io(io_handler);
+                    q.register_io_buf(tag, &buf);
+                    loop {
+                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+                        if cmd_res == sys::UBLK_IO_RES_ABORT {
+                            break;
+                        }
+
+                        res = handle_io_cmd(&q, tag, dev_addr, buf.as_mut_ptr()).await;
+                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                    }
+                }));
+            }
+
+            ublk_wait_and_handle_ios(&exe, &q_rc);
+            smol::block_on(async { futures::future::join_all(f_vec).await });
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
