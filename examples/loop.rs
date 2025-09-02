@@ -261,15 +261,13 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
             // Use IoBuf for safe I/O buffer management with automatic memory alignment
             let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
-            // Extract raw pointer only when required by libublk APIs for buffer registration
-            // The raw pointer is needed for the libublk buffer registration system
-            let buf_addr = buf.as_mut_ptr();
+            // No longer need raw pointer since we use the unified API with slices
             let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
 
             q.register_io_buf(tag, &buf);
             loop {
-                let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
                 if cmd_res == sys::UBLK_IO_RES_ABORT {
                     break;
                 }

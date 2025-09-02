@@ -9,7 +9,7 @@ use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_run_ctrl_task;
-use libublk::{UblkError, UblkFlags};
+use libublk::{UblkError, UblkFlags, BufDesc};
 use std::io::{Error, ErrorKind};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -80,14 +80,12 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) {
     // IoBuf provides slice-based access through Deref/DerefMut traits
     let mut buffer = IoBuf::<u8>::new(buf_size);
     
-    // Extract raw pointer only when required by libublk APIs
-    // For actual memory operations, we'll use safe slice access
-    let addr = buffer.as_mut_ptr();
+    // No longer need raw pointer since we use the unified API with slices
     let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
     loop {
-        let cmd_res = q.submit_io_cmd(tag, cmd_op, addr, res).await;
+        let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buffer.as_slice()), res).unwrap().await;
         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }

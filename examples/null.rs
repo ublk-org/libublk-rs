@@ -76,20 +76,21 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
             let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
             let mut res = 0;
             // Use IoBuf with slice-based access for memory safety
-            let (_buf, buf_addr) = if user_copy {
-                (None, std::ptr::null_mut())
+            let _buf = if user_copy {
+                None
             } else {
                 let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-
                 q.register_io_buf(tag, &buf);
-                // Extract raw pointer only when required by libublk APIs
-                // IoBuf provides safe slice access via Deref/DerefMut traits
-                let addr = buf.as_mut_ptr();
-                (Some(buf), addr)
+                Some(buf)
             };
 
             loop {
-                let cmd_res = q.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                let buf_desc = if user_copy {
+                    BufDesc::Slice(&[])
+                } else {
+                    BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
+                };
+                let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, buf_desc, res).unwrap().await;
                 if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                     break;
                 }

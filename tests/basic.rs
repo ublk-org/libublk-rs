@@ -207,7 +207,7 @@ mod integration {
 
                     q.register_io_buf(tag, &buf);
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+                        let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -310,8 +310,8 @@ mod integration {
 
                     loop {
                         let cmd_res = q
-                            .submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &auto_buf_reg, res)
-                            .await;
+                            .submit_io_cmd_unified(tag, cmd_op, BufDesc::AutoReg(auto_buf_reg), res)
+                            .unwrap().await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }
@@ -483,7 +483,7 @@ mod integration {
 
                     q.register_io_buf(tag, &buf);
                     loop {
-                        let cmd_res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+                        let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
                         if cmd_res == sys::UBLK_IO_RES_ABORT {
                             break;
                         }

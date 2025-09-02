@@ -46,7 +46,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16) {
     loop {
         // Complete previous command with result and re-submit
         // IO command for fetching new IO request from /dev/ublkbN
-        res = q.submit_io_cmd(tag, cmd_op, buf.as_mut_ptr(), res).await;
+        res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
         if res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }
