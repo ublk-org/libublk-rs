@@ -15,7 +15,7 @@ pub mod sys;
 pub mod uring_async;
 
 // Re-export important types for unified buffer management
-pub use io::{BufDesc, BufDescList};
+pub use io::{init_task_ring, with_queue_ring, with_queue_ring_mut, BufDesc, BufDescList};
 
 bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]

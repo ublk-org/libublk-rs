@@ -111,9 +111,9 @@ fn ublk_process_queue_io(
     let res = if !q.is_stopping() {
         q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits)
     } else {
-        let mut r = q.q_ring.borrow_mut();
+        crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
 
-        match ublk_try_reap_cqe(&mut r, nr_waits) {
+        match ublk_try_reap_cqe(r, nr_waits) {
             Some(cqe) => {
                 let user_data = cqe.user_data();
                 ublk_wake_task(user_data, &cqe);
@@ -121,6 +121,7 @@ fn ublk_process_queue_io(
             }
             None => Ok(0),
         }
+        })
     };
     while exe.try_tick() {}
 
