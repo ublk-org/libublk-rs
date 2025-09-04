@@ -418,6 +418,43 @@ impl UblkJsonManager {
     }
 }
 
+/// Configuration for creating UblkCtrlInner
+#[derive(Debug, Clone)]
+struct UblkCtrlConfig {
+    name: Option<String>,
+    id: i32,
+    nr_queues: u32,
+    depth: u32,
+    io_buf_bytes: u32,
+    flags: u64,
+    tgt_flags: u64,
+    dev_flags: UblkFlags,
+}
+
+impl UblkCtrlConfig {
+    fn new(
+        name: Option<String>,
+        id: i32,
+        nr_queues: u32,
+        depth: u32,
+        io_buf_bytes: u32,
+        flags: u64,
+        tgt_flags: u64,
+        dev_flags: UblkFlags,
+    ) -> Self {
+        Self {
+            name,
+            id,
+            nr_queues,
+            depth,
+            io_buf_bytes,
+            flags,
+            tgt_flags,
+            dev_flags,
+        }
+    }
+}
+
 /// UblkSession: build one new ublk control device or recover the old one.
 ///
 /// High level API.
@@ -601,9 +638,112 @@ impl Drop for UblkCtrlInner {
 }
 
 impl UblkCtrlInner {
+    /// Create device info structure from parameters
+    fn create_device_info(
+        id: i32,
+        nr_queues: u32,
+        depth: u32,
+        io_buf_bytes: u32,
+        flags: u64,
+        tgt_flags: u64,
+    ) -> sys::ublksrv_ctrl_dev_info {
+        sys::ublksrv_ctrl_dev_info {
+            nr_hw_queues: nr_queues as u16,
+            queue_depth: depth as u16,
+            max_io_buf_bytes: io_buf_bytes,
+            dev_id: id as u32,
+            ublksrv_pid: unsafe { libc::getpid() } as i32,
+            flags,
+            ublksrv_flags: tgt_flags,
+            ..Default::default()
+        }
+    }
+
+    /// Open control device file
+    fn open_control_device() -> Result<fs::File, UblkError> {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(CTRL_PATH)
+            .map_err(UblkError::from)
+    }
+
+    /// Initialize queue data structures
+    fn init_queue_data(nr_queues: u32) -> (Vec<i32>, Vec<usize>) {
+        let queue_tids = {
+            let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
+            unsafe {
+                tids.set_len(nr_queues as usize);
+            }
+            tids
+        };
+        let queue_selected_cpus = vec![0; nr_queues as usize];
+        (queue_tids, queue_selected_cpus)
+    }
+
+    /// Handle device lifecycle (add new device or recover existing)
+    fn handle_device_lifecycle(&mut self, id: i32) -> Result<(), UblkError> {
+        if self.for_add_dev() {
+            self.add()?;
+            // Update JSON manager with the actual allocated device ID
+            self.json_manager.update_dev_id(self.dev_info.dev_id);
+        } else if id >= 0 {
+            if let Err(_) = self.reload_json() {
+                eprintln!("device reload json failed");
+            }
+            self.read_dev_info()?;
+        }
+        Ok(())
+    }
+
+    /// Detect and store driver features
+    fn detect_features(&mut self) {
+        self.features = match self.__get_features() {
+            Ok(f) => Some(f),
+            _ => None,
+        };
+    }
+
+    fn new(config: UblkCtrlConfig) -> Result<UblkCtrlInner, UblkError> {
+        let dev_info = Self::create_device_info(
+            config.id,
+            config.nr_queues,
+            config.depth,
+            config.io_buf_bytes,
+            config.flags,
+            config.tgt_flags,
+        );
+        let file = Self::open_control_device()?;
+        let (queue_tids, queue_selected_cpus) = Self::init_queue_data(config.nr_queues);
+
+        let mut dev = UblkCtrlInner {
+            name: config.name,
+            file,
+            dev_info,
+            json_manager: UblkJsonManager::new(dev_info.dev_id),
+            cmd_token: 0,
+            queue_tids,
+            queue_selected_cpus,
+            nr_queues_configured: 0,
+            dev_flags: config.dev_flags,
+            features: None,
+        };
+
+        dev.detect_features();
+        dev.handle_device_lifecycle(config.id)?;
+
+        log::info!(
+            "ctrl: device {} flags {:x} created",
+            dev.dev_info.dev_id,
+            dev.dev_flags
+        );
+
+        Ok(dev)
+    }
+
+    /// Legacy constructor wrapper for backward compatibility
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::uninit_vec)]
-    fn new(
+    fn new_with_params(
         name: Option<String>,
         id: i32,
         nr_queues: u32,
@@ -613,66 +753,8 @@ impl UblkCtrlInner {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrlInner, UblkError> {
-        let info = sys::ublksrv_ctrl_dev_info {
-            nr_hw_queues: nr_queues as u16,
-            queue_depth: depth as u16,
-            max_io_buf_bytes: io_buf_bytes,
-            dev_id: id as u32,
-            ublksrv_pid: unsafe { libc::getpid() } as i32,
-            flags,
-            ublksrv_flags: tgt_flags,
-            ..Default::default()
-        };
-        let fd = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(CTRL_PATH)?;
-
-        let mut dev = UblkCtrlInner {
-            name,
-            file: fd,
-            dev_info: info,
-            json_manager: UblkJsonManager::new(info.dev_id),
-            cmd_token: 0,
-            queue_tids: {
-                let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
-                unsafe {
-                    tids.set_len(nr_queues as usize);
-                }
-                tids
-            },
-            queue_selected_cpus: vec![0; nr_queues as usize],
-            nr_queues_configured: 0,
-            dev_flags,
-            features: None,
-        };
-
-        let features = match dev.__get_features() {
-            Ok(f) => Some(f),
-            _ => None,
-        };
-        dev.features = features;
-
-        //add cdev if the device is for adding device
-        if dev.for_add_dev() {
-            dev.add()?;
-            // Update JSON manager with the actual allocated device ID
-            dev.json_manager.update_dev_id(dev.dev_info.dev_id);
-        } else if id >= 0 {
-            let res = dev.reload_json();
-            if res.is_err() {
-                eprintln!("device reload json failed");
-            }
-            dev.read_dev_info()?;
-        }
-
-        log::info!(
-            "ctrl: device {} flags {:x} created",
-            dev.dev_info.dev_id,
-            dev.dev_flags
-        );
-
-        Ok(dev)
+        let config = UblkCtrlConfig::new(name, id, nr_queues, depth, io_buf_bytes, flags, tgt_flags, dev_flags);
+        Self::new(config)
     }
 
     fn is_unprivileged(&self) -> bool {
@@ -1312,7 +1394,7 @@ impl UblkCtrl {
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         Self::validate_param(io_buf_bytes <= MAX_BUF_SZ && (io_buf_bytes & (page_sz - 1)) == 0)?;
 
-        let inner = RwLock::new(UblkCtrlInner::new(
+        let inner = RwLock::new(UblkCtrlInner::new_with_params(
             name,
             id,
             nr_queues,
