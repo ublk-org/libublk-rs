@@ -386,14 +386,23 @@ impl UblkJsonManager {
         if !Path::new(&self.get_json_path()).exists() {
             return;
         }
-        let mut file = fs::File::open(self.get_json_path()).expect("Failed to open file");
+
+        let Ok(mut file) = fs::File::open(self.get_json_path()) else {
+            eprintln!("Warning: Failed to open JSON file for dumping");
+            return;
+        };
+
         let mut json_str = String::new();
+        if file.read_to_string(&mut json_str).is_err() {
+            eprintln!("Warning: Failed to read JSON file content");
+            return;
+        }
 
-        file.read_to_string(&mut json_str)
-            .expect("Failed to read file");
+        let Ok(json_value): Result<serde_json::Value, _> = serde_json::from_str(&json_str) else {
+            eprintln!("Warning: Failed to parse JSON content");
+            return;
+        };
 
-        let json_value: serde_json::Value =
-            serde_json::from_str(&json_str).expect("Failed to parse JSON");
         let queues = &json_value["queues"];
 
         for i in 0..16 {
@@ -817,7 +826,16 @@ impl UblkCtrlInner {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrlInner, UblkError> {
-        let config = UblkCtrlConfig::new(name, id, nr_queues, depth, io_buf_bytes, flags, tgt_flags, dev_flags);
+        let config = UblkCtrlConfig::new(
+            name,
+            id,
+            nr_queues,
+            depth,
+            io_buf_bytes,
+            flags,
+            tgt_flags,
+            dev_flags,
+        );
         Self::new(config)
     }
 
@@ -904,7 +922,9 @@ impl UblkCtrlInner {
 
         unsafe {
             CTRL_URING.with(|refcell| {
-                refcell.borrow_mut().submission().push(&sqe).unwrap();
+                if let Err(e) = refcell.borrow_mut().submission().push(&sqe) {
+                    eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
+                }
             })
         }
         f
@@ -929,7 +949,12 @@ impl UblkCtrlInner {
         CTRL_URING.with(|refcell| {
             let mut r = refcell.borrow_mut();
 
-            unsafe { r.submission().push(&sqe).unwrap() };
+            unsafe {
+                if let Err(e) = r.submission().push(&sqe) {
+                    eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
+                    return;
+                }
+            };
             let _ = r.submit_and_wait(to_wait);
         });
         Ok(token)
@@ -1096,13 +1121,7 @@ impl UblkCtrlInner {
     }
 
     fn read_dev_info(&mut self) -> Result<i32, UblkError> {
-        let res = self.__read_dev_info2();
-
-        if res.is_err() {
-            self.__read_dev_info()
-        } else {
-            res
-        }
+        self.__read_dev_info2().or_else(|_| self.__read_dev_info())
     }
 
     /// Start this device by sending command to ublk driver
@@ -1309,11 +1328,17 @@ impl UblkCtrl {
         | sys::UBLK_F_AUTO_BUF_REG) as u64;
 
     fn get_inner(&self) -> std::sync::RwLockReadGuard<'_, UblkCtrlInner> {
-        self.inner.read().unwrap()
+        self.inner.read().unwrap_or_else(|poisoned| {
+            eprintln!("Warning: RwLock poisoned, recovering");
+            poisoned.into_inner()
+        })
     }
 
     fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<'_, UblkCtrlInner> {
-        self.inner.write().unwrap()
+        self.inner.write().unwrap_or_else(|poisoned| {
+            eprintln!("Warning: RwLock poisoned, recovering");
+            poisoned.into_inner()
+        })
     }
 
     pub fn get_name(&self) -> String {
@@ -1879,23 +1904,32 @@ impl UblkCtrl {
 
             q_threads.push(std::thread::spawn(move || {
                 let (pthread_handle, tid) = Self::init_queue_thread();
-                _tx.send((q, pthread_handle, tid)).unwrap();
+                if let Err(e) = _tx.send((q, pthread_handle, tid)) {
+                    eprintln!("Warning: Failed to send queue thread info: {}", e);
+                    return;
+                }
                 _q_fn(q, &_dev);
             }));
         }
 
         // Set affinity from main thread context using pthread handles
         for _q in 0..nr_queues {
-            let (qid, pthread_handle, tid) = rx.recv().unwrap();
+            let (qid, pthread_handle, tid) = match rx.recv() {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("Warning: Failed to receive queue thread info: {}", e);
+                    continue;
+                }
+            };
 
             // Calculate and set affinity using the pthread handle
             let affinity = self.calculate_queue_affinity(qid);
             Self::set_thread_affinity(pthread_handle, &affinity);
 
-            if self.configure_queue(dev, qid, tid).is_err() {
-                println!(
-                    "create_queue_handler: configure queue failed for {}-{}",
-                    dev.dev_info.dev_id, qid
+            if let Err(e) = self.configure_queue(dev, qid, tid) {
+                eprintln!(
+                    "Warning: configure queue failed for {}-{}: {:?}",
+                    dev.dev_info.dev_id, qid, e
                 );
             }
         }
