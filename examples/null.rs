@@ -1,9 +1,9 @@
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, BufDescList};
+use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, UblkFlags, UblkIORes, BufDesc};
+use libublk::{ctrl::UblkCtrl, BufDesc, UblkFlags, UblkIORes};
 use std::rc::Rc;
 
 bitflags! {
@@ -26,7 +26,7 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
 #[inline]
 fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
     let bytes = get_io_cmd_result(q, tag);
-    
+
     // Use unified buffer API - choose appropriate buffer descriptor based on mode
     let buf_desc = if let Some(slice) = io_slice {
         BufDesc::Slice(slice)
@@ -34,7 +34,7 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
         // For user_copy mode, create an empty slice since no buffer is needed
         BufDesc::Slice(&[])
     };
-    
+
     q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
         .unwrap();
 }
@@ -60,7 +60,12 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
-        .submit_fetch_commands_unified(BufDescList::Slices(if user_copy { None } else { Some(&bufs_rc) })).unwrap()
+        .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
+            None
+        } else {
+            Some(&bufs_rc)
+        }))
+        .unwrap()
         .wait_and_handle_io(io_handler);
 }
 
@@ -90,7 +95,10 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
                 } else {
                     BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
                 };
-                let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, buf_desc, res).unwrap().await;
+                let cmd_res = q
+                    .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)
+                    .unwrap()
+                    .await;
                 if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
                     break;
                 }
@@ -121,7 +129,7 @@ fn __null_add(
         .nr_queues(nr_queues.try_into().unwrap())
         .io_buf_bytes(buf_size)
         .ctrl_flags(ctrl_flags)
-        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
         .build()
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| {
