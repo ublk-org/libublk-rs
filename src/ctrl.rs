@@ -145,6 +145,70 @@ struct UblkCtrlCmdData {
 }
 
 impl UblkCtrlCmdData {
+    /// Create a simple command with no data or buffer
+    fn new_simple_cmd(cmd_op: u32) -> Self {
+        Self {
+            cmd_op,
+            ..Default::default()
+        }
+    }
+
+    /// Create a command with data only
+    fn new_data_cmd(cmd_op: u32, data: u64) -> Self {
+        Self {
+            cmd_op,
+            flags: CTRL_CMD_HAS_DATA,
+            data,
+            ..Default::default()
+        }
+    }
+
+    /// Create a command with buffer for reading
+    fn new_read_buffer_cmd(cmd_op: u32, addr: u64, len: u32, no_dev_path: bool) -> Self {
+        let mut flags = CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ;
+        if no_dev_path {
+            flags |= CTRL_CMD_NO_NEED_DEV_PATH;
+        }
+        Self {
+            cmd_op,
+            flags,
+            addr,
+            len,
+            ..Default::default()
+        }
+    }
+
+    /// Create a command with buffer for writing
+    fn new_write_buffer_cmd(cmd_op: u32, addr: u64, len: u32, no_dev_path: bool) -> Self {
+        let mut flags = CTRL_CMD_HAS_BUF;
+        if no_dev_path {
+            flags |= CTRL_CMD_NO_NEED_DEV_PATH;
+        }
+        Self {
+            cmd_op,
+            flags,
+            addr,
+            len,
+            ..Default::default()
+        }
+    }
+
+    /// Create a command with both data and buffer
+    fn new_data_buffer_cmd(cmd_op: u32, data: u64, addr: u64, len: u32, read_buffer: bool) -> Self {
+        let mut flags = CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA;
+        if read_buffer {
+            flags |= CTRL_CMD_BUF_READ;
+        }
+        Self {
+            cmd_op,
+            flags,
+            data,
+            addr,
+            len,
+            ..Default::default()
+        }
+    }
+
     fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Vec<u8>>) {
         // handle GET_DEV_INFO2 always with dev_path attached
         let cmd_op = self.cmd_op & 0xff;
@@ -961,13 +1025,12 @@ impl UblkCtrlInner {
     }
 
     fn add(&mut self) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_ADD_DEV,
-            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_NO_NEED_DEV_PATH,
-            addr: std::ptr::addr_of!(self.dev_info) as u64,
-            len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_write_buffer_cmd(
+            sys::UBLK_U_CMD_ADD_DEV,
+            std::ptr::addr_of!(self.dev_info) as u64,
+            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
+            true, // no_dev_path
+        );
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -975,17 +1038,15 @@ impl UblkCtrlInner {
     /// Remove this device
     ///
     fn del(&mut self) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: if self
-                .dev_flags
-                .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
-            {
-                sys::UBLK_U_CMD_DEL_DEV_ASYNC
-            } else {
-                sys::UBLK_U_CMD_DEL_DEV
-            },
-            ..Default::default()
+        let cmd_op = if self
+            .dev_flags
+            .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
+        {
+            sys::UBLK_U_CMD_DEL_DEV_ASYNC
+        } else {
+            sys::UBLK_U_CMD_DEL_DEV
         };
+        let data = UblkCtrlCmdData::new_simple_cmd(cmd_op);
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -993,23 +1054,19 @@ impl UblkCtrlInner {
     /// Remove this device
     ///
     fn del_async(&mut self) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_DEL_DEV_ASYNC,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
 
         self.ublk_ctrl_cmd(&data)
     }
 
     fn __get_features(&mut self) -> Result<u64, UblkError> {
         let features = 0_u64;
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_GET_FEATURES,
-            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ | CTRL_CMD_NO_NEED_DEV_PATH,
-            addr: std::ptr::addr_of!(features) as u64,
-            len: core::mem::size_of::<u64>() as u32,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_FEATURES,
+            std::ptr::addr_of!(features) as u64,
+            core::mem::size_of::<u64>() as u32,
+            true, // no_dev_path
+        );
 
         self.ublk_ctrl_cmd(&data)?;
 
@@ -1017,25 +1074,23 @@ impl UblkCtrlInner {
     }
 
     fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_GET_DEV_INFO,
-            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
-            addr: std::ptr::addr_of!(self.dev_info) as u64,
-            len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_DEV_INFO,
+            std::ptr::addr_of!(self.dev_info) as u64,
+            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
+            false, // need dev_path
+        );
 
         self.ublk_ctrl_cmd(&data)
     }
 
     fn __read_dev_info2(&mut self) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_GET_DEV_INFO2,
-            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
-            addr: std::ptr::addr_of!(self.dev_info) as u64,
-            len: core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_DEV_INFO2,
+            std::ptr::addr_of!(self.dev_info) as u64,
+            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
+            false, // need dev_path
+        );
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -1053,12 +1108,7 @@ impl UblkCtrlInner {
     /// Start this device by sending command to ublk driver
     ///
     fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_START_DEV,
-            flags: CTRL_CMD_HAS_DATA,
-            data: pid as u64,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64);
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -1066,12 +1116,7 @@ impl UblkCtrlInner {
     /// Start this device by sending command to ublk driver
     ///
     async fn start_async(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_START_DEV,
-            flags: CTRL_CMD_HAS_DATA,
-            data: pid as u64,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64);
 
         self.ublk_ctrl_cmd_async(&data).await
     }
@@ -1079,10 +1124,7 @@ impl UblkCtrlInner {
     /// Stop this device by sending command to ublk driver
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_STOP_DEV,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV);
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -1093,13 +1135,12 @@ impl UblkCtrlInner {
     /// Can't pass params by reference(&mut), why?
     fn get_params(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         params.len = core::mem::size_of::<sys::ublk_params>() as u32;
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_GET_PARAMS,
-            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_BUF_READ,
-            addr: params as *const sys::ublk_params as u64,
-            len: params.len,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_PARAMS,
+            params as *const sys::ublk_params as u64,
+            params.len,
+            false, // need dev_path
+        );
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -1112,34 +1153,29 @@ impl UblkCtrlInner {
         let mut p = *params;
 
         p.len = core::mem::size_of::<sys::ublk_params>() as u32;
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_SET_PARAMS,
-            flags: CTRL_CMD_HAS_BUF,
-            addr: std::ptr::addr_of!(p) as u64,
-            len: p.len,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_write_buffer_cmd(
+            sys::UBLK_U_CMD_SET_PARAMS,
+            std::ptr::addr_of!(p) as u64,
+            p.len,
+            false, // need dev_path
+        );
 
         self.ublk_ctrl_cmd(&data)
     }
 
     fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
-            flags: CTRL_CMD_HAS_BUF | CTRL_CMD_HAS_DATA | CTRL_CMD_BUF_READ,
-            addr: bm.addr() as u64,
-            data: q as u64,
-            len: bm.buf_len() as u32,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_data_buffer_cmd(
+            sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
+            q as u64,
+            bm.addr() as u64,
+            bm.buf_len() as u32,
+            true, // read_buffer
+        );
         self.ublk_ctrl_cmd(&data)
     }
 
     fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_START_USER_RECOVERY,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY);
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -1147,12 +1183,7 @@ impl UblkCtrlInner {
     /// End user recover for this device, do similar thing done in start_dev()
     ///
     fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_END_USER_RECOVERY,
-            flags: CTRL_CMD_HAS_DATA,
-            data: pid as u64,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64);
 
         self.ublk_ctrl_cmd(&data)
     }
@@ -1160,12 +1191,7 @@ impl UblkCtrlInner {
     /// End user recover for this device, do similar thing done in start_dev()
     ///
     async fn end_user_recover_async(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data: UblkCtrlCmdData = UblkCtrlCmdData {
-            cmd_op: sys::UBLK_U_CMD_END_USER_RECOVERY,
-            flags: CTRL_CMD_HAS_DATA,
-            data: pid as u64,
-            ..Default::default()
-        };
+        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64);
 
         self.ublk_ctrl_cmd_async(&data).await
     }
