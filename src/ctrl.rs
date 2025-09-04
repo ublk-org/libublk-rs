@@ -211,6 +211,198 @@ struct QueueAffinityJson {
     tid: u32,
 }
 
+/// JSON management for ublk device persistence
+///
+/// Handles all JSON serialization/deserialization, file I/O, and persistence
+/// operations for ublk devices. This includes device information, queue data,
+/// target configuration, and runtime state management.
+#[derive(Debug)]
+struct UblkJsonManager {
+    /// Device ID for JSON file naming
+    dev_id: u32,
+    /// Current JSON data
+    json: serde_json::Value,
+}
+
+impl UblkJsonManager {
+    /// Create a new JSON manager for the specified device
+    pub fn new(dev_id: u32) -> Self {
+        Self {
+            dev_id,
+            json: serde_json::json!({}),
+        }
+    }
+
+    /// Get the JSON file path for this device
+    pub fn get_json_path(&self) -> String {
+        format!("{}/{:04}.json", UblkCtrl::run_dir(), self.dev_id)
+    }
+
+    /// Get reference to the JSON data
+    pub fn get_json(&self) -> &serde_json::Value {
+        &self.json
+    }
+
+    /// Get mutable reference to the JSON data
+    pub fn get_json_mut(&mut self) -> &mut serde_json::Value {
+        &mut self.json
+    }
+
+    /// Set file permissions for the JSON file
+    fn set_path_permission(path: &Path, mode: u32) -> Result<(), std::io::Error> {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(path, permissions)
+    }
+
+    /// Flush JSON data to file
+    pub fn flush_json(&mut self) -> Result<i32, UblkError> {
+        if self.json == serde_json::json!({}) {
+            return Ok(0);
+        }
+
+        // Flushing json should only be done in case of adding new device
+        let run_path = self.get_json_path();
+
+        let json_path = Path::new(&run_path);
+
+        if let Some(parent_dir) = json_path.parent() {
+            if !parent_dir.exists() {
+                std::fs::create_dir_all(parent_dir)?;
+                // Set directory permissions to 777 for exported running json
+                Self::set_path_permission(parent_dir, 0o777)?;
+            }
+        }
+
+        let mut run_file = fs::File::create(json_path)?;
+
+        // Each exported json file is only visible for the device owner
+        Self::set_path_permission(json_path, 0o700)?;
+
+        run_file.write_all(self.json.to_string().as_bytes())?;
+        Ok(0)
+    }
+
+    /// Reload JSON data from file
+    pub fn reload_json(&mut self) -> Result<i32, UblkError> {
+        let mut file = fs::File::open(self.get_json_path())?;
+        let mut json_str = String::new();
+        file.read_to_string(&mut json_str)?;
+        self.json = serde_json::from_str(&json_str).map_err(UblkError::JsonError)?;
+        Ok(0)
+    }
+
+    /// Set the JSON data (called from UblkCtrlInner::build_json)
+    pub fn set_json(&mut self, json: serde_json::Value) {
+        self.json = json;
+    }
+
+    /// Update the device ID (called after device is added and real ID is allocated)
+    pub fn update_dev_id(&mut self, new_dev_id: u32) {
+        self.dev_id = new_dev_id;
+    }
+
+    /// Dump JSON content to console
+    pub fn dump_json(&self) {
+        if !Path::new(&self.get_json_path()).exists() {
+            return;
+        }
+        let mut file = fs::File::open(self.get_json_path()).expect("Failed to open file");
+        let mut json_str = String::new();
+
+        file.read_to_string(&mut json_str)
+            .expect("Failed to read file");
+
+        let json_value: serde_json::Value =
+            serde_json::from_str(&json_str).expect("Failed to parse JSON");
+        let queues = &json_value["queues"];
+
+        for i in 0..16 {
+            // Max queues for display
+            if let Some(queue) = queues.get(&i.to_string()) {
+                let this_queue: Result<QueueAffinityJson, _> =
+                    serde_json::from_value(queue.clone());
+
+                if let Ok(p) = this_queue {
+                    println!(
+                        "\tqueue {} tid: {} affinity({})",
+                        p.qid,
+                        p.tid,
+                        p.affinity
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<String>>()
+                            .join(" ")
+                    );
+                }
+            }
+        }
+        let tgt_val = &json_value["target"];
+        let tgt: Result<UblkTgt, _> = serde_json::from_value(tgt_val.clone());
+        if let Ok(p) = tgt {
+            println!(
+                "\ttarget {{\"dev_size\":{},\"name\":\"{}\",\"type\":0}}",
+                p.dev_size, p.tgt_type
+            );
+        }
+        println!("\ttarget_data {}", &json_value["target_data"]);
+    }
+
+    /// Get queue pthread ID from JSON
+    pub fn get_queue_tid_from_json(&self, qid: u16) -> Result<i32, UblkError> {
+        let queues = &self.json["queues"];
+        let queue = &queues[qid.to_string()];
+        let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
+
+        if let Ok(p) = this_queue {
+            Ok(p.tid as i32)
+        } else {
+            Err(UblkError::OtherError(-libc::EEXIST))
+        }
+    }
+
+    /// Get target flags from JSON
+    pub fn get_target_flags_from_json(&self) -> Result<u32, UblkError> {
+        let __tgt_flags = &self.json["target_flags"];
+        let tgt_flags: Result<u32, _> = serde_json::from_value(__tgt_flags.clone());
+        if let Ok(t) = tgt_flags {
+            Ok(t)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Get target configuration from JSON
+    pub fn get_target_from_json(&self) -> Result<super::io::UblkTgt, UblkError> {
+        let tgt_val = &self.json["target"];
+        let tgt: Result<super::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
+        if let Ok(t) = tgt {
+            Ok(t)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Get target data from JSON
+    pub fn get_target_data_from_json(&self) -> Option<serde_json::Value> {
+        let val = &self.json["target_data"];
+        if !val.is_null() {
+            Some(val.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Get target type from JSON
+    pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
+        if let Ok(tgt) = self.get_target_from_json() {
+            Ok(tgt.tgt_type)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+}
+
 /// UblkSession: build one new ublk control device or recover the old one.
 ///
 /// High level API.
@@ -301,7 +493,7 @@ struct UblkCtrlInner {
     name: Option<String>,
     file: fs::File,
     dev_info: sys::ublksrv_ctrl_dev_info,
-    json: serde_json::Value,
+    json_manager: UblkJsonManager,
     features: Option<u64>,
 
     /// global flags, shared with UblkDev and UblkQueue
@@ -357,7 +549,7 @@ impl UblkCtrlInner {
             name,
             file: fd,
             dev_info: info,
-            json: serde_json::json!({}),
+            json_manager: UblkJsonManager::new(info.dev_id),
             cmd_token: 0,
             queue_tids: {
                 let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
@@ -381,6 +573,8 @@ impl UblkCtrlInner {
         //add cdev if the device is for adding device
         if dev.for_add_dev() {
             dev.add()?;
+            // Update JSON manager with the actual allocated device ID
+            dev.json_manager.update_dev_id(dev.dev_info.dev_id);
         } else if id >= 0 {
             let res = dev.reload_json();
             if res.is_err() {
@@ -428,51 +622,13 @@ impl UblkCtrlInner {
     }
 
     fn dump_from_json(&self) {
-        if !Path::new(&self.run_path()).exists() {
-            return;
-        }
-        let mut file = fs::File::open(self.run_path()).expect("Failed to open file");
-        let mut json_str = String::new();
-
-        file.read_to_string(&mut json_str)
-            .expect("Failed to read file");
-
-        let json_value: serde_json::Value =
-            serde_json::from_str(&json_str).expect("Failed to parse JSON");
-        let queues = &json_value["queues"];
-
-        for i in 0..self.dev_info.nr_hw_queues {
-            let queue = &queues[i.to_string()];
-            let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
-
-            if let Ok(p) = this_queue {
-                println!(
-                    "\tqueue {} tid: {} affinity({})",
-                    p.qid,
-                    p.tid,
-                    p.affinity
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<String>>()
-                        .join(" ")
-                );
-            }
-        }
-        let tgt_val = &json_value["target"];
-        let tgt: Result<UblkTgt, _> = serde_json::from_value(tgt_val.clone());
-        if let Ok(p) = tgt {
-            println!(
-                "\ttarget {{\"dev_size\":{},\"name\":\"{}\",\"type\":0}}",
-                p.dev_size, p.tgt_type
-            );
-        }
-        println!("\ttarget_data {}", &json_value["target_data"]);
+        self.json_manager.dump_json();
     }
 
     /// Returned path of this device's exported json file
     ///
     fn run_path(&self) -> String {
-        format!("{}/{:04}.json", UblkCtrl::run_dir(), self.dev_info.dev_id)
+        self.json_manager.get_json_path()
     }
 
     fn ublk_ctrl_prep_cmd(
@@ -867,52 +1023,15 @@ impl UblkCtrlInner {
         Ok(0)
     }
 
-    fn set_path_permission(path: &Path, mode: u32) -> Result<i32, UblkError> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let metadata = fs::metadata(path)?;
-        let mut permissions = metadata.permissions();
-
-        permissions.set_mode(mode);
-        fs::set_permissions(path, permissions)?;
-
-        Ok(0)
-    }
-
     /// Flush this device's json info as file
     fn flush_json(&mut self) -> Result<i32, UblkError> {
-        if self.json == serde_json::json!({}) {
-            return Ok(0);
-        }
-
         // flushing json should only be done in case of adding new device
         // or recovering old device
         if !self.for_add_dev() && !self.for_recover_dev() {
             return Ok(0);
         }
 
-        let run_path = self.run_path();
-        let json_path = Path::new(&run_path);
-
-        if let Some(parent_dir) = json_path.parent() {
-            if !Path::new(&parent_dir).exists() {
-                fs::create_dir_all(parent_dir)?;
-
-                // It is just fine to expose the running parent directory as
-                // 777, and we will make sure every exported running json
-                // file as 700.
-                Self::set_path_permission(parent_dir, 0o777)?;
-            }
-        }
-        let mut run_file = fs::File::create(json_path)?;
-
-        // Each exported json file is only visible for the device owner.
-        // In future, it can be relaxed, such as allowing group to access,
-        // according to ublk use policy
-        Self::set_path_permission(json_path, 0o700)?;
-
-        run_file.write_all(self.json.to_string().as_bytes())?;
-        Ok(0)
+        self.json_manager.flush_json()
     }
 
     /// Build json info for this device
@@ -925,13 +1044,15 @@ impl UblkCtrlInner {
     /// pthread tid
     ///
     fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        // keep everything not changed except for queue tid
-        if dev.dev_info.state == sys::UBLK_S_DEV_QUIESCED as u16 {
-            if let Some(queues) = self.json.get_mut("queues") {
+        // Update queue thread IDs if they exist and JSON already has content
+        if !self.json_manager.get_json().is_null()
+            && self.json_manager.get_json().is_object()
+            && !self.json_manager.get_json().as_object().unwrap().is_empty()
+        {
+            if let Some(queues) = self.json_manager.get_json_mut().get_mut("queues") {
                 for qid in 0..dev.dev_info.nr_hw_queues {
-                    let t = format!("{}", qid);
-                    if let Some(q) = queues.get_mut(t) {
-                        if let Some(tid) = q.get_mut("tid") {
+                    if let Some(queue) = queues.get_mut(&qid.to_string()) {
+                        if let Some(tid) = queue.get_mut("tid") {
                             *tid = serde_json::json!(self.queue_tids[qid as usize]);
                         }
                     }
@@ -969,9 +1090,9 @@ impl UblkCtrlInner {
         }
 
         let mut json = serde_json::json!({
-                    "dev_info": dev.dev_info,
-                    "target": dev.tgt,
-                    "target_flags": dev.flags.bits(),
+            "dev_info": dev.dev_info,
+            "target": dev.tgt,
+            "target_flags": dev.flags.bits(),
         });
 
         if let Some(val) = tgt_data {
@@ -980,20 +1101,14 @@ impl UblkCtrlInner {
 
         json["queues"] = serde_json::Value::Object(map);
 
-        self.json = json;
+        self.json_manager.set_json(json);
         Ok(0)
     }
 
     /// Reload json info for this device
     ///
     fn reload_json(&mut self) -> Result<i32, UblkError> {
-        let mut file = fs::File::open(self.run_path())?;
-        let mut json_str = String::new();
-
-        file.read_to_string(&mut json_str)?;
-        self.json = serde_json::from_str(&json_str).map_err(UblkError::JsonError)?;
-
-        Ok(0)
+        self.json_manager.reload_json()
     }
 }
 
@@ -1114,8 +1229,8 @@ impl UblkCtrl {
             // mlock feature is incompatible with certain other features
             Self::validate_param(
                 (flags & sys::UBLK_F_USER_COPY as u64) == 0
-                && (flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0
-                && (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) == 0
+                    && (flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0
+                    && (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) == 0,
             )?;
         }
 
@@ -1177,42 +1292,22 @@ impl UblkCtrl {
     /// * `qid`: queue id
     ///
     pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
-        let ctrl = self.get_inner_mut();
-        let queues = &ctrl.json["queues"];
-        let queue = &queues[qid.to_string()];
-        let this_queue: Result<QueueAffinityJson, _> = serde_json::from_value(queue.clone());
-
-        if let Ok(p) = this_queue {
-            Ok(p.tid as i32)
-        } else {
-            Self::sys_result_to_error(-libc::EEXIST)
-        }
+        let ctrl = self.get_inner();
+        ctrl.json_manager.get_queue_tid_from_json(qid as u16)
     }
 
     /// Get target flags from exported json file for this device
     ///
     pub fn get_target_flags_from_json(&self) -> Result<u32, UblkError> {
-        let ctrl = self.get_inner_mut();
-        let __tgt_flags = &ctrl.json["target_flags"];
-        let tgt_flags: Result<u32, _> = serde_json::from_value(__tgt_flags.clone());
-
-        if let Ok(flags) = tgt_flags {
-            Ok(flags)
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
+        let ctrl = self.get_inner();
+        ctrl.json_manager.get_target_flags_from_json()
     }
 
     /// Get target from exported json file for this device
     ///
     pub fn get_target_from_json(&self) -> Result<super::io::UblkTgt, UblkError> {
-        let tgt_val = &self.get_inner().json["target"];
-        let tgt: Result<super::io::UblkTgt, _> = serde_json::from_value(tgt_val.clone());
-        if let Ok(p) = tgt {
-            Ok(p)
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
+        let ctrl = self.get_inner();
+        ctrl.json_manager.get_target_from_json()
     }
 
     /// Return target json data
@@ -1220,22 +1315,15 @@ impl UblkCtrl {
     /// Should only be called after device is started, otherwise target data
     /// won't be serialized out, and this API returns None
     pub fn get_target_data_from_json(&self) -> Option<serde_json::Value> {
-        let val = &self.get_inner().json["target_data"];
-        if !val.is_null() {
-            Some(val.clone())
-        } else {
-            None
-        }
+        let ctrl = self.get_inner();
+        ctrl.json_manager.get_target_data_from_json()
     }
 
     /// Get target type from exported json file for this device
     ///
     pub fn get_target_type_from_json(&self) -> Result<String, UblkError> {
-        if let Ok(tgt) = self.get_target_from_json() {
-            Ok(tgt.tgt_type)
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
+        let ctrl = self.get_inner();
+        ctrl.json_manager.get_target_type_from_json()
     }
 
     /// Configure queue affinity and record queue tid
