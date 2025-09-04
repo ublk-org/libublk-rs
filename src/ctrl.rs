@@ -593,6 +593,7 @@ impl UblkCtrlInner {
         }
     }
 
+    /// Convert uring result to UblkError
     fn ublk_err_to_result(res: i32) -> Result<i32, UblkError> {
         if res >= 0 || res == -libc::EBUSY {
             Ok(res)
@@ -860,7 +861,7 @@ impl UblkCtrlInner {
         } else if self.for_recover_dev() {
             self.flush_json()?;
         } else {
-            return Err(crate::UblkError::OtherError(-libc::EINVAL));
+            return Err(UblkError::OtherError(-libc::EINVAL));
         };
 
         Ok(0)
@@ -1034,6 +1035,44 @@ impl UblkCtrl {
         self.get_inner().dev_flags
     }
 
+    /// Consolidated error handling helpers
+
+    /// Convert system call result to UblkError::OtherError
+    fn sys_result_to_error(res: i32) -> Result<i32, UblkError> {
+        if res >= 0 {
+            Ok(res)
+        } else {
+            Err(UblkError::OtherError(res))
+        }
+    }
+
+    /// Validate input parameter and return InvalidVal error if condition fails
+    fn validate_param(condition: bool) -> Result<(), UblkError> {
+        if condition {
+            Ok(())
+        } else {
+            Err(UblkError::InvalidVal)
+        }
+    }
+
+    /// Validate queue ID bounds
+    fn validate_queue_id(qid: u16, max_queues: u16) -> Result<(), UblkError> {
+        if (qid as usize) < (max_queues as usize) {
+            Ok(())
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Check if thread ID is valid (non-zero)
+    fn validate_thread_id(tid: i32) -> Result<(), UblkError> {
+        if tid != 0 {
+            Ok(())
+        } else {
+            Err(UblkError::OtherError(-libc::ESRCH))
+        }
+    }
+
     /// New one ublk control device
     ///
     /// # Arguments:
@@ -1061,46 +1100,31 @@ impl UblkCtrl {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
-        if (flags & !Self::UBLK_DRV_F_ALL) != 0 {
-            return Err(UblkError::InvalidVal);
-        }
+        Self::validate_param((flags & !Self::UBLK_DRV_F_ALL) == 0)?;
 
         if !Path::new(CTRL_PATH).exists() {
             eprintln!("Please run `modprobe ublk_drv` first");
             return Err(UblkError::OtherError(-libc::ENOENT));
         }
 
-        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0) {
-            return Err(UblkError::InvalidVal);
-        }
+        Self::validate_param(!dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0))?;
 
         // Check mlock feature compatibility
         if dev_flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
             // mlock feature is incompatible with certain other features
-            if (flags & sys::UBLK_F_USER_COPY as u64) != 0
-                || (flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
-                || (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
-            {
-                return Err(UblkError::InvalidVal);
-            }
+            Self::validate_param(
+                (flags & sys::UBLK_F_USER_COPY as u64) == 0
+                && (flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0
+                && (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) == 0
+            )?;
         }
 
-        if id < 0 && id != -1 {
-            return Err(UblkError::InvalidVal);
-        }
-
-        if nr_queues > sys::UBLK_MAX_NR_QUEUES {
-            return Err(UblkError::InvalidVal);
-        }
-
-        if depth > sys::UBLK_MAX_QUEUE_DEPTH {
-            return Err(UblkError::InvalidVal);
-        }
+        Self::validate_param(id >= -1)?;
+        Self::validate_param(nr_queues <= sys::UBLK_MAX_NR_QUEUES)?;
+        Self::validate_param(depth <= sys::UBLK_MAX_QUEUE_DEPTH)?;
 
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-        if io_buf_bytes > MAX_BUF_SZ || io_buf_bytes & (page_sz - 1) != 0 {
-            return Err(UblkError::InvalidVal);
-        }
+        Self::validate_param(io_buf_bytes <= MAX_BUF_SZ && (io_buf_bytes & (page_sz - 1)) == 0)?;
 
         let inner = RwLock::new(UblkCtrlInner::new(
             name,
@@ -1161,7 +1185,7 @@ impl UblkCtrl {
         if let Ok(p) = this_queue {
             Ok(p.tid as i32)
         } else {
-            Err(UblkError::OtherError(-libc::EEXIST))
+            Self::sys_result_to_error(-libc::EEXIST)
         }
     }
 
@@ -1396,16 +1420,12 @@ impl UblkCtrl {
         let inner = self.get_inner();
 
         // Validate queue ID
-        if (qid as usize) >= inner.queue_tids.len() {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
+        Self::validate_queue_id(qid, inner.queue_tids.len() as u16)?;
 
         let tid = inner.queue_tids[qid as usize];
 
         // Check if the thread has been configured (tid != 0)
-        if tid == 0 {
-            return Err(UblkError::OtherError(-libc::ESRCH));
-        }
+        Self::validate_thread_id(tid)?;
 
         // Use sched_getaffinity to get the actual thread affinity
         let result = unsafe {
@@ -1419,7 +1439,7 @@ impl UblkCtrl {
         if result == 0 {
             Ok(0)
         } else {
-            Err(UblkError::OtherError(-unsafe { *libc::__errno_location() }))
+            Self::sys_result_to_error(-unsafe { *libc::__errno_location() })
         }
     }
 
