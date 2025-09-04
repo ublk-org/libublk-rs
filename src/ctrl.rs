@@ -6,7 +6,7 @@ use derive_setters::*;
 use io_uring::{opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
-use std::cell::RefCell;
+use std::cell::{LazyCell, RefCell};
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, RwLock};
 use std::{
@@ -22,9 +22,9 @@ const MAX_BUF_SZ: u32 = 32_u32 << 20;
 // per-thread control uring
 //
 std::thread_local! {
-    pub(crate) static CTRL_URING: RefCell<IoUring::<squeue::Entry128>> =
-        RefCell::new(IoUring::<squeue::Entry128>::builder()
-            .build(16).unwrap());
+    pub(crate) static CTRL_URING: LazyCell<RefCell<IoUring::<squeue::Entry128>>> =
+        LazyCell::new(|| RefCell::new(IoUring::<squeue::Entry128>::builder()
+            .build(16).unwrap()));
 }
 
 /// Ublk per-queue CPU affinity
