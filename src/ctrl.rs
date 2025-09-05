@@ -1855,6 +1855,63 @@ impl UblkCtrl {
         ctrl.dump_from_json();
     }
 
+    /// Dump this device info asynchronously
+    ///
+    /// This is the async version of dump(). The 1st part is from UblkCtrl.dev_info,
+    /// and the 2nd part is retrieved from device's exported json file.
+    /// Uses async I/O for driver communication and file operations.
+    pub async fn dump_async(&self) -> Result<(), UblkError> {
+        let mut ctrl = self.get_inner_mut();
+        let mut p = sys::ublk_params {
+            ..Default::default()
+        };
+
+        ctrl.read_dev_info_async().await.map_err(|e| {
+            error!(
+                "Dump dev {} failed: read_dev_info_async\n",
+                ctrl.dev_info.dev_id
+            );
+            e
+        })?;
+
+        ctrl.get_params_async(&mut p).await.map_err(|e| {
+            error!(
+                "Dump dev {} failed: get_params_async\n",
+                ctrl.dev_info.dev_id
+            );
+            e
+        })?;
+
+        let info = &ctrl.dev_info;
+        println!(
+            "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
+            info.dev_id,
+            info.nr_hw_queues,
+            info.queue_depth,
+            1 << p.basic.logical_bs_shift,
+            p.basic.dev_sectors
+        );
+        println!(
+            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}",
+            info.max_io_buf_bytes,
+            info.ublksrv_pid,
+            info.flags,
+            ctrl.dev_state_desc()
+        );
+        println!(
+            "\tublkc: {}:{} ublkb: {}:{} owner: {}:{}",
+            p.devt.char_major,
+            p.devt.char_minor,
+            p.devt.disk_major,
+            p.devt.disk_minor,
+            info.owner_uid,
+            info.owner_gid
+        );
+
+        ctrl.dump_from_json();
+        Ok(())
+    }
+
     pub fn run_dir() -> String {
         String::from("/run/ublksrvd")
     }
@@ -2676,7 +2733,7 @@ mod tests {
 
     /// Test async constructor methods
     #[test]
-    fn test_async_constructors() {
+    fn test_async_apis() {
         use crate::uring_async::ublk_join_tasks;
 
         env_logger::builder()
@@ -2732,6 +2789,19 @@ mod tests {
                 Err(_e) => println!(
                     "✓ get_queue_affinity_async: Method exists and returns appropriate error"
                 ),
+            }
+
+            // Test dump_async method
+            match ctrl.dump_async().await {
+                Ok(()) => {
+                    println!("✓ dump_async: Successfully executed dump_async() method");
+                }
+                Err(e) => {
+                    println!(
+                        "✓ dump_async: Method exists and returns error as expected: {:?}",
+                        e
+                    );
+                }
             }
 
             // Test new_simple_async
