@@ -792,7 +792,7 @@ impl UblkCtrlInner {
             if let Err(_) = self.reload_json() {
                 eprintln!("device reload json failed");
             }
-            self.read_dev_info()?;
+            self.read_dev_info_async().await?;
         }
         Ok(())
     }
@@ -1225,6 +1225,37 @@ impl UblkCtrlInner {
 
     fn read_dev_info(&mut self) -> Result<i32, UblkError> {
         self.__read_dev_info2().or_else(|_| self.__read_dev_info())
+    }
+
+    /// Async version of read_dev_info() - retrieve device info from ublk driver
+    ///
+    async fn read_dev_info_async(&mut self) -> Result<i32, UblkError> {
+        match self.__read_dev_info2_async().await {
+            Ok(result) => Ok(result),
+            Err(_) => self.__read_dev_info_async().await,
+        }
+    }
+
+    async fn __read_dev_info_async(&mut self) -> Result<i32, UblkError> {
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_DEV_INFO,
+            std::ptr::addr_of!(self.dev_info) as u64,
+            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
+            false, // need dev_path
+        );
+
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    async fn __read_dev_info2_async(&mut self) -> Result<i32, UblkError> {
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_DEV_INFO2,
+            std::ptr::addr_of!(self.dev_info) as u64,
+            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
+            false, // need dev_path
+        );
+
+        self.ublk_ctrl_cmd_async(&data).await
     }
 
     /// Start this device by sending command to ublk driver
@@ -1817,6 +1848,16 @@ impl UblkCtrl {
     ///
     pub fn read_dev_info(&self) -> Result<i32, UblkError> {
         self.get_inner_mut().read_dev_info()
+    }
+
+    /// Retrieving device info from ublk driver in async/.await
+    ///
+    /// This method performs the same functionality as read_dev_info() but returns a Future
+    /// that resolves to the result. It uses the same fallback mechanism as the synchronous
+    /// version, trying UBLK_U_CMD_GET_DEV_INFO2 first and falling back to UBLK_U_CMD_GET_DEV_INFO.
+    ///
+    pub async fn read_dev_info_async(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().read_dev_info_async().await
     }
 
     /// Retrieve this device's parameter from ublk driver by
@@ -2559,14 +2600,17 @@ mod tests {
                 }
             };
 
+            if ctrl.read_dev_info_async().await.is_err() {
+                println!("new_async: read_dev_info_async() failed");
+                return;
+            }
+
             // Test new_simple_async
             let result_simple = UblkCtrl::new_simple_async(ctrl.dev_info().dev_id as i32).await;
             match result_simple {
-                Ok(_ctrl) => {
-                    println!("✓ new_simple_async: Successfully created simple device");
-                }
+                Ok(_ctrl) => println!("✓ new_simple_async: Successfully created simple device"),
                 Err(_e) => {
-                    println!("✓ new_simple_async: Method exists and returns appropriate error");
+                    println!("✓ new_simple_async: Method exists and returns appropriate error")
                 }
             }
         });
