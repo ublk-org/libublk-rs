@@ -112,15 +112,14 @@ fn ublk_process_queue_io(
         q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), nr_waits)
     } else {
         crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-
-        match ublk_try_reap_cqe(r, nr_waits) {
-            Some(cqe) => {
-                let user_data = cqe.user_data();
-                ublk_wake_task(user_data, &cqe);
-                Ok(1)
+            match ublk_try_reap_cqe(r, nr_waits) {
+                Some(cqe) => {
+                    let user_data = cqe.user_data();
+                    ublk_wake_task(user_data, &cqe);
+                    Ok(1)
+                }
+                None => Ok(0),
             }
-            None => Ok(0),
-        }
         })
     };
     while exe.try_tick() {}
@@ -245,4 +244,29 @@ pub fn ublk_wait_and_handle_ios(exe: &smol::LocalExecutor, q: &UblkQueue) {
         }
     }
     q.unregister_io_bufs();
+}
+
+/// Block on all tasks in the executor until they are finished
+#[cfg(test)]
+pub(crate) fn ublk_join_tasks<T>(
+    exe: &smol::LocalExecutor,
+    tasks: Vec<smol::Task<T>>,
+) -> Result<(), UblkError> {
+    loop {
+        // Check if all tasks are finished
+        if tasks.iter().all(|task| task.is_finished()) {
+            break;
+        }
+
+        // Drive the executor to make progress on tasks
+        while exe.try_tick() {}
+
+        // Handle control uring events
+        let entry =
+            crate::ctrl::CTRL_URING.with(|refcell| ublk_try_reap_cqe(&mut refcell.borrow_mut(), 0));
+        if let Some(cqe) = entry {
+            ublk_wake_task(cqe.user_data(), &cqe);
+        }
+    }
+    Ok(())
 }
