@@ -3187,6 +3187,7 @@ mod tests {
         let ctrl = UblkCtrlBuilder::default()
             .name("test_async")
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .depth(8)
             .build_async()
             .await
             .unwrap();
@@ -3237,12 +3238,19 @@ mod tests {
             .try_init();
         let exe_rc = Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
-        let job = exe_rc.spawn(async {
-            device_handler_async().await.unwrap();
-        });
+        let mut fvec = Vec::new();
+
+        //support 64 devices
+        crate::ctrl::init_ctrl_task_ring_default(64 * 2).unwrap();
+
+        for _ in 0..64 {
+            fvec.push(exe_rc.spawn(async {
+                device_handler_async().await.unwrap();
+            }));
+        }
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
+            let _ = ublk_join_tasks(&exe, fvec);
         }));
     }
 }
