@@ -1373,6 +1373,24 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
+    /// Send this device's parameter to ublk driver asynchronously
+    ///
+    /// Note: device parameter has to send to driver before starting
+    /// this device
+    async fn set_params_async(&mut self, params: &sys::ublk_params) -> Result<i32, UblkError> {
+        let mut p = *params;
+
+        p.len = core::mem::size_of::<sys::ublk_params>() as u32;
+        let data = UblkCtrlCmdData::new_write_buffer_cmd(
+            sys::UBLK_U_CMD_SET_PARAMS,
+            std::ptr::addr_of!(p) as u64,
+            p.len,
+            false, // need dev_path
+        );
+
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
     fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
         let data = UblkCtrlCmdData::new_data_buffer_cmd(
             sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
@@ -1437,6 +1455,25 @@ impl UblkCtrlInner {
 
         if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             self.set_params(&dev.tgt.params)?;
+            self.flush_json()?;
+        } else if self.for_recover_dev() {
+            self.flush_json()?;
+        } else {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        };
+
+        Ok(0)
+    }
+
+    /// Prepare to start device asynchronously - async version of prep_start_dev
+    async fn prep_start_dev_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        self.read_dev_info_async().await?;
+        if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
+            return Ok(0);
+        }
+
+        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            self.set_params_async(&dev.tgt.params).await?;
             self.flush_json()?;
         } else if self.for_recover_dev() {
             self.flush_json()?;
@@ -2025,6 +2062,17 @@ impl UblkCtrl {
         self.get_inner_mut().set_params(params)
     }
 
+    /// Send this device's parameter to ublk driver asynchronously
+    ///
+    /// This method performs the same functionality as set_params() but returns a Future
+    /// that resolves to the result. It uses the async uring infrastructure to avoid
+    /// blocking the calling thread while waiting for the ublk driver response.
+    ///
+    /// Note: device parameter has to send to driver before starting this device
+    pub async fn set_params_async(&self, params: &sys::ublk_params) -> Result<i32, UblkError> {
+        self.get_inner_mut().set_params_async(params).await
+    }
+
     /// Retrieving the specified queue's affinity from ublk driver
     ///
     pub fn get_queue_affinity(&self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
@@ -2186,7 +2234,7 @@ impl UblkCtrl {
     ///
     pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
-        ctrl.prep_start_dev(dev)?;
+        ctrl.prep_start_dev_async(dev).await?;
 
         if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             ctrl.start_async(unsafe { libc::getpid() as i32 }).await
