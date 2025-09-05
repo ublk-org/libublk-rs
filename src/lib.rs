@@ -17,6 +17,9 @@ pub mod uring_async;
 // Re-export important types for unified buffer management
 pub use io::{ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, BufDesc, BufDescList};
 
+// Re-export control ring initialization
+pub use ctrl::ublk_init_ctrl_task_ring;
+
 bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
     /// UblkFlags: top 8bits are reserved for internal use

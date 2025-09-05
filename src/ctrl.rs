@@ -6,7 +6,7 @@ use derive_setters::*;
 use io_uring::{opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
-use std::cell::{LazyCell, RefCell};
+use std::cell::{OnceCell, RefCell};
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, RwLock};
 use std::{
@@ -19,12 +19,130 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
 
-// per-thread control uring
+// per-thread control uring using OnceCell for conditional initialization
 //
 std::thread_local! {
-    pub(crate) static CTRL_URING: LazyCell<RefCell<IoUring::<squeue::Entry128>>> =
-        LazyCell::new(|| RefCell::new(IoUring::<squeue::Entry128>::builder()
-            .build(16).unwrap()));
+    pub(crate) static CTRL_URING: OnceCell<RefCell<IoUring::<squeue::Entry128>>> =
+        OnceCell::new();
+}
+
+// Internal macro versions for backwards compatibility within the crate
+#[macro_export]
+macro_rules! with_ctrl_ring_internal {
+    ($closure:expr) => {
+        $crate::ctrl::CTRL_URING.with(|cell| {
+            if let Some(ring_cell) = cell.get() {
+                let ring = ring_cell.borrow();
+                $closure(&*ring)
+            } else {
+                panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
+            }
+        })
+    };
+}
+
+#[macro_export]
+macro_rules! with_ctrl_ring_mut_internal {
+    ($closure:expr) => {
+        $crate::ctrl::CTRL_URING.with(|cell| {
+            if let Some(ring_cell) = cell.get() {
+                let mut ring = ring_cell.borrow_mut();
+                $closure(&mut *ring)
+            } else {
+                panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
+            }
+        })
+    };
+}
+
+// Make internal macros available within the crate
+pub(crate) use with_ctrl_ring_internal;
+pub(crate) use with_ctrl_ring_mut_internal;
+
+/// Initialize the thread-local control ring using a custom closure
+///
+/// This API allows users to customize the io_uring initialization for control operations.
+/// The closure receives the OnceCell and can conditionally initialize it if not already set.
+/// If the thread-local variable is already initialized, the closure does nothing.
+///
+/// # Arguments
+/// * `init_fn` - Closure that receives OnceCell<RefCell<IoUring<squeue::Entry128>>> and returns
+///               Result<(), UblkError>. Should call `cell.set()` to initialize if needed.
+///
+/// # Examples
+///
+/// ## Basic custom initialization:
+/// ```no_run
+/// use libublk::ublk_init_ctrl_task_ring;
+/// use io_uring::IoUring;
+/// use std::cell::RefCell;
+///
+/// fn example() -> Result<(), Box<dyn std::error::Error>> {
+///     // Custom initialization before creating UblkCtrl
+///     ublk_init_ctrl_task_ring(|cell| {
+///         if cell.get().is_none() {
+///             let ring = IoUring::builder()
+///                 .setup_cqsize(256)  // Custom completion queue size
+///                 .setup_coop_taskrun()  // Enable cooperative task running
+///                 .build(128)?;  // Custom submission queue size
+///             cell.set(RefCell::new(ring))
+///                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+///         }
+///         Ok(())
+///     })?;
+///     
+///     // Now create UblkCtrl - it will use the pre-initialized ring
+///     println!("Control ring initialized!");
+///     Ok(())
+/// }
+/// ```
+///
+/// ## Advanced initialization with custom flags and size:
+/// ```no_run
+/// use libublk::ublk_init_ctrl_task_ring;
+/// use io_uring::IoUring;
+/// use std::cell::RefCell;
+///
+/// fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
+///     ublk_init_ctrl_task_ring(|cell| {
+///         if cell.get().is_none() {
+///             let ring = IoUring::builder()
+///                 .setup_cqsize(512)
+///                 .setup_sqpoll(1000)  // Enable SQPOLL mode
+///                 .setup_iopoll()      // Enable IOPOLL for high performance
+///                 .build(256)?;
+///             cell.set(RefCell::new(ring))
+///                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+///         }
+///         Ok(())
+///     })?;
+///     println!("Advanced control ring initialized!");
+///     Ok(())
+/// }
+/// ```
+pub fn ublk_init_ctrl_task_ring<F>(init_fn: F) -> Result<(), UblkError>
+where
+    F: FnOnce(&OnceCell<RefCell<IoUring<squeue::Entry128>>>) -> Result<(), UblkError>,
+{
+    CTRL_URING.with(|cell| init_fn(cell))
+}
+
+/// Internal function to initialize the control ring with default parameters
+///
+/// This is called by UblkCtrlInner::new()/new_async() when the ring hasn't been
+/// initialized yet. Uses default values similar to the original LazyCell approach.
+fn init_ctrl_task_ring_default(depth: u32) -> Result<(), UblkError> {
+    ublk_init_ctrl_task_ring(|cell| {
+        if cell.get().is_none() {
+            let ring = IoUring::<squeue::Entry128>::builder()
+                .build(depth)
+                .map_err(UblkError::IOError)?;
+
+            cell.set(RefCell::new(ring))
+                .map_err(|_| UblkError::OtherError(-libc::EEXIST))?;
+        }
+        Ok(())
+    })
 }
 
 /// Ublk per-queue CPU affinity
@@ -834,6 +952,9 @@ impl UblkCtrlInner {
         let file = Self::open_control_device()?;
         let (queue_tids, queue_selected_cpus) = Self::init_queue_data(config.nr_queues);
 
+        // Initialize control ring with default parameters
+        init_ctrl_task_ring_default(16)?;
+
         let mut dev = UblkCtrlInner {
             name: config.name,
             file,
@@ -870,6 +991,9 @@ impl UblkCtrlInner {
         );
         let file = Self::open_control_device()?;
         let (queue_tids, queue_selected_cpus) = Self::init_queue_data(config.nr_queues);
+
+        // Initialize control ring with default parameters
+        init_ctrl_task_ring_default(16)?;
 
         let mut dev = UblkCtrlInner {
             name: config.name,
@@ -1028,8 +1152,8 @@ impl UblkCtrlInner {
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
 
         unsafe {
-            CTRL_URING.with(|refcell| {
-                if let Err(e) = refcell.borrow_mut().submission().push(&sqe) {
+            with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                if let Err(e) = ring.submission().push(&sqe) {
                     eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
                 }
             })
@@ -1053,9 +1177,7 @@ impl UblkCtrlInner {
         } as u64;
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
 
-        CTRL_URING.with(|refcell| {
-            let mut r = refcell.borrow_mut();
-
+        with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
             unsafe {
                 if let Err(e) = r.submission().push(&sqe) {
                     eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
@@ -1070,9 +1192,7 @@ impl UblkCtrlInner {
     /// check one control command and see if it is completed
     ///
     fn poll_cmd(&mut self, token: u64) -> i32 {
-        CTRL_URING.with(|refcell| {
-            let mut r = refcell.borrow_mut();
-
+        with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
             let res = match r.completion().next() {
                 Some(cqe) => {
                     if cqe.user_data() != token {
