@@ -45,6 +45,7 @@ bitflags! {
 
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
+        const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;
     }
 }
 

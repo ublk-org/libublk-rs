@@ -724,6 +724,7 @@ impl Drop for UblkCtrlInner {
 }
 
 impl UblkCtrlInner {
+    const UBLK_CTRL_DEV_DELETED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_2;
     /// Create device info structure from parameters
     fn create_device_info(
         id: i32,
@@ -795,6 +796,14 @@ impl UblkCtrlInner {
             self.read_dev_info_async().await?;
         }
         Ok(())
+    }
+
+    fn is_deleted(&self) -> bool {
+        self.dev_flags.intersects(Self::UBLK_CTRL_DEV_DELETED)
+    }
+
+    fn mark_deleted(&mut self) {
+        self.dev_flags |= Self::UBLK_CTRL_DEV_DELETED;
     }
 
     /// Detect and store driver features
@@ -1174,6 +1183,10 @@ impl UblkCtrlInner {
     /// Remove this device
     ///
     fn del(&mut self) -> Result<i32, UblkError> {
+        if self.is_deleted() {
+            return Ok(0);
+        }
+
         let cmd_op = if self
             .dev_flags
             .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
@@ -1184,15 +1197,23 @@ impl UblkCtrlInner {
         };
         let data = UblkCtrlCmdData::new_simple_cmd(cmd_op);
 
-        self.ublk_ctrl_cmd(&data)
+        let res = self.ublk_ctrl_cmd(&data)?;
+        self.mark_deleted();
+
+        Ok(res)
     }
 
     /// Remove this device
     ///
     fn del_async(&mut self) -> Result<i32, UblkError> {
+        if self.is_deleted() {
+            return Ok(0);
+        }
         let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
 
-        self.ublk_ctrl_cmd(&data)
+        let res = self.ublk_ctrl_cmd(&data)?;
+        self.mark_deleted();
+        Ok(res)
     }
 
     /// Delete this device using proper async/await pattern
@@ -1203,9 +1224,14 @@ impl UblkCtrlInner {
     /// and DEL_DEV commands based on device flags.
     ///
     async fn del_async_await(&mut self) -> Result<i32, UblkError> {
+        if self.is_deleted() {
+            return Ok(0);
+        }
         let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
 
-        self.ublk_ctrl_cmd_async(&data).await
+        let res = self.ublk_ctrl_cmd_async(&data).await?;
+        self.mark_deleted();
+        Ok(res)
     }
 
     fn __get_features(&mut self) -> Result<u64, UblkError> {
@@ -3070,6 +3096,10 @@ mod tests {
 
         ctrl.dump_async().await?;
         ctrl.kill_dev_async().await?;
+
+        // async/await needs to delete device by itself, otherwise we
+        // may hang in Drop() of UblkCtrlInner.
+        ctrl.del_dev_async_await().await?;
 
         qh.join().unwrap_or_else(|_| {
             eprintln!("dev-{} join queue thread failed", dev_arc.dev_info.dev_id)
