@@ -1298,6 +1298,20 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
+    /// Retrieve this device's parameter from ublk driver by
+    /// sending command in async/.await
+    async fn get_params_async(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
+        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_PARAMS,
+            params as *const sys::ublk_params as u64,
+            params.len,
+            false, // need dev_path
+        );
+
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
     /// Send this device's parameter to ublk driver
     ///
     /// Note: device parameter has to send to driver before starting
@@ -1866,6 +1880,18 @@ impl UblkCtrl {
     /// Can't pass params by reference(&mut), why?
     pub fn get_params(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         self.get_inner_mut().get_params(params)
+    }
+
+    /// Retrieve this device's parameter from ublk driver by
+    /// sending command in async/.await
+    ///
+    /// This method performs the same functionality as get_params() but returns a Future
+    /// that resolves to the result. It uses the async uring infrastructure to avoid
+    /// blocking the calling thread while waiting for the ublk driver response.
+    ///
+    /// Can't pass params by reference(&mut), why?
+    pub async fn get_params_async(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
+        self.get_inner_mut().get_params_async(params).await
     }
 
     /// Send this device's parameter to ublk driver
@@ -2602,6 +2628,15 @@ mod tests {
 
             if ctrl.read_dev_info_async().await.is_err() {
                 println!("new_async: read_dev_info_async() failed");
+                return;
+            }
+
+            let mut p = crate::sys::ublk_params {
+                ..Default::default()
+            };
+
+            if ctrl.get_params_async(&mut p).await.is_err() {
+                println!("new_async: get_prarams_async() failed");
                 return;
             }
 
