@@ -805,6 +805,14 @@ impl UblkCtrlInner {
         };
     }
 
+    /// Detect and store driver features asynchronously
+    async fn detect_features_async(&mut self) {
+        self.features = match self.__get_features_async().await {
+            Ok(f) => Some(f),
+            _ => None,
+        };
+    }
+
     fn new(config: UblkCtrlConfig) -> Result<UblkCtrlInner, UblkError> {
         let dev_info = Self::create_device_info(
             config.id,
@@ -867,11 +875,11 @@ impl UblkCtrlInner {
             features: None,
         };
 
-        dev.detect_features();
+        dev.detect_features_async().await;
         dev.handle_device_lifecycle_async(config.id).await?;
 
         log::info!(
-            "ctrl: device {} flags {:x} created",
+            "ctrl/async: device {} flags {:x} created",
             dev.dev_info.dev_id,
             dev.dev_flags
         );
@@ -1210,6 +1218,20 @@ impl UblkCtrlInner {
         );
 
         self.ublk_ctrl_cmd(&data)?;
+
+        Ok(features)
+    }
+
+    async fn __get_features_async(&mut self) -> Result<u64, UblkError> {
+        let features = 0_u64;
+        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_FEATURES,
+            std::ptr::addr_of!(features) as u64,
+            core::mem::size_of::<u64>() as u32,
+            true, // no_dev_path
+        );
+
+        self.ublk_ctrl_cmd_async(&data).await?;
 
         Ok(features)
     }
