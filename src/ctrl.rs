@@ -1187,6 +1187,19 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
+    /// Delete this device using proper async/await pattern
+    ///
+    /// This method provides the same functionality as del() but uses the
+    /// async uring infrastructure. It follows the same command selection
+    /// logic as the synchronous version, choosing between DEL_DEV_ASYNC
+    /// and DEL_DEV commands based on device flags.
+    ///
+    async fn del_async_await(&mut self) -> Result<i32, UblkError> {
+        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
+
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
     fn __get_features(&mut self) -> Result<u64, UblkError> {
         let features = 0_u64;
         let data = UblkCtrlCmdData::new_read_buffer_cmd(
@@ -1282,6 +1295,14 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd(&data)
     }
 
+    /// Stop this device by sending command to ublk driver asynchronously
+    ///
+    async fn stop_async(&mut self) -> Result<i32, UblkError> {
+        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV);
+
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
     /// Retrieve this device's parameter from ublk driver by
     /// sending command
     ///
@@ -1362,6 +1383,12 @@ impl UblkCtrlInner {
         let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY);
 
         self.ublk_ctrl_cmd(&data)
+    }
+
+    async fn __start_user_recover_async(&mut self) -> Result<i32, UblkError> {
+        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY);
+
+        self.ublk_ctrl_cmd_async(&data).await
     }
 
     /// End user recover for this device, do similar thing done in start_dev()
@@ -2083,6 +2110,27 @@ impl UblkCtrl {
         }
     }
 
+    /// Start user recover for this device asynchronously
+    ///
+    pub async fn start_user_recover_async(&self) -> Result<i32, UblkError> {
+        let mut count = 0u32;
+        let unit = 100_u32;
+
+        loop {
+            let res = self.get_inner_mut().__start_user_recover_async().await;
+            if let Ok(r) = res {
+                if r == -libc::EBUSY {
+                    futures_timer::Delay::new(std::time::Duration::from_millis(unit as u64)).await;
+                    count += unit;
+                    if count < 30000 {
+                        continue;
+                    }
+                }
+            }
+            return res;
+        }
+    }
+
     /// Start ublk device
     ///
     /// # Arguments:
@@ -2142,6 +2190,20 @@ impl UblkCtrl {
         ctrl.stop()
     }
 
+    /// Stop ublk device asynchronously
+    ///
+    /// Remove json export, and send stop command to control device asynchronously
+    ///
+    pub async fn stop_dev_async(&self) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+        let rp = ctrl.run_path();
+
+        if ctrl.for_add_dev() && Path::new(&rp).exists() {
+            fs::remove_file(rp)?;
+        }
+        ctrl.stop_async().await
+    }
+
     /// Kill this device
     ///
     /// Preferred method for target code to stop & delete device,
@@ -2152,6 +2214,18 @@ impl UblkCtrl {
     ///
     pub fn kill_dev(&self) -> Result<i32, UblkError> {
         self.get_inner_mut().stop()
+    }
+
+    /// Kill this device asynchronously
+    ///
+    /// Preferred method for target code to stop & delete device,
+    /// which is safe and can avoid deadlock.
+    ///
+    /// But device may not be really removed yet, and the device ID
+    /// can still be in-use after kill_dev_async() returns.
+    ///
+    pub async fn kill_dev_async(&self) -> Result<i32, UblkError> {
+        self.get_inner_mut().stop_async().await
     }
 
     /// Remove this device and its exported json file
@@ -2178,6 +2252,23 @@ impl UblkCtrl {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del_async()?;
+        if Path::new(&ctrl.run_path()).exists() {
+            fs::remove_file(ctrl.run_path())?;
+        }
+        Ok(0)
+    }
+
+    /// Delete ublk device using async/await pattern
+    ///
+    /// This method provides true async/await support for device deletion,
+    /// using the async uring infrastructure for non-blocking operations.
+    /// This is an alternative to del_dev_async() that follows the established
+    /// async/await patterns used by other async methods in the API.
+    ///
+    pub async fn del_dev_async_await(&self) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+
+        ctrl.del_async_await().await?;
         if Path::new(&ctrl.run_path()).exists() {
             fs::remove_file(ctrl.run_path())?;
         }
@@ -2731,7 +2822,7 @@ mod tests {
         println!("  - Random CPU selection: PASS (selected CPU {})", cpu);
     }
 
-    /// Test async constructor methods
+    /// Test async APIs
     #[test]
     fn test_async_apis() {
         use crate::uring_async::ublk_join_tasks;
@@ -2767,8 +2858,10 @@ mod tests {
             };
 
             if ctrl.read_dev_info_async().await.is_err() {
-                println!("new_async: read_dev_info_async() failed");
+                println!("✓ new_async: read_dev_info_async() failed");
                 return;
+            } else {
+                println!("✓ read_dev_info_async: Successfully read dev info")
             }
 
             let mut p = crate::sys::ublk_params {
@@ -2776,8 +2869,9 @@ mod tests {
             };
 
             if ctrl.get_params_async(&mut p).await.is_err() {
-                println!("new_async: get_prarams_async() failed");
-                return;
+                println!("✓ new_async: get_prarams_async() failed");
+            } else {
+                println!("✓ get_params_async: Successfully get parameters")
             }
 
             // Test get_queue_affinity_async
@@ -2802,6 +2896,18 @@ mod tests {
                         e
                     );
                 }
+            }
+
+            if ctrl.stop_dev_async().await.is_err() {
+                println!("✓ new_async: stop_dev_async() failed");
+            } else {
+                println!("✓ stop_dev_async: Successfully")
+            }
+
+            if ctrl.del_dev_async_await().await.is_err() {
+                println!("✓ new_async: del_dev_async_await() failed");
+            } else {
+                println!("✓ del_dev_async_await: Successfully")
             }
 
             // Test new_simple_async
