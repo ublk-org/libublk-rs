@@ -2827,10 +2827,10 @@ mod tests {
     fn test_async_apis() {
         use crate::uring_async::ublk_join_tasks;
 
-        env_logger::builder()
+        let _ = env_logger::builder()
             .format_target(false)
             .format_timestamp(None)
-            .init();
+            .try_init();
         let exe_rc = Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
 
@@ -2925,5 +2925,104 @@ mod tests {
         }));
 
         println!("✓ Async constructor methods are properly defined");
+    }
+
+    async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) {
+        use crate::helpers::IoBuf;
+        use crate::BufDesc;
+
+        let mut cmd_op = crate::sys::UBLK_U_IO_FETCH_REQ;
+        let mut res = 0;
+        let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+        q.register_io_buf(tag, &buf);
+        let _buf = Some(buf);
+        let iod = q.get_iod(tag);
+
+        loop {
+            let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
+            let cmd_res = q
+                .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)
+                .unwrap()
+                .await;
+            if cmd_res == crate::sys::UBLK_IO_RES_ABORT {
+                break;
+            }
+
+            res = (iod.nr_sectors << 9) as i32;
+            cmd_op = crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+        }
+    }
+
+    fn q_async_fn<'a>(
+        exe: &smol::LocalExecutor<'a>,
+        q_rc: &Rc<UblkQueue<'a>>,
+        depth: u16,
+        f_vec: &mut Vec<smol::Task<()>>,
+    ) {
+        for tag in 0..depth as u16 {
+            let q = q_rc.clone();
+            f_vec.push(exe.spawn(async move {
+                io_async_fn(tag, &q).await;
+            }));
+        }
+    }
+
+    async fn device_handler_async() -> Result<(), UblkError> {
+        let ctrl = UblkCtrlBuilder::default()
+            .name("test_async")
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build_async()
+            .await
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+        let dev_arc = &std::sync::Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl)?);
+        let dev = dev_arc.clone();
+        assert!(dev_arc.dev_info.nr_hw_queues == 1);
+
+        // Todo: support to handle multiple queues in one thread context
+        let qh = std::thread::spawn(move || {
+            let q_rc = Rc::new(UblkQueue::new(0 as u16, &dev).unwrap());
+            let q = q_rc.clone();
+            let exe = smol::LocalExecutor::new();
+            let mut f_vec: Vec<smol::Task<()>> = Vec::new();
+
+            q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
+
+            crate::uring_async::ublk_wait_and_handle_ios(&exe, &q_rc);
+            smol::block_on(async { futures::future::join_all(f_vec).await });
+        });
+
+        ctrl.start_dev_async(dev_arc).await?;
+
+        ctrl.dump_async().await?;
+        ctrl.kill_dev_async().await?;
+
+        qh.join().unwrap_or_else(|_| {
+            eprintln!("dev-{} join queue thread failed", dev_arc.dev_info.dev_id)
+        });
+        Ok(())
+    }
+
+    /// Test async APIs for building ublk device
+    #[test]
+    fn test_create_ublk_async() {
+        use crate::uring_async::ublk_join_tasks;
+        let _ = env_logger::builder()
+            .format_target(false)
+            .format_timestamp(None)
+            .try_init();
+        let exe_rc = Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
+        let job = exe_rc.spawn(async {
+            device_handler_async().await.unwrap();
+        });
+
+        smol::block_on(exe_rc.run(async move {
+            let _ = ublk_join_tasks(&exe, vec![job]);
+        }));
     }
 }
