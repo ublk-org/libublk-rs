@@ -67,11 +67,12 @@
 //! ### Traditional Buffer Operations
 //! ```no_run
 //! use libublk::io::{BufDesc, UblkQueue};
+//! use libublk::helpers::IoBuf;
 //! use libublk::sys;
 //!
 //! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
-//!     let buffer = [0u8; 4096];
-//!     let slice_desc = BufDesc::Slice(&buffer);
+//!     let io_buf = IoBuf::<u8>::new(4096);
+//!     let slice_desc = BufDesc::from_io_buf(&io_buf);
 //!     let future = queue.submit_io_cmd_unified(0, sys::UBLK_U_IO_FETCH_REQ, slice_desc, -1)?;
 //!     // ... handle future
 //!     Ok(())
