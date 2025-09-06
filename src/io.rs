@@ -2274,6 +2274,21 @@ impl UblkQueue<'_> {
     pub fn get_slab_key(&self) -> u16 {
         self.queue_slab_key
     }
+
+    // Multi-queue support methods - public wrappers for private methods
+
+    pub(crate) fn handle_timeout_multi(&self) {
+        self.enter_queue_idle();
+    }
+
+    pub(crate) fn handle_io_cmd_multi(&self, cqe: &cqueue::Entry) {
+        self.update_state(cqe);
+        self.exit_queue_idle();
+    }
+
+    pub(crate) fn queue_is_done_multi(&self) -> bool {
+        self.state.borrow().queue_is_done()
+    }
 }
 
 #[cfg(test)]
