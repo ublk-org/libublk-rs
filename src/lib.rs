@@ -11,11 +11,15 @@ mod bindings;
 pub mod ctrl;
 pub mod helpers;
 pub mod io;
+pub mod multi_queue;
 pub mod sys;
 pub mod uring_async;
 
 // Re-export important types for unified buffer management
 pub use io::{ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, BufDesc, BufDescList};
+
+// Re-export multi-queue support
+pub use multi_queue::MultiQueueManager;
 
 // Re-export control ring initialization
 pub use ctrl::ublk_init_ctrl_task_ring;

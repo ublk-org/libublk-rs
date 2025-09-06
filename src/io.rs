@@ -79,14 +79,37 @@
 //! }
 //! ```
 //!
+//! ## Multi-Queue Support Examples
+//!
+//! ### Multi-Queue Manager
+//! ```no_run
+//! use libublk::io::{UblkQueue, UblkDev};
+//! use libublk::multi_queue::MultiQueueManager;
+//!
+//! fn example(dev: &UblkDev) -> Result<(), libublk::UblkError> {
+//!     let mut manager = MultiQueueManager::new();
+//!     let mut queues = Vec::new();
+//!
+//!     // Create and register queues automatically
+//!     for q_id in 0..8 {
+//!         let queue = UblkQueue::new_multi(q_id, dev, &mut manager)?;
+//!         println!("Created queue {} with slab key: {}", q_id, queue.get_slab_key());
+//!         queues.push(queue);
+//!     }
+//!
+//!     println!("Managing {} queues", manager.queue_count());
+//!     Ok(())
+//! }
+//! ```
+//!
 //! ### Zero-Copy Operations
 //! ```no_run
 //! use libublk::io::{BufDesc, UblkQueue};
 //! use libublk::sys;
 //!
 //! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
-//!     let auto_reg = sys::ublk_auto_buf_reg { 
-//!         index: 0, flags: 0, reserved0: 0, reserved1: 0 
+//!     let auto_reg = sys::ublk_auto_buf_reg {
+//!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
 //!     let future = queue.submit_io_cmd_unified(1, sys::UBLK_U_IO_FETCH_REQ, auto_desc, -1)?;
@@ -128,6 +151,7 @@ use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
+use crate::multi_queue::MultiQueueManager;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
@@ -605,6 +629,7 @@ impl<'a> UblkIOCtx<'a> {
     }
 
     /// Extract tag from userdata
+    /// Available for async/.await UblkUringOpFuture
     #[inline(always)]
     pub fn user_data_to_tag(user_data: u64) -> u32 {
         (user_data & 0xffff) as u32
@@ -616,6 +641,19 @@ impl<'a> UblkIOCtx<'a> {
         ((user_data >> 16) & 0xff) as u32
     }
 
+    /// Extract slab_key from multi-queue userdata
+    /// only available for async/.await UblkUringOpFuture
+    #[inline(always)]
+    pub fn user_data_to_slab_key(user_data: u64) -> u16 {
+        ((user_data >> 48) & 0x3ff) as u16 // 0x3ff = 1023, 10-bit mask
+    }
+
+    /// Extract target data from userdata
+    #[inline(always)]
+    pub fn user_data_to_tgt_data(user_data: u64) -> u32 {
+        ((user_data >> 24) & 0xffff) as u32
+    }
+
     /// Check if this userdata is from target IO
     #[inline(always)]
     fn is_target_io(user_data: u64) -> bool {
@@ -625,7 +663,7 @@ impl<'a> UblkIOCtx<'a> {
     /// Check if this userdata is from IO command which is from
     /// ublk driver
     #[inline(always)]
-    fn is_io_command(user_data: u64) -> bool {
+    pub(crate) fn is_io_command(user_data: u64) -> bool {
         (user_data & (1_u64 << 63)) == 0
     }
 }
@@ -898,6 +936,8 @@ pub struct UblkQueue<'a> {
     pub dev: &'a UblkDev,
     bufs: RefCell<Vec<*mut u8>>,
     state: RefCell<UblkQueueState>,
+    /// Slab key for multi-queue support (0 if not registered)
+    queue_slab_key: u16,
 }
 
 impl AsRawFd for UblkQueue<'_> {
@@ -966,17 +1006,8 @@ impl UblkQueue<'_> {
         self.flags.intersects(Self::UBLK_QUEUE_IOCTL_ENCODE)
     }
 
-    /// New one ublk queue
-    ///
-    /// # Arguments:
-    ///
-    /// * `q_id`: queue id, [0, nr_queues)
-    /// * `dev`: ublk device reference
-    ///
-    ///ublk queue is handling IO from driver, so far we use dedicated
-    ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
-    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
+    fn __new(q_id: u16, dev: &UblkDev, slab_key: u16) -> Result<UblkQueue<'_>, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
@@ -990,7 +1021,6 @@ impl UblkQueue<'_> {
         // Initialize the thread-local queue ring with default parameters
         // Users can call init_task_ring() before UblkQueue::new() to customize initialization
         init_task_ring_default(sq_depth as u32, cq_depth as u32)?;
-
 
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();
@@ -1061,9 +1091,67 @@ impl UblkQueue<'_> {
                 state: 0,
             }),
             bufs: RefCell::new(bufs),
+            queue_slab_key: slab_key,
         };
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
+
+        Ok(q)
+    }
+
+    /// New one ublk queue
+    ///
+    /// # Arguments:
+    ///
+    /// * `q_id`: queue id, [0, nr_queues)
+    /// * `dev`: ublk device reference
+    ///
+    ///ublk queue is handling IO from driver, so far we use dedicated
+    ///io_uring for handling both IO command and IO
+    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
+        Self::__new(q_id, dev, crate::multi_queue::slab_key::UNUSE_KEY)
+    }
+
+    /// Create a new ublk queue with automatic multi-queue registration
+    ///
+    /// # Arguments:
+    ///
+    /// * `q_id`: queue id, [0, nr_queues)
+    /// * `dev`: ublk device reference
+    /// * `manager`: multi-queue manager that will manage this queue's lifecycle
+    ///
+    /// This method creates a queue and automatically registers it with the provided
+    /// MultiQueueManager. The slab key is allocated efficiently using vacant_entry()
+    /// and stored directly in the queue for fast access. The queue will be automatically
+    /// unregistered when the manager is dropped.
+    ///
+    /// # Returns:
+    /// Result containing the created queue with embedded slab key, or error on failure
+    pub fn new_multi<'a>(
+        q_id: u16,
+        dev: &'a UblkDev,
+        manager: &mut MultiQueueManager,
+    ) -> Result<UblkQueue<'a>, UblkError> {
+        // Allocate slab entry first
+        let slab_key = manager.allocate_queue_slot()?;
+        let q = match Self::__new(q_id, dev, slab_key) {
+            Ok(_q) => _q,
+            Err(e) => {
+                // Clean up the allocated slot on failure
+                manager.remove_queue_slot(slab_key)?;
+                return Err(e);
+            }
+        };
+
+        // Register the queue in the slab with the allocated key
+        manager.register_queue_at_slot(&q, slab_key)?;
+
+        log::info!(
+            "dev {} queue {} started with slab key {}",
+            dev.dev_info.dev_id,
+            q_id,
+            slab_key
+        );
 
         Ok(q)
     }
@@ -1298,10 +1386,10 @@ impl UblkQueue<'_> {
         buf_addr: *mut u8,
         result: i32,
     ) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
+        let queue_slab_key = self.get_slab_key();
+        let f = UblkUringOpFuture::new_multi(tag, queue_slab_key, false);
         with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            self.__queue_io_cmd(r, tag, cmd_op, buf_addr as u64, None, user_data, result)
+            self.__queue_io_cmd(r, tag, cmd_op, buf_addr as u64, None, f.user_data, result)
         });
 
         f
@@ -1325,10 +1413,10 @@ impl UblkQueue<'_> {
     ) -> UblkUringOpFuture {
         let auto_buf_addr = Some(bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data));
 
-        let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
+        let queue_slab_key = self.get_slab_key();
+        let f = UblkUringOpFuture::new_multi(tag, queue_slab_key, false);
         with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            self.__queue_io_cmd(r, tag, cmd_op, 0, auto_buf_addr, user_data, result)
+            self.__queue_io_cmd(r, tag, cmd_op, 0, auto_buf_addr, f.user_data, result)
         });
 
         f
@@ -1409,7 +1497,8 @@ impl UblkQueue<'_> {
 
     #[inline]
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(1_u64 << 63);
+        let queue_slab_key = self.get_slab_key();
+        let f = UblkUringOpFuture::new_multi(0, queue_slab_key, true); // Use tag 0 for generic SQE
         let sqe = sqe.user_data(f.user_data);
 
         loop {
@@ -1453,8 +1542,8 @@ impl UblkQueue<'_> {
     }
 
     fn submit_reg_unreg_io_buf(&self, op: u32, tag: u16, buf_index: u16) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
+        let queue_slab_key = self.get_slab_key();
+        let f = UblkUringOpFuture::new_multi(tag, queue_slab_key, true);
 
         let io_cmd = sys::ublksrv_io_cmd {
             tag,
@@ -1472,7 +1561,7 @@ impl UblkQueue<'_> {
         let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
-            .user_data(user_data);
+            .user_data(f.user_data);
 
         with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
             loop {
@@ -2179,6 +2268,11 @@ impl UblkQueue<'_> {
                 Ok(done)
             }
         }
+    }
+
+    /// Get the slab key for this queue (0 if not registered)
+    pub fn get_slab_key(&self) -> u16 {
+        self.queue_slab_key
     }
 }
 

@@ -26,7 +26,49 @@ pub struct UblkUringOpFuture {
 }
 
 impl UblkUringOpFuture {
+    // Retrieve future key from user data
+    pub fn user_data_to_future_key(user_data: u64) -> u32 {
+        ((user_data >> 16) & 0xffffffff) as u32
+    }
+
+    fn build_user_data(tag: u16, future_key: u32, q_key: u16, tgt_io: u64) -> u64 {
+        tag as u64
+                | ((future_key as u64) << 16) // future slab key in tgt_data for lookup
+                | ((q_key as u64) << 48) // queue slab key for routing
+                | ((tgt_io as u64) << 63) // target_io flag controlled by parameter
+    }
+    // Keep it for not breaking public API
     pub fn new(tgt_io: u64) -> Self {
+        MY_SLAB.with(|refcell| {
+            let mut map = refcell.borrow_mut();
+            let key = map.insert(FutureData {
+                waker: None,
+                result: None,
+            });
+
+            let user_data = Self::build_user_data(0, key.try_into().unwrap(), 0, tgt_io);
+            log::trace!("uring: new future {:x}", user_data);
+            UblkUringOpFuture { user_data }
+        })
+    }
+
+    /// Create a new future with queue slab key for multi-queue support
+    ///
+    /// # Arguments:
+    /// * `tag`: IO tag (16-bit)
+    /// * `queue_slab_key`: Slab key for queue identification (10-bit value, 0-1023)
+    /// * `tgt_io`: Whether this is a target IO operation (true) or regular queue operation (false)
+    ///
+    /// This method creates a future with user_data that encodes the queue slab key,
+    /// enabling automatic queue routing in multi-queue scenarios.
+    ///
+    /// User_data bit layout:
+    /// - Bits 0-15: tag (16 bits) - for ublk uring command only
+    /// - Bits 16-47: future slab key (32 bits) - for future lookup
+    /// - Bits 48-57: queue slab key (10 bits) - for queue identification
+    /// - Bits 58-62: reserved (5 bits)
+    /// - Bit 63: target_io flag (1 bit) - controlled by tgt_io parameter
+    pub fn new_multi(tag: u16, q_key: u16, tgt_io: bool) -> Self {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
 
@@ -34,8 +76,21 @@ impl UblkUringOpFuture {
                 waker: None,
                 result: None,
             });
-            let user_data = ((key as u32) << 16) as u64 | tgt_io;
-            log::trace!("uring: new future {:x}", user_data);
+
+            // Validate slab key is within 10-bit range
+            assert!(
+                (q_key >> 10) == 0,
+                "queue slab key must be 10-bit value (0-1023)"
+            );
+
+            let user_data =
+                Self::build_user_data(tag, key.try_into().unwrap(), q_key, tgt_io as u64);
+            log::trace!(
+                "uring: new future {:x} for tag {} queue_slab_key {}",
+                user_data,
+                tag,
+                q_key
+            );
             UblkUringOpFuture { user_data }
         })
     }
@@ -46,21 +101,30 @@ impl Future for UblkUringOpFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
-            let key = ((self.user_data & !(1_u64 << 63)) >> 16) as usize;
+            let key = Self::user_data_to_future_key(self.user_data) as usize;
+
             match map.get_mut(key) {
                 None => {
-                    log::trace!("uring: null slab {:x}", self.user_data);
+                    log::trace!("uring: null slab {:x} (key={})", self.user_data, key);
                     Poll::Pending
                 }
                 Some(fd) => match fd.result {
                     Some(result) => {
                         map.remove(key);
-                        log::trace!("uring: uring io ready userdata {:x} ready", self.user_data);
+                        log::trace!(
+                            "uring: uring io ready userdata {:x} (key={}) ready",
+                            self.user_data,
+                            key
+                        );
                         Poll::Ready(result)
                     }
                     None => {
                         fd.waker = Some(cx.waker().clone());
-                        log::trace!("uring: uring io pending userdata {:x}", self.user_data);
+                        log::trace!(
+                            "uring: uring io pending userdata {:x} (key={})",
+                            self.user_data,
+                            key
+                        );
                         Poll::Pending
                     }
                 },
@@ -83,8 +147,10 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
             cqe.user_data(),
             cqe.result()
         );
-        let data = ((data & !(1_u64 << 63)) >> 16) as usize;
-        if let Some(fd) = map.get_mut(data) {
+
+        let future_key = UblkUringOpFuture::user_data_to_future_key(data) as usize;
+
+        if let Some(fd) = map.get_mut(future_key) {
             fd.result = Some(cqe.result());
             if let Some(w) = &fd.waker {
                 w.wake_by_ref();
@@ -174,7 +240,8 @@ pub fn ublk_run_ctrl_task<T>(
     task: &smol::Task<T>,
 ) -> Result<(), UblkError> {
     let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder().build(4)?;
-    let ctrl_fd = crate::ctrl::with_ctrl_ring_internal!(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
+    let ctrl_fd =
+        crate::ctrl::with_ctrl_ring_internal!(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
     let q_fd = q.as_raw_fd();
     let mut poll_q = true;
     let mut poll_ctrl = true;
@@ -211,7 +278,10 @@ pub fn ublk_run_ctrl_task<T>(
         }
 
         ublk_process_queue_io(exe, q, 0)?;
-        let entry = crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| ublk_try_reap_cqe(ring, 0));
+        let entry =
+            crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                ublk_try_reap_cqe(ring, 0)
+            });
         if let Some(cqe) = entry {
             ublk_wake_task(cqe.user_data(), &cqe);
             while exe.try_tick() {}
@@ -261,7 +331,10 @@ pub(crate) fn ublk_join_tasks<T>(
         while exe.try_tick() {}
 
         // Handle control uring events
-        let entry = crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| ublk_try_reap_cqe(ring, 0));
+        let entry =
+            crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                ublk_try_reap_cqe(ring, 0)
+            });
         if let Some(cqe) = entry {
             ublk_wake_task(cqe.user_data(), &cqe);
         }

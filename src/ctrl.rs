@@ -1153,7 +1153,7 @@ impl UblkCtrlInner {
     fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> UblkUringOpFuture {
         let fd = self.file.as_raw_fd();
         let dev_id = self.dev_info.dev_id;
-        let f = UblkUringOpFuture::new(0);
+        let f = UblkUringOpFuture::new_multi(0, crate::multi_queue::slab_key::CONTROL_CMD, false);
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
 
         unsafe {
