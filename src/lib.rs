@@ -15,7 +15,10 @@ pub mod sys;
 pub mod uring_async;
 
 // Re-export important types for unified buffer management
-pub use io::{init_task_ring, with_queue_ring, with_queue_ring_mut, BufDesc, BufDescList};
+pub use io::{ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, BufDesc, BufDescList};
+
+// Re-export control ring initialization
+pub use ctrl::ublk_init_ctrl_task_ring;
 
 bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
@@ -45,6 +48,7 @@ bitflags! {
 
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
+        const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;
     }
 }
 
