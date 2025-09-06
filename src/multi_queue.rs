@@ -31,7 +31,7 @@
 //! }
 //! ```
 
-use crate::io::UblkQueue;
+use crate::io::{UblkQueue, register_all_uring_resources, add_queue_resources_to_uring_manager, QueueResourceRange};
 use crate::UblkError;
 use std::cell::RefCell;
 
@@ -81,6 +81,7 @@ std::thread_local! {
 #[derive(Debug, Default)]
 pub struct MultiQueueManager {
     queue_keys: Vec<u16>,
+    resources_registered: bool,
 }
 
 impl MultiQueueManager {
@@ -88,6 +89,7 @@ impl MultiQueueManager {
     pub fn new() -> Self {
         Self {
             queue_keys: Vec::new(),
+            resources_registered: false,
         }
     }
 
@@ -160,6 +162,59 @@ impl MultiQueueManager {
     /// Get the number of managed queues
     pub fn queue_count(&self) -> usize {
         self.queue_keys.len()
+    }
+
+    /// Add queue resources to the centralized io_uring resource manager
+    ///
+    /// This method accumulates files and buffer requirements from a queue
+    /// into the thread-local io_uring resource manager. Resources are not actually
+    /// registered with io_uring until `register_resources()` is called.
+    ///
+    /// # Arguments
+    /// * `queue_slab_key`: The slab key of the queue
+    /// * `files`: File descriptors that this queue needs registered
+    /// * `buffer_count`: Number of buffers this queue needs for auto buffer registration
+    ///
+    /// # Returns
+    /// The resource range allocated to this queue
+    pub fn add_queue_files_and_buffers(
+        &mut self,
+        queue_slab_key: u16,
+        files: &[std::os::unix::io::RawFd],
+        buffer_count: u32,
+    ) -> Result<QueueResourceRange, UblkError> {
+        if self.resources_registered {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+
+        let range = add_queue_resources_to_uring_manager(queue_slab_key, files, buffer_count);
+        Ok(range)
+    }
+
+    /// Register all accumulated resources with the io_uring instance
+    ///
+    /// This method performs the batch registration of all files and buffers
+    /// that have been accumulated via `add_queue_files_and_buffers()` calls.
+    /// It must be called after all queues have been created and before any
+    /// queue operations begin.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Resources successfully registered
+    /// * `Err(UblkError)` - Registration failed (e.g., io_uring not initialized)
+    pub fn register_resources(&mut self) -> Result<(), UblkError> {
+        if self.resources_registered {
+            return Ok(()); // Already registered
+        }
+
+        register_all_uring_resources()?;
+        self.resources_registered = true;
+        log::debug!("MultiQueueManager: Resources registered for {} queues", self.queue_keys.len());
+        Ok(())
+    }
+
+    /// Check if resources have been registered
+    pub fn are_resources_registered(&self) -> bool {
+        self.resources_registered
     }
 
     /// Unregister a queue from multi-queue handling (internal function)
