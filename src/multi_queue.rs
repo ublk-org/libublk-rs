@@ -31,7 +31,7 @@
 //! }
 //! ```
 
-use crate::io::{add_queue_resources_to_uring_manager, register_all_uring_resources, UblkQueue};
+use crate::io::{register_all_uring_resources, UblkQueue};
 use crate::uring::QueueResourceRange;
 use crate::UblkError;
 use std::cell::RefCell;
@@ -188,7 +188,9 @@ impl MultiQueueManager {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
-        let range = add_queue_resources_to_uring_manager(queue_slab_key, files, buffer_count);
+        let range = crate::uring::with_uring_resource_manager(|manager| {
+            manager.add_queue_resources(queue_slab_key, files, buffer_count)
+        });
         Ok(range)
     }
 

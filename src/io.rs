@@ -159,25 +159,6 @@ use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-/// Initialize or get access to the io_uring resource manager
-pub(crate) fn with_uring_resource_manager<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut crate::uring::UringResourceManager) -> R,
-{
-    UBLK_URING.with(|ublk_uring| ublk_uring.with_resource_manager(f))
-}
-
-/// Add queue resources to the centralized io_uring manager
-pub(crate) fn add_queue_resources_to_uring_manager(
-    queue_slab_key: u16,
-    files: &[std::os::unix::io::RawFd],
-    buffer_count: u32,
-) -> QueueResourceRange {
-    with_uring_resource_manager(|manager| {
-        manager.add_queue_resources(queue_slab_key, files, buffer_count)
-    })
-}
-
 /// Perform batch registration of all accumulated io_uring resources
 pub(crate) fn register_all_uring_resources() -> Result<(), UblkError> {
     UBLK_URING.with(|ublk_uring| {
@@ -1071,37 +1052,6 @@ impl UblkQueue<'_> {
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
-        // Handle resource registration based on whether we're in multi-queue mode
-        if Self::is_single_queue_mode_key(slab_key) {
-            // Single queue mode: register files and buffers directly (legacy behavior)
-            with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-                ring.submitter()
-                    .register_files(&tgt.fds[0..tgt.nr_fds as usize])
-                    .map_err(UblkError::IOError)
-            })?;
-
-            if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
-                with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-                    ring.submitter()
-                        .register_buffers_sparse(depth)
-                        .map_err(UblkError::IOError)
-                })?;
-            }
-        } else {
-            // Multi-queue mode: add resources to centralized io_uring manager
-            // Resources will be registered later when MultiQueueManager::register_resources() is called
-            let buffer_count = if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
-                depth
-            } else {
-                0
-            };
-            add_queue_resources_to_uring_manager(
-                slab_key,
-                &tgt.fds[0..tgt.nr_fds as usize],
-                buffer_count,
-            );
-        }
-
         let off =
             sys::UBLKSRV_CMD_BUF_OFFSET as libc::off_t + (q_id as libc::off_t) * max_cmd_buf_sz;
         let io_cmd_buf = unsafe {
@@ -1152,11 +1102,7 @@ impl UblkQueue<'_> {
             }),
             bufs: RefCell::new(bufs),
             queue_slab_key: slab_key,
-            resource_range: if Self::is_single_queue_mode_key(slab_key) {
-                None
-            } else {
-                get_queue_resource_range(slab_key)
-            },
+            resource_range: None,
         };
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
@@ -1174,7 +1120,25 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
-        Self::__new(q_id, dev, crate::multi_queue::slab_key::UNUSE_KEY)
+        let res = Self::__new(q_id, dev, crate::multi_queue::slab_key::UNUSE_KEY)?;
+        let tgt = &dev.tgt;
+
+        // Single queue mode: register files and buffers directly (legacy behavior)
+        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+            ring.submitter()
+                .register_files(&tgt.fds[0..tgt.nr_fds as usize])
+                .map_err(UblkError::IOError)
+        })?;
+
+        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+            let depth = dev.dev_info.queue_depth as u32;
+            with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                ring.submitter()
+                    .register_buffers_sparse(depth)
+                    .map_err(UblkError::IOError)
+            })?;
+        }
+        Ok(res)
     }
 
     /// Create a new ublk queue with automatic multi-queue registration
@@ -1199,7 +1163,7 @@ impl UblkQueue<'_> {
     ) -> Result<UblkQueue<'a>, UblkError> {
         // Allocate slab entry first
         let slab_key = manager.allocate_queue_slot()?;
-        let q = match Self::__new(q_id, dev, slab_key) {
+        let mut q = match Self::__new(q_id, dev, slab_key) {
             Ok(_q) => _q,
             Err(e) => {
                 // Clean up the allocated slot on failure
@@ -1208,8 +1172,22 @@ impl UblkQueue<'_> {
             }
         };
 
-        // Register the queue in the slab with the allocated key
+        // Multi-queue mode: add resources to centralized io_uring manager
+        // Resources will be registered later when MultiQueueManager::register_resources() is called
+        let buffer_count = if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+            dev.dev_info.queue_depth as u32
+        } else {
+            0
+        };
+
+        let tgt = &dev.tgt;
+        manager.add_queue_files_and_buffers(
+            slab_key,
+            &tgt.fds[0..tgt.nr_fds as usize],
+            buffer_count,
+        )?;
         manager.register_queue_at_slot(&q, slab_key)?;
+        q.resource_range = get_queue_resource_range(slab_key);
 
         log::info!(
             "dev {} queue {} started with slab key {}",
@@ -2397,8 +2375,11 @@ impl UblkQueue<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::{get_queue_resource_range, QueueResourceRange};
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{BufDesc, UblkDev, UblkQueue};
+    use crate::multi_queue::MultiQueueManager;
+    use crate::uring::with_uring_resource_manager;
     use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
 
@@ -2598,14 +2579,18 @@ mod tests {
         UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
     }
 
+    /// Add queue resources to the centralized io_uring manager
+    fn add_queue_resources_to_uring_manager(
+        queue_slab_key: u16,
+        files: &[std::os::unix::io::RawFd],
+        buffer_count: u32,
+    ) -> QueueResourceRange {
+        with_uring_resource_manager(|manager| {
+            manager.add_queue_resources(queue_slab_key, files, buffer_count)
+        })
+    }
     #[test]
     fn test_multi_queue_resource_registration() {
-        use super::{
-            add_queue_resources_to_uring_manager, get_queue_resource_range,
-            with_uring_resource_manager,
-        };
-        use crate::multi_queue::MultiQueueManager;
-
         // Test io_uring resource manager accumulation and range assignment
         let queue1_slab_key = 1u16;
         let queue2_slab_key = 2u16;

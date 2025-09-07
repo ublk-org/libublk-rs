@@ -278,8 +278,9 @@ std::thread_local! {
 mod tests {
     use super::*;
     use crate::ctrl::UblkCtrlBuilder;
-    use crate::io::{with_uring_resource_manager, UblkDev, UblkQueue};
+    use crate::io::{UblkDev, UblkQueue};
     use crate::multi_queue::MultiQueueManager;
+    use crate::uring::with_uring_resource_manager;
     use crate::UblkFlags;
 
     #[test]
@@ -572,4 +573,12 @@ mod tests {
             });
         });
     }
+}
+
+/// Initialize or get access to the io_uring resource manager
+pub(crate) fn with_uring_resource_manager<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut crate::uring::UringResourceManager) -> R,
+{
+    UBLK_URING.with(|ublk_uring| ublk_uring.with_resource_manager(f))
 }
