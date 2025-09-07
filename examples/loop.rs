@@ -4,9 +4,9 @@ use clap::{Arg, ArgAction, Command};
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, BufDescList};
+use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes, BufDesc};
+use libublk::{ctrl::UblkCtrl, sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -129,17 +129,24 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
 }
 
 #[inline]
-fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_uring::squeue::Entry {
+fn __lo_make_io_sqe(
+    q: &UblkQueue<'_>,
+    op: u32,
+    off: u64,
+    bytes: u32,
+    buf_addr: *mut u8,
+) -> io_uring::squeue::Entry {
+    let fd_idx = types::Fixed(q.translate_file_index(1).into());
     match op {
-        libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(types::Fixed(1), bytes)
+        libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(fd_idx, bytes)
             .offset(off)
             .build()
             .flags(squeue::Flags::FIXED_FILE),
-        libublk::sys::UBLK_IO_OP_READ => opcode::Read::new(types::Fixed(1), buf_addr, bytes)
+        libublk::sys::UBLK_IO_OP_READ => opcode::Read::new(fd_idx, buf_addr, bytes)
             .offset(off)
             .build()
             .flags(squeue::Flags::FIXED_FILE),
-        libublk::sys::UBLK_IO_OP_WRITE => opcode::Write::new(types::Fixed(1), buf_addr, bytes)
+        libublk::sys::UBLK_IO_OP_WRITE => opcode::Write::new(fd_idx, buf_addr, bytes)
             .offset(off)
             .build()
             .flags(squeue::Flags::FIXED_FILE),
@@ -171,7 +178,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, io_slice: &mut [u8]
         // This conversion is necessary because io_uring operations require raw pointers
         // for kernel interface compatibility. The slice ensures we have valid bounds.
         let buf_addr = io_slice.as_mut_ptr();
-        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
+        let sqe = __lo_make_io_sqe(q, op, off, bytes, buf_addr);
         let res = q.ublk_submit_sqe(sqe).await;
         if res != -(libc::EAGAIN) {
             return res;
@@ -198,28 +205,22 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, io_slice: &
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd_unified(
-                tag,
-                BufDesc::Slice(io_slice),
-                Ok(UblkIORes::Result(res)),
-            ).unwrap();
+            q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), Ok(UblkIORes::Result(res)))
+                .unwrap();
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd_unified(
-            tag,
-            BufDesc::Slice(io_slice),
-            Ok(UblkIORes::Result(res)),
-        ).unwrap();
+        q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), Ok(UblkIORes::Result(res)))
+            .unwrap();
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
-        let sqe = __lo_make_io_sqe(op, off, bytes, io_slice.as_ptr() as *mut u8).user_data(data);
+        let sqe = __lo_make_io_sqe(q, op, off, bytes, io_slice.as_ptr() as *mut u8).user_data(data);
         q.ublk_submit_sqe_sync(sqe).unwrap();
     }
 }
@@ -245,7 +246,8 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap()
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
+        .unwrap()
         .wait_and_handle_io(lo_io_handler);
 }
 
@@ -267,7 +269,10 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
 
             q.register_io_buf(tag, &buf);
             loop {
-                let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
+                let cmd_res = q
+                    .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
+                    .unwrap()
+                    .await;
                 if cmd_res == sys::UBLK_IO_RES_ABORT {
                     break;
                 }

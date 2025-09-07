@@ -1337,7 +1337,8 @@ impl UblkQueue<'_> {
             cmd_op
         };
 
-        let mut sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+        let fd_idx = self.translate_file_index(0);
+        let mut sqe = opcode::UringCmd16::new(types::Fixed(fd_idx.into()), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
@@ -1601,7 +1602,8 @@ impl UblkQueue<'_> {
             op
         };
 
-        let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+        let fd_idx = self.translate_file_index(0);
+        let sqe = opcode::UringCmd16::new(types::Fixed(fd_idx.into()), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(f.user_data);

@@ -309,7 +309,11 @@ mod integration {
                 f_vec.push(exe.spawn(async move {
                     let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
                     let mut res = 0;
-                    let buf_index = if !bad_buf_idx { tag } else { depth + 1 };
+                    let buf_index = if !bad_buf_idx {
+                        q.translate_buffer_index(tag)
+                    } else {
+                        depth + 1
+                    };
 
                     // Create auto buffer registration data with fallback support
                     let auto_buf_reg = sys::ublk_auto_buf_reg {
