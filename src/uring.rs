@@ -273,3 +273,270 @@ impl Default for UblkUring {
 std::thread_local! {
     pub(crate) static UBLK_URING: UblkUring = UblkUring::new();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ctrl::UblkCtrlBuilder;
+    use crate::io::{with_uring_resource_manager, UblkDev, UblkQueue};
+    use crate::multi_queue::MultiQueueManager;
+    use crate::UblkFlags;
+
+    #[test]
+    fn test_multi_queue_resource_manager_integration() {
+        // Test comprehensive multi-queue resource management integration
+        // This is adapted from the examples/multi_queue.rs example
+
+        let nr_queues = 4;
+
+        // Create a ublk controller with multiple queues for testing
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .name("test-multi-queue-resource-mgr")
+            .nr_queues(nr_queues)
+            .build()
+            .expect("Failed to create ublk controller");
+
+        // Test target initialization with multi-queue resource management
+        let tgt_init = |dev: &mut UblkDev| {
+            // Create a multi-queue manager
+            let mut manager = MultiQueueManager::new();
+            let mut queues: Vec<UblkQueue<'_>> = Vec::new();
+
+            // Verify initial state
+            assert_eq!(manager.queue_count(), 0);
+            assert!(!manager.are_resources_registered());
+
+            // Create multiple queues with automatic resource management
+            for q_id in 0..nr_queues {
+                // Create queue - this will automatically add its resources to the manager
+                let queue = UblkQueue::new_multi(q_id, dev, &mut manager)?;
+
+                // Verify queue was created with proper slab key
+                let slab_key = queue.get_slab_key();
+                assert_ne!(slab_key, crate::multi_queue::slab_key::UNUSE_KEY);
+                assert!(slab_key <= crate::multi_queue::slab_key::MAX_QUEUE_KEY);
+
+                let range = queue
+                    .get_resource_range()
+                    .expect("resources are not added after creating queues");
+
+                // Check resource range for multi-queue scenarios
+                assert_eq!(range.queue_slab_key, slab_key);
+                assert_eq!(range.file_count, 1); // Each queue should have 1 file (cdev)
+
+                // Verify resource ranges don't overlap
+                for existing_queue in &queues {
+                    if let Some(existing_range) = existing_queue.get_resource_range() {
+                        // File ranges should not overlap
+                        assert!(
+                            range.file_start_index
+                                >= existing_range.file_start_index + existing_range.file_count
+                                || existing_range.file_start_index
+                                    >= range.file_start_index + range.file_count,
+                            "File ranges overlap between queues"
+                        );
+
+                        // Buffer ranges should not overlap (if both have buffers)
+                        if range.buffer_count > 0 && existing_range.buffer_count > 0 {
+                            assert!(
+                                range.buffer_start_index
+                                    >= existing_range.buffer_start_index
+                                        + existing_range.buffer_count
+                                    || existing_range.buffer_start_index
+                                        >= range.buffer_start_index + range.buffer_count,
+                                "Buffer ranges overlap between queues"
+                            );
+                        }
+                    }
+                }
+
+                queues.push(queue);
+            }
+
+            // Verify manager state after queue creation
+            assert_eq!(manager.queue_count(), nr_queues as usize);
+            assert!(!manager.are_resources_registered());
+
+            // Test resource registration
+            manager.register_resources()?;
+            assert!(manager.are_resources_registered());
+
+            // Test that double registration is safe
+            let result = manager.register_resources();
+            assert!(result.is_ok(), "Double registration should be safe");
+
+            // Test index translation functionality
+            if let Some(queue) = queues.first() {
+                // Test file index translation
+                let global_file_idx = queue.translate_file_index(0);
+                if let Some(range) = queue.get_resource_range() {
+                    assert_eq!(global_file_idx, range.file_start_index);
+                } else {
+                    assert_eq!(global_file_idx, 0); // Single queue mode
+                }
+
+                // Test buffer index translation (if buffers are used)
+                if queue
+                    .get_resource_range()
+                    .map(|r| r.buffer_count > 0)
+                    .unwrap_or(false)
+                {
+                    let global_buffer_idx = queue.translate_buffer_index(0);
+                    if let Some(range) = queue.get_resource_range() {
+                        assert_eq!(global_buffer_idx, range.buffer_start_index);
+                    }
+                }
+            }
+
+            // Verify resource manager state through UBLK_URING
+            UBLK_URING.with(|ublk_uring| {
+                ublk_uring.with_resource_manager(|resource_mgr| {
+                    assert_eq!(resource_mgr.queue_ranges.len(), nr_queues as usize);
+                    assert_eq!(resource_mgr.files.len(), nr_queues as usize); // One file per queue
+                    assert!(resource_mgr.registered);
+
+                    // Verify each queue has its range properly registered
+                    for queue in &queues {
+                        let slab_key = queue.get_slab_key();
+                        let range = resource_mgr.get_queue_range(slab_key);
+                        assert!(range.is_some(), "Queue range should be registered");
+
+                        if let Some(range) = range {
+                            assert_eq!(range.queue_slab_key, slab_key);
+                        }
+                    }
+                });
+            });
+
+            // Test queue lookup functionality
+            for queue in &queues {
+                let slab_key = queue.get_slab_key();
+                let retrieved_range = crate::io::get_queue_resource_range(slab_key);
+                assert!(
+                    retrieved_range.is_some(),
+                    "Should be able to retrieve queue range"
+                );
+
+                if let Some(range) = retrieved_range {
+                    assert_eq!(range.queue_slab_key, slab_key);
+                }
+            }
+
+            Ok(())
+        };
+
+        // Create the ublk device with our multi-queue initialization
+        let _dev =
+            UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).expect("Failed to create ublk device");
+    }
+
+    #[test]
+    fn test_uring_resource_manager_lifecycle() {
+        // Test the basic lifecycle of UringResourceManager
+
+        // Test initial state
+        UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_resource_manager(|manager| {
+                assert_eq!(manager.files.len(), 0);
+                assert_eq!(manager.queue_ranges.len(), 0);
+                assert!(!manager.registered);
+                assert_eq!(manager.total_buffer_count, 0);
+            });
+        });
+
+        // Test adding resources
+        let test_files = [42, 43, 44]; // Mock file descriptors
+        let range1 =
+            with_uring_resource_manager(|manager| manager.add_queue_resources(1, &test_files, 64));
+
+        assert_eq!(range1.queue_slab_key, 1);
+        assert_eq!(range1.file_start_index, 0);
+        assert_eq!(range1.file_count, 3);
+        assert_eq!(range1.buffer_start_index, 0);
+        assert_eq!(range1.buffer_count, 64);
+
+        // Add another queue's resources
+        let test_files2 = [45];
+        let range2 =
+            with_uring_resource_manager(|manager| manager.add_queue_resources(2, &test_files2, 32));
+
+        assert_eq!(range2.queue_slab_key, 2);
+        assert_eq!(range2.file_start_index, 3); // After first queue's 3 files
+        assert_eq!(range2.file_count, 1);
+        assert_eq!(range2.buffer_start_index, 64); // After first queue's 64 buffers
+        assert_eq!(range2.buffer_count, 32);
+
+        // Verify accumulated state
+        UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_resource_manager(|manager| {
+                assert_eq!(manager.files.len(), 4); // 3 + 1 files
+                assert_eq!(manager.queue_ranges.len(), 2);
+                assert!(!manager.registered);
+                assert_eq!(manager.total_buffer_count, 96); // 64 + 32 buffers
+            });
+        });
+
+        // Test range lookup
+        let retrieved_range1 = UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_resource_manager(|manager| manager.get_queue_range(1).cloned())
+        });
+        assert!(retrieved_range1.is_some());
+        assert_eq!(retrieved_range1.unwrap().queue_slab_key, 1);
+
+        // Test queue removal
+        let removal_result =
+            UBLK_URING.with(|ublk_uring| ublk_uring.remove_queue_from_resource_manager(1));
+        assert!(removal_result.is_ok());
+
+        // Verify queue was removed
+        UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_resource_manager(|manager| {
+                assert_eq!(manager.queue_ranges.len(), 1);
+                assert!(manager.get_queue_range(1).is_none());
+                assert!(manager.get_queue_range(2).is_some());
+            });
+        });
+    }
+
+    #[test]
+    fn test_ublk_uring_drop_ordering() {
+        // This test verifies that the Drop implementation works correctly
+        // We can't directly test Drop, but we can verify the cleanup methods work
+
+        // Initialize the ring first since cleanup may need it
+        use crate::io::ublk_init_task_ring;
+        use io_uring::IoUring;
+        use std::cell::RefCell;
+
+        ublk_init_task_ring(|cell| {
+            if cell.get().is_none() {
+                let ring = IoUring::builder()
+                    .setup_cqsize(64)
+                    .build(32)
+                    .map_err(crate::UblkError::IOError)?;
+                cell.set(RefCell::new(ring))
+                    .map_err(|_| crate::UblkError::OtherError(-libc::EEXIST))?;
+            }
+            Ok(())
+        })
+        .expect("Failed to initialize ring for test");
+
+        // Add some test resources
+        with_uring_resource_manager(|manager| {
+            manager.add_queue_resources(99, &[999], 10);
+        });
+
+        // Test manual cleanup
+        let cleanup_result =
+            UBLK_URING.with(|ublk_uring| ublk_uring.remove_queue_from_resource_manager(99));
+        assert!(cleanup_result.is_ok());
+
+        // Verify cleanup worked
+        UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_resource_manager(|manager| {
+                assert!(manager.get_queue_range(99).is_none());
+            });
+        });
+    }
+}
