@@ -13,6 +13,7 @@ pub mod helpers;
 pub mod io;
 pub mod multi_queue;
 pub mod sys;
+pub mod uring;
 pub mod uring_async;
 
 // Re-export important types for unified buffer management
