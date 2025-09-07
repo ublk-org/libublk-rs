@@ -31,7 +31,8 @@
 //! }
 //! ```
 
-use crate::io::{UblkQueue, register_all_uring_resources, add_queue_resources_to_uring_manager, QueueResourceRange};
+use crate::io::{add_queue_resources_to_uring_manager, register_all_uring_resources, UblkQueue};
+use crate::uring::QueueResourceRange;
 use crate::UblkError;
 use std::cell::RefCell;
 
@@ -208,7 +209,10 @@ impl MultiQueueManager {
 
         register_all_uring_resources()?;
         self.resources_registered = true;
-        log::debug!("MultiQueueManager: Resources registered for {} queues", self.queue_keys.len());
+        log::debug!(
+            "MultiQueueManager: Resources registered for {} queues",
+            self.queue_keys.len()
+        );
         Ok(())
     }
 

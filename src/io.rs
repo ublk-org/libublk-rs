@@ -152,194 +152,19 @@ use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
 use crate::multi_queue::MultiQueueManager;
+use crate::uring::{QueueResourceRange, UBLK_URING};
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-// Unified thread-local io_uring for all queue operations
-
-// Thread-local queue ring using OnceCell for conditional initialization
-std::thread_local! {
-    pub(crate) static QUEUE_RING: OnceCell<RefCell<IoUring<squeue::Entry>>> =
-        OnceCell::new();
-}
-
-/// Queue resource range tracking for multi-queue scenarios
-#[derive(Debug, Clone)]
-pub struct QueueResourceRange {
-    /// Queue's slab key for identification
-    pub queue_slab_key: u16,
-    /// Starting index in the global file table
-    pub file_start_index: u16,
-    /// Number of files owned by this queue
-    pub file_count: u16,
-    /// Starting index in the global buffer table (for auto buffer registration)
-    pub buffer_start_index: u16,
-    /// Number of buffers owned by this queue
-    pub buffer_count: u16,
-}
-
-/// Centralized resource manager for io_uring resource registration across multiple queues
-#[derive(Debug)]
-pub(crate) struct UringResourceManager {
-    /// All files to be registered with io_uring (accumulated from all queues)
-    pub files: Vec<std::os::unix::io::RawFd>,
-    /// Resource ranges for each queue
-    pub queue_ranges: Vec<QueueResourceRange>,
-    /// Whether resources have been registered with io_uring
-    pub registered: bool,
-    /// Total buffer count needed for sparse buffer registration
-    pub total_buffer_count: u32,
-}
-
-impl UringResourceManager {
-    fn new() -> Self {
-        Self {
-            files: Vec::new(),
-            queue_ranges: Vec::new(),
-            registered: false,
-            total_buffer_count: 0,
-        }
-    }
-
-    /// Add files and buffer requirements for a queue
-    pub fn add_queue_resources(
-        &mut self,
-        queue_slab_key: u16,
-        files: &[std::os::unix::io::RawFd],
-        buffer_count: u32,
-    ) -> QueueResourceRange {
-        if self.registered {
-            panic!("Cannot add resources after registration");
-        }
-
-        let file_start_index = self.files.len() as u16;
-        let buffer_start_index = self.total_buffer_count as u16;
-
-        // Add files to the global table
-        self.files.extend_from_slice(files);
-
-        // Create range record for this queue
-        let range = QueueResourceRange {
-            queue_slab_key,
-            file_start_index,
-            file_count: files.len() as u16,
-            buffer_start_index,
-            buffer_count: buffer_count as u16,
-        };
-
-        self.queue_ranges.push(range.clone());
-        self.total_buffer_count += buffer_count;
-
-        range
-    }
-
-    /// Perform batch registration of all accumulated files and buffers
-    pub fn register_resources_with_ring(&mut self) -> Result<(), UblkError> {
-        if self.registered {
-            return Ok(()); // Already registered
-        }
-
-        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-            // Register all files
-            if !self.files.is_empty() {
-                ring.submitter()
-                    .register_files(&self.files)
-                    .map_err(UblkError::IOError)?;
-            }
-
-            // Register sparse buffers if needed
-            if self.total_buffer_count > 0 {
-                ring.submitter()
-                    .register_buffers_sparse(self.total_buffer_count)
-                    .map_err(UblkError::IOError)?;
-            }
-
-            Ok::<(), UblkError>(())
-        })?;
-
-        self.registered = true;
-        log::debug!(
-            "Registered {} files and {} buffers for {} queues",
-            self.files.len(),
-            self.total_buffer_count,
-            self.queue_ranges.len()
-        );
-        Ok(())
-    }
-
-    /// Get resource range for a specific queue
-    pub fn get_queue_range(&self, queue_slab_key: u16) -> Option<&QueueResourceRange> {
-        self.queue_ranges
-            .iter()
-            .find(|range| range.queue_slab_key == queue_slab_key)
-    }
-
-    /// Unregister resources when all queues are dropped
-    pub fn unregister_resources(&mut self) -> Result<(), UblkError> {
-        if !self.registered {
-            return Ok(()); // Nothing to unregister
-        }
-
-        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-            // Unregister files if any were registered
-            if !self.files.is_empty() {
-                if let Err(e) = ring.submitter().unregister_files() {
-                    log::error!("Failed to unregister files in multi-queue mode: {}", e);
-                    return Err(UblkError::IOError(e));
-                }
-            }
-
-            // Unregister sparse buffers if any were registered
-            if self.total_buffer_count > 0 {
-                if let Err(e) = ring.submitter().unregister_buffers() {
-                    log::error!("Failed to unregister buffers in multi-queue mode: {}", e);
-                    return Err(UblkError::IOError(e));
-                }
-            }
-
-            Ok::<(), UblkError>(())
-        })?;
-
-        self.registered = false;
-        log::debug!(
-            "Unregistered {} files and {} buffers for {} queues",
-            self.files.len(),
-            self.total_buffer_count,
-            self.queue_ranges.len()
-        );
-        Ok(())
-    }
-}
-
-impl Drop for UringResourceManager {
-    fn drop(&mut self) {
-        if let Err(e) = self.unregister_resources() {
-            log::error!("Failed to cleanup UringResourceManager resources: {:?}", e);
-        }
-    }
-}
-
-// Thread-local io_uring resource manager for multi-queue scenarios
-std::thread_local! {
-    pub(crate) static URING_RESOURCE_MANAGER: RefCell<Option<UringResourceManager>> =
-        RefCell::new(None);
-}
-
 /// Initialize or get access to the io_uring resource manager
 pub(crate) fn with_uring_resource_manager<F, R>(f: F) -> R
 where
-    F: FnOnce(&mut UringResourceManager) -> R,
+    F: FnOnce(&mut crate::uring::UringResourceManager) -> R,
 {
-    URING_RESOURCE_MANAGER.with(|cell| {
-        let mut manager_opt = cell.borrow_mut();
-        if manager_opt.is_none() {
-            *manager_opt = Some(UringResourceManager::new());
-        }
-        f(manager_opt.as_mut().unwrap())
-    })
+    UBLK_URING.with(|ublk_uring| ublk_uring.with_resource_manager(f))
 }
 
 /// Add queue resources to the centralized io_uring manager
@@ -355,67 +180,39 @@ pub(crate) fn add_queue_resources_to_uring_manager(
 
 /// Perform batch registration of all accumulated io_uring resources
 pub(crate) fn register_all_uring_resources() -> Result<(), UblkError> {
-    with_uring_resource_manager(|manager| manager.register_resources_with_ring())
+    UBLK_URING.with(|ublk_uring| {
+        ublk_uring.with_resource_manager(|manager| {
+            ublk_uring.with_ring_mut(|ring| manager.register_resources_with_ring(ring))
+        })
+    })
 }
 
 /// Get resource range for a specific queue
 pub(crate) fn get_queue_resource_range(queue_slab_key: u16) -> Option<QueueResourceRange> {
-    URING_RESOURCE_MANAGER.with(|cell| {
-        let manager_opt = cell.borrow();
-        manager_opt
-            .as_ref()
-            .and_then(|manager| manager.get_queue_range(queue_slab_key))
-            .cloned()
+    UBLK_URING.with(|ublk_uring| {
+        ublk_uring.with_resource_manager(|manager| manager.get_queue_range(queue_slab_key).cloned())
     })
 }
 
 /// Remove a queue from the io_uring resource manager and cleanup if it was the last one
-pub(crate) fn remove_queue_from_uring_resource_manager(queue_slab_key: u16) -> Result<(), UblkError> {
-    URING_RESOURCE_MANAGER.with(|cell| {
-        let mut manager_opt = cell.borrow_mut();
-        if let Some(manager) = manager_opt.as_mut() {
-            // Remove the queue from the ranges
-            manager.queue_ranges.retain(|range| range.queue_slab_key != queue_slab_key);
-            
-            // If this was the last queue, clean up the manager
-            if manager.queue_ranges.is_empty() {
-                log::debug!("Last queue removed, cleaning up io_uring resource manager");
-                // Move the manager out of the Option to trigger Drop
-                let mut cleanup_manager = manager_opt.take().unwrap();
-                // Explicitly call unregister_resources before drop
-                cleanup_manager.unregister_resources()?;
-            }
-        }
-        Ok(())
-    })
+pub(crate) fn remove_queue_from_uring_resource_manager(
+    queue_slab_key: u16,
+) -> Result<(), UblkError> {
+    UBLK_URING.with(|ublk_uring| ublk_uring.remove_queue_from_resource_manager(queue_slab_key))
 }
 
 // Internal macro versions for backwards compatibility within the crate
 #[macro_export]
 macro_rules! with_queue_ring_internal {
     ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
-                let ring = ring_cell.borrow();
-                $closure(&*ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
-            }
-        })
+        $crate::uring::UBLK_URING.with(|ublk_uring| ublk_uring.with_ring($closure))
     };
 }
 
 #[macro_export]
 macro_rules! with_queue_ring_mut_internal {
     ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
-                let mut ring = ring_cell.borrow_mut();
-                $closure(&mut *ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
-            }
-        })
+        $crate::uring::UBLK_URING.with(|ublk_uring| ublk_uring.with_ring_mut($closure))
     };
 }
 
@@ -484,7 +281,7 @@ pub fn ublk_init_task_ring<F>(init_fn: F) -> Result<(), UblkError>
 where
     F: FnOnce(&OnceCell<RefCell<IoUring<squeue::Entry>>>) -> Result<(), UblkError>,
 {
-    QUEUE_RING.with(|cell| init_fn(cell))
+    UBLK_URING.with(|ublk_uring| ublk_uring.init_ring(init_fn))
 }
 
 /// Internal function to initialize the queue ring with default parameters
@@ -1190,9 +987,10 @@ impl Drop for UblkQueue<'_> {
 
             // Unregister sparse buffer table if auto buffer registration was enabled
             if self.support_auto_buf_zc() {
-                if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
-                    .submitter()
-                    .unregister_buffers())
+                if let Err(r) =
+                    with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
+                        .submitter()
+                        .unregister_buffers())
                 {
                     log::error!("unregister sparse buffers failed {}", r);
                 }
@@ -1200,7 +998,11 @@ impl Drop for UblkQueue<'_> {
         } else {
             // Multi-queue mode: notify io_uring resource manager that this queue is being dropped
             if let Err(e) = remove_queue_from_uring_resource_manager(self.queue_slab_key) {
-                log::error!("Failed to remove queue {} from io_uring resource manager: {:?}", self.queue_slab_key, e);
+                log::error!(
+                    "Failed to remove queue {} from io_uring resource manager: {:?}",
+                    self.queue_slab_key,
+                    e
+                );
             }
         }
 
@@ -2544,10 +2346,16 @@ impl UblkQueue<'_> {
     }
 
     /// Translate local file index to global file index for io_uring operations
+    #[inline(always)]
     pub fn translate_file_index(&self, local_index: u16) -> u16 {
         match &self.resource_range {
             Some(range) => {
-                assert!(local_index < range.file_count, "Local file index {} out of range (max {})", local_index, range.file_count);
+                assert!(
+                    local_index < range.file_count,
+                    "Local file index {} out of range (max {})",
+                    local_index,
+                    range.file_count
+                );
                 range.file_start_index + local_index
             }
             None => local_index, // Single queue mode, no translation needed
@@ -2555,10 +2363,16 @@ impl UblkQueue<'_> {
     }
 
     /// Translate local buffer index to global buffer index for io_uring operations
+    #[inline(always)]
     pub fn translate_buffer_index(&self, local_index: u16) -> u16 {
         match &self.resource_range {
             Some(range) => {
-                assert!(local_index < range.buffer_count, "Local buffer index {} out of range (max {})", local_index, range.buffer_count);
+                assert!(
+                    local_index < range.buffer_count,
+                    "Local buffer index {} out of range (max {})",
+                    local_index,
+                    range.buffer_count
+                );
                 range.buffer_start_index + local_index
             }
             None => local_index, // Single queue mode, no translation needed
@@ -2786,26 +2600,37 @@ mod tests {
 
     #[test]
     fn test_multi_queue_resource_registration() {
+        use super::{
+            add_queue_resources_to_uring_manager, get_queue_resource_range,
+            with_uring_resource_manager,
+        };
         use crate::multi_queue::MultiQueueManager;
-        use super::{with_uring_resource_manager, add_queue_resources_to_uring_manager, get_queue_resource_range};
 
         // Test io_uring resource manager accumulation and range assignment
         let queue1_slab_key = 1u16;
         let queue2_slab_key = 2u16;
-        
+
         // Simulate queue 1: 2 files, 64 buffers
         let queue1_files = [10, 11]; // Mock file descriptors
         let queue1_buffer_count = 64u32;
-        
-        // Simulate queue 2: 1 file, 32 buffers  
+
+        // Simulate queue 2: 1 file, 32 buffers
         let queue2_files = [20]; // Mock file descriptors
         let queue2_buffer_count = 32u32;
 
         // Add resources for queue 1
-        let range1 = add_queue_resources_to_uring_manager(queue1_slab_key, &queue1_files, queue1_buffer_count);
-        
+        let range1 = add_queue_resources_to_uring_manager(
+            queue1_slab_key,
+            &queue1_files,
+            queue1_buffer_count,
+        );
+
         // Add resources for queue 2
-        let range2 = add_queue_resources_to_uring_manager(queue2_slab_key, &queue2_files, queue2_buffer_count);
+        let range2 = add_queue_resources_to_uring_manager(
+            queue2_slab_key,
+            &queue2_files,
+            queue2_buffer_count,
+        );
 
         // Verify range allocation for queue 1
         assert_eq!(range1.queue_slab_key, queue1_slab_key);
@@ -2829,13 +2654,15 @@ mod tests {
             assert!(!manager.registered); // Not yet registered
         });
 
-        // Test MultiQueueManager integration  
+        // Test MultiQueueManager integration
         let mut multi_manager = MultiQueueManager::new();
         assert!(!multi_manager.are_resources_registered());
-        
+
         // Test adding queue resources via MultiQueueManager
-        let _range3 = multi_manager.add_queue_files_and_buffers(3u16, &[30, 31], 16).unwrap();
-        
+        let _range3 = multi_manager
+            .add_queue_files_and_buffers(3u16, &[30, 31], 16)
+            .unwrap();
+
         // Verify resource accumulation continues
         with_uring_resource_manager(|manager| {
             assert_eq!(manager.files.len(), 5); // 3 + 2 files total
@@ -2847,7 +2674,7 @@ mod tests {
         let lookup_range1 = get_queue_resource_range(queue1_slab_key).unwrap();
         assert_eq!(lookup_range1.file_start_index, 0);
         assert_eq!(lookup_range1.file_count, 2);
-        
+
         let lookup_range2 = get_queue_resource_range(queue2_slab_key).unwrap();
         assert_eq!(lookup_range2.file_start_index, 2);
         assert_eq!(lookup_range2.file_count, 1);
@@ -2869,14 +2696,14 @@ mod tests {
 
         // Simulate creating a queue with this range (normally done in UblkQueue::__new)
         // We can't actually create a UblkQueue in tests, so we'll test the logic directly
-        
+
         // Test file index translation
         assert_eq!(test_range.file_start_index + 0, 10); // Local 0 -> Global 10
-        assert_eq!(test_range.file_start_index + 1, 11); // Local 1 -> Global 11  
+        assert_eq!(test_range.file_start_index + 1, 11); // Local 1 -> Global 11
         assert_eq!(test_range.file_start_index + 2, 12); // Local 2 -> Global 12
 
         // Test buffer index translation
-        assert_eq!(test_range.buffer_start_index + 0, 100);  // Local 0 -> Global 100
+        assert_eq!(test_range.buffer_start_index + 0, 100); // Local 0 -> Global 100
         assert_eq!(test_range.buffer_start_index + 10, 110); // Local 10 -> Global 110
         assert_eq!(test_range.buffer_start_index + 19, 119); // Local 19 -> Global 119
 
@@ -2884,7 +2711,7 @@ mod tests {
         assert!(0 < test_range.file_count);
         assert!(2 < test_range.file_count);
         assert!(!(3 < test_range.file_count)); // Should fail bounds check
-        
+
         assert!(0 < test_range.buffer_count);
         assert!(19 < test_range.buffer_count);
         assert!(!(20 < test_range.buffer_count)); // Should fail bounds check
