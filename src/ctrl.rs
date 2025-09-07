@@ -754,6 +754,9 @@ struct UblkCtrlInner {
 
     /// global flags, shared with UblkDev and UblkQueue
     dev_flags: UblkFlags,
+    // only set when running start_dev_async() which is enabled before
+    // adding UBLK_CTRL_ASYNC_AWAIT
+    force_async: bool,
     cmd_token: i32,
     queue_tids: Vec<i32>,
     queue_selected_cpus: Vec<usize>,
@@ -965,6 +968,7 @@ impl UblkCtrlInner {
             queue_selected_cpus,
             nr_queues_configured: 0,
             dev_flags: config.dev_flags,
+            force_async: false,
             features: None,
         };
 
@@ -1005,6 +1009,7 @@ impl UblkCtrlInner {
             queue_selected_cpus,
             nr_queues_configured: 0,
             dev_flags: config.dev_flags,
+            force_async: false,
             features: None,
         };
 
@@ -1240,6 +1245,11 @@ impl UblkCtrlInner {
     }
 
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        // Enforce async/await API usage: async methods can only be used when UBLK_CTRL_ASYNC_AWAIT is set
+        if !self.force_async && !self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
         let mut new_data = *data;
         let mut res: i32 = 0;
 
@@ -1258,6 +1268,11 @@ impl UblkCtrlInner {
     }
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
+        // Enforce non-async API usage: sync methods can only be used when UBLK_CTRL_ASYNC_AWAIT is NOT set
+        if self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
         let mut new_data = *data;
         let mut res: i32 = 0;
 
@@ -1628,6 +1643,19 @@ impl UblkCtrlInner {
         };
 
         Ok(0)
+    }
+
+    async fn start_dev_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        self.prep_start_dev_async(dev).await?;
+
+        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            self.start_async(unsafe { libc::getpid() as i32 }).await
+        } else if self.for_recover_dev() {
+            self.end_user_recover_async(unsafe { libc::getpid() as i32 })
+                .await
+        } else {
+            Err(crate::UblkError::OtherError(-libc::EINVAL))
+        }
     }
 
     /// Flush this device's json info as file
@@ -2378,18 +2406,15 @@ impl UblkCtrl {
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
     ///
+    /// This is the only one async API allowed without UBLK_CTRL_ASYNC_AWAIT
+    ///
     pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
-        ctrl.prep_start_dev_async(dev).await?;
 
-        if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
-            ctrl.start_async(unsafe { libc::getpid() as i32 }).await
-        } else if ctrl.for_recover_dev() {
-            ctrl.end_user_recover_async(unsafe { libc::getpid() as i32 })
-                .await
-        } else {
-            Err(crate::UblkError::OtherError(-libc::EINVAL))
-        }
+        ctrl.force_async = true;
+        let res = ctrl.start_dev_async(dev).await;
+        ctrl.force_async = false;
+        res
     }
 
     /// Stop ublk device
@@ -3056,7 +3081,7 @@ mod tests {
             // Test new_async with basic parameters
             let result = UblkCtrlBuilder::default()
                 .name("test_async")
-                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
                 .build_async()
                 .await;
 
@@ -3186,7 +3211,7 @@ mod tests {
     async fn device_handler_async() -> Result<(), UblkError> {
         let ctrl = UblkCtrlBuilder::default()
             .name("test_async")
-            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
             .depth(8)
             .build_async()
             .await
@@ -3252,5 +3277,102 @@ mod tests {
         smol::block_on(exe_rc.run(async move {
             let _ = ublk_join_tasks(&exe, fvec);
         }));
+    }
+
+    /// Test UBLK_CTRL_ASYNC_AWAIT flag enforcement
+    #[test]
+    fn test_ctrl_async_await_flag_enforcement() {
+        // Test with async flag support using a sync runtime context
+        use crate::uring_async::ublk_join_tasks;
+
+        let exe_rc = std::rc::Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
+
+        let job = exe_rc.spawn(async move {
+            // Test with UBLK_CTRL_ASYNC_AWAIT flag set - should allow async but reject sync
+            let ctrl_async = UblkCtrlBuilder::default()
+                .name("test_async_flag")
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
+                .build_async()
+                .await
+                .unwrap();
+
+            // Test with flag NOT set - should allow sync but reject async
+            let ctrl_sync = UblkCtrlBuilder::default()
+                .name("test_sync_flag")
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                .build()
+                .unwrap();
+
+            // Verify flags are set correctly
+            assert!(ctrl_async
+                .get_dev_flags()
+                .contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT));
+            assert!(!ctrl_sync
+                .get_dev_flags()
+                .contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT));
+
+            // Test sync API that should be rejected when UBLK_CTRL_ASYNC_AWAIT is set
+            {
+                let mut params = crate::sys::ublk_params {
+                    ..Default::default()
+                };
+                let sync_result = ctrl_async.get_params(&mut params);
+
+                match sync_result {
+                    Err(UblkError::OtherError(err)) => {
+                        assert_eq!(
+                            err,
+                            -libc::EPERM,
+                            "Sync API should be rejected with EPERM when UBLK_CTRL_ASYNC_AWAIT is set"
+                        );
+                    }
+                    _ => panic!("Sync API should fail when UBLK_CTRL_ASYNC_AWAIT flag is set"),
+                }
+            }
+
+            // Test async API that should be rejected when UBLK_CTRL_ASYNC_AWAIT is NOT set
+            {
+                let mut params = crate::sys::ublk_params {
+                    ..Default::default()
+                };
+                let async_result = ctrl_sync.get_params_async(&mut params).await;
+
+                match async_result {
+                    Err(UblkError::OtherError(err)) => {
+                        assert_eq!(err, -libc::EPERM, "Async API should be rejected with EPERM when UBLK_CTRL_ASYNC_AWAIT is not set");
+                    }
+                    _ => panic!("Async API should fail when UBLK_CTRL_ASYNC_AWAIT flag is not set"),
+                }
+            }
+
+            // Test async API that should work when UBLK_CTRL_ASYNC_AWAIT is set
+            {
+                let mut params = crate::sys::ublk_params {
+                    ..Default::default()
+                };
+                let async_result = ctrl_async.get_params_async(&mut params).await;
+
+                // The result may succeed or fail depending on system support,
+                // but it should NOT fail with EPERM (permission denied)
+                match async_result {
+                    Err(UblkError::OtherError(err)) => {
+                        assert_ne!(err, -libc::EPERM, "Async API should not be rejected with EPERM when UBLK_CTRL_ASYNC_AWAIT is set");
+                    }
+                    _ => {
+                        // Success or other errors are acceptable - we just care that EPERM is not returned
+                    }
+                }
+            }
+        });
+
+        smol::block_on(exe_rc.run(async move {
+            let _ = ublk_join_tasks(&exe, vec![job]);
+        }));
+
+        println!("✓ UBLK_CTRL_ASYNC_AWAIT flag enforcement tests passed");
+        println!("  - Sync API rejection when flag is set: PASS");
+        println!("  - Async API rejection when flag is not set: PASS");
+        println!("  - Async API acceptance when flag is set: PASS");
     }
 }

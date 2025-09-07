@@ -46,6 +46,10 @@ bitflags! {
         /// It is required for ublk to be used as swap disk
         const UBLK_DEV_F_MLOCK_IO_BUFFER = 0b00100000;
 
+        /// enable async/await API enforcement: when set, only async/await control
+        /// APIs can be used; when not set, only synchronous control APIs can be used
+        const UBLK_CTRL_ASYNC_AWAIT = 0b01000000;
+
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
         const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;
