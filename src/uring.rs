@@ -290,10 +290,13 @@ mod tests {
         let nr_queues = 4;
 
         // Create a ublk controller with multiple queues for testing
+        // Include UBLK_F_AUTO_BUF_REG to test buffer resource registration
         let ctrl = UblkCtrlBuilder::default()
+            .ctrl_flags(crate::sys::UBLK_F_AUTO_BUF_REG as u64)
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .name("test-multi-queue-resource-mgr")
             .nr_queues(nr_queues)
+            .depth(64_u16) // Set queue depth for buffer testing
             .build()
             .expect("Failed to create ublk controller");
 
@@ -325,6 +328,18 @@ mod tests {
                 assert_eq!(range.queue_slab_key, slab_key);
                 assert_eq!(range.file_count, 1); // Each queue should have 1 file (cdev)
 
+                // Verify buffer resources are properly allocated when UBLK_F_AUTO_BUF_REG is enabled
+                assert_eq!(
+                    range.buffer_count, 64,
+                    "Each queue should have 64 buffers (queue_depth)"
+                );
+
+                // Verify buffer range starts at the correct position
+                let expected_buffer_start = (q_id as u16) * 64;
+                assert_eq!(
+                    range.buffer_start_index, expected_buffer_start,
+                    "Buffer start index should be queue_id * queue_depth"
+                );
                 // Verify resource ranges don't overlap
                 for existing_queue in &queues {
                     if let Some(existing_range) = existing_queue.get_resource_range() {
@@ -337,17 +352,14 @@ mod tests {
                             "File ranges overlap between queues"
                         );
 
-                        // Buffer ranges should not overlap (if both have buffers)
-                        if range.buffer_count > 0 && existing_range.buffer_count > 0 {
-                            assert!(
-                                range.buffer_start_index
-                                    >= existing_range.buffer_start_index
-                                        + existing_range.buffer_count
-                                    || existing_range.buffer_start_index
-                                        >= range.buffer_start_index + range.buffer_count,
-                                "Buffer ranges overlap between queues"
-                            );
-                        }
+                        // Buffer ranges should not overlap
+                        assert!(
+                            range.buffer_start_index
+                                >= existing_range.buffer_start_index + existing_range.buffer_count
+                                || existing_range.buffer_start_index
+                                    >= range.buffer_start_index + range.buffer_count,
+                            "Buffer ranges overlap between queues"
+                        );
                     }
                 }
 
@@ -376,16 +388,24 @@ mod tests {
                     assert_eq!(global_file_idx, 0); // Single queue mode
                 }
 
-                // Test buffer index translation (if buffers are used)
-                if queue
-                    .get_resource_range()
-                    .map(|r| r.buffer_count > 0)
-                    .unwrap_or(false)
-                {
-                    let global_buffer_idx = queue.translate_buffer_index(0);
-                    if let Some(range) = queue.get_resource_range() {
-                        assert_eq!(global_buffer_idx, range.buffer_start_index);
-                    }
+                // Test buffer index translation (should always have buffers with UBLK_F_AUTO_BUF_REG)
+                if let Some(range) = queue.get_resource_range() {
+                    assert!(
+                        range.buffer_count > 0,
+                        "Should have buffers with UBLK_F_AUTO_BUF_REG"
+                    );
+
+                    // Test buffer index translation
+                    let global_buffer_idx_0 = queue.translate_buffer_index(0);
+                    let global_buffer_idx_10 = queue.translate_buffer_index(10);
+                    let global_buffer_idx_63 = queue.translate_buffer_index(63);
+
+                    assert_eq!(global_buffer_idx_0, range.buffer_start_index);
+                    assert_eq!(global_buffer_idx_10, range.buffer_start_index + 10);
+                    assert_eq!(global_buffer_idx_63, range.buffer_start_index + 63);
+
+                    println!("Queue 0 buffer translations: local 0->global {}, local 10->global {}, local 63->global {}",
+                            global_buffer_idx_0, global_buffer_idx_10, global_buffer_idx_63);
                 }
             }
 
@@ -396,14 +416,27 @@ mod tests {
                     assert_eq!(resource_mgr.files.len(), nr_queues as usize); // One file per queue
                     assert!(resource_mgr.registered);
 
+                    // Verify total buffer count is correct (4 queues * 64 buffers each = 256)
+                    let expected_total_buffers = (nr_queues * 64) as u32;
+                    assert_eq!(
+                        resource_mgr.total_buffer_count, expected_total_buffers,
+                        "Total buffer count should be nr_queues * queue_depth"
+                    );
+
                     // Verify each queue has its range properly registered
-                    for queue in &queues {
+                    for (idx, queue) in queues.iter().enumerate() {
                         let slab_key = queue.get_slab_key();
                         let range = resource_mgr.get_queue_range(slab_key);
                         assert!(range.is_some(), "Queue range should be registered");
 
                         if let Some(range) = range {
                             assert_eq!(range.queue_slab_key, slab_key);
+                            assert_eq!(range.buffer_count, 64, "Each queue should have 64 buffers");
+                            assert_eq!(
+                                range.buffer_start_index,
+                                (idx as u16) * 64,
+                                "Buffer start index should be sequential"
+                            );
                         }
                     }
                 });
