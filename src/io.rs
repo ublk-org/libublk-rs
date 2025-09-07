@@ -846,6 +846,16 @@ impl Drop for UblkQueue<'_> {
             log::error!("unregister fixed files failed {}", r);
         }
 
+        // Unregister sparse buffer table if auto buffer registration was enabled
+        if self.support_auto_buf_zc() {
+            if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
+                .submitter()
+                .unregister_buffers())
+            {
+                log::error!("unregister sparse buffers failed {}", r);
+            }
+        }
+
         let depth = dev.dev_info.queue_depth as u32;
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
 
