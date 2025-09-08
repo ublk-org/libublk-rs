@@ -350,7 +350,7 @@ where
             // Extract queue slab key and route to appropriate queue
             let slab_key = UblkIOCtx::user_data_to_slab_key(user_data);
 
-            if let Some(queue) = MultiQueueManager::get_queue_by_key(slab_key) {
+            if let Some(queue) = manager.get_queue_by_key(slab_key.into()) {
                 queue.handle_io_cmd_multi(&cqe);
 
                 // Extract tag for cmd_handler
@@ -396,7 +396,7 @@ pub fn ublk_handle_ios_in_current_thread<F>(
 ) where
     F: Fn(&UblkQueue, u16, &cqueue::Entry),
 {
-    let mut queue_cnt = MultiQueueManager::get_registered_queue_count();
+    let mut queue_cnt = manager.get_registered_queue_count();
 
     loop {
         // Execute any pending tasks
@@ -421,8 +421,8 @@ pub fn ublk_handle_ios_in_current_thread<F>(
             // Handle timeout - handle timeout for each queue managed by this MultiQueueManager
             Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
                 // Call UblkQueue::enter_queue_idle() for all managed queues
-                for &queue_key in manager.get_queue_keys() {
-                    if let Some(queue) = MultiQueueManager::get_queue_by_key(queue_key) {
+                for queue_key in manager.get_queue_keys() {
+                    if let Some(queue) = manager.get_queue_by_key(queue_key.into()) {
                         queue.handle_timeout_multi();
                     }
                 }

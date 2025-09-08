@@ -88,13 +88,13 @@
 //!
 //! fn example(dev: &UblkDev) -> Result<(), libublk::UblkError> {
 //!     let mut manager = MultiQueueManager::new();
-//!     let mut queues = Vec::new();
 //!
 //!     // Create and register queues automatically
 //!     for q_id in 0..8 {
-//!         let queue = UblkQueue::new_multi(q_id, dev, &mut manager)?;
-//!         println!("Created queue {} with slab key: {}", q_id, queue.get_slab_key());
-//!         queues.push(queue);
+//!         let queue_key = manager.create_queue(q_id, dev)?;
+//!         if let Some(queue) = manager.get_queue_by_key(queue_key) {
+//!             println!("Created queue {} with slab key: {}", q_id, queue.get_slab_key());
+//!         }
 //!     }
 //!
 //!     println!("Managing {} queues", manager.queue_count());
@@ -1156,47 +1156,46 @@ impl UblkQueue<'_> {
     ///
     /// # Returns:
     /// Result containing the created queue with embedded slab key, or error on failure
-    pub fn new_multi<'a>(
-        q_id: u16,
-        dev: &'a UblkDev,
-        manager: &mut MultiQueueManager,
-    ) -> Result<UblkQueue<'a>, UblkError> {
-        // Allocate slab entry first
-        let slab_key = manager.allocate_queue_slot()?;
-        let mut q = match Self::__new(q_id, dev, slab_key) {
-            Ok(_q) => _q,
-            Err(e) => {
-                // Clean up the allocated slot on failure
-                manager.remove_queue_slot(slab_key)?;
-                return Err(e);
-            }
-        };
+    pub fn new_multi(q_id: u16, dev: &UblkDev, slab_key: u16) -> Result<UblkQueue, UblkError> {
+        // Create queue with the provided slab key (which is the Vec index)
+        let q = Self::__new(q_id, dev, slab_key)?;
 
-        // Multi-queue mode: add resources to centralized io_uring manager
-        // Resources will be registered later when MultiQueueManager::register_resources() is called
-        let buffer_count = if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
-            dev.dev_info.queue_depth as u32
-        } else {
-            0
-        };
-
-        let tgt = &dev.tgt;
-        manager.add_queue_files_and_buffers(
-            slab_key,
-            &tgt.fds[0..tgt.nr_fds as usize],
-            buffer_count,
-        )?;
-        manager.register_queue_at_slot(&q, slab_key)?;
-        q.resource_range = get_queue_resource_range(slab_key);
+        // Note: Managed queues cannot reregister files and buffers
+        // Resource registration must be handled at the manager level
 
         log::info!(
-            "dev {} queue {} started with slab key {}",
+            "dev {} managed queue {} created with slab key {}",
             dev.dev_info.dev_id,
             q_id,
             slab_key
         );
 
+        // SAFETY: The queue lifetime is managed by MultiQueueManager which ensures proper cleanup
+        //unsafe { Ok(std::mem::transmute::<UblkQueue<'_>, UblkQueue<'static>>(q)) }
         Ok(q)
+    }
+
+    pub(crate) fn add_resources(
+        &mut self,
+        manager: &mut MultiQueueManager,
+        slab_key: u16,
+    ) -> Result<(), UblkError> {
+        // Multi-queue mode: add resources to centralized io_uring manager
+        // Resources will be registered later when MultiQueueManager::register_resources() is called
+        let buffer_count = if (self.dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+            self.dev.dev_info.queue_depth as u32
+        } else {
+            0
+        };
+
+        let tgt = &self.dev.tgt;
+        manager.add_queue_files_and_buffers(
+            slab_key,
+            &tgt.fds[0..tgt.nr_fds as usize],
+            buffer_count,
+        )?;
+        self.resource_range = get_queue_resource_range(slab_key);
+        Ok(())
     }
 
     // Return if queue is idle

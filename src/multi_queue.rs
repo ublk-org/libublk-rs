@@ -18,12 +18,11 @@
 //!
 //! fn example(dev: &UblkDev) -> Result<(), libublk::UblkError> {
 //!     let mut manager = MultiQueueManager::new();
-//!     let mut queues = Vec::new();
 //!
 //!     // Create queues with automatic registration
 //!     for q_id in 0..4 {
-//!         let queue = UblkQueue::new_multi(q_id, dev, &mut manager)?;
-//!         queues.push(queue);
+//!         let queue_key = manager.create_queue(q_id, dev)?;
+//!         // Access queue via manager.get_queue_by_key(queue_key)
 //!     }
 //!
 //!     println!("Managing {} queues", manager.queue_count());
@@ -31,10 +30,11 @@
 //! }
 //! ```
 
-use crate::io::{register_all_uring_resources, UblkQueue};
+use crate::io::{register_all_uring_resources, UblkDev, UblkQueue};
 use crate::uring::QueueResourceRange;
 use crate::UblkError;
-use std::cell::RefCell;
+use slab::Slab;
+use std::rc::Rc;
 
 /// Multi-queue slab key constants
 #[allow(dead_code)]
@@ -67,102 +67,83 @@ pub(crate) mod slab_key {
     }
 }
 
-// Thread-local slab for storing queue references in multi-queue scenarios
-// Uses raw pointers to allow non-static lifetimes within a controlled scope
-std::thread_local! {
-    static QUEUE_SLAB: RefCell<slab::Slab<*const ()>> =
-        RefCell::new(slab::Slab::new());
-}
-
 /// Multi-queue manager for coordinating multiple queues
 ///
-/// This manager handles automatic allocation and cleanup of slab entries for
-/// multi-queue operations. Queues created with `UblkQueue::new_multi()` are
-/// automatically registered and will be unregistered when the manager is dropped.
-#[derive(Debug, Default)]
-pub struct MultiQueueManager {
-    queue_keys: Vec<u16>,
+/// This manager handles automatic allocation and cleanup of queues for
+/// multi-queue operations. Queues created with `manager.create_queue()` are
+/// automatically stored and managed, and will be cleaned up when the manager is dropped.
+/// Uses a Slab for stable queue keys that don't change when other queues are removed.
+pub struct MultiQueueManager<'a> {
     resources_registered: bool,
+    /// Managed queue storage - manager owns all queues with stable slab keys
+    queue_registry: Slab<Rc<UblkQueue<'a>>>,
 }
 
-impl MultiQueueManager {
+impl<'a> MultiQueueManager<'a> {
     /// Create a new multi-queue manager
     pub fn new() -> Self {
         Self {
-            queue_keys: Vec::new(),
             resources_registered: false,
+            queue_registry: Slab::new(),
         }
     }
 
-    /// Remove a queue from the manager
+    /// Create a new queue and add it to the manager
+    ///
+    /// Creates a new UblkQueue using UblkQueue::new_multi() and stores it in the
+    /// manager's queue registry. Returns the stable slab key that can be used to reference
+    /// the queue via get_queue_by_key(). The slab key remains valid until the queue is
+    /// explicitly removed, even if other queues are removed.
+    ///
+    /// # Arguments
+    /// * `q_id`: Queue ID
+    /// * `dev`: UblkDev reference
+    ///
+    /// # Returns
+    /// Stable slab key of the created queue in the registry, or error on failure
+    pub fn create_queue<'b>(&mut self, q_id: u16, dev: &'b UblkDev) -> Result<usize, UblkError>
+    where
+        'b: 'a, // dev must outlive the manager's lifetime
+    {
+        // Insert into slab to get a stable key, then create queue with that key
+        let slab_key = self.queue_registry.vacant_entry().key();
+        let mut queue = UblkQueue::new_multi(q_id, dev, slab_key as u16)?;
+
+        queue.add_resources(self, slab_key.try_into().unwrap())?;
+
+        let inserted_key = self.queue_registry.insert(Rc::new(queue));
+        assert_eq!(slab_key, inserted_key); // Verify the key matches
+        Ok(slab_key)
+    }
+
+    /// Remove a queue from the manager by slab key
+    ///
+    /// # Arguments
+    /// * `slab_key`: The stable slab key of the queue to remove
+    ///
+    /// # Returns
+    /// Ok(()) if the queue was successfully removed, or error if the key is invalid
     pub fn remove_queue(&mut self, slab_key: u16) -> Result<(), UblkError> {
-        Self::unregister_queue(slab_key)?;
-        self.queue_keys.retain(|&key| key != slab_key);
-        Ok(())
+        let key = slab_key as usize;
+        if self.queue_registry.contains(key) {
+            self.queue_registry.remove(key);
+            Ok(())
+        } else {
+            Err(UblkError::OtherError(-libc::ENOENT))
+        }
     }
 
-    /// Remove the queue slot from the manager
-    pub(crate) fn remove_queue_slot(&mut self, slab_key: u16) -> Result<(), UblkError> {
-        self.remove_queue(slab_key)
-    }
-
-    /// Allocate a queue slot efficiently using vacant_entry()
-    ///
-    /// This method is used internally by `UblkQueue::new_multi()` to pre-allocate
-    /// a slab entry before queue creation.
-    pub(crate) fn allocate_queue_slot(&mut self) -> Result<u16, UblkError> {
-        QUEUE_SLAB.with(|slab_cell| {
-            let mut slab = slab_cell.borrow_mut();
-
-            if slab.len() >= slab_key::MAX_QUEUE_KEY as usize {
-                return Err(UblkError::OtherError(-libc::ENOSPC));
-            }
-
-            let entry = slab.vacant_entry();
-            let key = entry.key();
-
-            if key > slab_key::MAX_QUEUE_KEY as usize {
-                return Err(UblkError::OtherError(-libc::ENOSPC));
-            }
-
-            // Reserve the slot with a placeholder
-            entry.insert(std::ptr::null());
-
-            Ok(key as u16)
-        })
-    }
-
-    /// Register a queue at the pre-allocated slot
-    ///
-    /// This method is used internally by `UblkQueue::new_multi()` to register
-    /// the queue after it has been created.
-    pub(crate) fn register_queue_at_slot(
-        &mut self,
-        queue: &UblkQueue,
-        slab_key: u16,
-    ) -> Result<(), UblkError> {
-        QUEUE_SLAB.with(|slab_cell| {
-            let mut slab = slab_cell.borrow_mut();
-
-            // Update the placeholder with the actual queue pointer
-            if let Some(slot) = slab.get_mut(slab_key as usize) {
-                *slot = queue as *const UblkQueue as *const ();
-                self.queue_keys.push(slab_key);
-                Ok(())
-            } else {
-                Err(UblkError::OtherError(-libc::ENOENT))
-            }
-        })
-    }
-
-    /// Get all managed queue keys
-    pub fn get_queue_keys(&self) -> &[u16] {
-        &self.queue_keys
+    /// Get all managed queue keys (stable slab keys as u16)
+    pub fn get_queue_keys(&self) -> Vec<u16> {
+        self.queue_registry
+            .iter()
+            .map(|(key, _)| key as u16)
+            .collect()
     }
 
     /// Get the number of managed queues
     pub fn queue_count(&self) -> usize {
-        self.queue_keys.len()
+        self.queue_registry.len()
     }
 
     /// Add queue resources to the centralized io_uring resource manager
@@ -213,7 +194,7 @@ impl MultiQueueManager {
         self.resources_registered = true;
         log::debug!(
             "MultiQueueManager: Resources registered for {} queues",
-            self.queue_keys.len()
+            self.queue_registry.len()
         );
         Ok(())
     }
@@ -223,68 +204,31 @@ impl MultiQueueManager {
         self.resources_registered
     }
 
-    /// Unregister a queue from multi-queue handling (internal function)
-    fn unregister_queue(slab_key: u16) -> Result<(), UblkError> {
-        if !slab_key::is_valid_queue_key(slab_key) {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
-
-        QUEUE_SLAB.with(|slab_cell| {
-            let mut slab = slab_cell.borrow_mut();
-
-            match slab.try_remove(slab_key as usize) {
-                Some(_) => Ok(()),
-                None => Err(UblkError::OtherError(-libc::ENOENT)),
-            }
-        })
-    }
-
-    /// Get a queue reference by slab key
+    /// Get a queue reference by slab key from this manager
     ///
     /// # Arguments
-    /// * `slab_key`: The slab key for the queue
+    /// * `slab_key`: The stable slab key of the queue in the registry
     ///
     /// # Returns
     /// Reference to the queue if found, None otherwise
-    pub fn get_queue_by_key(slab_key: u16) -> Option<&'static UblkQueue<'static>> {
-        if !slab_key::is_valid_queue_key(slab_key) {
-            return None;
-        }
-
-        QUEUE_SLAB.with(|slab_cell| {
-            let slab = slab_cell.borrow();
-            slab.get(slab_key as usize).map(|queue_ptr| {
-                // SAFETY: The pointer is valid as long as the caller ensures proper usage
-                unsafe { &*(*queue_ptr as *const UblkQueue) }
-            })
-        })
+    pub fn get_queue_by_key(&self, slab_key: usize) -> Option<&Rc<UblkQueue>> {
+        self.queue_registry.get(slab_key)
     }
 
     /// Get the number of registered queues
-    pub fn get_registered_queue_count() -> usize {
-        QUEUE_SLAB.with(|slab_cell| {
-            let slab = slab_cell.borrow();
-            slab.len()
-        })
+    pub fn get_registered_queue_count(&self) -> usize {
+        self.queue_registry.len()
     }
 }
 
-impl Drop for MultiQueueManager {
-    /// Automatically unregister all managed queues when the manager is dropped
+impl<'a> Drop for MultiQueueManager<'a> {
+    /// Automatically clean up all managed queues when the manager is dropped
     fn drop(&mut self) {
-        for &slab_key in &self.queue_keys {
-            if let Err(e) = Self::unregister_queue(slab_key) {
-                log::warn!(
-                    "Failed to unregister queue with slab key {}: {:?}",
-                    slab_key,
-                    e
-                );
-            }
-        }
-        self.queue_keys.clear();
+        let queue_count = self.queue_registry.len();
+        self.queue_registry.clear();
         log::debug!(
-            "MultiQueueManager dropped, unregistered {} queues",
-            self.queue_keys.len()
+            "MultiQueueManager dropped, cleaned up {} queues",
+            queue_count
         );
     }
 }
@@ -298,9 +242,10 @@ mod tests {
     #[test]
     fn test_multi_queue_slab_operations() {
         // Test basic slab operations
+        let manager = MultiQueueManager::new();
 
         // Initially no queues should be registered
-        assert_eq!(MultiQueueManager::get_registered_queue_count(), 0);
+        assert_eq!(manager.queue_count(), 0);
 
         // Test user_data encoding/decoding with 10-bit slab keys
         let tag = 42u16;
