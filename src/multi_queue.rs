@@ -29,6 +29,55 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## Iteration Examples
+//!
+//! The `MultiQueueManager` provides several ways to iterate over managed queues:
+//!
+//! ```no_run
+//! use libublk::multi_queue::{MultiQueueManager};
+//! use libublk::io::{UblkQueue, UblkDev};
+//!
+//! fn iteration_examples(dev: &UblkDev) -> Result<(), libublk::UblkError> {
+//!     let mut manager = MultiQueueManager::new();
+//!     
+//!     // Create some queues
+//!     for q_id in 0..3 {
+//!         manager.create_queue(q_id, dev)?;
+//!     }
+//!
+//!     // Method 1: Using IntoIterator trait (for loops)
+//!     for (slab_key, queue) in &manager {
+//!         println!("Queue {} at slab key {}", queue.get_qid(), slab_key);
+//!     }
+//!
+//!     // Method 2: Using explicit iter() method
+//!     for (slab_key, queue) in manager.iter() {
+//!         println!("Queue {} at slab key {}", queue.get_qid(), slab_key);
+//!     }
+//!
+//!     // Method 3: Iterate over queue values only
+//!     for queue in manager.values() {
+//!         println!("Queue ID: {}", queue.get_qid());
+//!     }
+//!
+//!     // Method 4: Iterate over slab keys only
+//!     for slab_key in manager.keys() {
+//!         println!("Slab key: {}", slab_key);
+//!     }
+//!
+//!     // Method 5: Use iterator combinators
+//!     let queue_count = manager.values().count();
+//!     println!("Total queues: {}", queue_count);
+//!
+//!     // Method 6: Find a specific queue
+//!     if let Some((key, queue)) = manager.iter().find(|(_, q)| q.get_qid() == 1) {
+//!         println!("Found queue 1 at slab key {}", key);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! ```
 
 use crate::io::{register_all_uring_resources, UblkDev, UblkQueue};
 use crate::uring::QueueResourceRange;
@@ -219,6 +268,111 @@ impl<'a> MultiQueueManager<'a> {
     pub fn get_registered_queue_count(&self) -> usize {
         self.queue_registry.len()
     }
+
+    /// Get an iterator over all managed queues
+    ///
+    /// Returns an iterator that yields `(slab_key, &Rc<UblkQueue>)` pairs
+    /// for each managed queue in the registry.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use libublk::multi_queue::MultiQueueManager;
+    /// # use libublk::io::UblkDev;
+    /// # fn example(dev: &UblkDev) -> Result<(), libublk::UblkError> {
+    /// let mut manager = MultiQueueManager::new();
+    /// let _key1 = manager.create_queue(0, dev)?;
+    /// let _key2 = manager.create_queue(1, dev)?;
+    ///
+    /// for (slab_key, queue) in manager.iter() {
+    ///     println!("Queue {} has slab key {}", queue.get_qid(), slab_key);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn iter(&self) -> impl Iterator<Item = (u16, &Rc<UblkQueue<'a>>)> + '_ {
+        self.queue_registry.iter().map(|(key, queue)| (key as u16, queue))
+    }
+
+    /// Get a mutable iterator over all managed queues
+    ///
+    /// Returns an iterator that yields `(slab_key, &mut Rc<UblkQueue>)` pairs
+    /// for each managed queue in the registry.
+    ///
+    /// Note: Since queues are wrapped in `Rc`, you cannot mutate the queue itself
+    /// through this iterator, but you can replace the `Rc` if needed.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (u16, &mut Rc<UblkQueue<'a>>)> + '_ {
+        self.queue_registry.iter_mut().map(|(key, queue)| (key as u16, queue))
+    }
+
+    /// Get an iterator over queue values only (without slab keys)
+    ///
+    /// Returns an iterator that yields `&Rc<UblkQueue>` for each managed queue.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use libublk::multi_queue::MultiQueueManager;
+    /// # use libublk::io::UblkDev;
+    /// # fn example(dev: &UblkDev) -> Result<(), libublk::UblkError> {
+    /// let mut manager = MultiQueueManager::new();
+    /// let _key1 = manager.create_queue(0, dev)?;
+    /// let _key2 = manager.create_queue(1, dev)?;
+    ///
+    /// for queue in manager.values() {
+    ///     println!("Queue ID: {}", queue.get_qid());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn values(&self) -> impl Iterator<Item = &Rc<UblkQueue>> {
+        self.queue_registry.iter().map(|(_, queue)| queue)
+    }
+
+    /// Get an iterator over slab keys only (without queue values)
+    ///
+    /// Returns an iterator that yields `u16` slab keys for each managed queue.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use libublk::multi_queue::MultiQueueManager;
+    /// # use libublk::io::UblkDev;
+    /// # fn example(dev: &UblkDev) -> Result<(), libublk::UblkError> {
+    /// let mut manager = MultiQueueManager::new();
+    /// let _key1 = manager.create_queue(0, dev)?;
+    /// let _key2 = manager.create_queue(1, dev)?;
+    ///
+    /// for slab_key in manager.keys() {
+    ///     println!("Slab key: {}", slab_key);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn keys(&self) -> impl Iterator<Item = u16> + '_ {
+        self.queue_registry.iter().map(|(key, _)| key as u16)
+    }
+
+    /// Check if the manager is empty (contains no queues)
+    pub fn is_empty(&self) -> bool {
+        self.queue_registry.is_empty()
+    }
+}
+
+// Implement IntoIterator for different reference types
+impl<'a> IntoIterator for &'a MultiQueueManager<'a> {
+    type Item = (u16, &'a Rc<UblkQueue<'a>>);
+    type IntoIter = std::iter::Map<slab::Iter<'a, Rc<UblkQueue<'a>>>, fn((usize, &'a Rc<UblkQueue<'a>>)) -> (u16, &'a Rc<UblkQueue<'a>>)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.queue_registry.iter().map(|(key, queue)| (key as u16, queue))
+    }
+}
+
+impl<'a> IntoIterator for &'a mut MultiQueueManager<'a> {
+    type Item = (u16, &'a mut Rc<UblkQueue<'a>>);
+    type IntoIter = std::iter::Map<slab::IterMut<'a, Rc<UblkQueue<'a>>>, fn((usize, &'a mut Rc<UblkQueue<'a>>)) -> (u16, &'a mut Rc<UblkQueue<'a>>)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.queue_registry.iter_mut().map(|(key, queue)| (key as u16, queue))
+    }
 }
 
 impl<'a> Drop for MultiQueueManager<'a> {
@@ -236,7 +390,7 @@ impl<'a> Drop for MultiQueueManager<'a> {
 #[cfg(test)]
 mod tests {
     use super::slab_key;
-    use crate::io::UblkIOCtx;
+    use crate::io::{UblkIOCtx, UblkQueue};
     use crate::multi_queue::MultiQueueManager;
 
     #[test]
@@ -293,5 +447,36 @@ mod tests {
             UblkIOCtx::user_data_to_slab_key(control_data),
             slab_key::CONTROL_CMD
         );
+    }
+
+    #[test]
+    fn test_multi_queue_manager_iterator() {
+        // Test the iterator functionality of MultiQueueManager
+        let manager = MultiQueueManager::new();
+
+        // Test empty manager
+        assert!(manager.is_empty());
+        assert_eq!(manager.iter().count(), 0);
+        assert_eq!(manager.values().count(), 0);
+        assert_eq!(manager.keys().count(), 0);
+
+        // Test IntoIterator for empty manager
+        let count: usize = (&manager).into_iter().count();
+        assert_eq!(count, 0);
+
+        // Note: We can't easily test with actual queues here because UblkQueue::new_multi
+        // requires a UblkDev which requires complex setup. Instead, we test the basic
+        // iterator structure and empty cases.
+        
+        // Test that the iterator methods exist and have correct types
+        let _iter = manager.iter();
+        let _values: Vec<&std::rc::Rc<UblkQueue>> = manager.values().collect();
+        let _keys: Vec<u16> = manager.keys().collect();
+        
+        // Test IntoIterator trait
+        for (_slab_key, _queue) in &manager {
+            // This loop won't execute since manager is empty, but verifies the trait works
+            unreachable!("Manager should be empty");
+        }
     }
 }
