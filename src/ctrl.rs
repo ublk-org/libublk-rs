@@ -3209,10 +3209,12 @@ mod tests {
     }
 
     async fn device_handler_async() -> Result<(), UblkError> {
+        let nr_queues = 4;
         let ctrl = UblkCtrlBuilder::default()
             .name("test_async")
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
             .depth(8)
+            .nr_queues(nr_queues)
             .build_async()
             .await
             .unwrap();
@@ -3223,18 +3225,25 @@ mod tests {
         };
         let dev_arc = &std::sync::Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl)?);
         let dev = dev_arc.clone();
-        assert!(dev_arc.dev_info.nr_hw_queues == 1);
 
-        // Todo: support to handle multiple queues in one thread context
         let qh = std::thread::spawn(move || {
-            let q_rc = Rc::new(UblkQueue::new(0 as u16, &dev).unwrap());
-            let q = q_rc.clone();
+            let mut manager = crate::MultiQueueManager::new();
             let exe = smol::LocalExecutor::new();
             let mut f_vec: Vec<smol::Task<()>> = Vec::new();
 
-            q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
+            for i in 0..nr_queues {
+                manager.create_queue(i as u16, &dev).unwrap();
+            }
+            manager
+                .register_resources()
+                .expect("register resource failed");
 
-            crate::uring_async::ublk_wait_and_handle_ios(&exe, &q_rc);
+            for q_rc in manager.values() {
+                let q = q_rc.clone();
+                q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
+            }
+
+            crate::uring_async::ublk_handle_ios_in_current_thread(&manager, &exe, |_, _, _| {});
             smol::block_on(async { futures::future::join_all(f_vec).await });
         });
 
