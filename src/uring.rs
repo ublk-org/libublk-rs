@@ -278,10 +278,144 @@ std::thread_local! {
 mod tests {
     use super::*;
     use crate::ctrl::UblkCtrlBuilder;
-    use crate::io::UblkDev;
+    use crate::io::{UblkDev, UblkQueue};
     use crate::multi_queue::MultiQueueManager;
     use crate::uring::with_uring_resource_manager;
     use crate::UblkFlags;
+
+    /// Verify that a queue was created correctly with proper slab key and resource allocation
+    fn verify_queue_creation(
+        queue: &UblkQueue, 
+        queue_key: usize, 
+        _q_id: u16, 
+        expected_buffer_start: u16
+    ) -> crate::uring::QueueResourceRange {
+        let slab_key = queue.get_slab_key();
+        assert_ne!(slab_key, crate::multi_queue::slab_key::UNUSE_KEY);
+        assert!(slab_key <= crate::multi_queue::slab_key::MAX_QUEUE_KEY);
+        assert_eq!(slab_key, queue_key as u16);
+
+        let range = queue
+            .get_resource_range()
+            .expect("resources are not added after creating queues");
+
+        // Check resource range for multi-queue scenarios
+        assert_eq!(range.queue_slab_key, slab_key);
+        assert_eq!(range.file_count, 1); // Each queue should have 1 file (cdev)
+        assert_eq!(range.buffer_count, 64, "Each queue should have 64 buffers (queue_depth)");
+        assert_eq!(
+            range.buffer_start_index, expected_buffer_start,
+            "Buffer start index should be queue_id * queue_depth"
+        );
+
+        range.clone()
+    }
+
+    /// Check that resource ranges don't overlap between queues
+    fn verify_no_resource_overlap(
+        manager: &MultiQueueManager,
+        current_range: &crate::uring::QueueResourceRange,
+        current_slab_key: u16
+    ) {
+        for (key, existing_queue) in manager.iter() {
+            // Skip comparing with self
+            if key == current_slab_key {
+                continue;
+            }
+            
+            if let Some(existing_range) = existing_queue.get_resource_range() {
+                // File ranges should not overlap
+                assert!(
+                    current_range.file_start_index >= existing_range.file_start_index + existing_range.file_count
+                        || existing_range.file_start_index >= current_range.file_start_index + current_range.file_count,
+                    "File ranges overlap between queues"
+                );
+
+                // Buffer ranges should not overlap
+                assert!(
+                    current_range.buffer_start_index >= existing_range.buffer_start_index + existing_range.buffer_count
+                        || existing_range.buffer_start_index >= current_range.buffer_start_index + current_range.buffer_count,
+                    "Buffer ranges overlap between queues"
+                );
+            }
+        }
+    }
+
+    /// Test index translation functionality for files and buffers
+    fn verify_index_translation(manager: &MultiQueueManager) {
+        if let Some((_, queue)) = manager.iter().next() {
+            // Test file index translation
+            let global_file_idx = queue.translate_file_index(0);
+            if let Some(range) = queue.get_resource_range() {
+                assert_eq!(global_file_idx, range.file_start_index);
+            } else {
+                assert_eq!(global_file_idx, 0); // Single queue mode
+            }
+
+            // Test buffer index translation (should always have buffers with UBLK_F_AUTO_BUF_REG)
+            if let Some(range) = queue.get_resource_range() {
+                assert!(range.buffer_count > 0, "Should have buffers with UBLK_F_AUTO_BUF_REG");
+
+                // Test buffer index translation
+                let global_buffer_idx_0 = queue.translate_buffer_index(0);
+                let global_buffer_idx_10 = queue.translate_buffer_index(10);
+                let global_buffer_idx_63 = queue.translate_buffer_index(63);
+
+                assert_eq!(global_buffer_idx_0, range.buffer_start_index);
+                assert_eq!(global_buffer_idx_10, range.buffer_start_index + 10);
+                assert_eq!(global_buffer_idx_63, range.buffer_start_index + 63);
+
+                println!("Queue 0 buffer translations: local 0->global {}, local 10->global {}, local 63->global {}",
+                        global_buffer_idx_0, global_buffer_idx_10, global_buffer_idx_63);
+            }
+        }
+    }
+
+    /// Verify the resource manager state through UBLK_URING
+    fn verify_resource_manager_state(manager: &MultiQueueManager, nr_queues: u16) {
+        UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_resource_manager(|resource_mgr| {
+                assert_eq!(resource_mgr.queue_ranges.len(), nr_queues as usize);
+                assert_eq!(resource_mgr.files.len(), nr_queues as usize); // One file per queue
+                assert!(resource_mgr.registered);
+
+                // Verify total buffer count is correct (nr_queues * 64 buffers each)
+                let expected_total_buffers = (nr_queues * 64) as u32;
+                assert_eq!(
+                    resource_mgr.total_buffer_count, expected_total_buffers,
+                    "Total buffer count should be nr_queues * queue_depth"
+                );
+
+                // Verify each queue has its range properly registered
+                for (idx, (slab_key, _queue)) in manager.iter().enumerate() {
+                    let range = resource_mgr.get_queue_range(slab_key);
+                    assert!(range.is_some(), "Queue range should be registered");
+
+                    if let Some(range) = range {
+                        assert_eq!(range.queue_slab_key, slab_key);
+                        assert_eq!(range.buffer_count, 64, "Each queue should have 64 buffers");
+                        assert_eq!(
+                            range.buffer_start_index,
+                            (idx as u16) * 64,
+                            "Buffer start index should be sequential"
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    /// Test queue lookup functionality through global functions
+    fn verify_queue_lookup(manager: &MultiQueueManager) {
+        for (slab_key, _queue) in manager.iter() {
+            let retrieved_range = crate::io::get_queue_resource_range(slab_key);
+            assert!(retrieved_range.is_some(), "Should be able to retrieve queue range");
+
+            if let Some(range) = retrieved_range {
+                assert_eq!(range.queue_slab_key, slab_key);
+            }
+        }
+    }
 
     #[test]
     fn test_multi_queue_resource_manager_integration() {
@@ -303,161 +437,39 @@ mod tests {
 
         // Test target initialization with multi-queue resource management
         let tgt_init = |dev: &mut UblkDev| {
-            // Create a multi-queue manager
+            // Create a multi-queue manager and verify initial state
             let mut manager = MultiQueueManager::new();
-
-            // Verify initial state
             assert_eq!(manager.queue_count(), 0);
             assert!(!manager.are_resources_registered());
 
-            // Create multiple queues with automatic resource management
+            // Create and verify multiple queues with automatic resource management
             for q_id in 0..nr_queues {
-                // Create queue - this will automatically add its resources to the manager
                 let queue_key = manager.create_queue(q_id, dev)?;
                 let queue = manager.get_queue_by_key(queue_key).expect("Queue should exist");
-
-                // Verify queue was created with proper slab key
-                let slab_key = queue.get_slab_key();
-                assert_ne!(slab_key, crate::multi_queue::slab_key::UNUSE_KEY);
-                assert!(slab_key <= crate::multi_queue::slab_key::MAX_QUEUE_KEY);
-                assert_eq!(slab_key, queue_key as u16);
-
-                let range = queue
-                    .get_resource_range()
-                    .expect("resources are not added after creating queues");
-
-                // Check resource range for multi-queue scenarios
-                assert_eq!(range.queue_slab_key, slab_key);
-                assert_eq!(range.file_count, 1); // Each queue should have 1 file (cdev)
-
-                // Verify buffer resources are properly allocated when UBLK_F_AUTO_BUF_REG is enabled
-                assert_eq!(
-                    range.buffer_count, 64,
-                    "Each queue should have 64 buffers (queue_depth)"
-                );
-
-                // Verify buffer range starts at the correct position
                 let expected_buffer_start = (q_id as u16) * 64;
-                assert_eq!(
-                    range.buffer_start_index, expected_buffer_start,
-                    "Buffer start index should be queue_id * queue_depth"
-                );
-                // Verify resource ranges don't overlap with other queues
-                for (key, existing_queue) in manager.iter() {
-                    // Skip comparing with self
-                    if key == slab_key {
-                        continue;
-                    }
-                    
-                    if let Some(existing_range) = existing_queue.get_resource_range() {
-                        // File ranges should not overlap
-                        assert!(
-                            range.file_start_index
-                                >= existing_range.file_start_index + existing_range.file_count
-                                || existing_range.file_start_index
-                                    >= range.file_start_index + range.file_count,
-                            "File ranges overlap between queues"
-                        );
-
-                        // Buffer ranges should not overlap
-                        assert!(
-                            range.buffer_start_index
-                                >= existing_range.buffer_start_index + existing_range.buffer_count
-                                || existing_range.buffer_start_index
-                                    >= range.buffer_start_index + range.buffer_count,
-                            "Buffer ranges overlap between queues"
-                        );
-                    }
-                }
+                
+                // Verify queue creation and get resource range
+                let range = verify_queue_creation(queue, queue_key, q_id, expected_buffer_start);
+                
+                // Verify no resource overlap with other queues
+                verify_no_resource_overlap(&manager, &range, queue.get_slab_key());
             }
 
-            // Verify manager state after queue creation
+            // Verify manager state and register resources
             assert_eq!(manager.queue_count(), nr_queues as usize);
             assert!(!manager.are_resources_registered());
-
-            // Test resource registration
+            
             manager.register_resources()?;
             assert!(manager.are_resources_registered());
-
+            
             // Test that double registration is safe
             let result = manager.register_resources();
             assert!(result.is_ok(), "Double registration should be safe");
 
-            // Test index translation functionality
-            if let Some((_, queue)) = manager.iter().next() {
-                // Test file index translation
-                let global_file_idx = queue.translate_file_index(0);
-                if let Some(range) = queue.get_resource_range() {
-                    assert_eq!(global_file_idx, range.file_start_index);
-                } else {
-                    assert_eq!(global_file_idx, 0); // Single queue mode
-                }
-
-                // Test buffer index translation (should always have buffers with UBLK_F_AUTO_BUF_REG)
-                if let Some(range) = queue.get_resource_range() {
-                    assert!(
-                        range.buffer_count > 0,
-                        "Should have buffers with UBLK_F_AUTO_BUF_REG"
-                    );
-
-                    // Test buffer index translation
-                    let global_buffer_idx_0 = queue.translate_buffer_index(0);
-                    let global_buffer_idx_10 = queue.translate_buffer_index(10);
-                    let global_buffer_idx_63 = queue.translate_buffer_index(63);
-
-                    assert_eq!(global_buffer_idx_0, range.buffer_start_index);
-                    assert_eq!(global_buffer_idx_10, range.buffer_start_index + 10);
-                    assert_eq!(global_buffer_idx_63, range.buffer_start_index + 63);
-
-                    println!("Queue 0 buffer translations: local 0->global {}, local 10->global {}, local 63->global {}",
-                            global_buffer_idx_0, global_buffer_idx_10, global_buffer_idx_63);
-                }
-            }
-
-            // Verify resource manager state through UBLK_URING
-            UBLK_URING.with(|ublk_uring| {
-                ublk_uring.with_resource_manager(|resource_mgr| {
-                    assert_eq!(resource_mgr.queue_ranges.len(), nr_queues as usize);
-                    assert_eq!(resource_mgr.files.len(), nr_queues as usize); // One file per queue
-                    assert!(resource_mgr.registered);
-
-                    // Verify total buffer count is correct (4 queues * 64 buffers each = 256)
-                    let expected_total_buffers = (nr_queues * 64) as u32;
-                    assert_eq!(
-                        resource_mgr.total_buffer_count, expected_total_buffers,
-                        "Total buffer count should be nr_queues * queue_depth"
-                    );
-
-                    // Verify each queue has its range properly registered
-                    for (idx, (slab_key, _queue)) in manager.iter().enumerate() {
-                        let range = resource_mgr.get_queue_range(slab_key);
-                        assert!(range.is_some(), "Queue range should be registered");
-
-                        if let Some(range) = range {
-                            assert_eq!(range.queue_slab_key, slab_key);
-                            assert_eq!(range.buffer_count, 64, "Each queue should have 64 buffers");
-                            assert_eq!(
-                                range.buffer_start_index,
-                                (idx as u16) * 64,
-                                "Buffer start index should be sequential"
-                            );
-                        }
-                    }
-                });
-            });
-
-            // Test queue lookup functionality
-            for (slab_key, _queue) in manager.iter() {
-                let retrieved_range = crate::io::get_queue_resource_range(slab_key);
-                assert!(
-                    retrieved_range.is_some(),
-                    "Should be able to retrieve queue range"
-                );
-
-                if let Some(range) = retrieved_range {
-                    assert_eq!(range.queue_slab_key, slab_key);
-                }
-            }
+            // Run comprehensive verification tests
+            verify_index_translation(&manager);
+            verify_resource_manager_state(&manager, nr_queues);
+            verify_queue_lookup(&manager);
 
             Ok(())
         };
