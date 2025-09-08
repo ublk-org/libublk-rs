@@ -343,13 +343,12 @@ mod tests {
                     "Buffer start index should be queue_id * queue_depth"
                 );
                 // Verify resource ranges don't overlap with other queues
-                for key in manager.get_queue_keys() {
+                for (key, existing_queue) in manager.iter() {
                     // Skip comparing with self
                     if key == slab_key {
                         continue;
                     }
                     
-                    let existing_queue = manager.get_queue_by_key(key.into()).expect("Queue should exist");
                     if let Some(existing_range) = existing_queue.get_resource_range() {
                         // File ranges should not overlap
                         assert!(
@@ -385,8 +384,7 @@ mod tests {
             assert!(result.is_ok(), "Double registration should be safe");
 
             // Test index translation functionality
-            if let Some(key) = manager.get_queue_keys().first() {
-                let queue = manager.get_queue_by_key((*key).into()).expect("Queue should exist");
+            if let Some((_, queue)) = manager.iter().next() {
                 // Test file index translation
                 let global_file_idx = queue.translate_file_index(0);
                 if let Some(range) = queue.get_resource_range() {
@@ -431,13 +429,12 @@ mod tests {
                     );
 
                     // Verify each queue has its range properly registered
-                    for (idx, slab_key) in manager.get_queue_keys().iter().enumerate() {
-                        let _queue = manager.get_queue_by_key((*slab_key).into()).expect("Queue should exist");
-                        let range = resource_mgr.get_queue_range(*slab_key);
+                    for (idx, (slab_key, _queue)) in manager.iter().enumerate() {
+                        let range = resource_mgr.get_queue_range(slab_key);
                         assert!(range.is_some(), "Queue range should be registered");
 
                         if let Some(range) = range {
-                            assert_eq!(range.queue_slab_key, *slab_key);
+                            assert_eq!(range.queue_slab_key, slab_key);
                             assert_eq!(range.buffer_count, 64, "Each queue should have 64 buffers");
                             assert_eq!(
                                 range.buffer_start_index,
@@ -450,8 +447,7 @@ mod tests {
             });
 
             // Test queue lookup functionality
-            for slab_key in manager.get_queue_keys() {
-                let _queue = manager.get_queue_by_key(slab_key.into()).expect("Queue should exist");
+            for (slab_key, _queue) in manager.iter() {
                 let retrieved_range = crate::io::get_queue_resource_range(slab_key);
                 assert!(
                     retrieved_range.is_some(),
