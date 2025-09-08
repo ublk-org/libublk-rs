@@ -159,28 +159,8 @@ use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-/// Perform batch registration of all accumulated io_uring resources
-pub(crate) fn register_all_uring_resources() -> Result<(), UblkError> {
-    UBLK_URING.with(|ublk_uring| {
-        ublk_uring.with_resource_manager(|manager| {
-            ublk_uring.with_ring_mut(|ring| manager.register_resources_with_ring(ring))
-        })
-    })
-}
 
-/// Get resource range for a specific queue
-pub(crate) fn get_queue_resource_range(queue_slab_key: u16) -> Option<QueueResourceRange> {
-    UBLK_URING.with(|ublk_uring| {
-        ublk_uring.with_resource_manager(|manager| manager.get_queue_range(queue_slab_key).cloned())
-    })
-}
 
-/// Remove a queue from the io_uring resource manager and cleanup if it was the last one
-pub(crate) fn remove_queue_from_uring_resource_manager(
-    queue_slab_key: u16,
-) -> Result<(), UblkError> {
-    UBLK_URING.with(|ublk_uring| ublk_uring.remove_queue_from_resource_manager(queue_slab_key))
-}
 
 // Internal macro versions for backwards compatibility within the crate
 #[macro_export]
@@ -977,14 +957,11 @@ impl Drop for UblkQueue<'_> {
                 }
             }
         } else {
-            // Multi-queue mode: notify io_uring resource manager that this queue is being dropped
-            if let Err(e) = remove_queue_from_uring_resource_manager(self.queue_slab_key) {
-                log::error!(
-                    "Failed to remove queue {} from io_uring resource manager: {:?}",
-                    self.queue_slab_key,
-                    e
-                );
-            }
+            // Multi-queue mode: Resource cleanup is now handled by MultiQueueManager
+            log::debug!(
+                "Multi-queue mode: queue {} cleanup handled by MultiQueueManager",
+                self.queue_slab_key
+            );
         }
 
         let depth = dev.dev_info.queue_depth as u32;
@@ -1194,7 +1171,7 @@ impl UblkQueue<'_> {
             &tgt.fds[0..tgt.nr_fds as usize],
             buffer_count,
         )?;
-        self.resource_range = get_queue_resource_range(slab_key);
+        self.resource_range = manager.get_queue_resource_range(slab_key);
         Ok(())
     }
 
@@ -2376,11 +2353,9 @@ impl UblkQueue<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_queue_resource_range, QueueResourceRange};
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{BufDesc, UblkDev, UblkQueue};
     use crate::multi_queue::MultiQueueManager;
-    use crate::uring::with_uring_resource_manager;
     use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
 
@@ -2580,21 +2555,15 @@ mod tests {
         UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
     }
 
-    /// Add queue resources to the centralized io_uring manager
-    fn add_queue_resources_to_uring_manager(
-        queue_slab_key: u16,
-        files: &[std::os::unix::io::RawFd],
-        buffer_count: u32,
-    ) -> QueueResourceRange {
-        with_uring_resource_manager(|manager| {
-            manager.add_queue_resources(queue_slab_key, files, buffer_count)
-        })
-    }
     #[test]
     fn test_multi_queue_resource_registration() {
-        // Test io_uring resource manager accumulation and range assignment
+        // Test MultiQueueManager resource accumulation and range assignment
+        let mut multi_manager = MultiQueueManager::new();
+        assert!(!multi_manager.are_resources_registered());
+
         let queue1_slab_key = 1u16;
         let queue2_slab_key = 2u16;
+        let queue3_slab_key = 3u16;
 
         // Simulate queue 1: 2 files, 64 buffers
         let queue1_files = [10, 11]; // Mock file descriptors
@@ -2604,19 +2573,24 @@ mod tests {
         let queue2_files = [20]; // Mock file descriptors
         let queue2_buffer_count = 32u32;
 
+        // Simulate queue 3: 2 files, 16 buffers
+        let queue3_files = [30, 31]; // Mock file descriptors
+        let queue3_buffer_count = 16u32;
+
         // Add resources for queue 1
-        let range1 = add_queue_resources_to_uring_manager(
-            queue1_slab_key,
-            &queue1_files,
-            queue1_buffer_count,
-        );
+        let range1 = multi_manager
+            .add_queue_files_and_buffers(queue1_slab_key, &queue1_files, queue1_buffer_count)
+            .unwrap();
 
         // Add resources for queue 2
-        let range2 = add_queue_resources_to_uring_manager(
-            queue2_slab_key,
-            &queue2_files,
-            queue2_buffer_count,
-        );
+        let range2 = multi_manager
+            .add_queue_files_and_buffers(queue2_slab_key, &queue2_files, queue2_buffer_count)
+            .unwrap();
+
+        // Add resources for queue 3
+        let range3 = multi_manager
+            .add_queue_files_and_buffers(queue3_slab_key, &queue3_files, queue3_buffer_count)
+            .unwrap();
 
         // Verify range allocation for queue 1
         assert_eq!(range1.queue_slab_key, queue1_slab_key);
@@ -2632,38 +2606,31 @@ mod tests {
         assert_eq!(range2.buffer_start_index, 64); // After queue 1's 64 buffers
         assert_eq!(range2.buffer_count, 32);
 
+        // Verify range allocation for queue 3 (should start after queue 2)
+        assert_eq!(range3.queue_slab_key, queue3_slab_key);
+        assert_eq!(range3.file_start_index, 3); // After queue 1's 2 files + queue 2's 1 file
+        assert_eq!(range3.file_count, 2);
+        assert_eq!(range3.buffer_start_index, 96); // After queue 1's 64 + queue 2's 32 buffers
+        assert_eq!(range3.buffer_count, 16);
+
         // Verify accumulated resources in the manager
-        with_uring_resource_manager(|manager| {
-            assert_eq!(manager.files.len(), 3); // 2 + 1 files total
-            assert_eq!(manager.total_buffer_count, 96); // 64 + 32 buffers total
-            assert_eq!(manager.queue_ranges.len(), 2); // 2 queues
-            assert!(!manager.registered); // Not yet registered
-        });
+        assert_eq!(multi_manager.get_files_count(), 5); // 2 + 1 + 2 files total
+        assert_eq!(multi_manager.get_total_buffer_count(), 112); // 64 + 32 + 16 buffers total
+        assert_eq!(multi_manager.get_queue_ranges_count(), 3); // 3 queues
+        assert!(!multi_manager.is_registered()); // Not yet registered
 
-        // Test MultiQueueManager integration
-        let mut multi_manager = MultiQueueManager::new();
-        assert!(!multi_manager.are_resources_registered());
-
-        // Test adding queue resources via MultiQueueManager
-        let _range3 = multi_manager
-            .add_queue_files_and_buffers(3u16, &[30, 31], 16)
-            .unwrap();
-
-        // Verify resource accumulation continues
-        with_uring_resource_manager(|manager| {
-            assert_eq!(manager.files.len(), 5); // 3 + 2 files total
-            assert_eq!(manager.total_buffer_count, 112); // 96 + 16 buffers total
-            assert_eq!(manager.queue_ranges.len(), 3); // 3 queues
-        });
-
-        // Test range lookup
-        let lookup_range1 = get_queue_resource_range(queue1_slab_key).unwrap();
+        // Test range lookup through manager
+        let lookup_range1 = multi_manager.get_queue_resource_range(queue1_slab_key).unwrap();
         assert_eq!(lookup_range1.file_start_index, 0);
         assert_eq!(lookup_range1.file_count, 2);
 
-        let lookup_range2 = get_queue_resource_range(queue2_slab_key).unwrap();
+        let lookup_range2 = multi_manager.get_queue_resource_range(queue2_slab_key).unwrap();
         assert_eq!(lookup_range2.file_start_index, 2);
         assert_eq!(lookup_range2.file_count, 1);
+
+        let lookup_range3 = multi_manager.get_queue_resource_range(queue3_slab_key).unwrap();
+        assert_eq!(lookup_range3.file_start_index, 3);
+        assert_eq!(lookup_range3.file_count, 2);
     }
 
     #[test]

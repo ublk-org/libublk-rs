@@ -79,8 +79,8 @@
 //! }
 //! ```
 
-use crate::io::{register_all_uring_resources, UblkDev, UblkQueue};
-use crate::uring::QueueResourceRange;
+use crate::io::{UblkDev, UblkQueue};
+use crate::uring::{QueueResourceRange, UringResourceManager};
 use crate::UblkError;
 use slab::Slab;
 use std::rc::Rc;
@@ -123,6 +123,8 @@ pub(crate) mod slab_key {
 /// automatically stored and managed, and will be cleaned up when the manager is dropped.
 /// Uses a Slab for stable queue keys that don't change when other queues are removed.
 pub struct MultiQueueManager<'a> {
+    /// Resource manager for io_uring file and buffer registration
+    resource_manager: UringResourceManager,
     resources_registered: bool,
     /// Managed queue storage - manager owns all queues with stable slab keys
     queue_registry: Slab<Rc<UblkQueue<'a>>>,
@@ -132,6 +134,7 @@ impl<'a> MultiQueueManager<'a> {
     /// Create a new multi-queue manager
     pub fn new() -> Self {
         Self {
+            resource_manager: UringResourceManager::new(),
             resources_registered: false,
             queue_registry: Slab::new(),
         }
@@ -195,10 +198,10 @@ impl<'a> MultiQueueManager<'a> {
         self.queue_registry.len()
     }
 
-    /// Add queue resources to the centralized io_uring resource manager
+    /// Add queue resources to the manager's resource manager
     ///
     /// This method accumulates files and buffer requirements from a queue
-    /// into the thread-local io_uring resource manager. Resources are not actually
+    /// into the manager's embedded resource manager. Resources are not actually
     /// registered with io_uring until `register_resources()` is called.
     ///
     /// # Arguments
@@ -218,9 +221,7 @@ impl<'a> MultiQueueManager<'a> {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
-        let range = crate::uring::with_uring_resource_manager(|manager| {
-            manager.add_queue_resources(queue_slab_key, files, buffer_count)
-        });
+        let range = self.resource_manager.add_queue_resources(queue_slab_key, files, buffer_count);
         Ok(range)
     }
 
@@ -239,11 +240,19 @@ impl<'a> MultiQueueManager<'a> {
             return Ok(()); // Already registered
         }
 
-        register_all_uring_resources()?;
+        // Register resources with the thread-local io_uring ring
+        crate::uring::UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_ring_mut(|ring| {
+                self.resource_manager.register_resources_with_ring(ring)
+            })
+        })?;
+        
         self.resources_registered = true;
         log::debug!(
-            "MultiQueueManager: Resources registered for {} queues",
-            self.queue_registry.len()
+            "MultiQueueManager: Resources registered for {} queues ({} files, {} buffers)",
+            self.queue_registry.len(),
+            self.resource_manager.files.len(),
+            self.resource_manager.total_buffer_count
         );
         Ok(())
     }
@@ -251,6 +260,17 @@ impl<'a> MultiQueueManager<'a> {
     /// Check if resources have been registered
     pub fn are_resources_registered(&self) -> bool {
         self.resources_registered
+    }
+
+    /// Get the resource range for a specific queue
+    ///
+    /// # Arguments
+    /// * `queue_slab_key`: The slab key of the queue
+    ///
+    /// # Returns
+    /// The resource range for the queue if found
+    pub fn get_queue_resource_range(&self, queue_slab_key: u16) -> Option<QueueResourceRange> {
+        self.resource_manager.get_queue_range(queue_slab_key).cloned()
     }
 
     /// Get a queue reference by slab key from this manager
@@ -354,6 +374,27 @@ impl<'a> MultiQueueManager<'a> {
     pub fn is_empty(&self) -> bool {
         self.queue_registry.is_empty()
     }
+
+    // Public methods for test access to internal state
+    #[cfg(test)]
+    pub fn get_files_count(&self) -> usize {
+        self.resource_manager.files.len()
+    }
+
+    #[cfg(test)]
+    pub fn get_total_buffer_count(&self) -> u32 {
+        self.resource_manager.total_buffer_count
+    }
+
+    #[cfg(test)]
+    pub fn get_queue_ranges_count(&self) -> usize {
+        self.resource_manager.queue_ranges.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_registered(&self) -> bool {
+        self.resource_manager.registered
+    }
 }
 
 // Implement IntoIterator for different reference types
@@ -379,6 +420,17 @@ impl<'a> Drop for MultiQueueManager<'a> {
     /// Automatically clean up all managed queues when the manager is dropped
     fn drop(&mut self) {
         let queue_count = self.queue_registry.len();
+        
+        // Warn if resources are still registered (they should be unregistered before drop)
+        if self.resource_manager.registered {
+            log::warn!(
+                "MultiQueueManager dropped while resources were still registered ({} files, {} buffers for {} queues)",
+                self.resource_manager.files.len(),
+                self.resource_manager.total_buffer_count,
+                self.resource_manager.queue_ranges.len()
+            );
+        }
+        
         self.queue_registry.clear();
         log::debug!(
             "MultiQueueManager dropped, cleaned up {} queues",
