@@ -2600,7 +2600,7 @@ impl UblkCtrl {
     ///
     /// This function sets up the basic thread properties and returns
     /// the pthread handle and thread ID for external affinity configuration.
-    fn init_queue_thread() -> (libc::pthread_t, libc::pid_t) {
+    pub fn init_queue_thread() -> (libc::pthread_t, libc::pid_t) {
         let pthread_handle = unsafe { libc::pthread_self() };
         let tid = unsafe { libc::gettid() };
 
