@@ -2240,22 +2240,8 @@ impl UblkCtrl {
     ///
     /// The 1st part is from UblkCtrl.dev_info, and the 2nd part is
     /// retrieved from device's exported json file
-    pub fn dump(&self) {
-        let mut ctrl = self.get_inner_mut();
-        let mut p = sys::ublk_params {
-            ..Default::default()
-        };
-
-        if ctrl.read_dev_info().is_err() {
-            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
-            return;
-        }
-
-        if ctrl.get_params(&mut p).is_err() {
-            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
-            return;
-        }
-
+    /// Print device info after data has been collected
+    fn dump_device_info(ctrl: &UblkCtrlInner, p: &sys::ublk_params) {
         let info = &ctrl.dev_info;
         println!(
             "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
@@ -2281,7 +2267,25 @@ impl UblkCtrl {
             info.owner_uid,
             info.owner_gid
         );
+    }
 
+    pub fn dump(&self) {
+        let mut ctrl = self.get_inner_mut();
+        let mut p = sys::ublk_params {
+            ..Default::default()
+        };
+
+        if ctrl.read_dev_info().is_err() {
+            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
+            return;
+        }
+
+        if ctrl.get_params(&mut p).is_err() {
+            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
+            return;
+        }
+
+        Self::dump_device_info(&ctrl, &p);
         ctrl.dump_from_json();
     }
 
@@ -2312,32 +2316,7 @@ impl UblkCtrl {
             e
         })?;
 
-        let info = &ctrl.dev_info;
-        println!(
-            "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
-            info.dev_id,
-            info.nr_hw_queues,
-            info.queue_depth,
-            1 << p.basic.logical_bs_shift,
-            p.basic.dev_sectors
-        );
-        println!(
-            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}",
-            info.max_io_buf_bytes,
-            info.ublksrv_pid,
-            info.flags,
-            ctrl.dev_state_desc()
-        );
-        println!(
-            "\tublkc: {}:{} ublkb: {}:{} owner: {}:{}",
-            p.devt.char_major,
-            p.devt.char_minor,
-            p.devt.disk_major,
-            p.devt.disk_minor,
-            info.owner_uid,
-            info.owner_gid
-        );
-
+        Self::dump_device_info(&ctrl, &p);
         ctrl.dump_from_json();
         Ok(())
     }
