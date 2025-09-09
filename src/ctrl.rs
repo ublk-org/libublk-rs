@@ -1609,14 +1609,19 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd_async(&data).await
     }
 
-    fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_buffer_cmd(
+    /// Prepare GET_QUEUE_AFFINITY command data
+    fn prepare_get_queue_affinity_cmd(q: u32, bm: &mut UblkQueueAffinity) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_buffer_cmd(
             sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
             q as u64,
             bm.addr() as u64,
             bm.buf_len() as u32,
             true, // read_buffer
-        );
+        )
+    }
+
+    fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
+        let data = Self::prepare_get_queue_affinity_cmd(q, bm);
         self.ublk_ctrl_cmd(&data)
     }
 
@@ -1627,41 +1632,41 @@ impl UblkCtrlInner {
         q: u32,
         bm: &mut UblkQueueAffinity,
     ) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_buffer_cmd(
-            sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
-            q as u64,
-            bm.addr() as u64,
-            bm.buf_len() as u32,
-            true, // read_buffer
-        );
+        let data = Self::prepare_get_queue_affinity_cmd(q, bm);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
-    fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY);
+    /// Prepare START_USER_RECOVERY command data
+    fn prepare_start_user_recover_cmd() -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY)
+    }
 
+    fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
+        let data = Self::prepare_start_user_recover_cmd();
         self.ublk_ctrl_cmd(&data)
     }
 
     async fn __start_user_recover_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY);
-
+        let data = Self::prepare_start_user_recover_cmd();
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare END_USER_RECOVERY command data
+    fn prepare_end_user_recover_cmd(pid: i32) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64)
     }
 
     /// End user recover for this device, do similar thing done in start_dev()
     ///
     fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64);
-
+        let data = Self::prepare_end_user_recover_cmd(pid);
         self.ublk_ctrl_cmd(&data)
     }
 
     /// End user recover for this device, do similar thing done in start_dev()
     ///
     async fn end_user_recover_async(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64);
-
+        let data = Self::prepare_end_user_recover_cmd(pid);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
