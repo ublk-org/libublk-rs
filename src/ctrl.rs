@@ -1382,14 +1382,9 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd_async(&data).await
     }
 
-    /// Remove this device
-    ///
-    fn del(&mut self) -> Result<i32, UblkError> {
-        if self.is_deleted() {
-            return Ok(0);
-        }
-
-        let cmd_op = if self
+    /// Prepare DEL_DEV command data  
+    fn prepare_del_cmd(&self, force_async: bool) -> UblkCtrlCmdData {
+        let cmd_op = if force_async || self
             .dev_flags
             .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
         {
@@ -1397,11 +1392,19 @@ impl UblkCtrlInner {
         } else {
             sys::UBLK_U_CMD_DEL_DEV
         };
-        let data = UblkCtrlCmdData::new_simple_cmd(cmd_op);
+        UblkCtrlCmdData::new_simple_cmd(cmd_op)
+    }
 
+    /// Remove this device
+    ///
+    fn del(&mut self) -> Result<i32, UblkError> {
+        if self.is_deleted() {
+            return Ok(0);
+        }
+
+        let data = self.prepare_del_cmd(false);
         let res = self.ublk_ctrl_cmd(&data)?;
         self.mark_deleted();
-
         Ok(res)
     }
 
@@ -1411,8 +1414,8 @@ impl UblkCtrlInner {
         if self.is_deleted() {
             return Ok(0);
         }
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
-
+        
+        let data = self.prepare_del_cmd(true);
         let res = self.ublk_ctrl_cmd(&data)?;
         self.mark_deleted();
         Ok(res)
@@ -1429,8 +1432,8 @@ impl UblkCtrlInner {
         if self.is_deleted() {
             return Ok(0);
         }
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
-
+        
+        let data = self.prepare_del_cmd(true);
         let res = self.ublk_ctrl_cmd_async(&data).await?;
         self.mark_deleted();
         Ok(res)
