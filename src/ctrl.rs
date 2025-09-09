@@ -2530,27 +2530,29 @@ impl UblkCtrl {
             })
     }
 
-    /// Set thread affinity using pthread handle
+    /// Set queue thread affinity using thread ID
     ///
-    /// This function sets CPU affinity for the specified pthread handle.
+    /// This function sets CPU affinity for the specified thread ID.
     /// It should be called from the main thread context after receiving
-    /// the pthread handle from the queue thread.
-    fn set_thread_affinity(pthread_handle: libc::pthread_t, affinity: &UblkQueueAffinity) {
+    /// the thread ID from the queue thread.
+    pub fn set_thread_affinity(&self, qid: u16, tid: libc::pid_t) {
+        // Calculate and set affinity using the thread ID
+        let affinity = self.calculate_queue_affinity(qid);
+
         unsafe {
-            libc::pthread_setaffinity_np(
-                pthread_handle,
+            libc::sched_setaffinity(
+                tid,
                 affinity.buf_len(),
                 affinity.addr() as *const libc::cpu_set_t,
             );
         }
     }
 
-    /// Initialize queue thread and return pthread handle and tid
+    /// Initialize queue thread and return tid
     ///
     /// This function sets up the basic thread properties and returns
-    /// the pthread handle and thread ID for external affinity configuration.
-    fn init_queue_thread() -> (libc::pthread_t, libc::pid_t) {
-        let pthread_handle = unsafe { libc::pthread_self() };
+    /// the thread ID for external affinity configuration.
+    fn init_queue_thread() -> libc::pid_t {
         let tid = unsafe { libc::gettid() };
 
         // Set IO flusher property for the queue thread
@@ -2559,7 +2561,7 @@ impl UblkCtrl {
             libc::prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
         }
 
-        (pthread_handle, tid)
+        tid
     }
 
     fn create_queue_handlers<Q>(
@@ -2583,8 +2585,8 @@ impl UblkCtrl {
             let mut _q_fn = q_fn.clone();
 
             q_threads.push(std::thread::spawn(move || {
-                let (pthread_handle, tid) = Self::init_queue_thread();
-                if let Err(e) = _tx.send((q, pthread_handle, tid)) {
+                let tid = Self::init_queue_thread();
+                if let Err(e) = _tx.send((q, tid)) {
                     eprintln!("Warning: Failed to send queue thread info: {}", e);
                     return;
                 }
@@ -2592,9 +2594,9 @@ impl UblkCtrl {
             }));
         }
 
-        // Set affinity from main thread context using pthread handles
+        // Set affinity from main thread context using thread IDs
         for _q in 0..nr_queues {
-            let (qid, pthread_handle, tid) = match rx.recv() {
+            let (qid, tid) = match rx.recv() {
                 Ok(data) => data,
                 Err(e) => {
                     eprintln!("Warning: Failed to receive queue thread info: {}", e);
@@ -2602,10 +2604,7 @@ impl UblkCtrl {
                 }
             };
 
-            // Calculate and set affinity using the pthread handle
-            let affinity = self.calculate_queue_affinity(qid);
-            Self::set_thread_affinity(pthread_handle, &affinity);
-
+            self.set_thread_affinity(qid, tid);
             if let Err(e) = self.configure_queue(dev, qid, tid) {
                 eprintln!(
                     "Warning: configure queue failed for {}-{}: {:?}",
