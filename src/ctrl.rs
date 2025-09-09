@@ -1441,53 +1441,47 @@ impl UblkCtrlInner {
         Ok(res)
     }
 
-    fn __get_features(&mut self) -> Result<u64, UblkError> {
-        let features = 0_u64;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+    /// Prepare GET_FEATURES command data
+    fn prepare_get_features_cmd(features_ptr: u64) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_read_buffer_cmd(
             sys::UBLK_U_CMD_GET_FEATURES,
-            std::ptr::addr_of!(features) as u64,
+            features_ptr,
             core::mem::size_of::<u64>() as u32,
             true, // no_dev_path
-        );
+        )
+    }
 
+    fn __get_features(&mut self) -> Result<u64, UblkError> {
+        let features = 0_u64;
+        let data = Self::prepare_get_features_cmd(std::ptr::addr_of!(features) as u64);
         self.ublk_ctrl_cmd(&data)?;
-
         Ok(features)
     }
 
     async fn __get_features_async(&mut self) -> Result<u64, UblkError> {
         let features = 0_u64;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_FEATURES,
-            std::ptr::addr_of!(features) as u64,
-            core::mem::size_of::<u64>() as u32,
-            true, // no_dev_path
-        );
-
+        let data = Self::prepare_get_features_cmd(std::ptr::addr_of!(features) as u64);
         self.ublk_ctrl_cmd_async(&data).await?;
-
         Ok(features)
     }
 
-    fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO,
+    /// Prepare read device info command data
+    fn prepare_read_dev_info_cmd(&self, cmd_op: u32) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_read_buffer_cmd(
+            cmd_op,
             std::ptr::addr_of!(self.dev_info) as u64,
             core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             false, // need dev_path
-        );
+        )
+    }
 
+    fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO);
         self.ublk_ctrl_cmd(&data)
     }
 
     fn __read_dev_info2(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO2,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            false, // need dev_path
-        );
-
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO2);
         self.ublk_ctrl_cmd(&data)
     }
 
@@ -1505,24 +1499,12 @@ impl UblkCtrlInner {
     }
 
     async fn __read_dev_info_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            false, // need dev_path
-        );
-
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
     async fn __read_dev_info2_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO2,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            false, // need dev_path
-        );
-
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO2);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
