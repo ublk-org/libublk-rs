@@ -1740,29 +1740,17 @@ impl UblkCtrlInner {
     /// * `tids`: queue pthread tid vector, in which each item stores the queue's
     /// pthread tid
     ///
-    fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        // Update queue thread IDs if they exist and JSON already has content
-        if !self.json_manager.get_json().is_null()
-            && self.json_manager.get_json().is_object()
-            && !self.json_manager.get_json().as_object().unwrap().is_empty()
-        {
-            if let Some(queues) = self.json_manager.get_json_mut().get_mut("queues") {
-                for qid in 0..dev.dev_info.nr_hw_queues {
-                    if let Some(queue) = queues.get_mut(&qid.to_string()) {
-                        if let Some(tid) = queue.get_mut("tid") {
-                            *tid = serde_json::json!(self.queue_tids[qid as usize]);
-                        }
-                    }
-                }
-            }
-            return Ok(0);
-        }
-
+    /// Build JSON data with provided queue affinities
+    fn build_json_with_affinities(
+        &self,
+        dev: &UblkDev,
+        queue_affinities: &[UblkQueueAffinity],
+    ) -> serde_json::Value {
         let tgt_data = dev.get_target_json();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
-            let affinity = self.get_queue_affinity_effective(qid)?;
+            let affinity = &queue_affinities[qid as usize];
 
             map.insert(
                 format!("{}", qid),
@@ -1785,57 +1773,72 @@ impl UblkCtrlInner {
         }
 
         json["queues"] = serde_json::Value::Object(map);
+        json
+    }
 
+    /// Build JSON data for device
+    fn build_json_internal(&mut self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
+        let mut queue_affinities = Vec::with_capacity(dev.dev_info.nr_hw_queues as usize);
+        
+        for qid in 0..dev.dev_info.nr_hw_queues {
+            let affinity = self.get_queue_affinity_effective(qid)?;
+            queue_affinities.push(affinity);
+        }
+
+        Ok(self.build_json_with_affinities(dev, &queue_affinities))
+    }
+
+    /// Build JSON data for device (async)
+    async fn build_json_internal_async(&mut self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
+        let mut queue_affinities = Vec::with_capacity(dev.dev_info.nr_hw_queues as usize);
+        
+        for qid in 0..dev.dev_info.nr_hw_queues {
+            let affinity = self.get_queue_affinity_effective_async(qid).await?;
+            queue_affinities.push(affinity);
+        }
+
+        Ok(self.build_json_with_affinities(dev, &queue_affinities))
+    }
+
+    /// Update existing JSON with queue thread IDs
+    fn update_json_queue_tids(&mut self, dev: &UblkDev) -> bool {
+        if !self.json_manager.get_json().is_null()
+            && self.json_manager.get_json().is_object()
+            && !self.json_manager.get_json().as_object().unwrap().is_empty()
+        {
+            if let Some(queues) = self.json_manager.get_json_mut().get_mut("queues") {
+                for qid in 0..dev.dev_info.nr_hw_queues {
+                    if let Some(queue) = queues.get_mut(&qid.to_string()) {
+                        if let Some(tid) = queue.get_mut("tid") {
+                            *tid = serde_json::json!(self.queue_tids[qid as usize]);
+                        }
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        // Update queue thread IDs if JSON already exists
+        if self.update_json_queue_tids(dev) {
+            return Ok(0);
+        }
+
+        let json = self.build_json_internal(dev)?;
         self.json_manager.set_json(json);
         Ok(0)
     }
 
     async fn build_json_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        // Update queue thread IDs if they exist and JSON already has content
-        if !self.json_manager.get_json().is_null()
-            && self.json_manager.get_json().is_object()
-            && !self.json_manager.get_json().as_object().unwrap().is_empty()
-        {
-            if let Some(queues) = self.json_manager.get_json_mut().get_mut("queues") {
-                for qid in 0..dev.dev_info.nr_hw_queues {
-                    if let Some(queue) = queues.get_mut(&qid.to_string()) {
-                        if let Some(tid) = queue.get_mut("tid") {
-                            *tid = serde_json::json!(self.queue_tids[qid as usize]);
-                        }
-                    }
-                }
-            }
+        // Update queue thread IDs if JSON already exists
+        if self.update_json_queue_tids(dev) {
             return Ok(0);
         }
 
-        let tgt_data = dev.get_target_json();
-        let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-
-        for qid in 0..dev.dev_info.nr_hw_queues {
-            let affinity = self.get_queue_affinity_effective_async(qid).await?;
-
-            map.insert(
-                format!("{}", qid),
-                serde_json::json!({
-                    "qid": qid,
-                    "tid": self.queue_tids[qid as usize],
-                    "affinity": affinity.to_bits_vec(),
-                }),
-            );
-        }
-
-        let mut json = serde_json::json!({
-            "dev_info": dev.dev_info,
-            "target": dev.tgt,
-            "target_flags": dev.flags.bits(),
-        });
-
-        if let Some(val) = tgt_data {
-            json["target_data"] = val.clone()
-        }
-
-        json["queues"] = serde_json::Value::Object(map);
-
+        let json = self.build_json_internal_async(dev).await?;
         self.json_manager.set_json(json);
         Ok(0)
     }
