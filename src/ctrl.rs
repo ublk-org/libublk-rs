@@ -1384,9 +1384,10 @@ impl UblkCtrlInner {
 
     /// Prepare DEL_DEV command data  
     fn prepare_del_cmd(&self, force_async: bool) -> UblkCtrlCmdData {
-        let cmd_op = if force_async || self
-            .dev_flags
-            .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
+        let cmd_op = if force_async
+            || self
+                .dev_flags
+                .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
         {
             sys::UBLK_U_CMD_DEL_DEV_ASYNC
         } else {
@@ -1414,7 +1415,7 @@ impl UblkCtrlInner {
         if self.is_deleted() {
             return Ok(0);
         }
-        
+
         let data = self.prepare_del_cmd(true);
         let res = self.ublk_ctrl_cmd(&data)?;
         self.mark_deleted();
@@ -1432,7 +1433,7 @@ impl UblkCtrlInner {
         if self.is_deleted() {
             return Ok(0);
         }
-        
+
         let data = self.prepare_del_cmd(true);
         let res = self.ublk_ctrl_cmd_async(&data).await?;
         self.mark_deleted();
@@ -1506,36 +1507,53 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd_async(&data).await
     }
 
+    /// Prepare START_DEV command data
+    fn prepare_start_cmd(pid: i32) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64)
+    }
+
     /// Start this device by sending command to ublk driver
     ///
     fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64);
-
+        let data = Self::prepare_start_cmd(pid);
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Start this device by sending command to ublk driver
     ///
     async fn start_async(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64);
-
+        let data = Self::prepare_start_cmd(pid);
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare STOP_DEV command data
+    fn prepare_stop_cmd() -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV)
     }
 
     /// Stop this device by sending command to ublk driver
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV);
-
+        let data = Self::prepare_stop_cmd();
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Stop this device by sending command to ublk driver asynchronously
     ///
     async fn stop_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV);
-
+        let data = Self::prepare_stop_cmd();
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare GET_PARAMS command data
+    fn prepare_get_params_cmd(params: &mut sys::ublk_params) -> UblkCtrlCmdData {
+        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
+        UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_PARAMS,
+            params as *const sys::ublk_params as u64,
+            params.len,
+            false, // need dev_path
+        )
     }
 
     /// Retrieve this device's parameter from ublk driver by
@@ -1543,28 +1561,14 @@ impl UblkCtrlInner {
     ///
     /// Can't pass params by reference(&mut), why?
     fn get_params(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
-        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_PARAMS,
-            params as *const sys::ublk_params as u64,
-            params.len,
-            false, // need dev_path
-        );
-
+        let data = Self::prepare_get_params_cmd(params);
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Retrieve this device's parameter from ublk driver by
     /// sending command in async/.await
     async fn get_params_async(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
-        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_PARAMS,
-            params as *const sys::ublk_params as u64,
-            params.len,
-            false, // need dev_path
-        );
-
+        let data = Self::prepare_get_params_cmd(params);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
@@ -1600,7 +1604,6 @@ impl UblkCtrlInner {
             p.len,
             false, // need dev_path
         );
-
         self.ublk_ctrl_cmd_async(&data).await
     }
 
