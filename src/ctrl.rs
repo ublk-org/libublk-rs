@@ -2578,12 +2578,15 @@ impl UblkCtrl {
             })
     }
 
-    /// Set thread affinity using pthread handle
+    /// Set queue thread affinity using pthread handle
     ///
     /// This function sets CPU affinity for the specified pthread handle.
     /// It should be called from the main thread context after receiving
     /// the pthread handle from the queue thread.
-    fn set_thread_affinity(pthread_handle: libc::pthread_t, affinity: &UblkQueueAffinity) {
+    pub fn set_thread_affinity(&self, qid: u16, pthread_handle: libc::pthread_t) {
+        // Calculate and set affinity using the pthread handle
+        let affinity = self.calculate_queue_affinity(qid);
+
         unsafe {
             libc::pthread_setaffinity_np(
                 pthread_handle,
@@ -2650,10 +2653,7 @@ impl UblkCtrl {
                 }
             };
 
-            // Calculate and set affinity using the pthread handle
-            let affinity = self.calculate_queue_affinity(qid);
-            Self::set_thread_affinity(pthread_handle, &affinity);
-
+            self.set_thread_affinity(qid, pthread_handle);
             if let Err(e) = self.configure_queue(dev, qid, tid) {
                 eprintln!(
                     "Warning: configure queue failed for {}-{}: {:?}",
