@@ -1360,27 +1360,25 @@ impl UblkCtrlInner {
         Self::ublk_err_to_result(res)
     }
 
-    fn add(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_write_buffer_cmd(
+    /// Prepare ADD_DEV command data
+    fn prepare_add_cmd(&self) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_write_buffer_cmd(
             sys::UBLK_U_CMD_ADD_DEV,
             std::ptr::addr_of!(self.dev_info) as u64,
             core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             true, // no_dev_path
-        );
+        )
+    }
 
+    fn add(&mut self) -> Result<i32, UblkError> {
+        let data = self.prepare_add_cmd();
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Add this device asynchronously
     ///
     async fn add_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_write_buffer_cmd(
-            sys::UBLK_U_CMD_ADD_DEV,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            true, // no_dev_path
-        );
-
+        let data = self.prepare_add_cmd();
         self.ublk_ctrl_cmd_async(&data).await
     }
 
