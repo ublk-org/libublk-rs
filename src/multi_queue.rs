@@ -221,7 +221,9 @@ impl<'a> MultiQueueManager<'a> {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
-        let range = self.resource_manager.add_queue_resources(queue_slab_key, files, buffer_count);
+        let range = self
+            .resource_manager
+            .add_queue_resources(queue_slab_key, files, buffer_count);
         Ok(range)
     }
 
@@ -242,11 +244,10 @@ impl<'a> MultiQueueManager<'a> {
 
         // Register resources with the thread-local io_uring ring
         crate::uring::UBLK_URING.with(|ublk_uring| {
-            ublk_uring.with_ring_mut(|ring| {
-                self.resource_manager.register_resources_with_ring(ring)
-            })
+            ublk_uring
+                .with_ring_mut(|ring| self.resource_manager.register_resources_with_ring(ring))
         })?;
-        
+
         self.resources_registered = true;
         log::debug!(
             "MultiQueueManager: Resources registered for {} queues ({} files, {} buffers)",
@@ -262,6 +263,34 @@ impl<'a> MultiQueueManager<'a> {
         self.resources_registered
     }
 
+    /// Unregister all resources from the io_uring instance
+    ///
+    /// This method should be called before dropping the MultiQueueManager
+    /// to properly clean up registered resources.
+    ///
+    /// # Returns
+    /// * `Ok(())` - Resources successfully unregistered
+    /// * `Err(UblkError)` - Unregistration failed
+    pub fn unregister_resources(&mut self) -> Result<(), UblkError> {
+        if !self.resources_registered {
+            return Ok(()); // Nothing to unregister
+        }
+
+        // Unregister resources with the thread-local io_uring ring
+        crate::uring::UBLK_URING.with(|ublk_uring| {
+            ublk_uring.with_ring_mut(|ring| self.resource_manager.unregister_resources(ring))
+        })?;
+
+        self.resources_registered = false;
+        log::debug!(
+            "MultiQueueManager: Resources unregistered for {} queues ({} files, {} buffers)",
+            self.queue_registry.len(),
+            self.resource_manager.files.len(),
+            self.resource_manager.total_buffer_count
+        );
+        Ok(())
+    }
+
     /// Get the resource range for a specific queue
     ///
     /// # Arguments
@@ -270,7 +299,9 @@ impl<'a> MultiQueueManager<'a> {
     /// # Returns
     /// The resource range for the queue if found
     pub fn get_queue_resource_range(&self, queue_slab_key: u16) -> Option<QueueResourceRange> {
-        self.resource_manager.get_queue_range(queue_slab_key).cloned()
+        self.resource_manager
+            .get_queue_range(queue_slab_key)
+            .cloned()
     }
 
     /// Get a queue reference by slab key from this manager
@@ -310,7 +341,9 @@ impl<'a> MultiQueueManager<'a> {
     /// # }
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = (u16, &Rc<UblkQueue<'a>>)> + '_ {
-        self.queue_registry.iter().map(|(key, queue)| (key as u16, queue))
+        self.queue_registry
+            .iter()
+            .map(|(key, queue)| (key as u16, queue))
     }
 
     /// Get a mutable iterator over all managed queues
@@ -321,7 +354,9 @@ impl<'a> MultiQueueManager<'a> {
     /// Note: Since queues are wrapped in `Rc`, you cannot mutate the queue itself
     /// through this iterator, but you can replace the `Rc` if needed.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (u16, &mut Rc<UblkQueue<'a>>)> + '_ {
-        self.queue_registry.iter_mut().map(|(key, queue)| (key as u16, queue))
+        self.queue_registry
+            .iter_mut()
+            .map(|(key, queue)| (key as u16, queue))
     }
 
     /// Get an iterator over queue values only (without slab keys)
@@ -400,19 +435,29 @@ impl<'a> MultiQueueManager<'a> {
 // Implement IntoIterator for different reference types
 impl<'a> IntoIterator for &'a MultiQueueManager<'a> {
     type Item = (u16, &'a Rc<UblkQueue<'a>>);
-    type IntoIter = std::iter::Map<slab::Iter<'a, Rc<UblkQueue<'a>>>, fn((usize, &'a Rc<UblkQueue<'a>>)) -> (u16, &'a Rc<UblkQueue<'a>>)>;
+    type IntoIter = std::iter::Map<
+        slab::Iter<'a, Rc<UblkQueue<'a>>>,
+        fn((usize, &'a Rc<UblkQueue<'a>>)) -> (u16, &'a Rc<UblkQueue<'a>>),
+    >;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.queue_registry.iter().map(|(key, queue)| (key as u16, queue))
+        self.queue_registry
+            .iter()
+            .map(|(key, queue)| (key as u16, queue))
     }
 }
 
 impl<'a> IntoIterator for &'a mut MultiQueueManager<'a> {
     type Item = (u16, &'a mut Rc<UblkQueue<'a>>);
-    type IntoIter = std::iter::Map<slab::IterMut<'a, Rc<UblkQueue<'a>>>, fn((usize, &'a mut Rc<UblkQueue<'a>>)) -> (u16, &'a mut Rc<UblkQueue<'a>>)>;
+    type IntoIter = std::iter::Map<
+        slab::IterMut<'a, Rc<UblkQueue<'a>>>,
+        fn((usize, &'a mut Rc<UblkQueue<'a>>)) -> (u16, &'a mut Rc<UblkQueue<'a>>),
+    >;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.queue_registry.iter_mut().map(|(key, queue)| (key as u16, queue))
+        self.queue_registry
+            .iter_mut()
+            .map(|(key, queue)| (key as u16, queue))
     }
 }
 
@@ -420,17 +465,10 @@ impl<'a> Drop for MultiQueueManager<'a> {
     /// Automatically clean up all managed queues when the manager is dropped
     fn drop(&mut self) {
         let queue_count = self.queue_registry.len();
-        
-        // Warn if resources are still registered (they should be unregistered before drop)
-        if self.resource_manager.registered {
-            log::warn!(
-                "MultiQueueManager dropped while resources were still registered ({} files, {} buffers for {} queues)",
-                self.resource_manager.files.len(),
-                self.resource_manager.total_buffer_count,
-                self.resource_manager.queue_ranges.len()
-            );
-        }
-        
+
+        self.unregister_resources()
+            .expect("fail to unregister resources");
+
         self.queue_registry.clear();
         log::debug!(
             "MultiQueueManager dropped, cleaned up {} queues",
@@ -519,12 +557,12 @@ mod tests {
         // Note: We can't easily test with actual queues here because UblkQueue::new_multi
         // requires a UblkDev which requires complex setup. Instead, we test the basic
         // iterator structure and empty cases.
-        
+
         // Test that the iterator methods exist and have correct types
         let _iter = manager.iter();
         let _values: Vec<&std::rc::Rc<UblkQueue>> = manager.values().collect();
         let _keys: Vec<u16> = manager.keys().collect();
-        
+
         // Test IntoIterator trait
         for (_slab_key, _queue) in &manager {
             // This loop won't execute since manager is empty, but verifies the trait works

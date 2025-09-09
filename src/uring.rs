@@ -372,7 +372,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // This test requires kernel ublk support and may hang in CI environments
     fn test_multi_queue_resource_manager_integration() {
         // Test comprehensive multi-queue resource management integration
         // This is adapted from the examples/multi_queue.rs example
