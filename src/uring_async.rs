@@ -5,6 +5,7 @@ use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
 use std::os::fd::AsRawFd;
+use std::os::unix::io::RawFd;
 use std::{
     future::Future,
     pin::Pin,
@@ -440,27 +441,66 @@ pub fn ublk_handle_ios_in_current_thread<F>(
 }
 
 /// Block on all tasks in the executor until they are finished
-#[cfg(test)]
-pub(crate) fn ublk_join_tasks<T>(
+pub fn ublk_block_on_ctrl_tasks<T>(
     exe: &smol::LocalExecutor,
     tasks: Vec<smol::Task<T>>,
+    eventfd: Option<RawFd>,
 ) -> Result<(), UblkError> {
+    // User data value to identify eventfd completions
+    const EVENTFD_USER_DATA: u64 = 0xDEADBEEF;
+    let mut eventfd_buf = [0u8; 8];
+    let mut eventfd_submitted = false;
+
     loop {
+        // Drive the executor to make progress on tasks
+        while exe.try_tick() {}
+
         // Check if all tasks are finished
         if tasks.iter().all(|task| task.is_finished()) {
             break;
         }
 
-        // Drive the executor to make progress on tasks
-        while exe.try_tick() {}
+        // Submit eventfd read if we have an eventfd and haven't submitted yet
+        if let Some(fd) = eventfd {
+            if !eventfd_submitted {
+                crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<
+                    squeue::Entry128,
+                >| {
+                    let read_op = opcode::Read::new(
+                        types::Fd(fd),
+                        eventfd_buf.as_mut_ptr(),
+                        eventfd_buf.len() as u32,
+                    );
+                    let entry =
+                        squeue::Entry128::from(read_op.build().user_data(EVENTFD_USER_DATA));
+                    if let Ok(_) = unsafe { ring.submission().push(&entry) } {
+                        eventfd_submitted = true;
+                    }
+                });
+            }
+        }
 
         // Handle control uring events
+        let nr_waits = if eventfd.is_some() && eventfd_submitted {
+            1
+        } else {
+            0
+        };
         let entry =
             crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
-                ublk_try_reap_cqe(ring, 0)
+                ublk_try_reap_cqe(ring, nr_waits)
             });
+
         if let Some(cqe) = entry {
-            ublk_wake_task(cqe.user_data(), &cqe);
+            let user_data = cqe.user_data();
+
+            // Check if this is an eventfd completion
+            if user_data == EVENTFD_USER_DATA {
+                eventfd_submitted = false;
+            } else {
+                // Regular task completion
+                ublk_wake_task(user_data, &cqe);
+            }
         }
     }
     Ok(())

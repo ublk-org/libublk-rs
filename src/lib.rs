@@ -25,6 +25,9 @@ pub use multi_queue::MultiQueueManager;
 // Re-export control ring initialization
 pub use ctrl::ublk_init_ctrl_task_ring;
 
+// Re-export async task management
+pub use uring_async::ublk_block_on_ctrl_tasks;
+
 bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
     /// UblkFlags: top 8bits are reserved for internal use

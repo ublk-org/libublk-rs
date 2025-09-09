@@ -1779,6 +1779,52 @@ impl UblkCtrl {
         self.get_inner().dev_flags
     }
 
+    /// Write a completion signal to an eventfd to wake up `ublk_block_on_ctrl_tasks`.
+    ///
+    /// This helper method writes a 64-bit value to the specified eventfd file descriptor,
+    /// which can be used to signal completion of asynchronous operations and wake up
+    /// tasks waiting in `ublk_block_on_ctrl_tasks`.
+    ///
+    /// # Arguments
+    /// * `eventfd` - The eventfd file descriptor to write to
+    ///
+    /// # Returns
+    /// * `Ok(())` - If the write was successful
+    /// * `Err(UblkError)` - If the write failed
+    ///
+    /// # Example
+    /// ```no_run
+    /// use libublk::ctrl::{UblkCtrl};
+    /// use libublk::uring_async::{ublk_block_on_ctrl_tasks};
+    /// use std::rc::Rc;
+    /// use smol::Task;
+    ///
+    /// let eventfd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::empty()).unwrap();
+    ///
+    /// // In an async task, signal completion
+    /// UblkCtrl::wakeup_control_ring(eventfd).expect("Failed to signal eventfd");
+    ///
+    /// // Use with ublk_block_on_ctrl_tasks for async task coordination
+    /// let exe = Rc::new(smol::LocalExecutor::new());
+    /// let tasks: Vec<Task<()>> = vec![/* your async tasks */];
+    /// ublk_block_on_ctrl_tasks(&exe, tasks, Some(eventfd));
+    /// ```
+    pub fn wakeup_control_ring(eventfd: i32) -> Result<(), UblkError> {
+        let value = 1u64;
+        let bytes = value.to_le_bytes();
+
+        let result =
+            unsafe { libc::write(eventfd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+
+        if result < 0 {
+            Err(UblkError::OtherError(unsafe {
+                -(*libc::__errno_location())
+            }))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Consolidated error handling helpers
 
     /// Convert system call result to UblkError::OtherError
@@ -2685,6 +2731,7 @@ impl UblkCtrl {
 mod tests {
     use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use crate::uring_async::ublk_block_on_ctrl_tasks;
     use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
     use std::cell::Cell;
@@ -2796,8 +2843,6 @@ mod tests {
 
     #[test]
     fn test_get_queue_affinity_async() {
-        use crate::uring_async::ublk_join_tasks;
-
         let exe_rc = Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
 
@@ -2836,7 +2881,7 @@ mod tests {
         });
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
+            let _ = ublk_block_on_ctrl_tasks(&exe, vec![job], None);
         }));
 
         println!("✓ get_queue_affinity_async method implemented correctly");
@@ -3066,8 +3111,6 @@ mod tests {
     /// Test async APIs
     #[test]
     fn test_async_apis() {
-        use crate::uring_async::ublk_join_tasks;
-
         let _ = env_logger::builder()
             .format_target(false)
             .format_timestamp(None)
@@ -3162,7 +3205,7 @@ mod tests {
         });
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
+            let _ = ublk_block_on_ctrl_tasks(&exe, vec![job], None);
         }));
 
         println!("✓ Async constructor methods are properly defined");
@@ -3259,13 +3302,13 @@ mod tests {
         qh.join().unwrap_or_else(|_| {
             eprintln!("dev-{} join queue thread failed", dev_arc.dev_info.dev_id)
         });
+
         Ok(())
     }
 
     /// Test async APIs for building ublk device
     #[test]
     fn test_create_ublk_async() {
-        use crate::uring_async::ublk_join_tasks;
         let _ = env_logger::builder()
             .format_target(false)
             .format_timestamp(None)
@@ -3277,14 +3320,19 @@ mod tests {
         //support 64 devices
         crate::ctrl::init_ctrl_task_ring_default(64 * 2).unwrap();
 
+        // Create eventfd for test coverage
+        let eventfd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::empty()).unwrap();
+
         for _ in 0..64 {
-            fvec.push(exe_rc.spawn(async {
+            fvec.push(exe_rc.spawn(async move {
                 device_handler_async().await.unwrap();
+                // Write to eventfd to wakeup ublk_block_on_ctrl_tasks
+                let _ = UblkCtrl::wakeup_control_ring(eventfd);
             }));
         }
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, fvec);
+            let _ = ublk_block_on_ctrl_tasks(&exe, fvec, Some(eventfd));
         }));
     }
 
@@ -3292,8 +3340,6 @@ mod tests {
     #[test]
     fn test_ctrl_async_await_flag_enforcement() {
         // Test with async flag support using a sync runtime context
-        use crate::uring_async::ublk_join_tasks;
-
         let exe_rc = std::rc::Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
 
@@ -3376,7 +3422,7 @@ mod tests {
         });
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
+            let _ = ublk_block_on_ctrl_tasks(&exe, vec![job], None);
         }));
 
         println!("✓ UBLK_CTRL_ASYNC_AWAIT flag enforcement tests passed");
