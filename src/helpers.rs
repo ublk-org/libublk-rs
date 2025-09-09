@@ -84,11 +84,11 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe immutable slice reference to the buffer contents.
-    /// 
+    ///
     /// This method provides safe slice access by leveraging the existing Deref
     /// implementation, eliminating the need for unsafe raw pointer operations.
     /// The returned slice is guaranteed to be valid for the lifetime of the IoBuf.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Bounds checking through slice operations
     /// - Compile-time lifetime verification
@@ -99,11 +99,11 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe mutable slice reference to the buffer contents.
-    /// 
+    ///
     /// This method provides safe mutable slice access by leveraging the existing
     /// DerefMut implementation, eliminating the need for unsafe raw pointer operations.
     /// The returned slice is guaranteed to be valid for the lifetime of the IoBuf.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Bounds checking through slice operations  
     /// - Compile-time lifetime verification
@@ -114,17 +114,17 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe immutable subslice of the buffer.
-    /// 
+    ///
     /// This method provides safe access to a portion of the buffer by leveraging
     /// the existing Deref implementation and standard slice indexing. This eliminates
     /// the need for unsafe pointer arithmetic and provides automatic bounds checking.
-    /// 
+    ///
     /// # Arguments
     /// * `range` - A range specifying the subslice bounds (e.g., `0..10`, `5..`, `..20`)
-    /// 
+    ///
     /// # Panics
     /// Panics if the range is out of bounds, following standard slice behavior.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Automatic bounds checking
     /// - No unsafe pointer operations
@@ -137,17 +137,17 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe mutable subslice of the buffer.
-    /// 
+    ///
     /// This method provides safe mutable access to a portion of the buffer by leveraging
     /// the existing DerefMut implementation and standard slice indexing. This eliminates
     /// the need for unsafe pointer arithmetic and provides automatic bounds checking.
-    /// 
+    ///
     /// # Arguments
     /// * `range` - A range specifying the subslice bounds (e.g., `0..10`, `5..`, `..20`)
-    /// 
+    ///
     /// # Panics
     /// Panics if the range is out of bounds, following standard slice behavior.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Automatic bounds checking
     /// - No unsafe pointer operations  

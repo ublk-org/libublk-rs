@@ -159,9 +159,6 @@ use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-
-
-
 // Internal macro versions for backwards compatibility within the crate
 #[macro_export]
 macro_rules! with_queue_ring_internal {
@@ -2620,15 +2617,21 @@ mod tests {
         assert!(!multi_manager.is_registered()); // Not yet registered
 
         // Test range lookup through manager
-        let lookup_range1 = multi_manager.get_queue_resource_range(queue1_slab_key).unwrap();
+        let lookup_range1 = multi_manager
+            .get_queue_resource_range(queue1_slab_key)
+            .unwrap();
         assert_eq!(lookup_range1.file_start_index, 0);
         assert_eq!(lookup_range1.file_count, 2);
 
-        let lookup_range2 = multi_manager.get_queue_resource_range(queue2_slab_key).unwrap();
+        let lookup_range2 = multi_manager
+            .get_queue_resource_range(queue2_slab_key)
+            .unwrap();
         assert_eq!(lookup_range2.file_start_index, 2);
         assert_eq!(lookup_range2.file_count, 1);
 
-        let lookup_range3 = multi_manager.get_queue_resource_range(queue3_slab_key).unwrap();
+        let lookup_range3 = multi_manager
+            .get_queue_resource_range(queue3_slab_key)
+            .unwrap();
         assert_eq!(lookup_range3.file_start_index, 3);
         assert_eq!(lookup_range3.file_count, 2);
     }

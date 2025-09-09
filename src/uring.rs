@@ -205,7 +205,6 @@ impl UblkUring {
         }
     }
 
-
     /// Initialize the ring using a custom closure
     pub fn init_ring<F>(&self, init_fn: F) -> Result<(), UblkError>
     where
@@ -213,7 +212,6 @@ impl UblkUring {
     {
         init_fn(&self.ring)
     }
-
 }
 
 impl Drop for UblkUring {
@@ -243,10 +241,10 @@ mod tests {
 
     /// Verify that a queue was created correctly with proper slab key and resource allocation
     fn verify_queue_creation(
-        queue: &UblkQueue, 
-        queue_key: usize, 
-        _q_id: u16, 
-        expected_buffer_start: u16
+        queue: &UblkQueue,
+        queue_key: usize,
+        _q_id: u16,
+        expected_buffer_start: u16,
     ) -> crate::uring::QueueResourceRange {
         let slab_key = queue.get_slab_key();
         assert_ne!(slab_key, crate::multi_queue::slab_key::UNUSE_KEY);
@@ -260,7 +258,10 @@ mod tests {
         // Check resource range for multi-queue scenarios
         assert_eq!(range.queue_slab_key, slab_key);
         assert_eq!(range.file_count, 1); // Each queue should have 1 file (cdev)
-        assert_eq!(range.buffer_count, 64, "Each queue should have 64 buffers (queue_depth)");
+        assert_eq!(
+            range.buffer_count, 64,
+            "Each queue should have 64 buffers (queue_depth)"
+        );
         assert_eq!(
             range.buffer_start_index, expected_buffer_start,
             "Buffer start index should be queue_id * queue_depth"
@@ -273,26 +274,30 @@ mod tests {
     fn verify_no_resource_overlap(
         manager: &MultiQueueManager,
         current_range: &crate::uring::QueueResourceRange,
-        current_slab_key: u16
+        current_slab_key: u16,
     ) {
         for (key, existing_queue) in manager.iter() {
             // Skip comparing with self
             if key == current_slab_key {
                 continue;
             }
-            
+
             if let Some(existing_range) = existing_queue.get_resource_range() {
                 // File ranges should not overlap
                 assert!(
-                    current_range.file_start_index >= existing_range.file_start_index + existing_range.file_count
-                        || existing_range.file_start_index >= current_range.file_start_index + current_range.file_count,
+                    current_range.file_start_index
+                        >= existing_range.file_start_index + existing_range.file_count
+                        || existing_range.file_start_index
+                            >= current_range.file_start_index + current_range.file_count,
                     "File ranges overlap between queues"
                 );
 
                 // Buffer ranges should not overlap
                 assert!(
-                    current_range.buffer_start_index >= existing_range.buffer_start_index + existing_range.buffer_count
-                        || existing_range.buffer_start_index >= current_range.buffer_start_index + current_range.buffer_count,
+                    current_range.buffer_start_index
+                        >= existing_range.buffer_start_index + existing_range.buffer_count
+                        || existing_range.buffer_start_index
+                            >= current_range.buffer_start_index + current_range.buffer_count,
                     "Buffer ranges overlap between queues"
                 );
             }
@@ -312,7 +317,10 @@ mod tests {
 
             // Test buffer index translation (should always have buffers with UBLK_F_AUTO_BUF_REG)
             if let Some(range) = queue.get_resource_range() {
-                assert!(range.buffer_count > 0, "Should have buffers with UBLK_F_AUTO_BUF_REG");
+                assert!(
+                    range.buffer_count > 0,
+                    "Should have buffers with UBLK_F_AUTO_BUF_REG"
+                );
 
                 // Test buffer index translation
                 let global_buffer_idx_0 = queue.translate_buffer_index(0);
@@ -338,7 +346,8 @@ mod tests {
         // Verify total buffer count is correct (nr_queues * 64 buffers each)
         let expected_total_buffers = (nr_queues * 64) as u32;
         assert_eq!(
-            manager.get_total_buffer_count(), expected_total_buffers,
+            manager.get_total_buffer_count(),
+            expected_total_buffers,
             "Total buffer count should be nr_queues * queue_depth"
         );
 
@@ -363,7 +372,10 @@ mod tests {
     fn verify_queue_lookup(manager: &MultiQueueManager) {
         for (slab_key, _queue) in manager.iter() {
             let retrieved_range = manager.get_queue_resource_range(slab_key);
-            assert!(retrieved_range.is_some(), "Should be able to retrieve queue range");
+            assert!(
+                retrieved_range.is_some(),
+                "Should be able to retrieve queue range"
+            );
 
             if let Some(range) = retrieved_range {
                 assert_eq!(range.queue_slab_key, slab_key);
@@ -400,12 +412,14 @@ mod tests {
             // Create and verify multiple queues with automatic resource management
             for q_id in 0..nr_queues {
                 let queue_key = manager.create_queue(q_id, dev)?;
-                let queue = manager.get_queue_by_key(queue_key).expect("Queue should exist");
+                let queue = manager
+                    .get_queue_by_key(queue_key)
+                    .expect("Queue should exist");
                 let expected_buffer_start = (q_id as u16) * 64;
-                
+
                 // Verify queue creation and get resource range
                 let range = verify_queue_creation(queue, queue_key, q_id, expected_buffer_start);
-                
+
                 // Verify no resource overlap with other queues
                 verify_no_resource_overlap(&manager, &range, queue.get_slab_key());
             }
@@ -413,10 +427,10 @@ mod tests {
             // Verify manager state and register resources
             assert_eq!(manager.queue_count(), nr_queues as usize);
             assert!(!manager.are_resources_registered());
-            
+
             manager.register_resources()?;
             assert!(manager.are_resources_registered());
-            
+
             // Test that double registration is safe
             let result = manager.register_resources();
             assert!(result.is_ok(), "Double registration should be safe");
@@ -447,7 +461,9 @@ mod tests {
 
         // Test adding resources
         let test_files = [42, 43, 44]; // Mock file descriptors
-        let range1 = manager.add_queue_files_and_buffers(1, &test_files, 64).unwrap();
+        let range1 = manager
+            .add_queue_files_and_buffers(1, &test_files, 64)
+            .unwrap();
 
         assert_eq!(range1.queue_slab_key, 1);
         assert_eq!(range1.file_start_index, 0);
@@ -457,7 +473,9 @@ mod tests {
 
         // Add another queue's resources
         let test_files2 = [45];
-        let range2 = manager.add_queue_files_and_buffers(2, &test_files2, 32).unwrap();
+        let range2 = manager
+            .add_queue_files_and_buffers(2, &test_files2, 32)
+            .unwrap();
 
         assert_eq!(range2.queue_slab_key, 2);
         assert_eq!(range2.file_start_index, 3); // After first queue's 3 files
@@ -512,7 +530,7 @@ mod tests {
         // Test resource management lifecycle through MultiQueueManager
         {
             let mut manager = MultiQueueManager::new();
-            
+
             // Add some test resources
             let range = manager.add_queue_files_and_buffers(99, &[999], 10).unwrap();
             assert_eq!(range.queue_slab_key, 99);
@@ -532,12 +550,11 @@ mod tests {
             // Test that non-existent queue returns None
             let nonexistent_range = manager.get_queue_resource_range(999);
             assert!(nonexistent_range.is_none());
-            
+
             // MultiQueueManager should clean up resources when dropped
         } // manager is dropped here, testing Drop implementation
-        
+
         // After drop, resources should be cleaned up (verified through Drop implementation)
         // The Drop implementation logs warnings if resources are still registered
     }
 }
-
