@@ -765,6 +765,25 @@ struct UblkCtrlInner {
 
 /// Affinity management helpers
 impl UblkCtrlInner {
+    async fn get_queue_affinity_effective_async(
+        &mut self,
+        qid: u16,
+    ) -> Result<UblkQueueAffinity, UblkError> {
+        let mut kernel_affinity = UblkQueueAffinity::new();
+        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+            .await?;
+
+        if self
+            .dev_flags
+            .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+        {
+            // Select single CPU from available CPUs
+            let selected_cpu = self.queue_selected_cpus[qid as usize];
+            Ok(UblkQueueAffinity::from_single_cpu(selected_cpu))
+        } else {
+            Ok(kernel_affinity)
+        }
+    }
     /// Get queue affinity from kernel and optionally transform for single CPU mode
     fn get_queue_affinity_effective(&mut self, qid: u16) -> Result<UblkQueueAffinity, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
@@ -782,6 +801,37 @@ impl UblkCtrlInner {
         }
     }
 
+    /// Select and store single CPU for queue (used during device setup)
+    async fn select_single_cpu_for_queue_async(
+        &mut self,
+        qid: u16,
+        cpu: Option<usize>,
+    ) -> Result<usize, UblkError> {
+        let mut kernel_affinity = UblkQueueAffinity::new();
+        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+            .await?;
+
+        let selected_cpu = if let Some(cpu) = cpu {
+            // Validate that the specified CPU is in the affinity mask
+            let available_cpus = kernel_affinity.to_bits_vec();
+            if available_cpus.contains(&cpu) {
+                cpu
+            } else {
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+        } else {
+            // Select a random CPU from the affinity mask
+            kernel_affinity.get_random_cpu().unwrap_or(0)
+        };
+
+        // Store the selected CPU
+        if (qid as usize) < self.queue_selected_cpus.len() {
+            self.queue_selected_cpus[qid as usize] = selected_cpu;
+            Ok(selected_cpu)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
     /// Select and store single CPU for queue (used during device setup)
     fn select_single_cpu_for_queue(
         &mut self,
@@ -826,6 +876,27 @@ impl UblkCtrlInner {
             // For multi-CPU mode, use kernel's full affinity
             let mut kernel_affinity = UblkQueueAffinity::new();
             self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+            Ok(kernel_affinity)
+        }
+    }
+
+    /// Create appropriate affinity for queue thread setup
+    async fn create_thread_affinity_async(
+        &mut self,
+        qid: u16,
+    ) -> Result<UblkQueueAffinity, UblkError> {
+        if self
+            .dev_flags
+            .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+        {
+            // For single CPU mode, select and store the CPU first
+            let selected_cpu = self.select_single_cpu_for_queue_async(qid, None).await?;
+            Ok(UblkQueueAffinity::from_single_cpu(selected_cpu))
+        } else {
+            // For multi-CPU mode, use kernel's full affinity
+            let mut kernel_affinity = UblkQueueAffinity::new();
+            self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+                .await?;
             Ok(kernel_affinity)
         }
     }
@@ -1728,6 +1799,56 @@ impl UblkCtrlInner {
         Ok(0)
     }
 
+    async fn build_json_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        // Update queue thread IDs if they exist and JSON already has content
+        if !self.json_manager.get_json().is_null()
+            && self.json_manager.get_json().is_object()
+            && !self.json_manager.get_json().as_object().unwrap().is_empty()
+        {
+            if let Some(queues) = self.json_manager.get_json_mut().get_mut("queues") {
+                for qid in 0..dev.dev_info.nr_hw_queues {
+                    if let Some(queue) = queues.get_mut(&qid.to_string()) {
+                        if let Some(tid) = queue.get_mut("tid") {
+                            *tid = serde_json::json!(self.queue_tids[qid as usize]);
+                        }
+                    }
+                }
+            }
+            return Ok(0);
+        }
+
+        let tgt_data = dev.get_target_json();
+        let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+        for qid in 0..dev.dev_info.nr_hw_queues {
+            let affinity = self.get_queue_affinity_effective_async(qid).await?;
+
+            map.insert(
+                format!("{}", qid),
+                serde_json::json!({
+                    "qid": qid,
+                    "tid": self.queue_tids[qid as usize],
+                    "affinity": affinity.to_bits_vec(),
+                }),
+            );
+        }
+
+        let mut json = serde_json::json!({
+            "dev_info": dev.dev_info,
+            "target": dev.tgt,
+            "target_flags": dev.flags.bits(),
+        });
+
+        if let Some(val) = tgt_data {
+            json["target_data"] = val.clone()
+        }
+
+        json["queues"] = serde_json::Value::Object(map);
+
+        self.json_manager.set_json(json);
+        Ok(0)
+    }
+
     /// Reload json info for this device
     ///
     fn reload_json(&mut self) -> Result<i32, UblkError> {
@@ -2107,6 +2228,25 @@ impl UblkCtrl {
 
         if ctrl.nr_queues_configured == ctrl.dev_info.nr_hw_queues {
             ctrl.build_json(dev)?;
+        }
+
+        Ok(0)
+    }
+
+    pub async fn configure_queue_async(
+        &self,
+        dev: &UblkDev,
+        qid: u16,
+        tid: i32,
+    ) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+
+        ctrl.store_queue_tid(qid, tid);
+
+        ctrl.nr_queues_configured += 1;
+
+        if ctrl.nr_queues_configured == ctrl.dev_info.nr_hw_queues {
+            ctrl.build_json_async(dev).await?;
         }
 
         Ok(0)
@@ -2578,6 +2718,22 @@ impl UblkCtrl {
             })
     }
 
+    async fn calculate_queue_affinity_async(&self, queue_id: u16) -> UblkQueueAffinity {
+        let affi = self
+            .get_inner_mut()
+            .create_thread_affinity_async(queue_id)
+            .await
+            .unwrap_or_else(|_| {
+                // Fallback to kernel affinity if thread affinity creation fails
+                let mut affinity = UblkQueueAffinity::new();
+                self.get_queue_affinity(queue_id as u32, &mut affinity)
+                    .unwrap_or_default();
+                affinity
+            });
+        log::info!("calculate queue affinity...done\n");
+        affi
+    }
+
     /// Set queue thread affinity using pthread handle
     ///
     /// This function sets CPU affinity for the specified pthread handle.
@@ -2586,6 +2742,24 @@ impl UblkCtrl {
     pub fn set_thread_affinity(&self, qid: u16, pthread_handle: libc::pthread_t) {
         // Calculate and set affinity using the pthread handle
         let affinity = self.calculate_queue_affinity(qid);
+
+        unsafe {
+            libc::pthread_setaffinity_np(
+                pthread_handle,
+                affinity.buf_len(),
+                affinity.addr() as *const libc::cpu_set_t,
+            );
+        }
+    }
+
+    /// Set queue thread affinity using pthread handle
+    ///
+    /// This function sets CPU affinity for the specified pthread handle.
+    /// It should be called from the main thread context after receiving
+    /// the pthread handle from the queue thread.
+    pub async fn set_thread_affinity_async(&self, qid: u16, pthread_handle: libc::pthread_t) {
+        // Calculate and set affinity using the pthread handle
+        let affinity = self.calculate_queue_affinity_async(qid).await;
 
         unsafe {
             libc::pthread_setaffinity_np(
