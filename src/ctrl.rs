@@ -1947,16 +1947,15 @@ impl UblkCtrl {
     /// device exported json file, dump, or any misc management task.
     ///
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: Option<String>,
+    /// Validate parameters for new UblkCtrl creation
+    fn validate_new_params(
+        flags: u64,
+        dev_flags: UblkFlags,
         id: i32,
         nr_queues: u32,
         depth: u32,
         io_buf_bytes: u32,
-        flags: u64,
-        tgt_flags: u64,
-        dev_flags: UblkFlags,
-    ) -> Result<UblkCtrl, UblkError> {
+    ) -> Result<(), UblkError> {
         Self::validate_param((flags & !Self::UBLK_DRV_F_ALL) == 0)?;
 
         if !Path::new(CTRL_PATH).exists() {
@@ -1982,6 +1981,21 @@ impl UblkCtrl {
 
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         Self::validate_param(io_buf_bytes <= MAX_BUF_SZ && (io_buf_bytes & (page_sz - 1)) == 0)?;
+
+        Ok(())
+    }
+
+    pub fn new(
+        name: Option<String>,
+        id: i32,
+        nr_queues: u32,
+        depth: u32,
+        io_buf_bytes: u32,
+        flags: u64,
+        tgt_flags: u64,
+        dev_flags: UblkFlags,
+    ) -> Result<UblkCtrl, UblkError> {
+        Self::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(UblkCtrlInner::new_with_params(
             name,
@@ -2032,31 +2046,7 @@ impl UblkCtrl {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
-        Self::validate_param((flags & !Self::UBLK_DRV_F_ALL) == 0)?;
-
-        if !Path::new(CTRL_PATH).exists() {
-            eprintln!("Please run `modprobe ublk_drv` first");
-            return Err(UblkError::OtherError(-libc::ENOENT));
-        }
-
-        Self::validate_param(!dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0))?;
-
-        // Check mlock feature compatibility
-        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
-            // mlock feature is incompatible with certain other features
-            Self::validate_param(
-                (flags & sys::UBLK_F_USER_COPY as u64) == 0
-                    && (flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0
-                    && (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) == 0,
-            )?;
-        }
-
-        Self::validate_param(id >= -1)?;
-        Self::validate_param(nr_queues <= sys::UBLK_MAX_NR_QUEUES)?;
-        Self::validate_param(depth <= sys::UBLK_MAX_QUEUE_DEPTH)?;
-
-        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-        Self::validate_param(io_buf_bytes <= MAX_BUF_SZ && (io_buf_bytes & (page_sz - 1)) == 0)?;
+        Self::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(
             UblkCtrlInner::new_with_params_async(
