@@ -1318,6 +1318,7 @@ impl UblkCtrlInner {
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce async/await API usage: async methods can only be used when UBLK_CTRL_ASYNC_AWAIT is set
         if !self.force_async && !self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+            log::warn!("Warn: async cmd {:x} is run from sync context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
@@ -1341,6 +1342,7 @@ impl UblkCtrlInner {
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce non-async API usage: sync methods can only be used when UBLK_CTRL_ASYNC_AWAIT is NOT set
         if self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+            log::warn!("Warn: sync cmd {:x} is run from async context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
@@ -1779,7 +1781,7 @@ impl UblkCtrlInner {
     /// Build JSON data for device
     fn build_json_internal(&mut self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
         let mut queue_affinities = Vec::with_capacity(dev.dev_info.nr_hw_queues as usize);
-        
+
         for qid in 0..dev.dev_info.nr_hw_queues {
             let affinity = self.get_queue_affinity_effective(qid)?;
             queue_affinities.push(affinity);
@@ -1789,9 +1791,12 @@ impl UblkCtrlInner {
     }
 
     /// Build JSON data for device (async)
-    async fn build_json_internal_async(&mut self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
+    async fn build_json_internal_async(
+        &mut self,
+        dev: &UblkDev,
+    ) -> Result<serde_json::Value, UblkError> {
         let mut queue_affinities = Vec::with_capacity(dev.dev_info.nr_hw_queues as usize);
-        
+
         for qid in 0..dev.dev_info.nr_hw_queues {
             let affinity = self.get_queue_affinity_effective_async(qid).await?;
             queue_affinities.push(affinity);
