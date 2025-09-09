@@ -2552,7 +2552,7 @@ impl UblkCtrl {
     ///
     /// This function sets up the basic thread properties and returns
     /// the thread ID for external affinity configuration.
-    fn init_queue_thread() -> libc::pid_t {
+    pub fn init_queue_thread() -> libc::pid_t {
         let tid = unsafe { libc::gettid() };
 
         // Set IO flusher property for the queue thread
