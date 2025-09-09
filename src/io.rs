@@ -2321,7 +2321,8 @@ impl UblkQueue<'_> {
         match &self.resource_range {
             Some(range) => {
                 assert!(
-                    local_index < range.buffer_count,
+                    range.buffer_count == 0
+                        || local_index < range.buffer_start_index + range.buffer_count,
                     "Local buffer index {} out of range (max {})",
                     local_index,
                     range.buffer_count
