@@ -1,9 +1,11 @@
-use crate::io::UblkQueue;
+use crate::io::{UblkIOCtx, UblkQueue};
+use crate::multi_queue::MultiQueueManager;
 use crate::UblkError;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
 use std::os::fd::AsRawFd;
+use std::os::unix::io::RawFd;
 use std::{
     future::Future,
     pin::Pin,
@@ -26,7 +28,49 @@ pub struct UblkUringOpFuture {
 }
 
 impl UblkUringOpFuture {
+    // Retrieve future key from user data
+    pub fn user_data_to_future_key(user_data: u64) -> u32 {
+        ((user_data >> 16) & 0xffffffff) as u32
+    }
+
+    fn build_user_data(tag: u16, future_key: u32, q_key: u16, tgt_io: u64) -> u64 {
+        tag as u64
+                | ((future_key as u64) << 16) // future slab key in tgt_data for lookup
+                | ((q_key as u64) << 48) // queue slab key for routing
+                | ((tgt_io as u64) << 63) // target_io flag controlled by parameter
+    }
+    // Keep it for not breaking public API
     pub fn new(tgt_io: u64) -> Self {
+        MY_SLAB.with(|refcell| {
+            let mut map = refcell.borrow_mut();
+            let key = map.insert(FutureData {
+                waker: None,
+                result: None,
+            });
+
+            let user_data = Self::build_user_data(0, key.try_into().unwrap(), 0, tgt_io);
+            log::trace!("uring: new future {:x}", user_data);
+            UblkUringOpFuture { user_data }
+        })
+    }
+
+    /// Create a new future with queue slab key for multi-queue support
+    ///
+    /// # Arguments:
+    /// * `tag`: IO tag (16-bit)
+    /// * `queue_slab_key`: Slab key for queue identification (10-bit value, 0-1023)
+    /// * `tgt_io`: Whether this is a target IO operation (true) or regular queue operation (false)
+    ///
+    /// This method creates a future with user_data that encodes the queue slab key,
+    /// enabling automatic queue routing in multi-queue scenarios.
+    ///
+    /// User_data bit layout:
+    /// - Bits 0-15: tag (16 bits) - for ublk uring command only
+    /// - Bits 16-47: future slab key (32 bits) - for future lookup
+    /// - Bits 48-57: queue slab key (10 bits) - for queue identification
+    /// - Bits 58-62: reserved (5 bits)
+    /// - Bit 63: target_io flag (1 bit) - controlled by tgt_io parameter
+    pub fn new_multi(tag: u16, q_key: u16, tgt_io: bool) -> Self {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
 
@@ -34,8 +78,21 @@ impl UblkUringOpFuture {
                 waker: None,
                 result: None,
             });
-            let user_data = ((key as u32) << 16) as u64 | tgt_io;
-            log::trace!("uring: new future {:x}", user_data);
+
+            // Validate slab key is within 10-bit range
+            assert!(
+                (q_key >> 10) == 0,
+                "queue slab key must be 10-bit value (0-1023)"
+            );
+
+            let user_data =
+                Self::build_user_data(tag, key.try_into().unwrap(), q_key, tgt_io as u64);
+            log::trace!(
+                "uring: new future {:x} for tag {} queue_slab_key {}",
+                user_data,
+                tag,
+                q_key
+            );
             UblkUringOpFuture { user_data }
         })
     }
@@ -46,21 +103,30 @@ impl Future for UblkUringOpFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
-            let key = ((self.user_data & !(1_u64 << 63)) >> 16) as usize;
+            let key = Self::user_data_to_future_key(self.user_data) as usize;
+
             match map.get_mut(key) {
                 None => {
-                    log::trace!("uring: null slab {:x}", self.user_data);
+                    log::trace!("uring: null slab {:x} (key={})", self.user_data, key);
                     Poll::Pending
                 }
                 Some(fd) => match fd.result {
                     Some(result) => {
                         map.remove(key);
-                        log::trace!("uring: uring io ready userdata {:x} ready", self.user_data);
+                        log::trace!(
+                            "uring: uring io ready userdata {:x} (key={}) ready",
+                            self.user_data,
+                            key
+                        );
                         Poll::Ready(result)
                     }
                     None => {
                         fd.waker = Some(cx.waker().clone());
-                        log::trace!("uring: uring io pending userdata {:x}", self.user_data);
+                        log::trace!(
+                            "uring: uring io pending userdata {:x} (key={})",
+                            self.user_data,
+                            key
+                        );
                         Poll::Pending
                     }
                 },
@@ -83,8 +149,10 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
             cqe.user_data(),
             cqe.result()
         );
-        let data = ((data & !(1_u64 << 63)) >> 16) as usize;
-        if let Some(fd) = map.get_mut(data) {
+
+        let future_key = UblkUringOpFuture::user_data_to_future_key(data) as usize;
+
+        if let Some(fd) = map.get_mut(future_key) {
             fd.result = Some(cqe.result());
             if let Some(w) = &fd.waker {
                 w.wake_by_ref();
@@ -174,7 +242,8 @@ pub fn ublk_run_ctrl_task<T>(
     task: &smol::Task<T>,
 ) -> Result<(), UblkError> {
     let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder().build(4)?;
-    let ctrl_fd = crate::ctrl::with_ctrl_ring_internal!(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
+    let ctrl_fd =
+        crate::ctrl::with_ctrl_ring_internal!(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
     let q_fd = q.as_raw_fd();
     let mut poll_q = true;
     let mut poll_ctrl = true;
@@ -211,7 +280,10 @@ pub fn ublk_run_ctrl_task<T>(
         }
 
         ublk_process_queue_io(exe, q, 0)?;
-        let entry = crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| ublk_try_reap_cqe(ring, 0));
+        let entry =
+            crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                ublk_try_reap_cqe(ring, 0)
+            });
         if let Some(cqe) = entry {
             ublk_wake_task(cqe.user_data(), &cqe);
             while exe.try_tick() {}
@@ -245,25 +317,190 @@ pub fn ublk_wait_and_handle_ios(exe: &smol::LocalExecutor, q: &UblkQueue) {
     q.unregister_io_bufs();
 }
 
+/// Handle incoming CQEs for multi-queue operations
+///
+/// # Arguments:
+///
+/// * `manager`: MultiQueueManager instance for queue routing
+/// * `cmd_handler`: Command handler closure called for ublk commands
+///
+/// Processes all available CQEs from the per-task io-uring, routes them to
+/// appropriate queues, and handles command processing and queue lifecycle.
+fn handle_incoming_cqes<F>(manager: &MultiQueueManager, cmd_handler: F) -> usize
+where
+    F: Fn(&UblkQueue, u16, &cqueue::Entry),
+{
+    let mut off = Vec::new();
+    loop {
+        let cqe = crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+            r.completion().next()
+        });
+
+        let cqe = match cqe {
+            Some(entry) => entry,
+            None => break, // No more entries
+        };
+
+        let user_data = cqe.user_data();
+
+        // Wake up io task by calling ublk_wake_task(user_data, &cqe)
+        ublk_wake_task(user_data, &cqe);
+
+        // Calling cmd_handler() if it is one ublk command
+        if UblkIOCtx::is_io_command(user_data) {
+            // Extract queue slab key and route to appropriate queue
+            let slab_key = UblkIOCtx::user_data_to_slab_key(user_data);
+
+            if let Some(queue) = manager.get_queue_by_key(slab_key.into()) {
+                queue.handle_io_cmd_multi(&cqe);
+
+                // Extract tag for cmd_handler
+                let tag = UblkIOCtx::user_data_to_tag(user_data) as u16;
+
+                // Call the command handler
+                cmd_handler(queue, tag, &cqe);
+
+                // if state.queue_is_done() { remove this queue from MultiQueueManager }
+                if queue.queue_is_done_multi() {
+                    off.push(slab_key);
+                }
+            }
+        }
+    }
+
+    if !off.is_empty() {
+        off.iter().collect::<std::collections::HashSet<_>>().len()
+    } else {
+        0
+    }
+}
+
+/// Handle multiple queue I/Os in current thread context
+///
+/// # Arguments:
+///
+/// * `manager`: MultiQueueManager instance managing all queues
+/// * `exe`: Local async Executor
+/// * `cmd_handler`: Command handler closure called for ublk commands
+///
+/// This is the multi-queue version of ublk_wait_and_handle_ios(), supporting
+/// handling of multiple queues from same or different devices within a single
+/// thread context. All queues are driven by a single per-task io-uring.
+///
+/// The function waits and accepts incoming CQEs from the per-task io-uring,
+/// routes them to appropriate queues, and handles timeouts and errors.
+/// It continues until all queues are removed from the manager.
+pub fn ublk_handle_ios_in_current_thread<F>(
+    manager: &MultiQueueManager,
+    exe: &smol::LocalExecutor,
+    cmd_handler: F,
+) where
+    F: Fn(&UblkQueue, u16, &cqueue::Entry),
+{
+    let mut queue_cnt = manager.get_registered_queue_count();
+
+    loop {
+        // Execute any pending tasks
+        while exe.try_tick() {}
+
+        if queue_cnt == 0 {
+            break;
+        }
+
+        // Execute any pending tasks
+        while exe.try_tick() {}
+
+        // Setup timeout for queue idle detection (20 seconds, same as UBLK_QUEUE_IDLE_SECS)
+        let ts = types::Timespec::new().sec(20);
+        let args = types::SubmitArgs::new().timespec(&ts);
+
+        let result = crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+            r.submitter().submit_with_args(1, &args)
+        });
+
+        match result {
+            // Handle timeout - handle timeout for each queue managed by this MultiQueueManager
+            Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
+                // Call UblkQueue::enter_queue_idle() for all managed queues
+                for queue_key in manager.get_queue_keys() {
+                    if let Some(queue) = manager.get_queue_by_key(queue_key.into()) {
+                        queue.handle_timeout_multi();
+                    }
+                }
+            }
+            // Handle other errors - remove all queues and break the big loop
+            Err(_) => {
+                break;
+            }
+            // Handle successful completion - process incoming CQEs
+            Ok(_) => {
+                queue_cnt -= handle_incoming_cqes(manager, &cmd_handler);
+            }
+        }
+    }
+}
+
 /// Block on all tasks in the executor until they are finished
-#[cfg(test)]
-pub(crate) fn ublk_join_tasks<T>(
+pub fn ublk_block_on_ctrl_tasks<T>(
     exe: &smol::LocalExecutor,
     tasks: Vec<smol::Task<T>>,
+    eventfd: Option<RawFd>,
 ) -> Result<(), UblkError> {
+    // User data value to identify eventfd completions
+    const EVENTFD_USER_DATA: u64 = 0xDEADBEEF;
+    let mut eventfd_buf = [0u8; 8];
+    let mut eventfd_submitted = false;
+
     loop {
+        // Drive the executor to make progress on tasks
+        while exe.try_tick() {}
+
         // Check if all tasks are finished
         if tasks.iter().all(|task| task.is_finished()) {
             break;
         }
 
-        // Drive the executor to make progress on tasks
-        while exe.try_tick() {}
+        // Submit eventfd read if we have an eventfd and haven't submitted yet
+        if let Some(fd) = eventfd {
+            if !eventfd_submitted {
+                crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<
+                    squeue::Entry128,
+                >| {
+                    let read_op = opcode::Read::new(
+                        types::Fd(fd),
+                        eventfd_buf.as_mut_ptr(),
+                        eventfd_buf.len() as u32,
+                    );
+                    let entry =
+                        squeue::Entry128::from(read_op.build().user_data(EVENTFD_USER_DATA));
+                    if let Ok(_) = unsafe { ring.submission().push(&entry) } {
+                        eventfd_submitted = true;
+                    }
+                });
+            }
+        }
 
         // Handle control uring events
-        let entry = crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| ublk_try_reap_cqe(ring, 0));
+        let nr_waits = if eventfd.is_some() && eventfd_submitted {
+            1
+        } else {
+            0
+        };
+        let entry =
+            crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                ublk_try_reap_cqe(ring, nr_waits)
+            });
+
         if let Some(cqe) = entry {
-            ublk_wake_task(cqe.user_data(), &cqe);
+            let user_data = cqe.user_data();
+
+            // Check if this is an eventfd completion
+            if user_data == EVENTFD_USER_DATA {
+                eventfd_submitted = false;
+            } else {
+                // Regular task completion
+                ublk_wake_task(user_data, &cqe);
+            }
         }
     }
     Ok(())

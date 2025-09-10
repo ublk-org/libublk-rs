@@ -46,6 +46,7 @@ slab = "0.4.9"
 derive_setters = "0.1"
 bitflags = "2.4.1"
 futures-timer = "3.0"
+async-lock = "3.4"
 
 [dev-dependencies]
 block-utils = "0.11.0"

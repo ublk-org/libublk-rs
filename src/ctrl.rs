@@ -765,6 +765,25 @@ struct UblkCtrlInner {
 
 /// Affinity management helpers
 impl UblkCtrlInner {
+    async fn get_queue_affinity_effective_async(
+        &mut self,
+        qid: u16,
+    ) -> Result<UblkQueueAffinity, UblkError> {
+        let mut kernel_affinity = UblkQueueAffinity::new();
+        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+            .await?;
+
+        if self
+            .dev_flags
+            .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+        {
+            // Select single CPU from available CPUs
+            let selected_cpu = self.queue_selected_cpus[qid as usize];
+            Ok(UblkQueueAffinity::from_single_cpu(selected_cpu))
+        } else {
+            Ok(kernel_affinity)
+        }
+    }
     /// Get queue affinity from kernel and optionally transform for single CPU mode
     fn get_queue_affinity_effective(&mut self, qid: u16) -> Result<UblkQueueAffinity, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
@@ -782,6 +801,37 @@ impl UblkCtrlInner {
         }
     }
 
+    /// Select and store single CPU for queue (used during device setup)
+    async fn select_single_cpu_for_queue_async(
+        &mut self,
+        qid: u16,
+        cpu: Option<usize>,
+    ) -> Result<usize, UblkError> {
+        let mut kernel_affinity = UblkQueueAffinity::new();
+        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+            .await?;
+
+        let selected_cpu = if let Some(cpu) = cpu {
+            // Validate that the specified CPU is in the affinity mask
+            let available_cpus = kernel_affinity.to_bits_vec();
+            if available_cpus.contains(&cpu) {
+                cpu
+            } else {
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+        } else {
+            // Select a random CPU from the affinity mask
+            kernel_affinity.get_random_cpu().unwrap_or(0)
+        };
+
+        // Store the selected CPU
+        if (qid as usize) < self.queue_selected_cpus.len() {
+            self.queue_selected_cpus[qid as usize] = selected_cpu;
+            Ok(selected_cpu)
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
     /// Select and store single CPU for queue (used during device setup)
     fn select_single_cpu_for_queue(
         &mut self,
@@ -826,6 +876,27 @@ impl UblkCtrlInner {
             // For multi-CPU mode, use kernel's full affinity
             let mut kernel_affinity = UblkQueueAffinity::new();
             self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+            Ok(kernel_affinity)
+        }
+    }
+
+    /// Create appropriate affinity for queue thread setup
+    async fn create_thread_affinity_async(
+        &mut self,
+        qid: u16,
+    ) -> Result<UblkQueueAffinity, UblkError> {
+        if self
+            .dev_flags
+            .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+        {
+            // For single CPU mode, select and store the CPU first
+            let selected_cpu = self.select_single_cpu_for_queue_async(qid, None).await?;
+            Ok(UblkQueueAffinity::from_single_cpu(selected_cpu))
+        } else {
+            // For multi-CPU mode, use kernel's full affinity
+            let mut kernel_affinity = UblkQueueAffinity::new();
+            self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+                .await?;
             Ok(kernel_affinity)
         }
     }
@@ -1153,7 +1224,7 @@ impl UblkCtrlInner {
     fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> UblkUringOpFuture {
         let fd = self.file.as_raw_fd();
         let dev_id = self.dev_info.dev_id;
-        let f = UblkUringOpFuture::new(0);
+        let f = UblkUringOpFuture::new_multi(0, crate::multi_queue::slab_key::CONTROL_CMD, false);
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
 
         unsafe {
@@ -1247,6 +1318,7 @@ impl UblkCtrlInner {
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce async/await API usage: async methods can only be used when UBLK_CTRL_ASYNC_AWAIT is set
         if !self.force_async && !self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+            log::warn!("Warn: async cmd {:x} is run from sync context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
@@ -1270,6 +1342,7 @@ impl UblkCtrlInner {
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce non-async API usage: sync methods can only be used when UBLK_CTRL_ASYNC_AWAIT is NOT set
         if self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+            log::warn!("Warn: sync cmd {:x} is run from async context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
@@ -1291,28 +1364,40 @@ impl UblkCtrlInner {
         Self::ublk_err_to_result(res)
     }
 
-    fn add(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_write_buffer_cmd(
+    /// Prepare ADD_DEV command data
+    fn prepare_add_cmd(&self) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_write_buffer_cmd(
             sys::UBLK_U_CMD_ADD_DEV,
             std::ptr::addr_of!(self.dev_info) as u64,
             core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             true, // no_dev_path
-        );
+        )
+    }
 
+    fn add(&mut self) -> Result<i32, UblkError> {
+        let data = self.prepare_add_cmd();
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Add this device asynchronously
     ///
     async fn add_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_write_buffer_cmd(
-            sys::UBLK_U_CMD_ADD_DEV,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            true, // no_dev_path
-        );
-
+        let data = self.prepare_add_cmd();
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare DEL_DEV command data  
+    fn prepare_del_cmd(&self, force_async: bool) -> UblkCtrlCmdData {
+        let cmd_op = if force_async
+            || self
+                .dev_flags
+                .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
+        {
+            sys::UBLK_U_CMD_DEL_DEV_ASYNC
+        } else {
+            sys::UBLK_U_CMD_DEL_DEV
+        };
+        UblkCtrlCmdData::new_simple_cmd(cmd_op)
     }
 
     /// Remove this device
@@ -1322,19 +1407,9 @@ impl UblkCtrlInner {
             return Ok(0);
         }
 
-        let cmd_op = if self
-            .dev_flags
-            .intersects(UblkFlags::UBLK_DEV_F_DEL_DEV_ASYNC)
-        {
-            sys::UBLK_U_CMD_DEL_DEV_ASYNC
-        } else {
-            sys::UBLK_U_CMD_DEL_DEV
-        };
-        let data = UblkCtrlCmdData::new_simple_cmd(cmd_op);
-
+        let data = self.prepare_del_cmd(false);
         let res = self.ublk_ctrl_cmd(&data)?;
         self.mark_deleted();
-
         Ok(res)
     }
 
@@ -1344,8 +1419,8 @@ impl UblkCtrlInner {
         if self.is_deleted() {
             return Ok(0);
         }
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
 
+        let data = self.prepare_del_cmd(true);
         let res = self.ublk_ctrl_cmd(&data)?;
         self.mark_deleted();
         Ok(res)
@@ -1362,60 +1437,54 @@ impl UblkCtrlInner {
         if self.is_deleted() {
             return Ok(0);
         }
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_DEL_DEV_ASYNC);
 
+        let data = self.prepare_del_cmd(true);
         let res = self.ublk_ctrl_cmd_async(&data).await?;
         self.mark_deleted();
         Ok(res)
     }
 
-    fn __get_features(&mut self) -> Result<u64, UblkError> {
-        let features = 0_u64;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
+    /// Prepare GET_FEATURES command data
+    fn prepare_get_features_cmd(features_ptr: u64) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_read_buffer_cmd(
             sys::UBLK_U_CMD_GET_FEATURES,
-            std::ptr::addr_of!(features) as u64,
+            features_ptr,
             core::mem::size_of::<u64>() as u32,
             true, // no_dev_path
-        );
+        )
+    }
 
+    fn __get_features(&mut self) -> Result<u64, UblkError> {
+        let features = 0_u64;
+        let data = Self::prepare_get_features_cmd(std::ptr::addr_of!(features) as u64);
         self.ublk_ctrl_cmd(&data)?;
-
         Ok(features)
     }
 
     async fn __get_features_async(&mut self) -> Result<u64, UblkError> {
         let features = 0_u64;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_FEATURES,
-            std::ptr::addr_of!(features) as u64,
-            core::mem::size_of::<u64>() as u32,
-            true, // no_dev_path
-        );
-
+        let data = Self::prepare_get_features_cmd(std::ptr::addr_of!(features) as u64);
         self.ublk_ctrl_cmd_async(&data).await?;
-
         Ok(features)
     }
 
-    fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO,
+    /// Prepare read device info command data
+    fn prepare_read_dev_info_cmd(&self, cmd_op: u32) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_read_buffer_cmd(
+            cmd_op,
             std::ptr::addr_of!(self.dev_info) as u64,
             core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
             false, // need dev_path
-        );
+        )
+    }
 
+    fn __read_dev_info(&mut self) -> Result<i32, UblkError> {
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO);
         self.ublk_ctrl_cmd(&data)
     }
 
     fn __read_dev_info2(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO2,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            false, // need dev_path
-        );
-
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO2);
         self.ublk_ctrl_cmd(&data)
     }
 
@@ -1433,57 +1502,62 @@ impl UblkCtrlInner {
     }
 
     async fn __read_dev_info_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            false, // need dev_path
-        );
-
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
     async fn __read_dev_info2_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_DEV_INFO2,
-            std::ptr::addr_of!(self.dev_info) as u64,
-            core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
-            false, // need dev_path
-        );
-
+        let data = self.prepare_read_dev_info_cmd(sys::UBLK_U_CMD_GET_DEV_INFO2);
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare START_DEV command data
+    fn prepare_start_cmd(pid: i32) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64)
     }
 
     /// Start this device by sending command to ublk driver
     ///
     fn start(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64);
-
+        let data = Self::prepare_start_cmd(pid);
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Start this device by sending command to ublk driver
     ///
     async fn start_async(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_START_DEV, pid as u64);
-
+        let data = Self::prepare_start_cmd(pid);
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare STOP_DEV command data
+    fn prepare_stop_cmd() -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV)
     }
 
     /// Stop this device by sending command to ublk driver
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV);
-
+        let data = Self::prepare_stop_cmd();
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Stop this device by sending command to ublk driver asynchronously
     ///
     async fn stop_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV);
-
+        let data = Self::prepare_stop_cmd();
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare GET_PARAMS command data
+    fn prepare_get_params_cmd(params: &mut sys::ublk_params) -> UblkCtrlCmdData {
+        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
+        UblkCtrlCmdData::new_read_buffer_cmd(
+            sys::UBLK_U_CMD_GET_PARAMS,
+            params as *const sys::ublk_params as u64,
+            params.len,
+            false, // need dev_path
+        )
     }
 
     /// Retrieve this device's parameter from ublk driver by
@@ -1491,28 +1565,14 @@ impl UblkCtrlInner {
     ///
     /// Can't pass params by reference(&mut), why?
     fn get_params(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
-        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_PARAMS,
-            params as *const sys::ublk_params as u64,
-            params.len,
-            false, // need dev_path
-        );
-
+        let data = Self::prepare_get_params_cmd(params);
         self.ublk_ctrl_cmd(&data)
     }
 
     /// Retrieve this device's parameter from ublk driver by
     /// sending command in async/.await
     async fn get_params_async(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
-        params.len = core::mem::size_of::<sys::ublk_params>() as u32;
-        let data = UblkCtrlCmdData::new_read_buffer_cmd(
-            sys::UBLK_U_CMD_GET_PARAMS,
-            params as *const sys::ublk_params as u64,
-            params.len,
-            false, // need dev_path
-        );
-
+        let data = Self::prepare_get_params_cmd(params);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
@@ -1548,18 +1608,22 @@ impl UblkCtrlInner {
             p.len,
             false, // need dev_path
         );
-
         self.ublk_ctrl_cmd_async(&data).await
     }
 
-    fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_buffer_cmd(
+    /// Prepare GET_QUEUE_AFFINITY command data
+    fn prepare_get_queue_affinity_cmd(q: u32, bm: &mut UblkQueueAffinity) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_buffer_cmd(
             sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
             q as u64,
             bm.addr() as u64,
             bm.buf_len() as u32,
             true, // read_buffer
-        );
+        )
+    }
+
+    fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
+        let data = Self::prepare_get_queue_affinity_cmd(q, bm);
         self.ublk_ctrl_cmd(&data)
     }
 
@@ -1570,41 +1634,41 @@ impl UblkCtrlInner {
         q: u32,
         bm: &mut UblkQueueAffinity,
     ) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_buffer_cmd(
-            sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
-            q as u64,
-            bm.addr() as u64,
-            bm.buf_len() as u32,
-            true, // read_buffer
-        );
+        let data = Self::prepare_get_queue_affinity_cmd(q, bm);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
-    fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY);
+    /// Prepare START_USER_RECOVERY command data
+    fn prepare_start_user_recover_cmd() -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY)
+    }
 
+    fn __start_user_recover(&mut self) -> Result<i32, UblkError> {
+        let data = Self::prepare_start_user_recover_cmd();
         self.ublk_ctrl_cmd(&data)
     }
 
     async fn __start_user_recover_async(&mut self) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_START_USER_RECOVERY);
-
+        let data = Self::prepare_start_user_recover_cmd();
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare END_USER_RECOVERY command data
+    fn prepare_end_user_recover_cmd(pid: i32) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64)
     }
 
     /// End user recover for this device, do similar thing done in start_dev()
     ///
     fn end_user_recover(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64);
-
+        let data = Self::prepare_end_user_recover_cmd(pid);
         self.ublk_ctrl_cmd(&data)
     }
 
     /// End user recover for this device, do similar thing done in start_dev()
     ///
     async fn end_user_recover_async(&mut self, pid: i32) -> Result<i32, UblkError> {
-        let data = UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_END_USER_RECOVERY, pid as u64);
-
+        let data = Self::prepare_end_user_recover_cmd(pid);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
@@ -1678,29 +1742,17 @@ impl UblkCtrlInner {
     /// * `tids`: queue pthread tid vector, in which each item stores the queue's
     /// pthread tid
     ///
-    fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
-        // Update queue thread IDs if they exist and JSON already has content
-        if !self.json_manager.get_json().is_null()
-            && self.json_manager.get_json().is_object()
-            && !self.json_manager.get_json().as_object().unwrap().is_empty()
-        {
-            if let Some(queues) = self.json_manager.get_json_mut().get_mut("queues") {
-                for qid in 0..dev.dev_info.nr_hw_queues {
-                    if let Some(queue) = queues.get_mut(&qid.to_string()) {
-                        if let Some(tid) = queue.get_mut("tid") {
-                            *tid = serde_json::json!(self.queue_tids[qid as usize]);
-                        }
-                    }
-                }
-            }
-            return Ok(0);
-        }
-
+    /// Build JSON data with provided queue affinities
+    fn build_json_with_affinities(
+        &self,
+        dev: &UblkDev,
+        queue_affinities: &[UblkQueueAffinity],
+    ) -> serde_json::Value {
         let tgt_data = dev.get_target_json();
         let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
 
         for qid in 0..dev.dev_info.nr_hw_queues {
-            let affinity = self.get_queue_affinity_effective(qid)?;
+            let affinity = &queue_affinities[qid as usize];
 
             map.insert(
                 format!("{}", qid),
@@ -1723,7 +1775,75 @@ impl UblkCtrlInner {
         }
 
         json["queues"] = serde_json::Value::Object(map);
+        json
+    }
 
+    /// Build JSON data for device
+    fn build_json_internal(&mut self, dev: &UblkDev) -> Result<serde_json::Value, UblkError> {
+        let mut queue_affinities = Vec::with_capacity(dev.dev_info.nr_hw_queues as usize);
+
+        for qid in 0..dev.dev_info.nr_hw_queues {
+            let affinity = self.get_queue_affinity_effective(qid)?;
+            queue_affinities.push(affinity);
+        }
+
+        Ok(self.build_json_with_affinities(dev, &queue_affinities))
+    }
+
+    /// Build JSON data for device (async)
+    async fn build_json_internal_async(
+        &mut self,
+        dev: &UblkDev,
+    ) -> Result<serde_json::Value, UblkError> {
+        let mut queue_affinities = Vec::with_capacity(dev.dev_info.nr_hw_queues as usize);
+
+        for qid in 0..dev.dev_info.nr_hw_queues {
+            let affinity = self.get_queue_affinity_effective_async(qid).await?;
+            queue_affinities.push(affinity);
+        }
+
+        Ok(self.build_json_with_affinities(dev, &queue_affinities))
+    }
+
+    /// Update existing JSON with queue thread IDs
+    fn update_json_queue_tids(&mut self, dev: &UblkDev) -> bool {
+        if !self.json_manager.get_json().is_null()
+            && self.json_manager.get_json().is_object()
+            && !self.json_manager.get_json().as_object().unwrap().is_empty()
+        {
+            if let Some(queues) = self.json_manager.get_json_mut().get_mut("queues") {
+                for qid in 0..dev.dev_info.nr_hw_queues {
+                    if let Some(queue) = queues.get_mut(&qid.to_string()) {
+                        if let Some(tid) = queue.get_mut("tid") {
+                            *tid = serde_json::json!(self.queue_tids[qid as usize]);
+                        }
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn build_json(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        // Update queue thread IDs if JSON already exists
+        if self.update_json_queue_tids(dev) {
+            return Ok(0);
+        }
+
+        let json = self.build_json_internal(dev)?;
+        self.json_manager.set_json(json);
+        Ok(0)
+    }
+
+    async fn build_json_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        // Update queue thread IDs if JSON already exists
+        if self.update_json_queue_tids(dev) {
+            return Ok(0);
+        }
+
+        let json = self.build_json_internal_async(dev).await?;
         self.json_manager.set_json(json);
         Ok(0)
     }
@@ -1777,6 +1897,52 @@ impl UblkCtrl {
 
     pub(crate) fn get_dev_flags(&self) -> UblkFlags {
         self.get_inner().dev_flags
+    }
+
+    /// Write a completion signal to an eventfd to wake up `ublk_block_on_ctrl_tasks`.
+    ///
+    /// This helper method writes a 64-bit value to the specified eventfd file descriptor,
+    /// which can be used to signal completion of asynchronous operations and wake up
+    /// tasks waiting in `ublk_block_on_ctrl_tasks`.
+    ///
+    /// # Arguments
+    /// * `eventfd` - The eventfd file descriptor to write to
+    ///
+    /// # Returns
+    /// * `Ok(())` - If the write was successful
+    /// * `Err(UblkError)` - If the write failed
+    ///
+    /// # Example
+    /// ```no_run
+    /// use libublk::ctrl::{UblkCtrl};
+    /// use libublk::uring_async::{ublk_block_on_ctrl_tasks};
+    /// use std::rc::Rc;
+    /// use smol::Task;
+    ///
+    /// let eventfd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::empty()).unwrap();
+    ///
+    /// // In an async task, signal completion
+    /// UblkCtrl::wakeup_control_ring(eventfd).expect("Failed to signal eventfd");
+    ///
+    /// // Use with ublk_block_on_ctrl_tasks for async task coordination
+    /// let exe = Rc::new(smol::LocalExecutor::new());
+    /// let tasks: Vec<Task<()>> = vec![/* your async tasks */];
+    /// ublk_block_on_ctrl_tasks(&exe, tasks, Some(eventfd));
+    /// ```
+    pub fn wakeup_control_ring(eventfd: i32) -> Result<(), UblkError> {
+        let value = 1u64;
+        let bytes = value.to_le_bytes();
+
+        let result =
+            unsafe { libc::write(eventfd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+
+        if result < 0 {
+            Err(UblkError::OtherError(unsafe {
+                -(*libc::__errno_location())
+            }))
+        } else {
+            Ok(())
+        }
     }
 
     /// Consolidated error handling helpers
@@ -1834,16 +2000,15 @@ impl UblkCtrl {
     /// device exported json file, dump, or any misc management task.
     ///
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: Option<String>,
+    /// Validate parameters for new UblkCtrl creation
+    fn validate_new_params(
+        flags: u64,
+        dev_flags: UblkFlags,
         id: i32,
         nr_queues: u32,
         depth: u32,
         io_buf_bytes: u32,
-        flags: u64,
-        tgt_flags: u64,
-        dev_flags: UblkFlags,
-    ) -> Result<UblkCtrl, UblkError> {
+    ) -> Result<(), UblkError> {
         Self::validate_param((flags & !Self::UBLK_DRV_F_ALL) == 0)?;
 
         if !Path::new(CTRL_PATH).exists() {
@@ -1869,6 +2034,21 @@ impl UblkCtrl {
 
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         Self::validate_param(io_buf_bytes <= MAX_BUF_SZ && (io_buf_bytes & (page_sz - 1)) == 0)?;
+
+        Ok(())
+    }
+
+    pub fn new(
+        name: Option<String>,
+        id: i32,
+        nr_queues: u32,
+        depth: u32,
+        io_buf_bytes: u32,
+        flags: u64,
+        tgt_flags: u64,
+        dev_flags: UblkFlags,
+    ) -> Result<UblkCtrl, UblkError> {
+        Self::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(UblkCtrlInner::new_with_params(
             name,
@@ -1919,31 +2099,7 @@ impl UblkCtrl {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
-        Self::validate_param((flags & !Self::UBLK_DRV_F_ALL) == 0)?;
-
-        if !Path::new(CTRL_PATH).exists() {
-            eprintln!("Please run `modprobe ublk_drv` first");
-            return Err(UblkError::OtherError(-libc::ENOENT));
-        }
-
-        Self::validate_param(!dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0))?;
-
-        // Check mlock feature compatibility
-        if dev_flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
-            // mlock feature is incompatible with certain other features
-            Self::validate_param(
-                (flags & sys::UBLK_F_USER_COPY as u64) == 0
-                    && (flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0
-                    && (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) == 0,
-            )?;
-        }
-
-        Self::validate_param(id >= -1)?;
-        Self::validate_param(nr_queues <= sys::UBLK_MAX_NR_QUEUES)?;
-        Self::validate_param(depth <= sys::UBLK_MAX_QUEUE_DEPTH)?;
-
-        let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
-        Self::validate_param(io_buf_bytes <= MAX_BUF_SZ && (io_buf_bytes & (page_sz - 1)) == 0)?;
+        Self::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(
             UblkCtrlInner::new_with_params_async(
@@ -2066,26 +2222,31 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    pub async fn configure_queue_async(
+        &self,
+        dev: &UblkDev,
+        qid: u16,
+        tid: i32,
+    ) -> Result<i32, UblkError> {
+        let mut ctrl = self.get_inner_mut();
+
+        ctrl.store_queue_tid(qid, tid);
+
+        ctrl.nr_queues_configured += 1;
+
+        if ctrl.nr_queues_configured == ctrl.dev_info.nr_hw_queues {
+            ctrl.build_json_async(dev).await?;
+        }
+
+        Ok(0)
+    }
+
     /// Dump this device info
     ///
     /// The 1st part is from UblkCtrl.dev_info, and the 2nd part is
     /// retrieved from device's exported json file
-    pub fn dump(&self) {
-        let mut ctrl = self.get_inner_mut();
-        let mut p = sys::ublk_params {
-            ..Default::default()
-        };
-
-        if ctrl.read_dev_info().is_err() {
-            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
-            return;
-        }
-
-        if ctrl.get_params(&mut p).is_err() {
-            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
-            return;
-        }
-
+    /// Print device info after data has been collected
+    fn dump_device_info(ctrl: &UblkCtrlInner, p: &sys::ublk_params) {
         let info = &ctrl.dev_info;
         println!(
             "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
@@ -2111,7 +2272,25 @@ impl UblkCtrl {
             info.owner_uid,
             info.owner_gid
         );
+    }
 
+    pub fn dump(&self) {
+        let mut ctrl = self.get_inner_mut();
+        let mut p = sys::ublk_params {
+            ..Default::default()
+        };
+
+        if ctrl.read_dev_info().is_err() {
+            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
+            return;
+        }
+
+        if ctrl.get_params(&mut p).is_err() {
+            error!("Dump dev {} failed\n", ctrl.dev_info.dev_id);
+            return;
+        }
+
+        Self::dump_device_info(&ctrl, &p);
         ctrl.dump_from_json();
     }
 
@@ -2142,32 +2321,7 @@ impl UblkCtrl {
             e
         })?;
 
-        let info = &ctrl.dev_info;
-        println!(
-            "\ndev id {}: nr_hw_queues {} queue_depth {} block size {} dev_capacity {}",
-            info.dev_id,
-            info.nr_hw_queues,
-            info.queue_depth,
-            1 << p.basic.logical_bs_shift,
-            p.basic.dev_sectors
-        );
-        println!(
-            "\tmax rq size {} daemon pid {} flags 0x{:x} state {}",
-            info.max_io_buf_bytes,
-            info.ublksrv_pid,
-            info.flags,
-            ctrl.dev_state_desc()
-        );
-        println!(
-            "\tublkc: {}:{} ublkb: {}:{} owner: {}:{}",
-            p.devt.char_major,
-            p.devt.char_minor,
-            p.devt.disk_major,
-            p.devt.disk_minor,
-            info.owner_uid,
-            info.owner_gid
-        );
-
+        Self::dump_device_info(&ctrl, &p);
         ctrl.dump_from_json();
         Ok(())
     }
@@ -2532,12 +2686,49 @@ impl UblkCtrl {
             })
     }
 
-    /// Set thread affinity using pthread handle
+    async fn calculate_queue_affinity_async(&self, queue_id: u16) -> UblkQueueAffinity {
+        let affi = self
+            .get_inner_mut()
+            .create_thread_affinity_async(queue_id)
+            .await
+            .unwrap_or_else(|_| {
+                // Fallback to kernel affinity if thread affinity creation fails
+                let mut affinity = UblkQueueAffinity::new();
+                self.get_queue_affinity(queue_id as u32, &mut affinity)
+                    .unwrap_or_default();
+                affinity
+            });
+        log::info!("calculate queue affinity...done\n");
+        affi
+    }
+
+    /// Set queue thread affinity using pthread handle
     ///
     /// This function sets CPU affinity for the specified pthread handle.
     /// It should be called from the main thread context after receiving
     /// the pthread handle from the queue thread.
-    fn set_thread_affinity(pthread_handle: libc::pthread_t, affinity: &UblkQueueAffinity) {
+    pub fn set_thread_affinity(&self, qid: u16, pthread_handle: libc::pthread_t) {
+        // Calculate and set affinity using the pthread handle
+        let affinity = self.calculate_queue_affinity(qid);
+
+        unsafe {
+            libc::pthread_setaffinity_np(
+                pthread_handle,
+                affinity.buf_len(),
+                affinity.addr() as *const libc::cpu_set_t,
+            );
+        }
+    }
+
+    /// Set queue thread affinity using pthread handle
+    ///
+    /// This function sets CPU affinity for the specified pthread handle.
+    /// It should be called from the main thread context after receiving
+    /// the pthread handle from the queue thread.
+    pub async fn set_thread_affinity_async(&self, qid: u16, pthread_handle: libc::pthread_t) {
+        // Calculate and set affinity using the pthread handle
+        let affinity = self.calculate_queue_affinity_async(qid).await;
+
         unsafe {
             libc::pthread_setaffinity_np(
                 pthread_handle,
@@ -2551,7 +2742,7 @@ impl UblkCtrl {
     ///
     /// This function sets up the basic thread properties and returns
     /// the pthread handle and thread ID for external affinity configuration.
-    fn init_queue_thread() -> (libc::pthread_t, libc::pid_t) {
+    pub fn init_queue_thread() -> (libc::pthread_t, libc::pid_t) {
         let pthread_handle = unsafe { libc::pthread_self() };
         let tid = unsafe { libc::gettid() };
 
@@ -2604,10 +2795,7 @@ impl UblkCtrl {
                 }
             };
 
-            // Calculate and set affinity using the pthread handle
-            let affinity = self.calculate_queue_affinity(qid);
-            Self::set_thread_affinity(pthread_handle, &affinity);
-
+            self.set_thread_affinity(qid, pthread_handle);
             if let Err(e) = self.configure_queue(dev, qid, tid) {
                 eprintln!(
                     "Warning: configure queue failed for {}-{}: {:?}",
@@ -2685,6 +2873,7 @@ impl UblkCtrl {
 mod tests {
     use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use crate::uring_async::ublk_block_on_ctrl_tasks;
     use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
     use std::cell::Cell;
@@ -2796,8 +2985,6 @@ mod tests {
 
     #[test]
     fn test_get_queue_affinity_async() {
-        use crate::uring_async::ublk_join_tasks;
-
         let exe_rc = Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
 
@@ -2836,7 +3023,7 @@ mod tests {
         });
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
+            let _ = ublk_block_on_ctrl_tasks(&exe, vec![job], None);
         }));
 
         println!("✓ get_queue_affinity_async method implemented correctly");
@@ -3066,8 +3253,6 @@ mod tests {
     /// Test async APIs
     #[test]
     fn test_async_apis() {
-        use crate::uring_async::ublk_join_tasks;
-
         let _ = env_logger::builder()
             .format_target(false)
             .format_timestamp(None)
@@ -3162,7 +3347,7 @@ mod tests {
         });
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
+            let _ = ublk_block_on_ctrl_tasks(&exe, vec![job], None);
         }));
 
         println!("✓ Async constructor methods are properly defined");
@@ -3209,10 +3394,12 @@ mod tests {
     }
 
     async fn device_handler_async() -> Result<(), UblkError> {
+        let nr_queues = 4;
         let ctrl = UblkCtrlBuilder::default()
             .name("test_async")
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
             .depth(8)
+            .nr_queues(nr_queues)
             .build_async()
             .await
             .unwrap();
@@ -3223,18 +3410,25 @@ mod tests {
         };
         let dev_arc = &std::sync::Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl)?);
         let dev = dev_arc.clone();
-        assert!(dev_arc.dev_info.nr_hw_queues == 1);
 
-        // Todo: support to handle multiple queues in one thread context
         let qh = std::thread::spawn(move || {
-            let q_rc = Rc::new(UblkQueue::new(0 as u16, &dev).unwrap());
-            let q = q_rc.clone();
+            let mut manager = crate::MultiQueueManager::new();
             let exe = smol::LocalExecutor::new();
             let mut f_vec: Vec<smol::Task<()>> = Vec::new();
 
-            q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
+            for i in 0..nr_queues {
+                manager.create_queue(i as u16, &dev).unwrap();
+            }
+            manager
+                .register_resources()
+                .expect("register resource failed");
 
-            crate::uring_async::ublk_wait_and_handle_ios(&exe, &q_rc);
+            for q_rc in manager.values() {
+                let q = q_rc.clone();
+                q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
+            }
+
+            crate::uring_async::ublk_handle_ios_in_current_thread(&manager, &exe, |_, _, _| {});
             smol::block_on(async { futures::future::join_all(f_vec).await });
         });
 
@@ -3250,13 +3444,13 @@ mod tests {
         qh.join().unwrap_or_else(|_| {
             eprintln!("dev-{} join queue thread failed", dev_arc.dev_info.dev_id)
         });
+
         Ok(())
     }
 
     /// Test async APIs for building ublk device
     #[test]
     fn test_create_ublk_async() {
-        use crate::uring_async::ublk_join_tasks;
         let _ = env_logger::builder()
             .format_target(false)
             .format_timestamp(None)
@@ -3268,14 +3462,19 @@ mod tests {
         //support 64 devices
         crate::ctrl::init_ctrl_task_ring_default(64 * 2).unwrap();
 
+        // Create eventfd for test coverage
+        let eventfd = nix::sys::eventfd::eventfd(0, nix::sys::eventfd::EfdFlags::empty()).unwrap();
+
         for _ in 0..64 {
-            fvec.push(exe_rc.spawn(async {
+            fvec.push(exe_rc.spawn(async move {
                 device_handler_async().await.unwrap();
+                // Write to eventfd to wakeup ublk_block_on_ctrl_tasks
+                let _ = UblkCtrl::wakeup_control_ring(eventfd);
             }));
         }
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, fvec);
+            let _ = ublk_block_on_ctrl_tasks(&exe, fvec, Some(eventfd));
         }));
     }
 
@@ -3283,8 +3482,6 @@ mod tests {
     #[test]
     fn test_ctrl_async_await_flag_enforcement() {
         // Test with async flag support using a sync runtime context
-        use crate::uring_async::ublk_join_tasks;
-
         let exe_rc = std::rc::Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
 
@@ -3367,7 +3564,7 @@ mod tests {
         });
 
         smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
+            let _ = ublk_block_on_ctrl_tasks(&exe, vec![job], None);
         }));
 
         println!("✓ UBLK_CTRL_ASYNC_AWAIT flag enforcement tests passed");
