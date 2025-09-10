@@ -243,9 +243,8 @@ impl<'a> MultiQueueManager<'a> {
         }
 
         // Register resources with the thread-local io_uring ring
-        crate::uring::UBLK_URING.with(|ublk_uring| {
-            ublk_uring
-                .with_ring_mut(|ring| self.resource_manager.register_resources_with_ring(ring))
+        crate::uring::with_ring_mut(|ring| {
+            self.resource_manager.register_resources_with_ring(ring)
         })?;
 
         self.resources_registered = true;
@@ -277,8 +276,8 @@ impl<'a> MultiQueueManager<'a> {
         }
 
         // Unregister resources with the thread-local io_uring ring
-        crate::uring::UBLK_URING.with(|ublk_uring| {
-            ublk_uring.with_ring_mut(|ring| self.resource_manager.unregister_resources(ring))
+        crate::uring::with_ring_mut(|ring| {
+            self.resource_manager.unregister_resources(ring)
         })?;
 
         self.resources_registered = false;

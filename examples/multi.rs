@@ -202,16 +202,12 @@ fn queue_thread_fn(
 
 fn setup_ring(nr_dev: u16, depth: u16) -> Result<(), UblkError> {
     let qd = depth * nr_dev;
-    libublk::io::ublk_init_task_ring(|cell| {
-        if cell.get().is_none() {
-            let ring = io_uring::IoUring::builder()
-                    .setup_cqsize(qd.into())  // Custom completion queue size
-                    .setup_coop_taskrun()  // Enable cooperative task running
-                    .build(qd.into())?; // Custom submission queue size
-            cell.set(std::cell::RefCell::new(ring))
-                .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-        }
-        Ok(())
+    libublk::io::ublk_init_task_ring(|| {
+        let ring = io_uring::IoUring::builder()
+                .setup_cqsize(qd.into())  // Custom completion queue size
+                .setup_coop_taskrun()  // Enable cooperative task running
+                .build(qd.into())?; // Custom submission queue size
+        Ok(ring)
     })
 }
 

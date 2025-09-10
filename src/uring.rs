@@ -5,7 +5,7 @@
 
 use super::UblkError;
 use io_uring::{squeue, IoUring};
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::os::unix::io::RawFd;
 
 /// Queue resource range tracking for multi-queue scenarios
@@ -163,73 +163,48 @@ impl Drop for UringResourceManager {
     }
 }
 
-/// Thread-local io_uring instance management
-///
-/// This structure encapsulates the io_uring instance for thread-local usage.
-/// Resource management is now handled by MultiQueueManager.
-pub struct UblkUring {
-    /// The io_uring instance
-    ring: OnceCell<RefCell<IoUring<squeue::Entry>>>,
-}
+/// Helper functions for thread-local io_uring instance management
 
-impl UblkUring {
-    pub fn new() -> Self {
-        Self {
-            ring: OnceCell::new(),
-        }
-    }
-
-    /// Access the ring with immutable reference
-    pub fn with_ring<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&IoUring<squeue::Entry>) -> R,
-    {
-        if let Some(ring_cell) = self.ring.get() {
-            let ring = ring_cell.borrow();
-            f(&*ring)
+/// Access the ring with immutable reference
+pub fn with_ring<F, R>(f: F) -> R
+where
+    F: FnOnce(&IoUring<squeue::Entry>) -> R,
+{
+    UBLK_URING.with(|ring_cell| {
+        let ring_ref = ring_cell.borrow();
+        if let Some(ref ring) = *ring_ref {
+            f(ring)
         } else {
             panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
         }
-    }
+    })
+}
 
-    /// Access the ring with mutable reference
-    pub fn with_ring_mut<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
-    {
-        if let Some(ring_cell) = self.ring.get() {
-            let mut ring = ring_cell.borrow_mut();
-            f(&mut *ring)
+/// Access the ring with mutable reference
+pub fn with_ring_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
+{
+    UBLK_URING.with(|ring_cell| {
+        let mut ring_ref = ring_cell.borrow_mut();
+        if let Some(ref mut ring) = *ring_ref {
+            f(ring)
         } else {
             panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
         }
-    }
-
-    /// Initialize the ring using a custom closure
-    pub fn init_ring<F>(&self, init_fn: F) -> Result<(), UblkError>
-    where
-        F: FnOnce(&OnceCell<RefCell<IoUring<squeue::Entry>>>) -> Result<(), UblkError>,
-    {
-        init_fn(&self.ring)
-    }
+    })
 }
 
-impl Drop for UblkUring {
-    fn drop(&mut self) {
-        // Ring cleanup is handled automatically by Drop
-        // Resource management is now handled by MultiQueueManager
-    }
+/// Initialize the ring with a custom one (only when None)
+pub fn set_ring(new_ring: IoUring<squeue::Entry>) -> Option<IoUring<squeue::Entry>> {
+    UBLK_URING.with(|ring_cell| {
+        ring_cell.replace(Some(new_ring))
+    })
 }
 
-impl Default for UblkUring {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Thread-local unified uring instance
+// Thread-local unified uring instance - direct RefCell<Option<IoUring<squeue::Entry>>>
 std::thread_local! {
-    pub(crate) static UBLK_URING: UblkUring = UblkUring::new();
+    pub(crate) static UBLK_URING: RefCell<Option<IoUring<squeue::Entry>>> = RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -512,18 +487,13 @@ mod tests {
         use crate::io::ublk_init_task_ring;
         use crate::multi_queue::MultiQueueManager;
         use io_uring::IoUring;
-        use std::cell::RefCell;
 
-        ublk_init_task_ring(|cell| {
-            if cell.get().is_none() {
-                let ring = IoUring::builder()
-                    .setup_cqsize(64)
-                    .build(32)
-                    .map_err(crate::UblkError::IOError)?;
-                cell.set(RefCell::new(ring))
-                    .map_err(|_| crate::UblkError::OtherError(-libc::EEXIST))?;
-            }
-            Ok(())
+        ublk_init_task_ring(|| {
+            let ring = IoUring::builder()
+                .setup_cqsize(64)
+                .build(32)
+                .map_err(crate::UblkError::IOError)?;
+            Ok(ring)
         })
         .expect("Failed to initialize ring for test");
 

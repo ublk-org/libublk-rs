@@ -16,23 +16,18 @@
 //! ```no_run
 //! use libublk::ublk_init_task_ring;
 //! use io_uring::IoUring;
-//! use std::cell::RefCell;
 //!
 //! fn example() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Custom initialization before creating UblkQueue
-//!     ublk_init_task_ring(|cell| {
-//!         if cell.get().is_none() {
-//!             let ring = IoUring::builder()
-//!                 .setup_cqsize(256)  // Custom completion queue size
-//!                 .setup_coop_taskrun()  // Enable cooperative task running
-//!                 .build(128)?;  // Custom submission queue size
-//!             cell.set(RefCell::new(ring))
-//!                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-//!         }
-//!         Ok(())
+//!     ublk_init_task_ring(|| {
+//!         let ring = IoUring::builder()
+//!             .setup_cqsize(256)  // Custom completion queue size
+//!             .setup_coop_taskrun()  // Enable cooperative task running
+//!             .build(128)?;  // Custom submission queue size
+//!         Ok(ring)
 //!     })?;
 //!     
-//!     // Now create UblkQueue - it will use the pre-initialized ring
+//!     // Now create UblkQueue - it will use the custom ring
 //!     println!("Ring initialized! Create UblkQueue to use it.");
 //!     Ok(())
 //! }
@@ -42,20 +37,15 @@
 //! ```no_run
 //! use libublk::ublk_init_task_ring;
 //! use io_uring::IoUring;
-//! use std::cell::RefCell;
 //!
 //! fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
-//!     ublk_init_task_ring(|cell| {
-//!         if cell.get().is_none() {
-//!             let ring = IoUring::builder()
-//!                 .setup_cqsize(512)
-//!                 .setup_sqpoll(1000)  // Enable SQPOLL mode
-//!                 .setup_iopoll()      // Enable IOPOLL for high performance
-//!                 .build(256)?;
-//!             cell.set(RefCell::new(ring))
-//!                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-//!         }
-//!         Ok(())
+//!     ublk_init_task_ring(|| {
+//!         let ring = IoUring::builder()
+//!             .setup_cqsize(512)
+//!             .setup_sqpoll(1000)  // Enable SQPOLL mode
+//!             .setup_iopoll()      // Enable IOPOLL for high performance
+//!             .build(256)?;
+//!         Ok(ring)
 //!     })?;
 //!     println!("Advanced ring initialized!");
 //!     Ok(())
@@ -152,10 +142,10 @@ use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
 use crate::multi_queue::MultiQueueManager;
-use crate::uring::{QueueResourceRange, UBLK_URING};
+use crate::uring::QueueResourceRange;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -163,14 +153,14 @@ use std::os::unix::io::{AsRawFd, RawFd};
 #[macro_export]
 macro_rules! with_queue_ring_internal {
     ($closure:expr) => {
-        $crate::uring::UBLK_URING.with(|ublk_uring| ublk_uring.with_ring($closure))
+        $crate::uring::with_ring($closure)
     };
 }
 
 #[macro_export]
 macro_rules! with_queue_ring_mut_internal {
     ($closure:expr) => {
-        $crate::uring::UBLK_URING.with(|ublk_uring| ublk_uring.with_ring_mut($closure))
+        $crate::uring::with_ring_mut($closure)
     };
 }
 
@@ -226,36 +216,36 @@ where
 
 /// Initialize the thread-local queue ring using a custom closure
 ///
-/// This API allows users to customize the io_uring initialization before creating UblkQueue.
-/// The closure receives the OnceCell and can conditionally initialize it if not already set.
-/// If the thread-local variable is already initialized, the closure does nothing.
+/// This API allows users to customize the io_uring initialization for the current thread.
+/// The ring starts uninitialized, and this function will only initialize it if it's None.
+/// If already initialized, this function does nothing and returns Ok(()).
 ///
 /// # Arguments
-/// * `init_fn` - Closure that receives OnceCell<RefCell<IoUring<squeue::Entry>>> and returns
-///               Result<(), UblkError>. Should call `cell.set()` to initialize if needed.
+/// * `init_fn` - Closure that returns a configured IoUring instance.
 ///
 /// For detailed examples of basic and advanced initialization patterns, see the module-level documentation.
 pub fn ublk_init_task_ring<F>(init_fn: F) -> Result<(), UblkError>
 where
-    F: FnOnce(&OnceCell<RefCell<IoUring<squeue::Entry>>>) -> Result<(), UblkError>,
+    F: FnOnce() -> Result<IoUring<squeue::Entry>, UblkError>,
 {
-    UBLK_URING.with(|ublk_uring| ublk_uring.init_ring(init_fn))
+    crate::uring::UBLK_URING.with(|ring_cell| {
+        if ring_cell.borrow().is_none() {
+            let new_ring = init_fn()?;
+            ring_cell.replace(Some(new_ring));
+        }
+        Ok(())
+    })
 }
 
 /// Internal function to initialize the queue ring with default parameters
 fn init_task_ring_default(sq_depth: u32, cq_depth: u32) -> Result<(), UblkError> {
-    ublk_init_task_ring(|cell| {
-        if cell.get().is_none() {
-            let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
-                .setup_cqsize(cq_depth)
-                .setup_coop_taskrun()
-                .build(sq_depth)
-                .map_err(UblkError::IOError)?;
-
-            cell.set(RefCell::new(ring))
-                .map_err(|_| UblkError::OtherError(-libc::EEXIST))?;
-        }
-        Ok(())
+    ublk_init_task_ring(|| {
+        let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
+            .setup_cqsize(cq_depth)
+            .setup_coop_taskrun()
+            .build(sq_depth)
+            .map_err(UblkError::IOError)?;
+        Ok(ring)
     })
 }
 
@@ -1017,9 +1007,16 @@ impl UblkQueue<'_> {
             return Err(UblkError::InvalidVal);
         }
 
-        // Initialize the thread-local queue ring with default parameters
-        // Users can call init_task_ring() before UblkQueue::new() to customize initialization
-        init_task_ring_default(sq_depth as u32, cq_depth as u32)?;
+        // Initialize the thread-local queue ring if not already initialized
+        // Users can call ublk_init_task_ring() before UblkQueue::new() to customize initialization
+        // Once initialized, we use the existing ring regardless of parameters
+        crate::uring::UBLK_URING.with(|ring_cell| {
+            if ring_cell.borrow().is_none() {
+                init_task_ring_default(sq_depth as u32, cq_depth as u32)
+            } else {
+                Ok(())
+            }
+        })?;
 
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();
@@ -2480,37 +2477,30 @@ mod tests {
     #[test]
     fn test_init_task_ring_api() {
         use crate::ublk_init_task_ring;
-        use std::cell::RefCell;
 
         // Test custom initialization
-        let result = ublk_init_task_ring(|cell| {
-            if cell.get().is_none() {
-                let ring = IoUring::builder()
-                    .setup_cqsize(64)
-                    .build(32)
-                    .map_err(UblkError::IOError)?;
-
-                cell.set(RefCell::new(ring))
-                    .map_err(|_| UblkError::OtherError(-libc::EEXIST))?;
-            }
-            Ok(())
+        let result = ublk_init_task_ring(|| {
+            let ring = IoUring::builder()
+                .setup_cqsize(64)
+                .build(32)
+                .map_err(UblkError::IOError)?;
+            Ok(ring)
         });
 
         assert!(result.is_ok(), "Failed to initialize queue ring");
 
-        // Test that subsequent calls don't overwrite
-        let result2 = ublk_init_task_ring(|cell| {
-            // This should be a no-op since it's already initialized
-            assert!(
-                cell.get().is_some(),
-                "Queue ring should already be initialized"
-            );
-            Ok(())
+        // Test that subsequent calls do nothing (don't replace existing ring)
+        let result2 = ublk_init_task_ring(|| {
+            let ring = IoUring::builder()
+                .setup_cqsize(128)
+                .build(64)
+                .map_err(UblkError::IOError)?;
+            Ok(ring)
         });
 
-        assert!(result2.is_ok(), "Second initialization call should succeed");
+        assert!(result2.is_ok(), "Second initialization call should succeed but do nothing");
 
-        // Test that we can access the initialized ring
+        // Test that we can access the initialized ring (should still be the first one)
         let access_result = with_queue_ring_internal!(|ring: &IoUring<io_uring::squeue::Entry>| {
             // Just verify we can access the ring
             ring.params().sq_entries()
@@ -2518,7 +2508,7 @@ mod tests {
 
         assert_eq!(
             access_result, 32,
-            "Should match the custom sq_entries we set"
+            "Should match the custom sq_entries from the first call (second call should be ignored)"
         );
 
         // Test the new public functions (they require a UblkQueue but we can't create one in tests)
@@ -2531,11 +2521,14 @@ mod tests {
         use crate::{io::init_task_ring_default, with_queue_ring, with_queue_ring_mut};
 
         let ctrl = UblkCtrlBuilder::default()
+            .depth(16)  // Match the custom ring configuration
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut _| {
+        let tgt_init = |dev: &mut UblkDev| {
+            // Set custom cq_depth to match the ring configuration
+            dev.tgt.cq_depth = 32;
             init_task_ring_default(16, 32)?;
             let q = UblkQueue::new(0, dev)?;
 
