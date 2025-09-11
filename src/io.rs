@@ -85,8 +85,8 @@
 //! use libublk::sys;
 //!
 //! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
-//!     let auto_reg = sys::ublk_auto_buf_reg { 
-//!         index: 0, flags: 0, reserved0: 0, reserved1: 0 
+//!     let auto_reg = sys::ublk_auto_buf_reg {
+//!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
 //!     let future = queue.submit_io_cmd_unified(1, sys::UBLK_U_IO_FETCH_REQ, auto_desc, -1)?;
@@ -990,7 +990,6 @@ impl UblkQueue<'_> {
         // Initialize the thread-local queue ring with default parameters
         // Users can call init_task_ring() before UblkQueue::new() to customize initialization
         init_task_ring_default(sq_depth as u32, cq_depth as u32)?;
-
 
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();

@@ -48,6 +48,7 @@ bitflags = "2.4.1"
 futures-timer = "3.0"
 
 [dev-dependencies]
+ctor = "0.5"
 block-utils = "0.11.0"
 tempfile = "3.6.0"
 regex = "1.8.4"

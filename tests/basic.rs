@@ -5,6 +5,7 @@ mod integration {
     use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
     use libublk::override_sqe;
     use libublk::uring_async::ublk_wait_and_handle_ios;
+    use libublk::uring_async::ublk_wake_task;
     use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkFlags, UblkIORes};
     use std::env;
     use std::io::{BufRead, BufReader};
@@ -12,6 +13,15 @@ mod integration {
     use std::process::{Command, Stdio};
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
+
+    #[ctor::ctor]
+    fn init_logger() {
+        let _ = env_logger::builder()
+            .format_target(false)
+            .format_timestamp(None)
+            .is_test(true)
+            .try_init();
+    }
 
     fn run_ublk_disk_sanity_test(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
         use std::os::unix::fs::PermissionsExt;
@@ -512,8 +522,21 @@ mod integration {
                 }));
             }
 
-            ublk_wait_and_handle_ios(&exe, &q_rc);
-            smol::block_on(async { futures::future::join_all(f_vec).await });
+            // Show standard async way, however, yield_now() does hurt perf, which is
+            // obviously slower than try_tick()
+            let q = q_rc.clone();
+            f_vec.push(exe.spawn(async move {
+                loop {
+                    if q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    //yield for handling incoming command
+                    smol::future::yield_now().await;
+                }
+            }));
+            smol::block_on(exe.run(futures::future::join_all(f_vec)));
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
