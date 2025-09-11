@@ -62,8 +62,8 @@ pub(crate) use with_ctrl_ring_mut_internal;
 /// Initialize the thread-local control ring using a custom closure
 ///
 /// This API allows users to customize the io_uring initialization for control operations.
-/// The closure receives a mutable reference to the Option and can conditionally initialize 
-/// it if not already set. If the thread-local variable is already initialized, the closure 
+/// The closure receives a mutable reference to the Option and can conditionally initialize
+/// it if not already set. If the thread-local variable is already initialized, the closure
 /// does nothing.
 ///
 /// # Arguments
@@ -2819,12 +2819,42 @@ impl UblkCtrl {
 mod tests {
     use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
+    use crate::uring_async::ublk_wake_task;
     use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
 
+    /// Block on all tasks in the executor until they are finished
+    fn ublk_join_tasks<T>(
+        exe: &smol::LocalExecutor,
+        tasks: Vec<smol::Task<T>>,
+    ) -> Result<(), UblkError> {
+        use io_uring::{squeue, IoUring};
+        loop {
+            // Check if all tasks are finished
+            if tasks.iter().all(|task| task.is_finished()) {
+                break;
+            }
+
+            // Drive the executor to make progress on tasks
+            while exe.try_tick() {}
+
+            // Handle control uring events
+            let entry =
+                crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+                    match r.submit_and_wait(0) {
+                        Err(_) => None,
+                        _ => r.completion().next(),
+                    }
+                });
+            if let Some(cqe) = entry {
+                ublk_wake_task(cqe.user_data(), &cqe);
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn test_ublk_get_features() {
         match UblkCtrl::get_features() {
@@ -2930,8 +2960,6 @@ mod tests {
 
     #[test]
     fn test_get_queue_affinity_async() {
-        use crate::uring_async::ublk_join_tasks;
-
         let exe_rc = Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
 
@@ -3200,8 +3228,6 @@ mod tests {
     /// Test async APIs
     #[test]
     fn test_async_apis() {
-        use crate::uring_async::ublk_join_tasks;
-
         let _ = env_logger::builder()
             .format_target(false)
             .format_timestamp(None)
@@ -3390,7 +3416,6 @@ mod tests {
     /// Test async APIs for building ublk device
     #[test]
     fn test_create_ublk_async() {
-        use crate::uring_async::ublk_join_tasks;
         let _ = env_logger::builder()
             .format_target(false)
             .format_timestamp(None)
@@ -3417,7 +3442,6 @@ mod tests {
     #[test]
     fn test_ctrl_async_await_flag_enforcement() {
         // Test with async flag support using a sync runtime context
-        use crate::uring_async::ublk_join_tasks;
 
         let exe_rc = std::rc::Rc::new(smol::LocalExecutor::new());
         let exe = exe_rc.clone();
