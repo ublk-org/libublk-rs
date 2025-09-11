@@ -6,7 +6,7 @@ use derive_setters::*;
 use io_uring::{opcode, squeue, types, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, RwLock};
 use std::{
@@ -19,11 +19,11 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
 
-// per-thread control uring using OnceCell for conditional initialization
+// per-thread control uring - thread_local! is already lazy
 //
 std::thread_local! {
-    pub(crate) static CTRL_URING: OnceCell<RefCell<IoUring::<squeue::Entry128>>> =
-        OnceCell::new();
+    pub(crate) static CTRL_URING: RefCell<Option<IoUring::<squeue::Entry128>>> =
+        RefCell::new(None);
 }
 
 // Internal macro versions for backwards compatibility within the crate
@@ -31,9 +31,9 @@ std::thread_local! {
 macro_rules! with_ctrl_ring_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
-                let ring = ring_cell.borrow();
-                $closure(&*ring)
+            let ring_ref = cell.borrow();
+            if let Some(ref ring) = *ring_ref {
+                $closure(ring)
             } else {
                 panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
             }
@@ -45,9 +45,9 @@ macro_rules! with_ctrl_ring_internal {
 macro_rules! with_ctrl_ring_mut_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
-                let mut ring = ring_cell.borrow_mut();
-                $closure(&mut *ring)
+            let mut ring_ref = cell.borrow_mut();
+            if let Some(ref mut ring) = *ring_ref {
+                $closure(ring)
             } else {
                 panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
             }
@@ -62,12 +62,13 @@ pub(crate) use with_ctrl_ring_mut_internal;
 /// Initialize the thread-local control ring using a custom closure
 ///
 /// This API allows users to customize the io_uring initialization for control operations.
-/// The closure receives the OnceCell and can conditionally initialize it if not already set.
-/// If the thread-local variable is already initialized, the closure does nothing.
+/// The closure receives a mutable reference to the Option and can conditionally initialize 
+/// it if not already set. If the thread-local variable is already initialized, the closure 
+/// does nothing.
 ///
 /// # Arguments
-/// * `init_fn` - Closure that receives OnceCell<RefCell<IoUring<squeue::Entry128>>> and returns
-///               Result<(), UblkError>. Should call `cell.set()` to initialize if needed.
+/// * `init_fn` - Closure that receives &mut Option<IoUring<squeue::Entry128>> and returns
+///               Result<(), UblkError>. Should set the Option to Some(ring) to initialize.
 ///
 /// # Examples
 ///
@@ -75,18 +76,16 @@ pub(crate) use with_ctrl_ring_mut_internal;
 /// ```no_run
 /// use libublk::ublk_init_ctrl_task_ring;
 /// use io_uring::IoUring;
-/// use std::cell::RefCell;
 ///
 /// fn example() -> Result<(), Box<dyn std::error::Error>> {
 ///     // Custom initialization before creating UblkCtrl
-///     ublk_init_ctrl_task_ring(|cell| {
-///         if cell.get().is_none() {
+///     ublk_init_ctrl_task_ring(|ring_opt| {
+///         if ring_opt.is_none() {
 ///             let ring = IoUring::builder()
 ///                 .setup_cqsize(256)  // Custom completion queue size
 ///                 .setup_coop_taskrun()  // Enable cooperative task running
 ///                 .build(128)?;  // Custom submission queue size
-///             cell.set(RefCell::new(ring))
-///                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+///             *ring_opt = Some(ring);
 ///         }
 ///         Ok(())
 ///     })?;
@@ -101,18 +100,16 @@ pub(crate) use with_ctrl_ring_mut_internal;
 /// ```no_run
 /// use libublk::ublk_init_ctrl_task_ring;
 /// use io_uring::IoUring;
-/// use std::cell::RefCell;
 ///
 /// fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
-///     ublk_init_ctrl_task_ring(|cell| {
-///         if cell.get().is_none() {
+///     ublk_init_ctrl_task_ring(|ring_opt| {
+///         if ring_opt.is_none() {
 ///             let ring = IoUring::builder()
 ///                 .setup_cqsize(512)
 ///                 .setup_sqpoll(1000)  // Enable SQPOLL mode
 ///                 .setup_iopoll()      // Enable IOPOLL for high performance
 ///                 .build(256)?;
-///             cell.set(RefCell::new(ring))
-///                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+///             *ring_opt = Some(ring);
 ///         }
 ///         Ok(())
 ///     })?;
@@ -122,24 +119,25 @@ pub(crate) use with_ctrl_ring_mut_internal;
 /// ```
 pub fn ublk_init_ctrl_task_ring<F>(init_fn: F) -> Result<(), UblkError>
 where
-    F: FnOnce(&OnceCell<RefCell<IoUring<squeue::Entry128>>>) -> Result<(), UblkError>,
+    F: FnOnce(&mut Option<IoUring<squeue::Entry128>>) -> Result<(), UblkError>,
 {
-    CTRL_URING.with(|cell| init_fn(cell))
+    CTRL_URING.with(|cell| {
+        let mut ring_ref = cell.borrow_mut();
+        init_fn(&mut *ring_ref)
+    })
 }
 
 /// Internal function to initialize the control ring with default parameters
 ///
 /// This is called by UblkCtrlInner::new()/new_async() when the ring hasn't been
-/// initialized yet. Uses default values similar to the original LazyCell approach.
+/// initialized yet. Uses default values similar to the original approach.
 fn init_ctrl_task_ring_default(depth: u32) -> Result<(), UblkError> {
-    ublk_init_ctrl_task_ring(|cell| {
-        if cell.get().is_none() {
+    ublk_init_ctrl_task_ring(|ring_opt| {
+        if ring_opt.is_none() {
             let ring = IoUring::<squeue::Entry128>::builder()
                 .build(depth)
                 .map_err(UblkError::IOError)?;
-
-            cell.set(RefCell::new(ring))
-                .map_err(|_| UblkError::OtherError(-libc::EEXIST))?;
+            *ring_opt = Some(ring);
         }
         Ok(())
     })
