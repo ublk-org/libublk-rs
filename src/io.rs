@@ -1,3 +1,127 @@
+//! # Ublk I/O Operations Module
+//!
+//! This module provides the core I/O functionality for ublk devices, including queue management,
+//! buffer handling, and unified APIs for both traditional copy-based and zero-copy operations.
+//!
+//! ## Key Components
+//!
+//! - **Queue Management**: `UblkQueue` provides per-queue I/O handling with io_uring integration
+//! - **Buffer Descriptors**: `BufDesc` and `BufDescList` provide unified buffer management
+//! - **Device Abstraction**: `UblkDev` represents ublk device instances
+//! - **I/O Context**: `UblkIOCtx` provides context for handling I/O operations
+//!
+//! ## Ring Initialization Examples
+//!
+//! ### Basic Custom Initialization
+//! ```no_run
+//! use libublk::ublk_init_task_ring;
+//! use io_uring::IoUring;
+//! use std::cell::RefCell;
+//!
+//! fn example() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Custom initialization before creating UblkQueue
+//!     ublk_init_task_ring(|cell| {
+//!         if cell.get().is_none() {
+//!             let ring = IoUring::builder()
+//!                 .setup_cqsize(256)  // Custom completion queue size
+//!                 .setup_coop_taskrun()  // Enable cooperative task running
+//!                 .build(128)?;  // Custom submission queue size
+//!             cell.set(RefCell::new(ring))
+//!                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+//!         }
+//!         Ok(())
+//!     })?;
+//!     
+//!     // Now create UblkQueue - it will use the pre-initialized ring
+//!     println!("Ring initialized! Create UblkQueue to use it.");
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Advanced Initialization with Custom Flags
+//! ```no_run
+//! use libublk::ublk_init_task_ring;
+//! use io_uring::IoUring;
+//! use std::cell::RefCell;
+//!
+//! fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
+//!     ublk_init_task_ring(|cell| {
+//!         if cell.get().is_none() {
+//!             let ring = IoUring::builder()
+//!                 .setup_cqsize(512)
+//!                 .setup_sqpoll(1000)  // Enable SQPOLL mode
+//!                 .setup_iopoll()      // Enable IOPOLL for high performance
+//!                 .build(256)?;
+//!             cell.set(RefCell::new(ring))
+//!                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+//!         }
+//!         Ok(())
+//!     })?;
+//!     println!("Advanced ring initialized!");
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Unified Buffer API Examples
+//!
+//! ### Traditional Buffer Operations
+//! ```no_run
+//! use libublk::io::{BufDesc, UblkQueue};
+//! use libublk::helpers::IoBuf;
+//! use libublk::sys;
+//!
+//! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
+//!     let io_buf = IoBuf::<u8>::new(4096);
+//!     let slice_desc = BufDesc::from_io_buf(&io_buf);
+//!     let future = queue.submit_io_cmd_unified(0, sys::UBLK_U_IO_FETCH_REQ, slice_desc, -1)?;
+//!     // ... handle future
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Zero-Copy Operations
+//! ```no_run
+//! use libublk::io::{BufDesc, UblkQueue};
+//! use libublk::sys;
+//!
+//! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
+//!     let auto_reg = sys::ublk_auto_buf_reg {
+//!         index: 0, flags: 0, reserved0: 0, reserved1: 0
+//!     };
+//!     let auto_desc = BufDesc::AutoReg(auto_reg);
+//!     let future = queue.submit_io_cmd_unified(1, sys::UBLK_U_IO_FETCH_REQ, auto_desc, -1)?;
+//!     // ... handle future
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### Buffer List Operations
+//! ```no_run
+//! use libublk::io::{BufDescList, UblkQueue};
+//! use libublk::helpers::IoBuf;
+//! use libublk::sys;
+//!
+//! fn example(queue: UblkQueue) -> Result<UblkQueue, libublk::UblkError> {
+//!     // For traditional buffer operations
+//!     let mut bufs = Vec::new();
+//!     for _ in 0..queue.get_depth() {
+//!         bufs.push(IoBuf::<u8>::new(4096));
+//!     }
+//!     let slice_list = BufDescList::Slices(Some(&bufs));
+//!     let queue = queue.submit_fetch_commands_unified(slice_list)?;
+//!
+//!     // For zero-copy operations
+//!     let auto_regs: Vec<sys::ublk_auto_buf_reg> = (0..queue.get_depth())
+//!         .map(|i| sys::ublk_auto_buf_reg {
+//!             index: i as u16, flags: 0, reserved0: 0, reserved1: 0,
+//!         })
+//!         .collect();
+//!     let auto_list = BufDescList::AutoRegs(&auto_regs);
+//!     let queue = queue.submit_fetch_commands_unified(auto_list)?;
+//!     Ok(queue)
+//! }
+//! ```
+
 use super::uring_async::UblkUringOpFuture;
 #[cfg(feature = "fat_complete")]
 use super::UblkFatRes;
@@ -11,7 +135,6 @@ use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 // Unified thread-local io_uring for all queue operations
-// Previously had separate TASK_URING, but now consolidated into QUEUE_RING
 
 // Thread-local queue ring using OnceCell for conditional initialization
 std::thread_local! {
@@ -108,58 +231,7 @@ where
 /// * `init_fn` - Closure that receives OnceCell<RefCell<IoUring<squeue::Entry>>> and returns
 ///               Result<(), UblkError>. Should call `cell.set()` to initialize if needed.
 ///
-/// # Examples
-///
-/// ## Basic custom initialization:
-/// ```no_run
-/// use libublk::ublk_init_task_ring;
-/// use io_uring::IoUring;
-/// use std::cell::RefCell;
-///
-/// fn example() -> Result<(), Box<dyn std::error::Error>> {
-///     // Custom initialization before creating UblkQueue
-///     ublk_init_task_ring(|cell| {
-///         if cell.get().is_none() {
-///             let ring = IoUring::builder()
-///                 .setup_cqsize(256)  // Custom completion queue size
-///                 .setup_coop_taskrun()  // Enable cooperative task running
-///                 .build(128)?;  // Custom submission queue size
-///             cell.set(RefCell::new(ring))
-///                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-///         }
-///         Ok(())
-///     })?;
-///     
-///     // Now create UblkQueue - it will use the pre-initialized ring
-///     // External users should use UblkQueue APIs rather than direct ring access
-///     println!("Ring initialized! Create UblkQueue to use it.");
-///     Ok(())
-/// }
-/// ```
-///
-/// ## Advanced initialization with custom flags:
-/// ```no_run
-/// use libublk::ublk_init_task_ring;
-/// use io_uring::IoUring;
-/// use std::cell::RefCell;
-///
-/// fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
-///     ublk_init_task_ring(|cell| {
-///         if cell.get().is_none() {
-///             let ring = IoUring::builder()
-///                 .setup_cqsize(512)
-///                 .setup_sqpoll(1000)  // Enable SQPOLL mode
-///                 .setup_iopoll()      // Enable IOPOLL for high performance
-///                 .build(256)?;
-///             cell.set(RefCell::new(ring))
-///                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-///         }
-///         Ok(())
-///     })?;
-///     println!("Advanced ring initialized!");
-///     Ok(())
-/// }
-/// ```
+/// For detailed examples of basic and advanced initialization patterns, see the module-level documentation.
 pub fn ublk_init_task_ring<F>(init_fn: F) -> Result<(), UblkError>
 where
     F: FnOnce(&OnceCell<RefCell<IoUring<squeue::Entry>>>) -> Result<(), UblkError>,
@@ -919,8 +991,6 @@ impl UblkQueue<'_> {
         // Users can call init_task_ring() before UblkQueue::new() to customize initialization
         init_task_ring_default(sq_depth as u32, cq_depth as u32)?;
 
-        //todo: apply io_uring flags from tgt.ring_flags
-
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
@@ -1288,34 +1358,10 @@ impl UblkQueue<'_> {
     /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
     /// * `BufDesc::RawAddress` - Compatible with all device configurations (unsafe)
     ///
-    /// # Validation:
-    ///
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
     ///
-    /// # Performance:
-    ///
-    /// This method has zero runtime overhead compared to calling the existing methods
-    /// directly, as it uses compile-time dispatch based on the buffer descriptor variant.
-    ///
-    /// # Usage Example:
-    ///
-    /// ```no_run
-    /// # use libublk::io::{BufDesc, UblkQueue};
-    /// # use libublk::sys;
-    /// # fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
-    /// // For traditional buffer operations
-    /// let buffer = [0u8; 4096];
-    /// let slice_desc = BufDesc::Slice(&buffer);
-    /// let future1 = queue.submit_io_cmd_unified(0, sys::UBLK_U_IO_FETCH_REQ, slice_desc, -1)?;
-    ///
-    /// // For zero-copy operations
-    /// let auto_reg = sys::ublk_auto_buf_reg { index: 0, flags: 0, reserved0: 0, reserved1: 0 };
-    /// let auto_desc = BufDesc::AutoReg(auto_reg);
-    /// let future2 = queue.submit_io_cmd_unified(1, sys::UBLK_U_IO_FETCH_REQ, auto_desc, -1)?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// For usage examples, see the module-level documentation.
     #[inline]
     pub fn submit_io_cmd_unified(
         &self,
@@ -1563,35 +1609,7 @@ impl UblkQueue<'_> {
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO.
     ///
-    /// # Usage Example:
-    ///
-    /// ```no_run
-    /// # use libublk::io::{BufDescList, UblkQueue};
-    /// # use libublk::helpers::IoBuf;
-    /// # use libublk::sys;
-    /// # fn example(queue: UblkQueue) -> Result<UblkQueue, libublk::UblkError> {
-    /// // For traditional buffer operations
-    /// let mut bufs = Vec::new();
-    /// for _ in 0..queue.get_depth() {
-    ///     bufs.push(IoBuf::<u8>::new(4096));
-    /// }
-    /// let slice_list = BufDescList::Slices(Some(&bufs));
-    /// let queue = queue.submit_fetch_commands_unified(slice_list)?;
-    ///
-    /// // For zero-copy operations
-    /// let auto_regs: Vec<sys::ublk_auto_buf_reg> = (0..queue.get_depth())
-    ///     .map(|i| sys::ublk_auto_buf_reg {
-    ///         index: i as u16,
-    ///         flags: 0,
-    ///         reserved0: 0,
-    ///         reserved1: 0,
-    ///     })
-    ///     .collect();
-    /// let auto_list = BufDescList::AutoRegs(&auto_regs);
-    /// let queue = queue.submit_fetch_commands_unified(auto_list)?;
-    /// # Ok(queue)
-    /// # }
-    /// ```
+    /// For usage examples, see the module-level documentation.
     #[inline]
     pub fn submit_fetch_commands_unified(
         self,
@@ -1767,15 +1785,8 @@ impl UblkQueue<'_> {
     /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
     /// * `BufDesc::RawAddress` - Compatible with all device configurations (unsafe)
     ///
-    /// # Validation:
-    ///
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
-    ///
-    /// # Performance:
-    ///
-    /// This method has zero runtime overhead compared to calling the existing methods
-    /// directly, as it uses compile-time dispatch based on the buffer descriptor variant.
     ///
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
     #[inline]
