@@ -247,7 +247,7 @@ mod integration {
             }
 
             ublk_wait_and_handle_ios(&exe, &q_rc);
-            smol::block_on(async { futures::future::join_all(f_vec).await });
+            smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
         };
 
         // kick off our targets
@@ -348,7 +348,7 @@ mod integration {
             }
 
             ublk_wait_and_handle_ios(&exe, &q_rc);
-            smol::block_on(async { futures::future::join_all(f_vec).await });
+            smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
         };
 
         // kick off our targets

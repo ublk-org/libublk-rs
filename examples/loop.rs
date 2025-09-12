@@ -4,9 +4,9 @@ use clap::{Arg, ArgAction, Command};
 use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkIOCtx, UblkQueue, BufDescList};
+use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes, BufDesc};
+use libublk::{ctrl::UblkCtrl, sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -198,22 +198,16 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, io_slice: &
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd_unified(
-                tag,
-                BufDesc::Slice(io_slice),
-                Ok(UblkIORes::Result(res)),
-            ).unwrap();
+            q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), Ok(UblkIORes::Result(res)))
+                .unwrap();
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd_unified(
-            tag,
-            BufDesc::Slice(io_slice),
-            Ok(UblkIORes::Result(res)),
-        ).unwrap();
+        q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), Ok(UblkIORes::Result(res)))
+            .unwrap();
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
@@ -245,7 +239,8 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))).unwrap()
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
+        .unwrap()
         .wait_and_handle_io(lo_io_handler);
 }
 
@@ -267,7 +262,10 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
 
             q.register_io_buf(tag, &buf);
             loop {
-                let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
+                let cmd_res = q
+                    .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
+                    .unwrap()
+                    .await;
                 if cmd_res == sys::UBLK_IO_RES_ABORT {
                     break;
                 }
@@ -282,7 +280,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
         }));
     }
     ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(async { futures::future::join_all(f_vec).await });
+    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
 }
 
 fn __loop_add(

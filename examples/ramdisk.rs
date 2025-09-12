@@ -9,13 +9,13 @@ use libublk::ctrl::UblkCtrl;
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::uring_async::ublk_run_ctrl_task;
-use libublk::{UblkError, UblkFlags, BufDesc};
+use libublk::{BufDesc, UblkError, UblkFlags};
 use std::io::{Error, ErrorKind};
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// Handle I/O operations using safe slice-based memory operations.
-/// 
+///
 /// This function demonstrates how slice operations provide memory safety
 /// benefits over raw pointer manipulation:
 /// - Automatic bounds checking prevents buffer overflows
@@ -34,7 +34,7 @@ fn handle_io(q: &UblkQueue, tag: u16, io_buf: &mut [u8], ramdisk_storage: &mut [
     if off.saturating_add(bytes) > ramdisk_storage.len() {
         return -libc::EINVAL;
     }
-    
+
     // Ensure I/O buffer has sufficient capacity for the operation
     // Slice bounds checking prevents reading/writing beyond buffer limits
     if bytes > io_buf.len() {
@@ -51,7 +51,7 @@ fn handle_io(q: &UblkQueue, tag: u16, io_buf: &mut [u8], ramdisk_storage: &mut [
             let src = &ramdisk_storage[off..off + bytes];
             let dst = &mut io_buf[..bytes];
             dst.copy_from_slice(src);
-        },
+        }
         libublk::sys::UBLK_IO_OP_WRITE => {
             // Safe slice-to-slice copy operation replaces unsafe libc::memcpy
             // This approach eliminates common memory safety issues:
@@ -61,7 +61,7 @@ fn handle_io(q: &UblkQueue, tag: u16, io_buf: &mut [u8], ramdisk_storage: &mut [
             let src = &io_buf[..bytes];
             let dst = &mut ramdisk_storage[off..off + bytes];
             dst.copy_from_slice(src);
-        },
+        }
         libublk::sys::UBLK_IO_OP_FLUSH => {
             // Flush operation requires no memory copying
         }
@@ -75,17 +75,20 @@ fn handle_io(q: &UblkQueue, tag: u16, io_buf: &mut [u8], ramdisk_storage: &mut [
 
 async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) {
     let buf_size = q.dev.dev_info.max_io_buf_bytes as usize;
-    
+
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
     // IoBuf provides slice-based access through Deref/DerefMut traits
     let mut buffer = IoBuf::<u8>::new(buf_size);
-    
+
     // No longer need raw pointer since we use the unified API with slices
     let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
     loop {
-        let cmd_res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buffer.as_slice()), res).unwrap().await;
+        let cmd_res = q
+            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buffer.as_slice()), res)
+            .unwrap()
+            .await;
         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }
@@ -120,7 +123,7 @@ fn start_dev_fn(
         }
     });
     ublk_run_ctrl_task(exe, q, &task)?;
-    smol::block_on(task)
+    smol::block_on(exe.run(task))
 }
 
 fn write_dev_id(ctrl: &UblkCtrl, efd: i32) -> Result<i32, Error> {
@@ -174,12 +177,12 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
 
     // spawn async io tasks
     let mut f_vec = Vec::new();
-    
+
     // Extract raw pointer and length for sharing across async tasks
     // This is the minimal unsafe code needed for async context sharing
     let storage_ptr = ramdisk_storage.as_mut_ptr();
     let storage_len = ramdisk_storage.len();
-    
+
     for tag in 0..ctrl.dev_info().queue_depth as u16 {
         let q_clone = q_rc.clone();
 
@@ -189,9 +192,7 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
             // 1. The original ramdisk_storage buffer outlives all async tasks
             // 2. Each task operates on different regions controlled by I/O offset bounds
             // 3. The slice provides bounds checking for all operations within io_task
-            let storage_slice = unsafe {
-                std::slice::from_raw_parts_mut(storage_ptr, storage_len)
-            };
+            let storage_slice = unsafe { std::slice::from_raw_parts_mut(storage_ptr, storage_len) };
             io_task(&q_clone, tag, storage_slice).await;
         }));
     }
@@ -206,7 +207,7 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         }
         _ => eprintln!("device can't be started"),
     }
-    smol::block_on(async { futures::future::join_all(f_vec).await });
+    smol::block_on(exec.run(async { futures::future::join_all(f_vec).await }));
 }
 
 fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {
@@ -245,11 +246,11 @@ fn test_add(recover: usize) {
             // Create ramdisk storage using IoBuf for proper alignment and memory management
             // IoBuf provides safe slice access while maintaining required memory alignment
             let mut ramdisk_buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
-            
+
             // Zero-initialize the ramdisk storage for consistent behavior
             // Using safe slice operations instead of unsafe memory manipulation
             ramdisk_buf.zero_buf();
-            
+
             // Get mutable slice for safe operations within rd_add_dev
             let storage_slice = ramdisk_buf.as_mut_slice();
             rd_add_dev(dev_id, storage_slice, size, recover == 0, efd);

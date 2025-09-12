@@ -3395,7 +3395,7 @@ mod tests {
             q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
 
             crate::uring_async::ublk_wait_and_handle_ios(&exe, &q_rc);
-            smol::block_on(async { futures::future::join_all(f_vec).await });
+            smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
         });
 
         ctrl.start_dev_async(dev_arc).await?;
