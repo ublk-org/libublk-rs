@@ -2244,6 +2244,7 @@ impl UblkCtrl {
 
         Self::dump_device_info(&ctrl, &p);
         ctrl.dump_from_json();
+        println!("\tublksrv_flags: 0x{:x}", ctrl.dev_info.ublksrv_flags);
     }
 
     /// Dump this device info asynchronously
