@@ -481,22 +481,6 @@ mod integration {
             let mut f_vec = Vec::new();
 
             let mlock_enabled = dev.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
-            if mlock_enabled {
-                // For async version, we need to allocate buffers to check mlock status
-                let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
-                let mlocked_count = bufs_rc
-                    .iter()
-                    .take(depth.into())
-                    .filter(|buf| buf.is_mlocked())
-                    .count();
-                assert!(mlocked_count == depth as usize);
-                println!(
-                    "Queue {} (async): mlock feature enabled, {}/{} buffers successfully mlocked",
-                    qid,
-                    mlocked_count,
-                    bufs_rc.len()
-                );
-            }
 
             for tag in 0..depth {
                 let q = q_rc.clone();
@@ -507,6 +491,15 @@ mod integration {
                     let mut res = 0;
 
                     q.register_io_buf(tag, &buf);
+
+                    // If mlock is enabled, verify the buffer is mlocked after registration
+                    if mlock_enabled {
+                        assert!(
+                            buf.is_mlocked(),
+                            "Buffer should be mlocked when UBLK_DEV_F_MLOCK_IO_BUFFER is set"
+                        );
+                    }
+
                     loop {
                         let cmd_res = q
                             .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
@@ -945,9 +938,14 @@ mod integration {
         );
 
         // Test IoBuf with mlock
-        let buf_mlock = IoBuf::<u8>::new_with_mlock(4096);
+        let buf_mlock = IoBuf::<u8>::new(4096);
+        let mlock_success = buf_mlock.mlock();
         // Note: mlock may fail due to permissions, but the method should still work
         // In CI or without CAP_IPC_LOCK, this might return false
-        println!("Buffer mlock status: {}", buf_mlock.is_mlocked());
+        println!(
+            "Buffer mlock success: {}, status: {}",
+            mlock_success,
+            buf_mlock.is_mlocked()
+        );
     }
 }

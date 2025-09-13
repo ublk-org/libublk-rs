@@ -759,14 +759,8 @@ impl UblkDev {
         let bytes = self.dev_info.max_io_buf_bytes as usize;
         let mut bvec = Vec::with_capacity(depth as usize);
 
-        let use_mlock = self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
-
         for _ in 0..depth {
-            if use_mlock {
-                bvec.push(IoBuf::<u8>::new_with_mlock(bytes));
-            } else {
-                bvec.push(IoBuf::<u8>::new(bytes));
-            }
+            bvec.push(IoBuf::<u8>::new(bytes));
         }
 
         bvec
@@ -1135,6 +1129,14 @@ impl UblkQueue<'_> {
         if self.support_auto_buf_zc() {
             return;
         }
+
+        // Apply UBLK_DEV_F_MLOCK_IO_BUFFER if the flag is set
+        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
+            if !buf.mlock() {
+                log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
+            }
+        }
+
         self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
     }
 

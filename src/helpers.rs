@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 
 pub fn type_of_this<T>(_: &T) -> String {
@@ -9,7 +10,7 @@ pub fn type_of_this<T>(_: &T) -> String {
 pub struct IoBuf<T> {
     ptr: *mut T,
     size: usize,
-    mlocked: bool,
+    mlocked: Cell<bool>,
 }
 
 // Users of IoBuf has to deal with Send & Sync
@@ -26,37 +27,47 @@ impl<T> IoBuf<T> {
         IoBuf {
             ptr,
             size,
-            mlocked: false,
+            mlocked: Cell::new(false),
         }
-    }
-
-    pub fn new_with_mlock(size: usize) -> Self {
-        let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
-        let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
-
-        assert!(size != 0);
-
-        let mut buf = IoBuf {
-            ptr,
-            size,
-            mlocked: false,
-        };
-
-        // Attempt to mlock the buffer
-        let mlock_result = unsafe { libc::mlock(ptr as *const libc::c_void, size) };
-
-        if mlock_result == 0 {
-            buf.mlocked = true;
-        }
-        // Note: We don't fail if mlock fails, as it might be due to permissions
-        // or system limits. The caller can check with is_mlocked().
-
-        buf
     }
 
     /// Check if the buffer is currently locked in memory
     pub fn is_mlocked(&self) -> bool {
-        self.mlocked
+        self.mlocked.get()
+    }
+
+    /// Lock the buffer in memory using mlock
+    /// Returns true if successful, false otherwise
+    pub fn mlock(&self) -> bool {
+        if self.mlocked.get() {
+            return true; // Already locked
+        }
+
+        let mlock_result = unsafe { libc::mlock(self.ptr as *const libc::c_void, self.size) };
+
+        if mlock_result == 0 {
+            self.mlocked.set(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unlock the buffer from memory using munlock
+    /// Returns true if successful, false otherwise
+    pub fn munlock(&self) -> bool {
+        if !self.mlocked.get() {
+            return true; // Already unlocked
+        }
+
+        let munlock_result = unsafe { libc::munlock(self.ptr as *const libc::c_void, self.size) };
+
+        if munlock_result == 0 {
+            self.mlocked.set(false);
+            true
+        } else {
+            false
+        }
     }
 
     /// how many elements in this buffer
@@ -84,11 +95,11 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe immutable slice reference to the buffer contents.
-    /// 
+    ///
     /// This method provides safe slice access by leveraging the existing Deref
     /// implementation, eliminating the need for unsafe raw pointer operations.
     /// The returned slice is guaranteed to be valid for the lifetime of the IoBuf.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Bounds checking through slice operations
     /// - Compile-time lifetime verification
@@ -99,11 +110,11 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe mutable slice reference to the buffer contents.
-    /// 
+    ///
     /// This method provides safe mutable slice access by leveraging the existing
     /// DerefMut implementation, eliminating the need for unsafe raw pointer operations.
     /// The returned slice is guaranteed to be valid for the lifetime of the IoBuf.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Bounds checking through slice operations  
     /// - Compile-time lifetime verification
@@ -114,17 +125,17 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe immutable subslice of the buffer.
-    /// 
+    ///
     /// This method provides safe access to a portion of the buffer by leveraging
     /// the existing Deref implementation and standard slice indexing. This eliminates
     /// the need for unsafe pointer arithmetic and provides automatic bounds checking.
-    /// 
+    ///
     /// # Arguments
     /// * `range` - A range specifying the subslice bounds (e.g., `0..10`, `5..`, `..20`)
-    /// 
+    ///
     /// # Panics
     /// Panics if the range is out of bounds, following standard slice behavior.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Automatic bounds checking
     /// - No unsafe pointer operations
@@ -137,17 +148,17 @@ impl<T> IoBuf<T> {
     }
 
     /// Get a safe mutable subslice of the buffer.
-    /// 
+    ///
     /// This method provides safe mutable access to a portion of the buffer by leveraging
     /// the existing DerefMut implementation and standard slice indexing. This eliminates
     /// the need for unsafe pointer arithmetic and provides automatic bounds checking.
-    /// 
+    ///
     /// # Arguments
     /// * `range` - A range specifying the subslice bounds (e.g., `0..10`, `5..`, `..20`)
-    /// 
+    ///
     /// # Panics
     /// Panics if the range is out of bounds, following standard slice behavior.
-    /// 
+    ///
     /// # Safety Benefits
     /// - Automatic bounds checking
     /// - No unsafe pointer operations  
@@ -193,7 +204,7 @@ impl<T> DerefMut for IoBuf<T> {
 impl<T> Drop for IoBuf<T> {
     fn drop(&mut self) {
         // munlock the buffer if it was mlocked
-        if self.mlocked {
+        if self.mlocked.get() {
             unsafe {
                 libc::munlock(self.ptr as *const libc::c_void, self.size);
             }
