@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
+use std::panic::{RefUnwindSafe, UnwindSafe};
 
 pub fn type_of_this<T>(_: &T) -> String {
     std::any::type_name::<T>().to_string()
@@ -16,6 +17,12 @@ pub struct IoBuf<T> {
 // Users of IoBuf has to deal with Send & Sync
 unsafe impl<T> Send for IoBuf<T> {}
 unsafe impl<T> Sync for IoBuf<T> {}
+
+// Explicitly implement RefUnwindSafe and UnwindSafe since Cell<bool> is not RefUnwindSafe
+// This is safe because the mlocked field is only used for tracking state and doesn't
+// affect memory safety across panic boundaries
+impl<T> RefUnwindSafe for IoBuf<T> {}
+impl<T> UnwindSafe for IoBuf<T> {}
 
 impl<T> IoBuf<T> {
     pub fn new(size: usize) -> Self {
