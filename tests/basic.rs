@@ -110,15 +110,21 @@ mod integration {
                     .unwrap();
             };
 
-            UblkQueue::new(qid, dev)
+            let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
                 .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
                     None
                 } else {
                     Some(&bufs_rc)
-                }))
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+                })) {
+                Ok(q) => q,
+                Err(e) => {
+                    log::error!("submit_fetch_commands_unified failed: {}", e);
+                    return;
+                }
+            };
+
+            queue.wait_and_handle_io(io_handler);
         }
 
         __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, null_handle_queue);
@@ -149,15 +155,21 @@ mod integration {
                 q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
             };
 
-            UblkQueue::new(qid, dev)
+            let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
                 .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
                     None
                 } else {
                     Some(&bufs_rc)
-                }))
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+                })) {
+                Ok(q) => q,
+                Err(e) => {
+                    log::error!("submit_fetch_commands_unified failed: {}", e);
+                    return;
+                }
+            };
+
+            queue.wait_and_handle_io(io_handler);
         }
 
         __test_ublk_null(
@@ -769,15 +781,21 @@ mod integration {
                     .unwrap();
             };
 
-            UblkQueue::new(qid, dev)
+            let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
                 .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
                     None
                 } else {
                     Some(&bufs_rc)
-                }))
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+                })) {
+                Ok(q) => q,
+                Err(e) => {
+                    log::error!("submit_fetch_commands_unified failed: {}", e);
+                    return;
+                }
+            };
+
+            queue.wait_and_handle_io(io_handler);
         }
 
         let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY;
@@ -870,11 +888,17 @@ mod integration {
                 .unwrap();
             };
 
-            UblkQueue::new(qid, dev)
+            let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands_unified(BufDescList::AutoRegs(&buf_reg_data_list))
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+                .submit_fetch_commands_unified(BufDescList::AutoRegs(&buf_reg_data_list)) {
+                Ok(q) => q,
+                Err(e) => {
+                    log::error!("submit_fetch_commands_unified failed: {}", e);
+                    return;
+                }
+            };
+
+            queue.wait_and_handle_io(io_handler);
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {

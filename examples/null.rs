@@ -57,16 +57,22 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         handle_io_cmd(q, tag, io_slice);
     };
 
-    UblkQueue::new(qid, dev)
+    let queue = match UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
         .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
             None
         } else {
             Some(&bufs_rc)
-        }))
-        .unwrap()
-        .wait_and_handle_io(io_handler);
+        })) {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("submit_fetch_commands_unified failed: {}", e);
+            return;
+        }
+    };
+
+    queue.wait_and_handle_io(io_handler);
 }
 
 async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<(), UblkError> {

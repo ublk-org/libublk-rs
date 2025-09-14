@@ -236,12 +236,18 @@ fn q_fn(qid: u16, dev: &UblkDev) {
         lo_handle_io_cmd_sync(q, tag, io, &io_slice);
     };
 
-    UblkQueue::new(qid, dev)
+    let queue = match UblkQueue::new(qid, dev)
         .unwrap()
         .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
-        .unwrap()
-        .wait_and_handle_io(lo_io_handler);
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))) {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("submit_fetch_commands_unified failed: {}", e);
+            return;
+        }
+    };
+
+    queue.wait_and_handle_io(lo_io_handler);
 }
 
 async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {

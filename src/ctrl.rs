@@ -3088,12 +3088,18 @@ mod tests {
                 q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
-            UblkQueue::new(qid, dev)
+            let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
                 .regiser_io_bufs(Some(&bufs))
-                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))) {
+                Ok(q) => q,
+                Err(e) => {
+                    log::error!("submit_fetch_commands_unified failed: {}", e);
+                    return;
+                }
+            };
+
+            queue.wait_and_handle_io(io_handler);
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
