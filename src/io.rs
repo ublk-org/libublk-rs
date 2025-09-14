@@ -823,6 +823,7 @@ struct UblkQueueState {
 impl UblkQueueState {
     const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
     const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
+    const UBLK_QUEUE_MLOCK_FAIL: u32 = 1_u32 << 2;
 
     #[inline(always)]
     fn queue_is_quiesced(&self) -> bool {
@@ -850,6 +851,11 @@ impl UblkQueueState {
     }
 
     #[inline(always)]
+    fn is_mlock_failed(&self) -> bool {
+        (self.state & Self::UBLK_QUEUE_MLOCK_FAIL) != 0
+    }
+
+    #[inline(always)]
     fn inc_cmd_inflight(&mut self) {
         self.cmd_inflight += 1;
     }
@@ -869,6 +875,10 @@ impl UblkQueueState {
         } else {
             self.state &= !Self::UBLK_QUEUE_IDLE;
         }
+    }
+
+    fn mark_mlock_failed(&mut self) {
+        self.state |= Self::UBLK_QUEUE_MLOCK_FAIL;
     }
 }
 
@@ -1131,6 +1141,13 @@ impl UblkQueue<'_> {
         self.bufs.borrow()[tag as usize]
     }
 
+    pub(crate) fn mark_mlock_failed(&self) {
+        self.state.borrow_mut().mark_mlock_failed();
+    }
+    pub(crate) fn is_mlock_failed(&self) -> bool {
+        self.state.borrow().is_mlock_failed()
+    }
+
     /// Register IO buffer, so that pages in this buffer can
     /// be discarded in case queue becomes idle
     pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
@@ -1138,15 +1155,16 @@ impl UblkQueue<'_> {
             return;
         }
 
+        if buf.as_ptr() == std::ptr::null() {
+            return;
+        }
+
         // Apply UBLK_DEV_F_MLOCK_IO_BUFFER if the flag is set
         if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
             if !buf.mlock() {
                 log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
+                self.mark_mlock_failed();
             }
-        }
-
-        if buf.as_ptr() == std::ptr::null() {
-            return;
         }
 
         self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
@@ -1531,6 +1549,11 @@ impl UblkQueue<'_> {
             self.wait_for_all_buffer_registrations().await;
         }
 
+        // Check if mlock failed and fail immediately if so, but only for FETCH_REQ operations
+        if self.is_mlock_failed() {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
         let future =
             self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
         let res = future.await;
@@ -1789,6 +1812,11 @@ impl UblkQueue<'_> {
         self,
         buf_desc_list: BufDescList,
     ) -> Result<Self, UblkError> {
+        // Check if mlock failed and fail immediately if so
+        if self.is_mlock_failed() {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
         // Validate and dispatch based on buffer descriptor list variant
         match buf_desc_list {
             BufDescList::Slices(slice_opt) => {
@@ -2175,6 +2203,12 @@ impl UblkQueue<'_> {
         let args = types::SubmitArgs::new().timespec(&ts);
 
         let state = self.state.borrow();
+
+        // Check if mlock failed and fail immediately if so
+        if state.is_mlock_failed() {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
         log::trace!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
