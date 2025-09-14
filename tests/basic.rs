@@ -6,7 +6,7 @@ mod integration {
     use libublk::override_sqe;
     use libublk::uring_async::ublk_wait_and_handle_ios;
     use libublk::uring_async::ublk_wake_task;
-    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkFlags, UblkIORes};
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags, UblkIORes};
     use std::env;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -179,6 +179,30 @@ mod integration {
             bytes + res
         }
 
+        async fn test_io_task(q: &UblkQueue<'_>, tag: u16, dev_data: &Arc<Mutex<DevData>>) -> Result<(), UblkError> {
+            let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
+            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let mut res = 0;
+
+            q.register_io_buf(tag, &buf);
+            loop {
+                let cmd_res = q
+                    .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)?
+                    .await;
+                if cmd_res == sys::UBLK_IO_RES_ABORT {
+                    break;
+                }
+
+                res = handle_io_cmd(&q, tag).await;
+                cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                {
+                    let mut guard = dev_data.lock().unwrap();
+                    (*guard).done += 1;
+                }
+            }
+            Ok(())
+        }
+
         //Device wide data shared among all queue context
         struct DevData {
             done: u64,
@@ -222,26 +246,8 @@ mod integration {
                 let __dev_data = _dev_data.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
-                    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-                    let mut res = 0;
-
-                    q.register_io_buf(tag, &buf);
-                    loop {
-                        let cmd_res = q
-                            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
-                            .unwrap()
-                            .await;
-                        if cmd_res == sys::UBLK_IO_RES_ABORT {
-                            break;
-                        }
-
-                        res = handle_io_cmd(&q, tag).await;
-                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
-                        {
-                            let mut guard = __dev_data.lock().unwrap();
-                            (*guard).done += 1;
-                        }
+                    if let Err(e) = test_io_task(&q, tag, &__dev_data).await {
+                        log::error!("test_io_task failed for tag {}: {}", tag, e);
                     }
                 }));
             }
@@ -289,6 +295,36 @@ mod integration {
             res
         }
 
+        async fn test_auto_reg_io_task(q: &UblkQueue<'_>, tag: u16, depth: u16, bad_buf_idx: bool, fallback: bool) -> Result<(), UblkError> {
+            let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
+            let mut res = 0;
+            let buf_index = if !bad_buf_idx { tag } else { depth + 1 };
+
+            // Create auto buffer registration data with fallback support
+            let auto_buf_reg = sys::ublk_auto_buf_reg {
+                index: buf_index,
+                flags: if fallback {
+                    sys::UBLK_AUTO_BUF_REG_FALLBACK as u8
+                } else {
+                    0
+                },
+                ..Default::default()
+            };
+
+            loop {
+                let cmd_res = q
+                    .submit_io_cmd_unified(tag, cmd_op, BufDesc::AutoReg(auto_buf_reg), res)?
+                    .await;
+                if cmd_res == sys::UBLK_IO_RES_ABORT {
+                    break;
+                }
+
+                res = handle_io_cmd(&q, tag).await;
+                cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            }
+            Ok(())
+        }
+
         let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
         let depth = 64_u16;
         let ctrl = UblkCtrlBuilder::default()
@@ -317,32 +353,8 @@ mod integration {
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
-                    let mut res = 0;
-                    let buf_index = if !bad_buf_idx { tag } else { depth + 1 };
-
-                    // Create auto buffer registration data with fallback support
-                    let auto_buf_reg = sys::ublk_auto_buf_reg {
-                        index: buf_index,
-                        flags: if fallback {
-                            sys::UBLK_AUTO_BUF_REG_FALLBACK as u8
-                        } else {
-                            0
-                        },
-                        ..Default::default()
-                    };
-
-                    loop {
-                        let cmd_res = q
-                            .submit_io_cmd_unified(tag, cmd_op, BufDesc::AutoReg(auto_buf_reg), res)
-                            .unwrap()
-                            .await;
-                        if cmd_res == sys::UBLK_IO_RES_ABORT {
-                            break;
-                        }
-
-                        res = handle_io_cmd(&q, tag).await;
-                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                    if let Err(e) = test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await {
+                        log::error!("test_auto_reg_io_task failed for tag {}: {}", tag, e);
                     }
                 }));
             }
@@ -458,6 +470,35 @@ mod integration {
             }
         }
 
+        async fn test_ramdisk_io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_addr: usize, mlock_enabled: bool) -> Result<(), UblkError> {
+            let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
+            let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let mut res = 0;
+
+            q.register_io_buf(tag, &buf);
+
+            // If mlock is enabled, verify the buffer is mlocked after registration
+            if mlock_enabled {
+                assert!(
+                    buf.is_mlocked(),
+                    "Buffer should be mlocked when UBLK_DEV_F_MLOCK_IO_BUFFER is set"
+                );
+            }
+
+            loop {
+                let cmd_res = q
+                    .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)?
+                    .await;
+                if cmd_res == sys::UBLK_IO_RES_ABORT {
+                    break;
+                }
+
+                res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
+                cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            }
+            Ok(())
+        }
+
         let size = 32_u64 << 20;
         let ramdisk_buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
         let ramdisk_addr = ramdisk_buf.as_mut_ptr() as usize;
@@ -486,31 +527,8 @@ mod integration {
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
-                    let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-                    let mut res = 0;
-
-                    q.register_io_buf(tag, &buf);
-
-                    // If mlock is enabled, verify the buffer is mlocked after registration
-                    if mlock_enabled {
-                        assert!(
-                            buf.is_mlocked(),
-                            "Buffer should be mlocked when UBLK_DEV_F_MLOCK_IO_BUFFER is set"
-                        );
-                    }
-
-                    loop {
-                        let cmd_res = q
-                            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
-                            .unwrap()
-                            .await;
-                        if cmd_res == sys::UBLK_IO_RES_ABORT {
-                            break;
-                        }
-
-                        res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
-                        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+                    if let Err(e) = test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await {
+                        log::error!("test_ramdisk_io_task failed for tag {}: {}", tag, e);
                     }
                 }));
             }

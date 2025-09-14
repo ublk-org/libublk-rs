@@ -3329,7 +3329,7 @@ mod tests {
         println!("✓ Async constructor methods are properly defined");
     }
 
-    async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) {
+    async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) -> Result<(), UblkError> {
         use crate::helpers::IoBuf;
         use crate::BufDesc;
 
@@ -3343,8 +3343,7 @@ mod tests {
         loop {
             let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
             let cmd_res = q
-                .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)
-                .unwrap()
+                .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)?
                 .await;
             if cmd_res == crate::sys::UBLK_IO_RES_ABORT {
                 break;
@@ -3353,6 +3352,7 @@ mod tests {
             res = (iod.nr_sectors << 9) as i32;
             cmd_op = crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
         }
+        Ok(())
     }
 
     fn q_async_fn<'a>(
@@ -3364,7 +3364,9 @@ mod tests {
         for tag in 0..depth as u16 {
             let q = q_rc.clone();
             f_vec.push(exe.spawn(async move {
-                io_async_fn(tag, &q).await;
+                if let Err(e) = io_async_fn(tag, &q).await {
+                    log::error!("io_async_fn failed for tag {}: {}", tag, e);
+                }
             }));
         }
     }

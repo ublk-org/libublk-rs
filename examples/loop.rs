@@ -244,6 +244,33 @@ fn q_fn(qid: u16, dev: &UblkDev) {
         .wait_and_handle_io(lo_io_handler);
 }
 
+async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
+    // Use IoBuf for safe I/O buffer management with automatic memory alignment
+    let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+
+    // No longer need raw pointer since we use the unified API with slices
+    let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
+    let mut res = 0;
+
+    q.register_io_buf(tag, &buf);
+    loop {
+        let cmd_res = q
+            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)?
+            .await;
+        if cmd_res == sys::UBLK_IO_RES_ABORT {
+            break;
+        }
+
+        // Use safe slice access for I/O operations
+        // IoBuf's as_mut_slice() provides bounds-checked access eliminating
+        // the need for unsafe pointer operations in the I/O handler
+        let io_slice = buf.as_mut_slice();
+        res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
+        cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+    }
+    Ok(())
+}
+
 fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
     let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
     let exe = smol::LocalExecutor::new();
@@ -253,29 +280,8 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            // Use IoBuf for safe I/O buffer management with automatic memory alignment
-            let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-
-            // No longer need raw pointer since we use the unified API with slices
-            let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
-            let mut res = 0;
-
-            q.register_io_buf(tag, &buf);
-            loop {
-                let cmd_res = q
-                    .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
-                    .unwrap()
-                    .await;
-                if cmd_res == sys::UBLK_IO_RES_ABORT {
-                    break;
-                }
-
-                // Use safe slice access for I/O operations
-                // IoBuf's as_mut_slice() provides bounds-checked access eliminating
-                // the need for unsafe pointer operations in the I/O handler
-                let io_slice = buf.as_mut_slice();
-                res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
-                cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            if let Err(e) = lo_io_task(&q, tag).await {
+                log::error!("lo_io_task failed for tag {}: {}", tag, e);
             }
         }));
     }
