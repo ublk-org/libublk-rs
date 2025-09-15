@@ -6,7 +6,9 @@ mod integration {
     use libublk::override_sqe;
     use libublk::uring_async::ublk_wait_and_handle_ios;
     use libublk::uring_async::ublk_wake_task;
-    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags, UblkIORes};
+    use libublk::{
+        ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags, UblkIORes,
+    };
     use std::env;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -191,13 +193,18 @@ mod integration {
             bytes + res
         }
 
-        async fn test_io_task(q: &UblkQueue<'_>, tag: u16, dev_data: &Arc<Mutex<DevData>>) -> Result<(), UblkError> {
+        async fn test_io_task(
+            q: &UblkQueue<'_>,
+            tag: u16,
+            dev_data: &Arc<Mutex<DevData>>,
+        ) -> Result<(), UblkError> {
             let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
             let mut res = 0;
 
             // Submit initial prep command - any error will exit the function
             // The IoBuf is automatically registered
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf))
+                .await?;
 
             loop {
                 res = handle_io_cmd(&q, tag).await;
@@ -207,7 +214,8 @@ mod integration {
                 }
 
                 // Any error (including QueueIsDown) will break the loop by exiting the function
-                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
+                    .await?;
             }
         }
 
@@ -303,7 +311,13 @@ mod integration {
             res
         }
 
-        async fn test_auto_reg_io_task(q: &UblkQueue<'_>, tag: u16, depth: u16, bad_buf_idx: bool, fallback: bool) -> Result<(), UblkError> {
+        async fn test_auto_reg_io_task(
+            q: &UblkQueue<'_>,
+            tag: u16,
+            depth: u16,
+            bad_buf_idx: bool,
+            fallback: bool,
+        ) -> Result<(), UblkError> {
             let mut res = 0;
             let buf_index = if !bad_buf_idx { tag } else { depth + 1 };
 
@@ -320,13 +334,15 @@ mod integration {
 
             // Submit initial prep command - any error will exit the function
             // AutoReg doesn't use IoBuf, so pass None
-            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res, None).await?;
+            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res, None)
+                .await?;
 
             loop {
                 res = handle_io_cmd(&q, tag).await;
 
                 // Any error (including QueueIsDown) will break the loop by exiting the function
-                q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res).await?;
+                q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res)
+                    .await?;
             }
         }
 
@@ -358,7 +374,9 @@ mod integration {
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    if let Err(e) = test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await {
+                    if let Err(e) =
+                        test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await
+                    {
                         log::error!("test_auto_reg_io_task failed for tag {}: {}", tag, e);
                     }
                 }));
@@ -475,13 +493,19 @@ mod integration {
             }
         }
 
-        async fn test_ramdisk_io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_addr: usize, mlock_enabled: bool) -> Result<(), UblkError> {
+        async fn test_ramdisk_io_task(
+            q: &UblkQueue<'_>,
+            tag: u16,
+            ramdisk_addr: usize,
+            mlock_enabled: bool,
+        ) -> Result<(), UblkError> {
             let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
             let mut res = 0;
 
             // Submit initial prep command - any error will exit the function
             // The IoBuf is automatically registered
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf))
+                .await?;
 
             // If mlock is enabled, verify the buffer is mlocked after registration
             if mlock_enabled {
@@ -495,7 +519,8 @@ mod integration {
                 res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
 
                 // Any error (including QueueIsDown) will break the loop by exiting the function
-                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
+                    .await?;
             }
         }
 
@@ -527,7 +552,8 @@ mod integration {
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    if let Err(e) = test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await {
+                    if let Err(e) = test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await
+                    {
                         log::error!("test_ramdisk_io_task failed for tag {}: {}", tag, e);
                     }
                 }));
@@ -538,13 +564,13 @@ mod integration {
             let q = q_rc.clone();
             f_vec.push(exe.spawn(async move {
                 loop {
+                    //yield for handling incoming command
+                    smol::future::yield_now().await;
                     if q.flush_and_wake_io_tasks(|data, cqe, _| ublk_wake_task(data, cqe), 1)
                         .is_err()
                     {
                         break;
                     }
-                    //yield for handling incoming command
-                    smol::future::yield_now().await;
                 }
             }));
             smol::block_on(exe.run(futures::future::join_all(f_vec)));
@@ -878,7 +904,8 @@ mod integration {
 
             let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands_unified(BufDescList::AutoRegs(&buf_reg_data_list)) {
+                .submit_fetch_commands_unified(BufDescList::AutoRegs(&buf_reg_data_list))
+            {
                 Ok(q) => q,
                 Err(e) => {
                     log::error!("submit_fetch_commands_unified failed: {}", e);

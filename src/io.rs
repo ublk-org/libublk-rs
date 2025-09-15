@@ -128,6 +128,7 @@ use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
+use async_lock::Semaphore;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
@@ -892,6 +893,11 @@ pub struct UblkQueue<'a> {
     pub dev: &'a UblkDev,
     bufs: RefCell<Vec<*mut u8>>,
     state: RefCell<UblkQueueState>,
+    /// Semaphore to coordinate buffer registrations
+    /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
+    buf_reg_semaphore: Semaphore,
+    /// Counter tracking number of registered buffers for optimization
+    buf_reg_counter: RefCell<u32>,
 }
 
 impl AsRawFd for UblkQueue<'_> {
@@ -1054,6 +1060,8 @@ impl UblkQueue<'_> {
                 state: 0,
             }),
             bufs: RefCell::new(bufs),
+            buf_reg_semaphore: Semaphore::new(0),
+            buf_reg_counter: RefCell::new(0),
         };
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
@@ -1137,7 +1145,37 @@ impl UblkQueue<'_> {
             }
         }
 
+        if buf.as_ptr() == std::ptr::null() {
+            return;
+        }
+
         self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
+
+        // Increment the registration counter
+        let mut counter = self.buf_reg_counter.borrow_mut();
+        *counter += 1;
+
+        // Only check if all buffers are registered when counter reaches queue depth
+        if *counter >= self.q_depth {
+            // Double-check that all buffers are actually registered
+            let bufs = self.bufs.borrow();
+            let all_registered = (0..self.q_depth).all(|i| !bufs[i as usize].is_null());
+
+            if all_registered {
+                self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+            }
+        }
+    }
+
+    /// Wait for all buffer registrations to complete
+    ///
+    /// Each task acquires one permit, which is only available after all buffers are registered.
+    async fn wait_for_all_buffer_registrations(&self) {
+        if !self.support_auto_buf_zc() {
+            // Simply acquire one permit - will block until all buffers are registered
+            let _permit = self.buf_reg_semaphore.acquire().await;
+            // Permit is automatically released when dropped
+        }
     }
 
     /// Register IO buffer, so that pages in this buffer can
@@ -1146,7 +1184,13 @@ impl UblkQueue<'_> {
         if self.support_auto_buf_zc() {
             return;
         }
-        self.bufs.borrow_mut()[tag as usize] = std::ptr::null_mut();
+
+        // Only decrement counter if buffer was actually registered
+        if !self.bufs.borrow()[tag as usize].is_null() {
+            self.bufs.borrow_mut()[tag as usize] = std::ptr::null_mut();
+            let mut counter = self.buf_reg_counter.borrow_mut();
+            *counter = counter.saturating_sub(1);
+        }
     }
 
     /// unregister all io buffers
@@ -1157,6 +1201,8 @@ impl UblkQueue<'_> {
         for tag in 0..self.q_depth {
             self.unregister_io_buf(tag.try_into().unwrap());
         }
+        // Reset counter to 0 after unregistering all buffers
+        *self.buf_reg_counter.borrow_mut() = 0;
     }
 
     /// Register Io buffers
@@ -1290,7 +1336,10 @@ impl UblkQueue<'_> {
     ///
     /// In case of zoned, `buf_addr` can be the returned LBA for zone append
     /// command.
-    #[deprecated(since = "0.8.0", note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead")]
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead"
+    )]
     #[inline]
     pub fn submit_io_cmd(
         &self,
@@ -1315,7 +1364,10 @@ impl UblkQueue<'_> {
     /// For UBLK_F_AUTO_BUF_REG, the buffer index and flags are passed via buf_reg_data.
     /// When auto buffer registration is enabled, buf_addr should be set to the encoded
     /// auto buffer registration data instead of the actual buffer address.
-    #[deprecated(since = "0.8.0", note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead")]
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead"
+    )]
     #[inline]
     pub fn submit_io_cmd_with_auto_buf_reg(
         &self,
@@ -1414,6 +1466,10 @@ impl UblkQueue<'_> {
     /// It should typically be called once outside of loops for better performance.
     /// If an IoBuf is provided, it will be automatically registered for the given tag.
     ///
+    /// The function includes synchronization to ensure all buffer registrations are
+    /// completed before any prep commands are submitted, providing similar behavior
+    /// to `submit_fetch_commands_unified()` where all registrations happen first.
+    ///
     /// The function performs cross-verification to ensure buffer descriptor alignment:
     /// - `BufDesc::Slice` with `Some(io_buf)`: Slice must point to the same memory as IoBuf
     /// - `BufDesc::Slice` with `None`: Slice must be empty (user_copy mode)
@@ -1467,12 +1523,16 @@ impl UblkQueue<'_> {
             }
         }
 
-        // Register the IoBuf if provided
+        // Register the IoBuf if provided and acquire permit
         if let Some(buf) = io_buf {
             self.register_io_buf(tag, buf);
+            // Wait for all buffer registrations to complete before submitting prep commands
+            // This ensures that the effect is similar to submit_fetch_commands_unified()
+            self.wait_for_all_buffer_registrations().await;
         }
 
-        let future = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
+        let future =
+            self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
         let res = future.await;
         if res == crate::sys::UBLK_IO_RES_ABORT {
             Err(UblkError::QueueIsDown)
@@ -1503,7 +1563,12 @@ impl UblkQueue<'_> {
         buf_desc: BufDesc<'_>,
         result: i32,
     ) -> Result<i32, UblkError> {
-        let future = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ, buf_desc, result)?;
+        let future = self.submit_io_cmd_unified(
+            tag,
+            crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
+            buf_desc,
+            result,
+        )?;
         let res = future.await;
         if res == crate::sys::UBLK_IO_RES_ABORT {
             Err(UblkError::QueueIsDown)
@@ -1725,8 +1790,14 @@ impl UblkQueue<'_> {
         buf_desc_list: BufDescList,
     ) -> Result<Self, UblkError> {
         // Validate and dispatch based on buffer descriptor list variant
-        let result = match buf_desc_list {
+        match buf_desc_list {
             BufDescList::Slices(slice_opt) => {
+                // For batch registration that doesn't use register_io_buf (when slice_opt is None),
+                // we need to add permits since the check won't happen automatically
+                if slice_opt.is_none() {
+                    self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+                }
+
                 // Automatically register IO buffers if provided and not in zero-copy mode
                 let queue_with_buffers = self.regiser_io_bufs(slice_opt);
 
@@ -1740,13 +1811,14 @@ impl UblkQueue<'_> {
                     return Err(UblkError::OtherError(-libc::ENOTSUP));
                 }
 
+                // For auto buffer registration, add permits since buffers aren't registered through register_io_buf
+                self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+
                 // Dispatch to existing submit_fetch_commands_with_auto_buf_reg method
                 #[allow(deprecated)]
                 Ok(self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice))
             }
-        };
-
-        result
+        }
     }
 
     fn __submit_fetch_commands(&self) {
@@ -2541,5 +2613,94 @@ mod tests {
         assert_eq!(empty_slice.len(), 0);
 
         println!("Buffer descriptor verification test cases validated");
+    }
+
+    #[test]
+    fn test_buffer_registration_synchronization() {
+        use crate::ctrl::UblkCtrlBuilder;
+        use crate::helpers::IoBuf;
+        use crate::UblkFlags;
+
+        // Test that semaphore-based synchronization works correctly
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .depth(4) // Small depth for easier testing
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut _| {
+            let q = UblkQueue::new(0, dev)?;
+
+            // Test that semaphore starts with 0 permits
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Semaphore should start with 0 permits"
+            );
+
+            // Test that counter starts at 0
+            assert_eq!(*q.buf_reg_counter.borrow(), 0, "Counter should start at 0");
+
+            // Register some buffers - should not add permits until ALL are registered
+            let buf1 = IoBuf::<u8>::new(4096);
+            let buf2 = IoBuf::<u8>::new(4096);
+            let buf3 = IoBuf::<u8>::new(4096);
+            let buf4 = IoBuf::<u8>::new(4096);
+
+            q.register_io_buf(0, &buf1);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                1,
+                "Counter should be 1 after first registration"
+            );
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Should have no permits until all buffers registered"
+            );
+
+            q.register_io_buf(1, &buf2);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                2,
+                "Counter should be 2 after second registration"
+            );
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Should have no permits until all buffers registered"
+            );
+
+            q.register_io_buf(2, &buf3);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                3,
+                "Counter should be 3 after third registration"
+            );
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Should have no permits until all buffers registered"
+            );
+
+            // Register the last buffer - this should add all permits
+            q.register_io_buf(3, &buf4);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                4,
+                "Counter should be 4 after all registrations"
+            );
+
+            // Now we should have 4 permits available
+            let permit1 = q.buf_reg_semaphore.try_acquire();
+            assert!(
+                permit1.is_some(),
+                "Should have permits after all buffers registered"
+            );
+
+            let permit2 = q.buf_reg_semaphore.try_acquire();
+            assert!(permit2.is_some(), "Should have multiple permits available");
+
+            println!("Optimized buffer registration synchronization test completed successfully");
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
     }
 }
