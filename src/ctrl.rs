@@ -3090,7 +3090,6 @@ mod tests {
 
             let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
-                .regiser_io_bufs(Some(&bufs))
                 .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))) {
                 Ok(q) => q,
                 Err(e) => {

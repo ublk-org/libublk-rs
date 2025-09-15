@@ -59,7 +59,6 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
 
     let queue = match UblkQueue::new(qid, dev)
         .unwrap()
-        .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
         .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
             None
         } else {

@@ -1672,9 +1672,12 @@ impl UblkQueue<'_> {
     /// existing method based on the buffer descriptor list variant while maintaining zero-cost
     /// abstraction principles.
     ///
+    /// When buffer slices are provided, this method automatically registers the IO buffers
+    /// before submitting fetch commands, eliminating the need for manual `regiser_io_bufs()` calls.
+    ///
     /// # Buffer Descriptor List Compatibility:
     ///
-    /// * `BufDescList::Slices` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
+    /// * `BufDescList::Slices` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`. Automatically registers buffers when provided.
     /// * `BufDescList::AutoRegs` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
     ///
     /// Only called during queue initialization. After queue is setup,
@@ -1690,9 +1693,12 @@ impl UblkQueue<'_> {
         // Validate and dispatch based on buffer descriptor list variant
         let result = match buf_desc_list {
             BufDescList::Slices(slice_opt) => {
+                // Automatically register IO buffers if provided and not in zero-copy mode
+                let queue_with_buffers = self.regiser_io_bufs(slice_opt);
+
                 // Dispatch to existing submit_fetch_commands method
                 #[allow(deprecated)]
-                Ok(self.submit_fetch_commands(slice_opt))
+                Ok(queue_with_buffers.submit_fetch_commands(slice_opt))
             }
             BufDescList::AutoRegs(auto_reg_slice) => {
                 // AutoReg operations require UBLK_F_AUTO_BUF_REG
