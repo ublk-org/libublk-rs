@@ -2491,9 +2491,15 @@ impl UblkCtrl {
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
     ///
+    /// Waits for all queue buffer registrations to complete before starting.
+    /// If any queue fails mlock, this method will fail immediately.
+    ///
     pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
         ctrl.prep_start_dev(dev)?;
+
+        // Wait for all queue buffer registrations to complete
+        dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
 
         if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             ctrl.start(unsafe { libc::getpid() as i32 })
@@ -2513,12 +2519,19 @@ impl UblkCtrl {
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
     ///
+    /// Waits for all queue buffer registrations to complete before starting.
+    /// If any queue fails mlock, this method will fail immediately.
+    ///
     /// This is the only one async API allowed without UBLK_CTRL_ASYNC_AWAIT
     ///
     pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.force_async = true;
+
+        // Wait for all queue buffer registrations to complete
+        dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
+
         let res = ctrl.start_dev_async(dev).await;
         ctrl.force_async = false;
         res
@@ -3088,12 +3101,17 @@ mod tests {
                 q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
             };
 
-            UblkQueue::new(qid, dev)
+            let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
-                .regiser_io_bufs(Some(&bufs))
-                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
-                .unwrap()
-                .wait_and_handle_io(io_handler);
+                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))) {
+                Ok(q) => q,
+                Err(e) => {
+                    log::error!("submit_fetch_commands_unified failed: {}", e);
+                    return;
+                }
+            };
+
+            queue.wait_and_handle_io(io_handler);
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
@@ -3329,29 +3347,24 @@ mod tests {
         println!("✓ Async constructor methods are properly defined");
     }
 
-    async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) {
+    async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) -> Result<(), UblkError> {
         use crate::helpers::IoBuf;
         use crate::BufDesc;
 
-        let mut cmd_op = crate::sys::UBLK_U_IO_FETCH_REQ;
         let mut res = 0;
         let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-        q.register_io_buf(tag, &buf);
         let _buf = Some(buf);
         let iod = q.get_iod(tag);
+        let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
+
+        // Submit initial prep command and handle any errors (including queue down)
+        // The IoBuf is automatically registered
+        q.submit_io_prep_cmd(tag, buf_desc.clone(), res, _buf.as_ref()).await?;
 
         loop {
-            let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
-            let cmd_res = q
-                .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)
-                .unwrap()
-                .await;
-            if cmd_res == crate::sys::UBLK_IO_RES_ABORT {
-                break;
-            }
-
             res = (iod.nr_sectors << 9) as i32;
-            cmd_op = crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            // Any error (including QueueIsDown) will break the loop
+            q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
         }
     }
 
@@ -3364,15 +3377,32 @@ mod tests {
         for tag in 0..depth as u16 {
             let q = q_rc.clone();
             f_vec.push(exe.spawn(async move {
-                io_async_fn(tag, &q).await;
+                if let Err(e) = io_async_fn(tag, &q).await {
+                    match e {
+                        UblkError::QueueIsDown => {
+                            // Queue down is expected during shutdown, don't log as error
+                        }
+                        _ => {
+                            log::debug!("io_async_fn failed for tag {}: {}", tag, e);
+                        }
+                    }
+                }
             }));
         }
     }
 
-    async fn device_handler_async() -> Result<(), UblkError> {
+    async fn device_handler_async(mlock_fail: bool) -> Result<(), UblkError> {
         let ctrl = UblkCtrlBuilder::default()
             .name("test_async")
-            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
+            .dev_flags(
+                UblkFlags::UBLK_DEV_F_ADD_DEV
+                    | UblkFlags::UBLK_CTRL_ASYNC_AWAIT
+                    | if mlock_fail {
+                        UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER
+                    } else {
+                        UblkFlags::empty()
+                    },
+            )
             .depth(8)
             .build_async()
             .await
@@ -3392,6 +3422,10 @@ mod tests {
             let q = q_rc.clone();
             let exe = smol::LocalExecutor::new();
             let mut f_vec: Vec<smol::Task<()>> = Vec::new();
+
+            if mlock_fail {
+                q.mark_mlock_failed();
+            }
 
             q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
 
@@ -3430,12 +3464,30 @@ mod tests {
 
         for _ in 0..64 {
             fvec.push(exe_rc.spawn(async {
-                device_handler_async().await.unwrap();
+                device_handler_async(false).await.unwrap();
             }));
         }
 
         smol::block_on(exe_rc.run(async move {
             let _ = ublk_join_tasks(&exe, fvec);
+        }));
+    }
+
+    #[test]
+    fn test_test_mlock_failure() {
+        let _ = env_logger::builder()
+            .format_target(false)
+            .format_timestamp(None)
+            .try_init();
+        let exe_rc = Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
+
+        let io_task = exe_rc.spawn(async {
+            device_handler_async(true).await.unwrap();
+        });
+
+        smol::block_on(exe_rc.run(async move {
+            let _ = ublk_join_tasks(&exe, vec![io_task]);
         }));
     }
 

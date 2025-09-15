@@ -6,7 +6,7 @@ use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, BufDesc, UblkError, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -236,12 +236,39 @@ fn q_fn(qid: u16, dev: &UblkDev) {
         lo_handle_io_cmd_sync(q, tag, io, &io_slice);
     };
 
-    UblkQueue::new(qid, dev)
+    let queue = match UblkQueue::new(qid, dev)
         .unwrap()
-        .regiser_io_bufs(Some(&bufs))
-        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
-        .unwrap()
-        .wait_and_handle_io(lo_io_handler);
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))) {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("submit_fetch_commands_unified failed: {}", e);
+            return;
+        }
+    };
+
+    queue.wait_and_handle_io(lo_io_handler);
+}
+
+async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
+    // Use IoBuf for safe I/O buffer management with automatic memory alignment
+    let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+
+    let mut res = 0;
+
+    // Submit initial prep command - any error will exit the function
+    // The IoBuf is automatically registered
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
+
+    loop {
+        // Use safe slice access for I/O operations
+        // IoBuf's as_mut_slice() provides bounds-checked access eliminating
+        // the need for unsafe pointer operations in the I/O handler
+        let io_slice = buf.as_mut_slice();
+        res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
+
+        // Any error (including QueueIsDown) will break the loop by exiting the function
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+    }
 }
 
 fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
@@ -253,29 +280,10 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            // Use IoBuf for safe I/O buffer management with automatic memory alignment
-            let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-
-            // No longer need raw pointer since we use the unified API with slices
-            let mut cmd_op = sys::UBLK_U_IO_FETCH_REQ;
-            let mut res = 0;
-
-            q.register_io_buf(tag, &buf);
-            loop {
-                let cmd_res = q
-                    .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res)
-                    .unwrap()
-                    .await;
-                if cmd_res == sys::UBLK_IO_RES_ABORT {
-                    break;
-                }
-
-                // Use safe slice access for I/O operations
-                // IoBuf's as_mut_slice() provides bounds-checked access eliminating
-                // the need for unsafe pointer operations in the I/O handler
-                let io_slice = buf.as_mut_slice();
-                res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
-                cmd_op = sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            match lo_io_task(&q, tag).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) =>
+                    log::error!("lo_io_task failed for tag {}: {}", tag, e),
             }
         }));
     }

@@ -73,32 +73,28 @@ fn handle_io(q: &UblkQueue, tag: u16, io_buf: &mut [u8], ramdisk_storage: &mut [
     bytes as i32
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) {
+async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Result<(), UblkError> {
     let buf_size = q.dev.dev_info.max_io_buf_bytes as usize;
 
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
     // IoBuf provides slice-based access through Deref/DerefMut traits
     let mut buffer = IoBuf::<u8>::new(buf_size);
 
-    // No longer need raw pointer since we use the unified API with slices
-    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
-    loop {
-        let cmd_res = q
-            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buffer.as_slice()), res)
-            .unwrap()
-            .await;
-        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-            break;
-        }
+    // Submit initial prep command - any error will exit the function
+    // The IoBuf is automatically registered
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), res, Some(&buffer)).await?;
 
+    loop {
         // Use safe slice access for memory operations
         // IoBuf's as_mut_slice() provides bounds-checked access
         // This eliminates the need for unsafe pointer operations
         let io_slice = buffer.as_mut_slice();
         res = handle_io(&q, tag, io_slice, ramdisk_storage);
-        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+
+        // Any error (including QueueIsDown) will break the loop by exiting the function
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), res).await?;
     }
 }
 
@@ -193,7 +189,11 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
             // 2. Each task operates on different regions controlled by I/O offset bounds
             // 3. The slice provides bounds checking for all operations within io_task
             let storage_slice = unsafe { std::slice::from_raw_parts_mut(storage_ptr, storage_len) };
-            io_task(&q_clone, tag, storage_slice).await;
+            match io_task(&q_clone, tag, storage_slice).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) =>
+                    log::error!("io_task failed for tag {}: {}", tag, e)
+            }
         }));
     }
 

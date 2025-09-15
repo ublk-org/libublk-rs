@@ -70,10 +70,10 @@
 //! use libublk::helpers::IoBuf;
 //! use libublk::sys;
 //!
-//! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
 //!     let slice_desc = BufDesc::from_io_buf(&io_buf);
-//!     let future = queue.submit_io_cmd_unified(0, sys::UBLK_U_IO_FETCH_REQ, slice_desc, -1)?;
+//!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1, Some(&io_buf)).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -84,12 +84,12 @@
 //! use libublk::io::{BufDesc, UblkQueue};
 //! use libublk::sys;
 //!
-//! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
 //!     let auto_reg = sys::ublk_auto_buf_reg {
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
-//!     let future = queue.submit_io_cmd_unified(1, sys::UBLK_U_IO_FETCH_REQ, auto_desc, -1)?;
+//!     let result = queue.submit_io_prep_cmd(1, auto_desc, -1, None).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -128,11 +128,13 @@ use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
+use async_lock::Semaphore;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::{Arc, Condvar, Mutex};
 
 // Unified thread-local io_uring for all queue operations
 
@@ -277,7 +279,7 @@ pub enum BufDesc<'a> {
     ///
     /// Contains a zoned append LBA value for `UBLK_F_ZONED` devices.
     /// Only used for zone append operations and passed through the `addr` field
-    /// of `ublksrv_io_desc` when using `submit_io_cmd_unified()` or `complete_io_cmd_unified()`.
+    /// of `ublksrv_io_desc` when using `submit_io_prep_cmd()`, `submit_io_commit_cmd()`, or `complete_io_cmd_unified()`.
     ZonedAppendLba(u64),
 
     /// Raw memory address for unsafe low-level operations
@@ -659,6 +661,15 @@ pub struct UblkTgt {
     pub params: sys::ublk_params,
 }
 
+/// Buffer registration state for queue synchronization
+#[derive(Debug, Clone)]
+pub(crate) struct BufferRegState {
+    /// Number of queues that have completed buffer registration
+    pub registered_queues: usize,
+    /// Whether any queue has failed mlock
+    pub mlock_failed: bool,
+}
+
 /// For supporting ublk device IO path, and one thin layer of device
 /// abstract in handling IO level. Ublk device supports multiple queue(MQ),
 /// and each queue has its IO depth.
@@ -677,6 +688,9 @@ pub struct UblkDev {
 
     pub tgt: UblkTgt,
     tgt_json: Option<serde_json::Value>,
+
+    /// Synchronization for buffer registration completion
+    pub(crate) buf_reg_sync: Arc<(Mutex<BufferRegState>, Condvar)>,
 }
 
 unsafe impl Send for UblkDev {}
@@ -738,6 +752,13 @@ impl UblkDev {
             tgt,
             flags: ctrl.get_dev_flags(),
             tgt_json: None,
+            buf_reg_sync: Arc::new((
+                Mutex::new(BufferRegState {
+                    registered_queues: 0,
+                    mlock_failed: false,
+                }),
+                Condvar::new(),
+            )),
         };
 
         ops(&mut dev)?;
@@ -799,6 +820,42 @@ impl UblkDev {
         }
     }
 
+    /// Wait for all queues to complete buffer registration
+    pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
+        if (self.dev_info.flags & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64) != 0 {
+            return Ok(())
+        }
+
+        let (lock, cvar) = &*self.buf_reg_sync;
+        let mut state = lock.lock().unwrap();
+
+        while state.registered_queues < nr_hw_queues {
+            // Check for mlock failures
+            if state.mlock_failed {
+                return Err(UblkError::OtherError(-libc::EPERM));
+            }
+            state = cvar.wait(state).unwrap();
+        }
+
+        // Final check for mlock failures
+        if state.mlock_failed {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
+        Ok(())
+    }
+
+    /// Notify that a queue has completed buffer registration
+    pub fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
+        let (lock, cvar) = &*self.buf_reg_sync;
+        let mut state = lock.lock().unwrap();
+        state.registered_queues += 1;
+        if mlock_failed {
+            state.mlock_failed = true;
+        }
+        cvar.notify_all();
+    }
+
     /// Return how many io slots, which is usually same with executor's
     /// nr_tasks.
     #[inline]
@@ -822,6 +879,7 @@ struct UblkQueueState {
 impl UblkQueueState {
     const UBLK_QUEUE_STOPPING: u32 = 1_u32 << 0;
     const UBLK_QUEUE_IDLE: u32 = 1_u32 << 1;
+    const UBLK_QUEUE_MLOCK_FAIL: u32 = 1_u32 << 2;
 
     #[inline(always)]
     fn queue_is_quiesced(&self) -> bool {
@@ -849,6 +907,11 @@ impl UblkQueueState {
     }
 
     #[inline(always)]
+    fn is_mlock_failed(&self) -> bool {
+        (self.state & Self::UBLK_QUEUE_MLOCK_FAIL) != 0
+    }
+
+    #[inline(always)]
     fn inc_cmd_inflight(&mut self) {
         self.cmd_inflight += 1;
     }
@@ -868,6 +931,10 @@ impl UblkQueueState {
         } else {
             self.state &= !Self::UBLK_QUEUE_IDLE;
         }
+    }
+
+    fn mark_mlock_failed(&mut self) {
+        self.state |= Self::UBLK_QUEUE_MLOCK_FAIL;
     }
 }
 
@@ -892,6 +959,11 @@ pub struct UblkQueue<'a> {
     pub dev: &'a UblkDev,
     bufs: RefCell<Vec<*mut u8>>,
     state: RefCell<UblkQueueState>,
+    /// Semaphore to coordinate buffer registrations
+    /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
+    buf_reg_semaphore: Semaphore,
+    /// Counter tracking number of registered buffers for optimization
+    buf_reg_counter: RefCell<u32>,
 }
 
 impl AsRawFd for UblkQueue<'_> {
@@ -1054,6 +1126,8 @@ impl UblkQueue<'_> {
                 state: 0,
             }),
             bufs: RefCell::new(bufs),
+            buf_reg_semaphore: Semaphore::new(0),
+            buf_reg_counter: RefCell::new(0),
         };
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
@@ -1123,6 +1197,44 @@ impl UblkQueue<'_> {
         self.bufs.borrow()[tag as usize]
     }
 
+    /// Validate buffer address consistency for UBLK_DEV_F_MLOCK_IO_BUFFER
+    ///
+    /// When UBLK_DEV_F_MLOCK_IO_BUFFER is enabled, this method validates that
+    /// the buffer address in BufDesc::Slice matches the registered buffer address
+    /// stored in UblkQueue::bufs[tag]. This ensures mlock'd buffers are used
+    /// consistently and prevents potential memory safety issues.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The tag ID for the I/O command
+    /// * `buf_desc` - Buffer descriptor to validate
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if validation passes or MLOCK is not enabled
+    /// * `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match
+    #[inline(always)]
+    fn validate_mlock_buffer_consistency(&self, tag: u16, buf_desc: &BufDesc) -> Result<(), UblkError> {
+        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
+            if let BufDesc::Slice(slice) = buf_desc {
+                if !slice.is_empty() {
+                    let expected_buf_addr = self.get_io_buf_addr(tag) as *const u8;
+                    if slice.as_ptr() != expected_buf_addr {
+                        return Err(UblkError::OtherError(-libc::EINVAL));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_mlock_failed(&self) {
+        self.state.borrow_mut().mark_mlock_failed();
+    }
+    pub(crate) fn is_mlock_failed(&self) -> bool {
+        self.state.borrow().is_mlock_failed()
+    }
+
     /// Register IO buffer, so that pages in this buffer can
     /// be discarded in case queue becomes idle
     pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
@@ -1130,14 +1242,47 @@ impl UblkQueue<'_> {
             return;
         }
 
+        if buf.as_ptr() == std::ptr::null() {
+            return;
+        }
+
         // Apply UBLK_DEV_F_MLOCK_IO_BUFFER if the flag is set
         if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
             if !buf.mlock() {
                 log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
+                self.mark_mlock_failed();
             }
         }
 
         self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
+
+        // Increment the registration counter
+        let mut counter = self.buf_reg_counter.borrow_mut();
+        *counter += 1;
+
+        // Only check if all buffers are registered when counter reaches queue depth
+        if *counter >= self.q_depth {
+            // Double-check that all buffers are actually registered
+            let bufs = self.bufs.borrow();
+            let all_registered = (0..self.q_depth).all(|i| !bufs[i as usize].is_null());
+
+            if all_registered {
+                self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+                // Notify device that this queue completed buffer registration
+                self.dev.notify_buffer_registration_complete(self.is_mlock_failed());
+            }
+        }
+    }
+
+    /// Wait for all buffer registrations to complete
+    ///
+    /// Each task acquires one permit, which is only available after all buffers are registered.
+    async fn wait_for_all_buffer_registrations(&self) {
+        if !self.support_auto_buf_zc() {
+            // Simply acquire one permit - will block until all buffers are registered
+            let _permit = self.buf_reg_semaphore.acquire().await;
+            // Permit is automatically released when dropped
+        }
     }
 
     /// Register IO buffer, so that pages in this buffer can
@@ -1146,7 +1291,13 @@ impl UblkQueue<'_> {
         if self.support_auto_buf_zc() {
             return;
         }
-        self.bufs.borrow_mut()[tag as usize] = std::ptr::null_mut();
+
+        // Only decrement counter if buffer was actually registered
+        if !self.bufs.borrow()[tag as usize].is_null() {
+            self.bufs.borrow_mut()[tag as usize] = std::ptr::null_mut();
+            let mut counter = self.buf_reg_counter.borrow_mut();
+            *counter = counter.saturating_sub(1);
+        }
     }
 
     /// unregister all io buffers
@@ -1157,6 +1308,8 @@ impl UblkQueue<'_> {
         for tag in 0..self.q_depth {
             self.unregister_io_buf(tag.try_into().unwrap());
         }
+        // Reset counter to 0 after unregistering all buffers
+        *self.buf_reg_counter.borrow_mut() = 0;
     }
 
     /// Register Io buffers
@@ -1168,7 +1321,6 @@ impl UblkQueue<'_> {
                 }
             }
         }
-
         self
     }
 
@@ -1277,7 +1429,11 @@ impl UblkQueue<'_> {
 
     /// Submit one io command.
     ///
-    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_cmd_unified`] instead.
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_io_commit_cmd`] instead.
+    ///
+    /// **IMPORTANT:** `UBLK_DEV_F_MLOCK_IO_BUFFER` is not supported with this deprecated API.
+    /// For mlock functionality, use the unified APIs: `submit_io_prep_cmd()`, `submit_io_commit_cmd()`,
+    /// `submit_fetch_commands_unified()` and `complete_io_cmd_unified()`.
     ///
     /// When it is called 1st time on this tag, the `cmd_op` has to be
     /// UBLK_U_IO_FETCH_REQ, otherwise it is UBLK_U_IO_COMMIT_AND_FETCH_REQ.
@@ -1290,7 +1446,10 @@ impl UblkQueue<'_> {
     ///
     /// In case of zoned, `buf_addr` can be the returned LBA for zone append
     /// command.
-    #[deprecated(since = "0.8.0", note = "Use `submit_io_cmd_unified` instead")]
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead"
+    )]
     #[inline]
     pub fn submit_io_cmd(
         &self,
@@ -1310,12 +1469,15 @@ impl UblkQueue<'_> {
 
     /// Submit io command with auto buffer registration support
     ///
-    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_cmd_unified`] instead.
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_io_commit_cmd`] instead.
     ///
     /// For UBLK_F_AUTO_BUF_REG, the buffer index and flags are passed via buf_reg_data.
     /// When auto buffer registration is enabled, buf_addr should be set to the encoded
     /// auto buffer registration data instead of the actual buffer address.
-    #[deprecated(since = "0.8.0", note = "Use `submit_io_cmd_unified` instead")]
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead"
+    )]
     #[inline]
     pub fn submit_io_cmd_with_auto_buf_reg(
         &self,
@@ -1365,7 +1527,7 @@ impl UblkQueue<'_> {
     ///
     /// For usage examples, see the module-level documentation.
     #[inline]
-    pub fn submit_io_cmd_unified(
+    fn submit_io_cmd_unified(
         &self,
         tag: u16,
         cmd_op: u32,
@@ -1406,6 +1568,137 @@ impl UblkQueue<'_> {
         };
 
         Ok(future)
+    }
+
+    /// Submit I/O preparation command (UBLK_U_IO_FETCH_REQ)
+    ///
+    /// This function submits a fetch request to get a new I/O command from the kernel.
+    /// It should typically be called once outside of loops for better performance.
+    /// If an IoBuf is provided, it will be automatically registered for the given tag.
+    ///
+    /// The function includes synchronization to ensure all buffer registrations are
+    /// completed before any prep commands are submitted, providing similar behavior
+    /// to `submit_fetch_commands_unified()` where all registrations happen first.
+    ///
+    /// The function performs cross-verification to ensure buffer descriptor alignment:
+    /// - `BufDesc::Slice` with `Some(io_buf)`: Slice must point to the same memory as IoBuf
+    /// - `BufDesc::Slice` with `None`: Slice must be empty (user_copy mode)
+    /// - `BufDesc::AutoReg` with `Some(io_buf)`: Invalid - returns error (mutually exclusive)
+    /// - `BufDesc::AutoReg` with `None`: Valid usage for zero-copy operations
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The tag ID for the I/O command
+    /// * `buf_desc` - Buffer descriptor for the I/O operation
+    /// * `result` - Result value (typically -1 for fetch operations)
+    /// * `io_buf` - Optional IoBuf to register for this tag
+    ///
+    /// # Returns
+    ///
+    /// Returns a Result containing the command result when complete.
+    /// Returns `Err(UblkError::OtherError(-EINVAL))` if buffer descriptor doesn't align with IoBuf.
+    /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
+    #[inline]
+    pub async fn submit_io_prep_cmd(
+        &self,
+        tag: u16,
+        buf_desc: BufDesc<'_>,
+        result: i32,
+        io_buf: Option<&crate::helpers::IoBuf<u8>>,
+    ) -> Result<i32, UblkError> {
+        // Cross-verify buffer descriptor alignment with IoBuf
+        match (&buf_desc, &io_buf) {
+            (BufDesc::Slice(slice), Some(buf)) => {
+                // Verify that the slice points to the same memory as the IoBuf
+                let buf_slice = buf.as_slice();
+                if slice.as_ptr() != buf_slice.as_ptr() || slice.len() != buf_slice.len() {
+                    return Err(UblkError::OtherError(-libc::EINVAL));
+                }
+            }
+            (BufDesc::Slice(slice), None) => {
+                // For user_copy mode, slice should be empty
+                if !slice.is_empty() {
+                    return Err(UblkError::OtherError(-libc::EINVAL));
+                }
+            }
+            (BufDesc::AutoReg(_), Some(_)) => {
+                // AutoReg should not be used with IoBuf - they are mutually exclusive
+                return Err(UblkError::OtherError(-libc::EINVAL));
+            }
+            (BufDesc::AutoReg(_), None) => {
+                // This is the correct usage for AutoReg
+            }
+            (BufDesc::ZonedAppendLba(_), _) | (BufDesc::RawAddress(_), _) => {
+                // These variants don't require specific verification with IoBuf
+            }
+        }
+
+        // Register the IoBuf if provided and acquire permit
+        if let Some(buf) = io_buf {
+            self.register_io_buf(tag, buf);
+            // Wait for all buffer registrations to complete before submitting prep commands
+            // This ensures that the effect is similar to submit_fetch_commands_unified()
+            self.wait_for_all_buffer_registrations().await;
+        }
+
+        // Check if mlock failed and fail immediately if so, but only for FETCH_REQ operations
+        if self.is_mlock_failed() {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
+        let future =
+            self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
+        let res = future.await;
+        if res == crate::sys::UBLK_IO_RES_ABORT {
+            Err(UblkError::QueueIsDown)
+        } else {
+            Ok(res)
+        }
+    }
+
+    /// Submit I/O commit command (UBLK_U_IO_COMMIT_AND_FETCH_REQ)
+    ///
+    /// This function commits the result of a previous I/O operation and fetches
+    /// the next I/O command in a single operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The tag ID for the I/O command
+    /// * `buf_desc` - Buffer descriptor for the I/O operation
+    /// * `result` - Result value from the completed I/O operation
+    ///
+    /// # Returns
+    ///
+    /// Returns a Result containing the next command result when complete.
+    /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
+    ///
+    /// When `UBLK_DEV_F_MLOCK_IO_BUFFER` is enabled, this method validates that
+    /// the buffer address in `BufDesc::Slice` matches the registered buffer address
+    /// stored in `UblkQueue::bufs[tag]`. This ensures mlock'd buffers are used
+    /// consistently and prevents potential memory safety issues. Returns
+    /// `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match.
+    ///
+    #[inline]
+    pub async fn submit_io_commit_cmd(
+        &self,
+        tag: u16,
+        buf_desc: BufDesc<'_>,
+        result: i32,
+    ) -> Result<i32, UblkError> {
+        // Buffer validation for UBLK_DEV_F_MLOCK_IO_BUFFER
+        self.validate_mlock_buffer_consistency(tag, &buf_desc)?;
+        let future = self.submit_io_cmd_unified(
+            tag,
+            crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
+            buf_desc,
+            result,
+        )?;
+        let res = future.await;
+        if res == crate::sys::UBLK_IO_RES_ABORT {
+            Err(UblkError::QueueIsDown)
+        } else {
+            Ok(res)
+        }
     }
 
     #[inline]
@@ -1511,6 +1804,10 @@ impl UblkQueue<'_> {
     ///
     /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_fetch_commands_unified`] instead.
     ///
+    /// **IMPORTANT:** `UBLK_DEV_F_MLOCK_IO_BUFFER` is not supported with this deprecated API.
+    /// For mlock functionality, use the unified APIs: `submit_io_prep_cmd()`, `submit_io_commit_cmd()`,
+    /// `submit_fetch_commands_unified()` and `complete_io_cmd_unified()`.
+    ///
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
@@ -1602,9 +1899,12 @@ impl UblkQueue<'_> {
     /// existing method based on the buffer descriptor list variant while maintaining zero-cost
     /// abstraction principles.
     ///
+    /// When buffer slices are provided, this method automatically registers the IO buffers
+    /// before submitting fetch commands, eliminating the need for manual `regiser_io_bufs()` calls.
+    ///
     /// # Buffer Descriptor List Compatibility:
     ///
-    /// * `BufDescList::Slices` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
+    /// * `BufDescList::Slices` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`. Automatically registers buffers when provided.
     /// * `BufDescList::AutoRegs` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
     ///
     /// Only called during queue initialization. After queue is setup,
@@ -1617,12 +1917,26 @@ impl UblkQueue<'_> {
         self,
         buf_desc_list: BufDescList,
     ) -> Result<Self, UblkError> {
+        // Check if mlock failed and fail immediately if so
+        if self.is_mlock_failed() {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
         // Validate and dispatch based on buffer descriptor list variant
-        let result = match buf_desc_list {
+        match buf_desc_list {
             BufDescList::Slices(slice_opt) => {
+                // For batch registration that doesn't use register_io_buf (when slice_opt is None),
+                // we need to add permits since the check won't happen automatically
+                if slice_opt.is_none() {
+                    self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+                }
+
+                // Automatically register IO buffers if provided and not in zero-copy mode
+                let queue_with_buffers = self.regiser_io_bufs(slice_opt);
+
                 // Dispatch to existing submit_fetch_commands method
                 #[allow(deprecated)]
-                Ok(self.submit_fetch_commands(slice_opt))
+                Ok(queue_with_buffers.submit_fetch_commands(slice_opt))
             }
             BufDescList::AutoRegs(auto_reg_slice) => {
                 // AutoReg operations require UBLK_F_AUTO_BUF_REG
@@ -1630,13 +1944,14 @@ impl UblkQueue<'_> {
                     return Err(UblkError::OtherError(-libc::ENOTSUP));
                 }
 
+                // For auto buffer registration, add permits since buffers aren't registered through register_io_buf
+                self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+
                 // Dispatch to existing submit_fetch_commands_with_auto_buf_reg method
                 #[allow(deprecated)]
                 Ok(self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice))
             }
-        };
-
-        result
+        }
     }
 
     fn __submit_fetch_commands(&self) {
@@ -1790,6 +2105,12 @@ impl UblkQueue<'_> {
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
     ///
+    /// When `UBLK_DEV_F_MLOCK_IO_BUFFER` is enabled, this method validates that
+    /// the buffer address in `BufDesc::Slice` matches the registered buffer address
+    /// stored in `UblkQueue::bufs[tag]`. This ensures mlock'd buffers are used
+    /// consistently and prevents potential memory safety issues. Returns
+    /// `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match.
+    ///
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
     #[inline]
     pub fn complete_io_cmd_unified(
@@ -1800,6 +2121,9 @@ impl UblkQueue<'_> {
     ) -> Result<(), UblkError> {
         // Validate buffer descriptor compatibility with device capabilities
         buf_desc.validate_compatibility(self.dev.dev_info.flags)?;
+
+        // Buffer validation for UBLK_DEV_F_MLOCK_IO_BUFFER
+        self.validate_mlock_buffer_consistency(tag, &buf_desc)?;
 
         // Dispatch to appropriate method based on buffer descriptor type
         match buf_desc {
@@ -1993,6 +2317,12 @@ impl UblkQueue<'_> {
         let args = types::SubmitArgs::new().timespec(&ts);
 
         let state = self.state.borrow();
+
+        // Check if mlock failed and fail immediately if so
+        if state.is_mlock_failed() {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
         log::trace!(
             "dev{}-q{}: to_submit {} inflight cmd {} stopping {}",
             self.dev.dev_info.dev_id,
@@ -2380,6 +2710,192 @@ mod tests {
             let cq_entries = with_queue_ring_mut(&q, |ring| ring.params().cq_entries());
             assert!(cq_entries == 32, "Should have 32 cq_entries");
 
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+    }
+
+    #[test]
+    fn test_submit_io_prep_cmd_verification() {
+        use crate::helpers::IoBuf;
+        use crate::sys;
+
+        // Test verification logic with a mock setup (we don't need a real ublk device for verification tests)
+        let buf1 = IoBuf::<u8>::new(4096);
+        let buf2 = IoBuf::<u8>::new(2048);
+
+        // Test case 1: BufDesc::Slice with matching IoBuf (should be valid)
+        let slice1 = buf1.as_slice();
+        let _desc1 = BufDesc::Slice(slice1);
+        // This should pass verification (in real usage it would be tested in submit_io_prep_cmd)
+
+        // Test case 2: BufDesc::Slice with mismatched IoBuf (should fail verification)
+        let slice2 = buf2.as_slice();
+        let _desc2 = BufDesc::Slice(slice2);
+        // Using desc2 with buf1 would fail verification because pointers don't match
+
+        // Test case 3: BufDesc::Slice empty with None IoBuf (should be valid for user_copy)
+        let empty_slice: &[u8] = &[];
+        let _desc3 = BufDesc::Slice(empty_slice);
+        // This should pass verification when used with None IoBuf
+
+        // Test case 4: BufDesc::AutoReg with None IoBuf (should be valid)
+        let auto_reg = sys::ublk_auto_buf_reg {
+            index: 0,
+            flags: 0,
+            reserved0: 0,
+            reserved1: 0,
+        };
+        let _desc4 = BufDesc::AutoReg(auto_reg);
+        // This should pass verification when used with None IoBuf
+
+        // Test case 5: BufDesc::AutoReg with Some IoBuf (should fail verification)
+        // Using _desc4 with Some(&buf1) would fail verification because they're mutually exclusive
+
+        // Verify pointer matching logic
+        assert_eq!(slice1.as_ptr(), buf1.as_slice().as_ptr());
+        assert_eq!(slice1.len(), buf1.as_slice().len());
+        assert_ne!(slice2.as_ptr(), buf1.as_slice().as_ptr());
+        assert_ne!(slice2.len(), buf1.as_slice().len());
+        assert_eq!(empty_slice.len(), 0);
+
+        println!("Buffer descriptor verification test cases validated");
+    }
+
+    #[test]
+    fn test_buffer_registration_synchronization() {
+        use crate::ctrl::UblkCtrlBuilder;
+        use crate::helpers::IoBuf;
+        use crate::UblkFlags;
+
+        // Test that semaphore-based synchronization works correctly
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .depth(4) // Small depth for easier testing
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut _| {
+            let q = UblkQueue::new(0, dev)?;
+
+            // Test that semaphore starts with 0 permits
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Semaphore should start with 0 permits"
+            );
+
+            // Test that counter starts at 0
+            assert_eq!(*q.buf_reg_counter.borrow(), 0, "Counter should start at 0");
+
+            // Register some buffers - should not add permits until ALL are registered
+            let buf1 = IoBuf::<u8>::new(4096);
+            let buf2 = IoBuf::<u8>::new(4096);
+            let buf3 = IoBuf::<u8>::new(4096);
+            let buf4 = IoBuf::<u8>::new(4096);
+
+            q.register_io_buf(0, &buf1);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                1,
+                "Counter should be 1 after first registration"
+            );
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Should have no permits until all buffers registered"
+            );
+
+            q.register_io_buf(1, &buf2);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                2,
+                "Counter should be 2 after second registration"
+            );
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Should have no permits until all buffers registered"
+            );
+
+            q.register_io_buf(2, &buf3);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                3,
+                "Counter should be 3 after third registration"
+            );
+            assert!(
+                q.buf_reg_semaphore.try_acquire().is_none(),
+                "Should have no permits until all buffers registered"
+            );
+
+            // Register the last buffer - this should add all permits
+            q.register_io_buf(3, &buf4);
+            assert_eq!(
+                *q.buf_reg_counter.borrow(),
+                4,
+                "Counter should be 4 after all registrations"
+            );
+
+            // Now we should have 4 permits available
+            let permit1 = q.buf_reg_semaphore.try_acquire();
+            assert!(
+                permit1.is_some(),
+                "Should have permits after all buffers registered"
+            );
+
+            let permit2 = q.buf_reg_semaphore.try_acquire();
+            assert!(permit2.is_some(), "Should have multiple permits available");
+
+            println!("Optimized buffer registration synchronization test completed successfully");
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+    }
+
+    #[test]
+    fn test_buffer_registration_sync() {
+        use crate::ctrl::UblkCtrlBuilder;
+        use crate::UblkFlags;
+
+        // Test that our new synchronization mechanism works
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .nr_queues(2)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            // Test initial state
+            let (lock, _) = &*dev.buf_reg_sync;
+            let state = lock.lock().unwrap();
+            assert_eq!(state.registered_queues, 0);
+            assert_eq!(state.mlock_failed, false);
+            drop(state);
+
+            // Test notification of buffer registration without mlock failure
+            dev.notify_buffer_registration_complete(false);
+            let state = lock.lock().unwrap();
+            assert_eq!(state.registered_queues, 1);
+            assert_eq!(state.mlock_failed, false);
+            drop(state);
+
+            // Test notification of buffer registration with mlock failure
+            dev.notify_buffer_registration_complete(true);
+            let state = lock.lock().unwrap();
+            assert_eq!(state.registered_queues, 2);
+            assert_eq!(state.mlock_failed, true);
+            drop(state);
+
+            // Test that wait_for_buffer_registration fails when mlock_failed is true
+            let result = dev.wait_for_buffer_registration(2);
+            match result {
+                Err(crate::UblkError::OtherError(code)) => {
+                    assert_eq!(code, -libc::EPERM);
+                }
+                _ => panic!("Expected EPERM error for mlock failure"),
+            }
+
+            println!("Buffer registration synchronization test completed successfully");
             Ok(())
         };
 

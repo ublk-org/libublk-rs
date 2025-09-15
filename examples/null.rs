@@ -3,7 +3,7 @@ use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, BufDesc, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::rc::Rc;
 
 bitflags! {
@@ -57,16 +57,48 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         handle_io_cmd(q, tag, io_slice);
     };
 
-    UblkQueue::new(qid, dev)
+    let queue = match UblkQueue::new(qid, dev)
         .unwrap()
-        .regiser_io_bufs(if user_copy { None } else { Some(&bufs_rc) })
         .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
             None
         } else {
             Some(&bufs_rc)
-        }))
-        .unwrap()
-        .wait_and_handle_io(io_handler);
+        })) {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("submit_fetch_commands_unified failed: {}", e);
+            return;
+        }
+    };
+
+    queue.wait_and_handle_io(io_handler);
+}
+
+async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<(), UblkError> {
+    let mut res = 0;
+    // Use IoBuf with slice-based access for memory safety
+    let _buf = if user_copy {
+        None
+    } else {
+        let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+        Some(buf)
+    };
+
+    let buf_desc = if user_copy {
+        BufDesc::Slice(&[])
+    } else {
+        BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
+    };
+
+    // Submit initial prep command - any error will exit the function
+    // The IoBuf is automatically registered if provided
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, _buf.as_ref()).await?;
+
+    loop {
+        res = get_io_cmd_result(&q, tag);
+        // Any error (including QueueIsDown) will break the loop by exiting the function
+        q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
+    }
 }
 
 fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
@@ -78,33 +110,10 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
-            let mut res = 0;
-            // Use IoBuf with slice-based access for memory safety
-            let _buf = if user_copy {
-                None
-            } else {
-                let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-                q.register_io_buf(tag, &buf);
-                Some(buf)
-            };
-
-            loop {
-                let buf_desc = if user_copy {
-                    BufDesc::Slice(&[])
-                } else {
-                    BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
-                };
-                let cmd_res = q
-                    .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)
-                    .unwrap()
-                    .await;
-                if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-                    break;
-                }
-
-                res = get_io_cmd_result(&q, tag);
-                cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+            match null_io_task(&q, tag, user_copy).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) =>
+                    log::error!("null_io_task failed for tag {}: {}", tag, e)
             }
         }));
     }
