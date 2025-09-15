@@ -9,6 +9,7 @@ use bitflags::bitflags;
 
 mod bindings;
 pub mod ctrl;
+pub mod ctrl_async;
 pub mod helpers;
 pub mod io;
 pub mod sys;

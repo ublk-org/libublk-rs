@@ -10,6 +10,35 @@
 //! - **Device Abstraction**: `UblkDev` represents ublk device instances
 //! - **I/O Context**: `UblkIOCtx` provides context for handling I/O operations
 //!
+//! ## Device Creation Example
+//!
+//! ```no_run
+//! use libublk::ctrl::UblkCtrl;
+//! use libublk::io::UblkDev;
+//! use libublk::UblkFlags;
+//!
+//! fn example() -> Result<(), Box<dyn std::error::Error>> {
+//!     let ctrl = UblkCtrl::new(
+//!         Some("example".to_string()),
+//!         -1, // Let driver allocate ID
+//!         1,  // nr_queues
+//!         64, // depth
+//!         4096, // io_buf_bytes
+//!         0,  // flags
+//!         0,  // tgt_flags
+//!         UblkFlags::UBLK_DEV_F_ADD_DEV
+//!     )?;
+//!
+//!     let tgt_init = |dev: &mut UblkDev| {
+//!         dev.set_default_params(1024 * 1024 * 1024); // 1GB
+//!         Ok(())
+//!     };
+//!
+//!     let dev = UblkDev::new("example".to_string(), tgt_init, &ctrl)?;
+//!     Ok(())
+//! }
+//! ```
+//!
 //! ## Ring Initialization Examples
 //!
 //! ### Basic Custom Initialization
@@ -697,32 +726,37 @@ unsafe impl Send for UblkDev {}
 unsafe impl Sync for UblkDev {}
 
 impl UblkDev {
-    /// New one ublk device
+    /// Helper function to create UblkDev with common device information
     ///
     /// # Arguments:
     ///
+    /// * `tgt_name`: target type name
+    /// * `dev_info`: device information
+    /// * `cdev_path`: character device path
+    /// * `dev_flags`: device flags
     /// * `ops`: target operation functions
-    /// * `ctrl`: control device reference
-    /// * `tgt_type`: target type, such as 'loop', 'null', ...
     ///
-    /// ublk device is abstraction for target, and prepare for setting
-    /// up target. Any target private data can be defined in the data
-    /// structure which implements UblkTgtImpl.
-    pub fn new<F>(tgt_name: String, ops: F, ctrl: &UblkCtrl) -> Result<UblkDev, UblkError>
+    /// This helper extracts the common device creation logic that can be
+    /// reused by both sync and async constructors.
+    fn new_with_info<F>(
+        tgt_name: String,
+        dev_info: sys::ublksrv_ctrl_dev_info,
+        cdev_path: String,
+        dev_flags: UblkFlags,
+        ops: F,
+    ) -> Result<UblkDev, UblkError>
     where
         F: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
     {
-        let info = ctrl.dev_info();
         let mut tgt = UblkTgt {
             tgt_type: tgt_name,
-            sq_depth: info.queue_depth,
-            cq_depth: info.queue_depth,
+            sq_depth: dev_info.queue_depth,
+            cq_depth: dev_info.queue_depth,
             fds: [0_i32; 32],
             ring_flags: 0,
             ..Default::default()
         };
         let mut cnt = 0;
-        let cdev_path = ctrl.get_cdev_path();
 
         // ublk char device setup(udev event handling, ...) may not be done
         // successfully, so wait a while. And the timeout is set as 3sec now.
@@ -747,10 +781,10 @@ impl UblkDev {
         tgt.nr_fds = 1;
 
         let mut dev = UblkDev {
-            dev_info: info,
+            dev_info,
             cdev_file,
             tgt,
-            flags: ctrl.get_dev_flags(),
+            flags: dev_flags,
             tgt_json: None,
             buf_reg_sync: Arc::new((
                 Mutex::new(BufferRegState {
@@ -765,6 +799,60 @@ impl UblkDev {
         log::info!("dev {} initialized", dev.dev_info.dev_id);
 
         Ok(dev)
+    }
+
+    /// New one ublk device
+    ///
+    /// # Arguments:
+    ///
+    /// * `ops`: target operation functions
+    /// * `ctrl`: control device reference
+    /// * `tgt_type`: target type, such as 'loop', 'null', ...
+    ///
+    /// ublk device is abstraction for target, and prepare for setting
+    /// up target. Any target private data can be defined in the data
+    /// structure which implements UblkTgtImpl.
+    pub fn new<F>(tgt_name: String, ops: F, ctrl: &UblkCtrl) -> Result<UblkDev, UblkError>
+    where
+        F: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
+    {
+        Self::new_with_info(
+            tgt_name,
+            ctrl.dev_info(),
+            ctrl.get_cdev_path(),
+            ctrl.get_dev_flags(),
+            ops,
+        )
+    }
+
+    /// Create new ublk device asynchronously
+    ///
+    /// # Arguments:
+    ///
+    /// * `tgt_name`: target type name, such as 'loop', 'null', ...
+    /// * `ops`: target operation functions
+    /// * `ctrl`: async control device reference
+    ///
+    /// This is the async version of `new()`. It creates a ublk device
+    /// using an async control device reference. The implementation
+    /// reuses the existing sync code since device creation is mostly
+    /// synchronous operations.
+    #[allow(dead_code)]
+    pub(crate) fn new_async<F>(
+        tgt_name: String,
+        ops: F,
+        ctrl: &super::ctrl_async::UblkCtrlAsync,
+    ) -> Result<UblkDev, UblkError>
+    where
+        F: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
+    {
+        Self::new_with_info(
+            tgt_name,
+            ctrl.dev_info(),
+            ctrl.get_cdev_path(),
+            ctrl.get_dev_flags(),
+            ops,
+        )
     }
 
     //private method for drop
