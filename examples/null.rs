@@ -110,8 +110,10 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            if let Err(e) = null_io_task(&q, tag, user_copy).await {
-                log::error!("null_io_task failed for tag {}: {}", tag, e);
+            match null_io_task(&q, tag, user_copy).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) =>
+                    log::error!("null_io_task failed for tag {}: {}", tag, e)
             }
         }));
     }

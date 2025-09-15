@@ -262,8 +262,10 @@ mod integration {
                 let __dev_data = _dev_data.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    if let Err(e) = test_io_task(&q, tag, &__dev_data).await {
-                        log::error!("test_io_task failed for tag {}: {}", tag, e);
+                    match test_io_task(&q, tag, &__dev_data).await {
+                        Err(UblkError::QueueIsDown) | Ok(_) => {}
+                        Err(e) =>
+                            log::error!("test_io_task failed for tag {}: {}", tag, e)
                     }
                 }));
             }
@@ -374,10 +376,10 @@ mod integration {
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    if let Err(e) =
-                        test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await
-                    {
-                        log::error!("test_auto_reg_io_task failed for tag {}: {}", tag, e);
+                    match test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await {
+                        Err(UblkError::QueueIsDown) | Ok(_) => {}
+                        Err(e) =>
+                            log::error!("test_auto_reg_io_task failed for tag {}: {}", tag, e),
                     }
                 }));
             }
@@ -552,9 +554,10 @@ mod integration {
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
-                    if let Err(e) = test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await
-                    {
-                        log::error!("test_ramdisk_io_task failed for tag {}: {}", tag, e);
+                    match test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await {
+                        Err(UblkError::QueueIsDown) | Ok(_) => {}
+                        Err(e) =>
+                            log::error!("test_ramdisk_io_task failed for tag {}: {}", tag, e)
                     }
                 }));
             }

@@ -189,8 +189,10 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
             // 2. Each task operates on different regions controlled by I/O offset bounds
             // 3. The slice provides bounds checking for all operations within io_task
             let storage_slice = unsafe { std::slice::from_raw_parts_mut(storage_ptr, storage_len) };
-            if let Err(e) = io_task(&q_clone, tag, storage_slice).await {
-                log::error!("io_task failed for tag {}: {}", tag, e);
+            match io_task(&q_clone, tag, storage_slice).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) =>
+                    log::error!("io_task failed for tag {}: {}", tag, e)
             }
         }));
     }

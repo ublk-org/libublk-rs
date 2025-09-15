@@ -280,8 +280,10 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            if let Err(e) = lo_io_task(&q, tag).await {
-                log::error!("lo_io_task failed for tag {}: {}", tag, e);
+            match lo_io_task(&q, tag).await {
+                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                Err(e) =>
+                    log::error!("lo_io_task failed for tag {}: {}", tag, e),
             }
         }));
     }
