@@ -73,7 +73,7 @@
 //! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
 //!     let slice_desc = BufDesc::from_io_buf(&io_buf);
-//!     let future = queue.submit_io_cmd_unified(0, sys::UBLK_U_IO_FETCH_REQ, slice_desc, -1)?;
+//!     let future = queue.submit_io_prep_cmd(0, slice_desc, -1)?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -89,7 +89,7 @@
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
-//!     let future = queue.submit_io_cmd_unified(1, sys::UBLK_U_IO_FETCH_REQ, auto_desc, -1)?;
+//!     let future = queue.submit_io_prep_cmd(1, auto_desc, -1)?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -277,7 +277,7 @@ pub enum BufDesc<'a> {
     ///
     /// Contains a zoned append LBA value for `UBLK_F_ZONED` devices.
     /// Only used for zone append operations and passed through the `addr` field
-    /// of `ublksrv_io_desc` when using `submit_io_cmd_unified()` or `complete_io_cmd_unified()`.
+    /// of `ublksrv_io_desc` when using `submit_io_prep_cmd()`, `submit_io_commit_cmd()`, or `complete_io_cmd_unified()`.
     ZonedAppendLba(u64),
 
     /// Raw memory address for unsafe low-level operations
@@ -1277,7 +1277,7 @@ impl UblkQueue<'_> {
 
     /// Submit one io command.
     ///
-    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_cmd_unified`] instead.
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_io_commit_cmd`] instead.
     ///
     /// When it is called 1st time on this tag, the `cmd_op` has to be
     /// UBLK_U_IO_FETCH_REQ, otherwise it is UBLK_U_IO_COMMIT_AND_FETCH_REQ.
@@ -1290,7 +1290,7 @@ impl UblkQueue<'_> {
     ///
     /// In case of zoned, `buf_addr` can be the returned LBA for zone append
     /// command.
-    #[deprecated(since = "0.8.0", note = "Use `submit_io_cmd_unified` instead")]
+    #[deprecated(since = "0.8.0", note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead")]
     #[inline]
     pub fn submit_io_cmd(
         &self,
@@ -1310,12 +1310,12 @@ impl UblkQueue<'_> {
 
     /// Submit io command with auto buffer registration support
     ///
-    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_cmd_unified`] instead.
+    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_io_commit_cmd`] instead.
     ///
     /// For UBLK_F_AUTO_BUF_REG, the buffer index and flags are passed via buf_reg_data.
     /// When auto buffer registration is enabled, buf_addr should be set to the encoded
     /// auto buffer registration data instead of the actual buffer address.
-    #[deprecated(since = "0.8.0", note = "Use `submit_io_cmd_unified` instead")]
+    #[deprecated(since = "0.8.0", note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead")]
     #[inline]
     pub fn submit_io_cmd_with_auto_buf_reg(
         &self,
@@ -1365,7 +1365,7 @@ impl UblkQueue<'_> {
     ///
     /// For usage examples, see the module-level documentation.
     #[inline]
-    pub fn submit_io_cmd_unified(
+    fn submit_io_cmd_unified(
         &self,
         tag: u16,
         cmd_op: u32,
@@ -1406,6 +1406,54 @@ impl UblkQueue<'_> {
         };
 
         Ok(future)
+    }
+
+    /// Submit I/O preparation command (UBLK_U_IO_FETCH_REQ)
+    ///
+    /// This function submits a fetch request to get a new I/O command from the kernel.
+    /// It should typically be called once outside of loops for better performance.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The tag ID for the I/O command
+    /// * `buf_desc` - Buffer descriptor for the I/O operation
+    /// * `result` - Result value (typically -1 for fetch operations)
+    ///
+    /// # Returns
+    ///
+    /// Returns a future that resolves to the command result when complete.
+    #[inline]
+    pub fn submit_io_prep_cmd(
+        &self,
+        tag: u16,
+        buf_desc: BufDesc,
+        result: i32,
+    ) -> Result<UblkUringOpFuture, UblkError> {
+        self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)
+    }
+
+    /// Submit I/O commit command (UBLK_U_IO_COMMIT_AND_FETCH_REQ)
+    ///
+    /// This function commits the result of a previous I/O operation and fetches
+    /// the next I/O command in a single operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The tag ID for the I/O command
+    /// * `buf_desc` - Buffer descriptor for the I/O operation
+    /// * `result` - Result value from the completed I/O operation
+    ///
+    /// # Returns
+    ///
+    /// Returns a future that resolves to the next command result when complete.
+    #[inline]
+    pub fn submit_io_commit_cmd(
+        &self,
+        tag: u16,
+        buf_desc: BufDesc,
+        result: i32,
+    ) -> Result<UblkUringOpFuture, UblkError> {
+        self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ, buf_desc, result)
     }
 
     #[inline]

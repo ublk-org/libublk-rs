@@ -80,24 +80,25 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
     // IoBuf provides slice-based access through Deref/DerefMut traits
     let mut buffer = IoBuf::<u8>::new(buf_size);
 
-    // No longer need raw pointer since we use the unified API with slices
-    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
-    loop {
-        let cmd_res = q
-            .submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buffer.as_slice()), res)?
-            .await;
-        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-            break;
-        }
+    // Submit initial prep command
+    let cmd_res = q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), res)?.await;
+    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+        return Ok(());
+    }
 
+    loop {
         // Use safe slice access for memory operations
         // IoBuf's as_mut_slice() provides bounds-checked access
         // This eliminates the need for unsafe pointer operations
         let io_slice = buffer.as_mut_slice();
         res = handle_io(&q, tag, io_slice, ramdisk_storage);
-        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
+
+        let cmd_res = q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), res)?.await;
+        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+            break;
+        }
     }
     Ok(())
 }

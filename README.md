@@ -33,28 +33,33 @@ async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
 }
 
 // implement whole ublk IO level protocol
-async fn io_task(q: &UblkQueue<'_>, tag: u16) {
+async fn io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), libublk::UblkError> {
     // IO buffer for exchange data with /dev/ublkbN
     let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
     let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
-    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
 
     // Register IO buffer, so that buffer pages can be discarded
     // when queue becomes idle
     q.register_io_buf(tag, &buf);
+
+    // Submit initial prep command to fetch first IO request
+    res = q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
+    if res == libublk::sys::UBLK_IO_RES_ABORT {
+        return Ok(());
+    }
+
     loop {
-        // Complete previous command with result and re-submit
-        // IO command for fetching new IO request from /dev/ublkbN
-        res = q.submit_io_cmd_unified(tag, cmd_op, BufDesc::Slice(buf.as_slice()), res).unwrap().await;
+        // Handle this incoming IO command
+        res = handle_io_cmd(&q, tag).await;
+
+        // Commit result and fetch next IO request
+        res = q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
         if res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }
-
-        // Handle this incoming IO command
-        res = handle_io_cmd(&q, tag).await;
-        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
+    Ok(())
 }
 
 fn q_fn(qid: u16, dev: &UblkDev) {

@@ -76,7 +76,6 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
 }
 
 async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<(), UblkError> {
-    let mut cmd_op = libublk::sys::UBLK_U_IO_FETCH_REQ;
     let mut res = 0;
     // Use IoBuf with slice-based access for memory safety
     let _buf = if user_copy {
@@ -87,21 +86,24 @@ async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<()
         Some(buf)
     };
 
+    let buf_desc = if user_copy {
+        BufDesc::Slice(&[])
+    } else {
+        BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
+    };
+
+    // Submit initial prep command
+    let cmd_res = q.submit_io_prep_cmd(tag, buf_desc.clone(), res)?.await;
+    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
+        return Ok(());
+    }
+
     loop {
-        let buf_desc = if user_copy {
-            BufDesc::Slice(&[])
-        } else {
-            BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
-        };
-        let cmd_res = q
-            .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)?
-            .await;
+        res = get_io_cmd_result(&q, tag);
+        let cmd_res = q.submit_io_commit_cmd(tag, buf_desc.clone(), res)?.await;
         if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
             break;
         }
-
-        res = get_io_cmd_result(&q, tag);
-        cmd_op = libublk::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
     }
     Ok(())
 }

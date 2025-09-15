@@ -3339,24 +3339,25 @@ mod tests {
         use crate::helpers::IoBuf;
         use crate::BufDesc;
 
-        let mut cmd_op = crate::sys::UBLK_U_IO_FETCH_REQ;
         let mut res = 0;
         let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
         q.register_io_buf(tag, &buf);
         let _buf = Some(buf);
         let iod = q.get_iod(tag);
+        let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
+
+        // Submit initial prep command
+        let cmd_res = q.submit_io_prep_cmd(tag, buf_desc.clone(), res)?.await;
+        if cmd_res == crate::sys::UBLK_IO_RES_ABORT {
+            return Ok(());
+        }
 
         loop {
-            let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
-            let cmd_res = q
-                .submit_io_cmd_unified(tag, cmd_op, buf_desc, res)?
-                .await;
+            res = (iod.nr_sectors << 9) as i32;
+            let cmd_res = q.submit_io_commit_cmd(tag, buf_desc.clone(), res)?.await;
             if cmd_res == crate::sys::UBLK_IO_RES_ABORT {
                 break;
             }
-
-            res = (iod.nr_sectors << 9) as i32;
-            cmd_op = crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ;
         }
         Ok(())
     }
