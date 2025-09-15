@@ -2575,14 +2575,15 @@ impl UblkCtrl {
     where
         T: Fn(u32) + Clone + 'static,
     {
-        if let Ok(entries) = std::fs::read_dir(UblkCtrl::run_dir()) {
+        if let Ok(entries) = std::fs::read_dir("/sys/class/ublk-char") {
             for entry in entries.flatten() {
                 let f = entry.path();
-                if f.is_file() {
-                    if let Some(file_stem) = f.file_stem() {
-                        if let Some(stem) = file_stem.to_str() {
-                            if let Ok(num) = stem.parse::<u32>() {
-                                ops(num);
+                if let Some(file_name) = f.file_name() {
+                    if let Some(name) = file_name.to_str() {
+                        // Extract device ID from ublkcN format
+                        if name.starts_with("ublkc") {
+                            if let Ok(dev_id) = name[5..].parse::<u32>() {
+                                ops(dev_id);
                             }
                         }
                     }
