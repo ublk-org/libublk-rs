@@ -755,6 +755,9 @@ struct UblkCtrlInner {
     // only set when running start_dev_async() which is enabled before
     // adding UBLK_CTRL_ASYNC_AWAIT
     force_async: bool,
+
+    //only used in Drop()
+    force_sync: bool,
     cmd_token: i32,
     queue_tids: Vec<i32>,
     queue_selected_cpus: Vec<usize>,
@@ -905,6 +908,7 @@ impl Drop for UblkCtrlInner {
         let id = self.dev_info.dev_id;
         trace!("ctrl: device {} dropped", id);
         if self.for_add_dev() {
+            self.force_sync = true;
             if let Err(r) = self.del() {
                 //Maybe deleted from other utilities, so no warn or error:w
                 trace!("Delete char device {} failed {}", self.dev_info.dev_id, r);
@@ -1038,6 +1042,7 @@ impl UblkCtrlInner {
             nr_queues_configured: 0,
             dev_flags: config.dev_flags,
             force_async: false,
+            force_sync: false,
             features: None,
         };
 
@@ -1079,6 +1084,7 @@ impl UblkCtrlInner {
             nr_queues_configured: 0,
             dev_flags: config.dev_flags,
             force_async: false,
+            force_sync: false,
             features: None,
         };
 
@@ -1339,7 +1345,7 @@ impl UblkCtrlInner {
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce non-async API usage: sync methods can only be used when UBLK_CTRL_ASYNC_AWAIT is NOT set
-        if self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+        if !self.force_sync && self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
             log::warn!("Warn: sync cmd {:x} is run from async context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
@@ -3009,6 +3015,7 @@ mod tests {
             // Both should fail with the same type of error (though exact values may differ)
             assert!(sync_result.is_err());
             assert!(async_result.is_err());
+            let _ = ctrl.del_dev_async_await().await;
         });
 
         smol::block_on(exe_rc.run(async move {
@@ -3433,7 +3440,10 @@ mod tests {
             smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
         });
 
-        ctrl.start_dev_async(dev_arc).await?;
+        // Avoid to leak device
+        if let Err(_) = ctrl.start_dev_async(dev_arc).await {
+            log::warn!("device_handler_async: fail to start device(async)");
+        }
 
         ctrl.dump_async().await?;
         ctrl.kill_dev_async().await?;
@@ -3575,6 +3585,7 @@ mod tests {
                     }
                 }
             }
+            let _ = ctrl_async.del_dev_async_await().await;
         });
 
         smol::block_on(exe_rc.run(async move {
