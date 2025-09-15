@@ -1197,6 +1197,37 @@ impl UblkQueue<'_> {
         self.bufs.borrow()[tag as usize]
     }
 
+    /// Validate buffer address consistency for UBLK_DEV_F_MLOCK_IO_BUFFER
+    ///
+    /// When UBLK_DEV_F_MLOCK_IO_BUFFER is enabled, this method validates that
+    /// the buffer address in BufDesc::Slice matches the registered buffer address
+    /// stored in UblkQueue::bufs[tag]. This ensures mlock'd buffers are used
+    /// consistently and prevents potential memory safety issues.
+    ///
+    /// # Arguments
+    ///
+    /// * `tag` - The tag ID for the I/O command
+    /// * `buf_desc` - Buffer descriptor to validate
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if validation passes or MLOCK is not enabled
+    /// * `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match
+    #[inline(always)]
+    fn validate_mlock_buffer_consistency(&self, tag: u16, buf_desc: &BufDesc) -> Result<(), UblkError> {
+        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
+            if let BufDesc::Slice(slice) = buf_desc {
+                if !slice.is_empty() {
+                    let expected_buf_addr = self.get_io_buf_addr(tag) as *const u8;
+                    if slice.as_ptr() != expected_buf_addr {
+                        return Err(UblkError::OtherError(-libc::EINVAL));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn mark_mlock_failed(&self) {
         self.state.borrow_mut().mark_mlock_failed();
     }
@@ -1640,6 +1671,13 @@ impl UblkQueue<'_> {
     ///
     /// Returns a Result containing the next command result when complete.
     /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
+    ///
+    /// When `UBLK_DEV_F_MLOCK_IO_BUFFER` is enabled, this method validates that
+    /// the buffer address in `BufDesc::Slice` matches the registered buffer address
+    /// stored in `UblkQueue::bufs[tag]`. This ensures mlock'd buffers are used
+    /// consistently and prevents potential memory safety issues. Returns
+    /// `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match.
+    ///
     #[inline]
     pub async fn submit_io_commit_cmd(
         &self,
@@ -1647,6 +1685,8 @@ impl UblkQueue<'_> {
         buf_desc: BufDesc<'_>,
         result: i32,
     ) -> Result<i32, UblkError> {
+        // Buffer validation for UBLK_DEV_F_MLOCK_IO_BUFFER
+        self.validate_mlock_buffer_consistency(tag, &buf_desc)?;
         let future = self.submit_io_cmd_unified(
             tag,
             crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
@@ -2065,6 +2105,12 @@ impl UblkQueue<'_> {
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
     ///
+    /// When `UBLK_DEV_F_MLOCK_IO_BUFFER` is enabled, this method validates that
+    /// the buffer address in `BufDesc::Slice` matches the registered buffer address
+    /// stored in `UblkQueue::bufs[tag]`. This ensures mlock'd buffers are used
+    /// consistently and prevents potential memory safety issues. Returns
+    /// `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match.
+    ///
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
     #[inline]
     pub fn complete_io_cmd_unified(
@@ -2075,6 +2121,9 @@ impl UblkQueue<'_> {
     ) -> Result<(), UblkError> {
         // Validate buffer descriptor compatibility with device capabilities
         buf_desc.validate_compatibility(self.dev.dev_info.flags)?;
+
+        // Buffer validation for UBLK_DEV_F_MLOCK_IO_BUFFER
+        self.validate_mlock_buffer_consistency(tag, &buf_desc)?;
 
         // Dispatch to appropriate method based on buffer descriptor type
         match buf_desc {
