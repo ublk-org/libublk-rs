@@ -3383,7 +3383,7 @@ mod tests {
                             // Queue down is expected during shutdown, don't log as error
                         }
                         _ => {
-                            log::error!("io_async_fn failed for tag {}: {}", tag, e);
+                            log::debug!("io_async_fn failed for tag {}: {}", tag, e);
                         }
                     }
                 }
@@ -3391,10 +3391,18 @@ mod tests {
         }
     }
 
-    async fn device_handler_async() -> Result<(), UblkError> {
+    async fn device_handler_async(mlock_fail: bool) -> Result<(), UblkError> {
         let ctrl = UblkCtrlBuilder::default()
             .name("test_async")
-            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
+            .dev_flags(
+                UblkFlags::UBLK_DEV_F_ADD_DEV
+                    | UblkFlags::UBLK_CTRL_ASYNC_AWAIT
+                    | if mlock_fail {
+                        UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER
+                    } else {
+                        UblkFlags::empty()
+                    },
+            )
             .depth(8)
             .build_async()
             .await
@@ -3414,6 +3422,10 @@ mod tests {
             let q = q_rc.clone();
             let exe = smol::LocalExecutor::new();
             let mut f_vec: Vec<smol::Task<()>> = Vec::new();
+
+            if mlock_fail {
+                q.mark_mlock_failed();
+            }
 
             q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
 
@@ -3452,12 +3464,30 @@ mod tests {
 
         for _ in 0..64 {
             fvec.push(exe_rc.spawn(async {
-                device_handler_async().await.unwrap();
+                device_handler_async(false).await.unwrap();
             }));
         }
 
         smol::block_on(exe_rc.run(async move {
             let _ = ublk_join_tasks(&exe, fvec);
+        }));
+    }
+
+    #[test]
+    fn test_test_mlock_failure() {
+        let _ = env_logger::builder()
+            .format_target(false)
+            .format_timestamp(None)
+            .try_init();
+        let exe_rc = Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
+
+        let io_task = exe_rc.spawn(async {
+            device_handler_async(true).await.unwrap();
+        });
+
+        smol::block_on(exe_rc.run(async move {
+            let _ = ublk_join_tasks(&exe, vec![io_task]);
         }));
     }
 
