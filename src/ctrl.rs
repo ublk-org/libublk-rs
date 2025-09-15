@@ -3346,20 +3346,14 @@ mod tests {
         let iod = q.get_iod(tag);
         let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
 
-        // Submit initial prep command
-        let cmd_res = q.submit_io_prep_cmd(tag, buf_desc.clone(), res)?.await;
-        if cmd_res == crate::sys::UBLK_IO_RES_ABORT {
-            return Ok(());
-        }
+        // Submit initial prep command and handle any errors (including queue down)
+        q.submit_io_prep_cmd(tag, buf_desc.clone(), res).await?;
 
         loop {
             res = (iod.nr_sectors << 9) as i32;
-            let cmd_res = q.submit_io_commit_cmd(tag, buf_desc.clone(), res)?.await;
-            if cmd_res == crate::sys::UBLK_IO_RES_ABORT {
-                break;
-            }
+            // Any error (including QueueIsDown) will break the loop
+            q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
         }
-        Ok(())
     }
 
     fn q_async_fn<'a>(
@@ -3372,7 +3366,14 @@ mod tests {
             let q = q_rc.clone();
             f_vec.push(exe.spawn(async move {
                 if let Err(e) = io_async_fn(tag, &q).await {
-                    log::error!("io_async_fn failed for tag {}: {}", tag, e);
+                    match e {
+                        UblkError::QueueIsDown => {
+                            // Queue down is expected during shutdown, don't log as error
+                        }
+                        _ => {
+                            log::error!("io_async_fn failed for tag {}: {}", tag, e);
+                        }
+                    }
                 }
             }));
         }

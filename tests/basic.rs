@@ -197,11 +197,8 @@ mod integration {
 
             q.register_io_buf(tag, &buf);
 
-            // Submit initial prep command
-            let cmd_res = q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-            if cmd_res == sys::UBLK_IO_RES_ABORT {
-                return Ok(());
-            }
+            // Submit initial prep command - any error will exit the function
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
 
             loop {
                 res = handle_io_cmd(&q, tag).await;
@@ -210,12 +207,9 @@ mod integration {
                     (*guard).done += 1;
                 }
 
-                let cmd_res = q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-                if cmd_res == sys::UBLK_IO_RES_ABORT {
-                    break;
-                }
+                // Any error (including QueueIsDown) will break the loop by exiting the function
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
             }
-            Ok(())
         }
 
         //Device wide data shared among all queue context
@@ -325,21 +319,15 @@ mod integration {
                 ..Default::default()
             };
 
-            // Submit initial prep command
-            let cmd_res = q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res)?.await;
-            if cmd_res == sys::UBLK_IO_RES_ABORT {
-                return Ok(());
-            }
+            // Submit initial prep command - any error will exit the function
+            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res).await?;
 
             loop {
                 res = handle_io_cmd(&q, tag).await;
 
-                let cmd_res = q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res)?.await;
-                if cmd_res == sys::UBLK_IO_RES_ABORT {
-                    break;
-                }
+                // Any error (including QueueIsDown) will break the loop by exiting the function
+                q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res).await?;
             }
-            Ok(())
         }
 
         let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
@@ -501,21 +489,15 @@ mod integration {
                 );
             }
 
-            // Submit initial prep command
-            let cmd_res = q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-            if cmd_res == sys::UBLK_IO_RES_ABORT {
-                return Ok(());
-            }
+            // Submit initial prep command - any error will exit the function
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
 
             loop {
                 res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
 
-                let cmd_res = q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-                if cmd_res == sys::UBLK_IO_RES_ABORT {
-                    break;
-                }
+                // Any error (including QueueIsDown) will break the loop by exiting the function
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
             }
-            Ok(())
         }
 
         let size = 32_u64 << 20;

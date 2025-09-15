@@ -82,11 +82,8 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
 
     let mut res = 0;
 
-    // Submit initial prep command
-    let cmd_res = q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), res)?.await;
-    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-        return Ok(());
-    }
+    // Submit initial prep command - any error will exit the function
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), res).await?;
 
     loop {
         // Use safe slice access for memory operations
@@ -95,12 +92,9 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
         let io_slice = buffer.as_mut_slice();
         res = handle_io(&q, tag, io_slice, ramdisk_storage);
 
-        let cmd_res = q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), res)?.await;
-        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-            break;
-        }
+        // Any error (including QueueIsDown) will break the loop by exiting the function
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), res).await?;
     }
-    Ok(())
 }
 
 /// Start device in async IO task, in which both control and io rings

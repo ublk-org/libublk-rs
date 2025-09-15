@@ -44,20 +44,16 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), libublk::UblkError> 
     q.register_io_buf(tag, &buf);
 
     // Submit initial prep command to fetch first IO request
-    res = q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-    if res == libublk::sys::UBLK_IO_RES_ABORT {
-        return Ok(());
-    }
+    // Any error (including queue down) will exit the function
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
 
     loop {
         // Handle this incoming IO command
         res = handle_io_cmd(&q, tag).await;
 
         // Commit result and fetch next IO request
-        res = q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-        if res == libublk::sys::UBLK_IO_RES_ABORT {
-            break;
-        }
+        // Any error (including queue down) will exit the function
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
     }
     Ok(())
 }

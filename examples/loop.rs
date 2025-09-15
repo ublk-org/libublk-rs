@@ -6,7 +6,7 @@ use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_wait_and_handle_ios;
-use libublk::{ctrl::UblkCtrl, sys, BufDesc, UblkError, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
@@ -258,11 +258,8 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
 
     q.register_io_buf(tag, &buf);
 
-    // Submit initial prep command
-    let cmd_res = q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-    if cmd_res == sys::UBLK_IO_RES_ABORT {
-        return Ok(());
-    }
+    // Submit initial prep command - any error will exit the function
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
 
     loop {
         // Use safe slice access for I/O operations
@@ -271,12 +268,9 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
         let io_slice = buf.as_mut_slice();
         res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
 
-        let cmd_res = q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)?.await;
-        if cmd_res == sys::UBLK_IO_RES_ABORT {
-            break;
-        }
+        // Any error (including QueueIsDown) will break the loop by exiting the function
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
     }
-    Ok(())
 }
 
 fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {

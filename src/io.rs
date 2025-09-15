@@ -70,10 +70,10 @@
 //! use libublk::helpers::IoBuf;
 //! use libublk::sys;
 //!
-//! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
 //!     let slice_desc = BufDesc::from_io_buf(&io_buf);
-//!     let future = queue.submit_io_prep_cmd(0, slice_desc, -1)?;
+//!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -84,12 +84,12 @@
 //! use libublk::io::{BufDesc, UblkQueue};
 //! use libublk::sys;
 //!
-//! fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
 //!     let auto_reg = sys::ublk_auto_buf_reg {
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
-//!     let future = queue.submit_io_prep_cmd(1, auto_desc, -1)?;
+//!     let result = queue.submit_io_prep_cmd(1, auto_desc, -1).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -1421,15 +1421,22 @@ impl UblkQueue<'_> {
     ///
     /// # Returns
     ///
-    /// Returns a future that resolves to the command result when complete.
+    /// Returns a Result containing the command result when complete.
+    /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
     #[inline]
-    pub fn submit_io_prep_cmd(
+    pub async fn submit_io_prep_cmd(
         &self,
         tag: u16,
-        buf_desc: BufDesc,
+        buf_desc: BufDesc<'_>,
         result: i32,
-    ) -> Result<UblkUringOpFuture, UblkError> {
-        self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)
+    ) -> Result<i32, UblkError> {
+        let future = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
+        let res = future.await;
+        if res == crate::sys::UBLK_IO_RES_ABORT {
+            Err(UblkError::QueueIsDown)
+        } else {
+            Ok(res)
+        }
     }
 
     /// Submit I/O commit command (UBLK_U_IO_COMMIT_AND_FETCH_REQ)
@@ -1445,15 +1452,22 @@ impl UblkQueue<'_> {
     ///
     /// # Returns
     ///
-    /// Returns a future that resolves to the next command result when complete.
+    /// Returns a Result containing the next command result when complete.
+    /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
     #[inline]
-    pub fn submit_io_commit_cmd(
+    pub async fn submit_io_commit_cmd(
         &self,
         tag: u16,
-        buf_desc: BufDesc,
+        buf_desc: BufDesc<'_>,
         result: i32,
-    ) -> Result<UblkUringOpFuture, UblkError> {
-        self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ, buf_desc, result)
+    ) -> Result<i32, UblkError> {
+        let future = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ, buf_desc, result)?;
+        let res = future.await;
+        if res == crate::sys::UBLK_IO_RES_ABORT {
+            Err(UblkError::QueueIsDown)
+        } else {
+            Ok(res)
+        }
     }
 
     #[inline]

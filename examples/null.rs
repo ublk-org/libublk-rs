@@ -92,20 +92,14 @@ async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<()
         BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
     };
 
-    // Submit initial prep command
-    let cmd_res = q.submit_io_prep_cmd(tag, buf_desc.clone(), res)?.await;
-    if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-        return Ok(());
-    }
+    // Submit initial prep command - any error will exit the function
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), res).await?;
 
     loop {
         res = get_io_cmd_result(&q, tag);
-        let cmd_res = q.submit_io_commit_cmd(tag, buf_desc.clone(), res)?.await;
-        if cmd_res == libublk::sys::UBLK_IO_RES_ABORT {
-            break;
-        }
+        // Any error (including QueueIsDown) will break the loop by exiting the function
+        q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
     }
-    Ok(())
 }
 
 fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
