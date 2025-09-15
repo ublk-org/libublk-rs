@@ -195,10 +195,9 @@ mod integration {
             let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
             let mut res = 0;
 
-            q.register_io_buf(tag, &buf);
-
             // Submit initial prep command - any error will exit the function
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+            // The IoBuf is automatically registered
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
 
             loop {
                 res = handle_io_cmd(&q, tag).await;
@@ -320,7 +319,8 @@ mod integration {
             };
 
             // Submit initial prep command - any error will exit the function
-            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res).await?;
+            // AutoReg doesn't use IoBuf, so pass None
+            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res, None).await?;
 
             loop {
                 res = handle_io_cmd(&q, tag).await;
@@ -479,7 +479,9 @@ mod integration {
             let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
             let mut res = 0;
 
-            q.register_io_buf(tag, &buf);
+            // Submit initial prep command - any error will exit the function
+            // The IoBuf is automatically registered
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
 
             // If mlock is enabled, verify the buffer is mlocked after registration
             if mlock_enabled {
@@ -488,9 +490,6 @@ mod integration {
                     "Buffer should be mlocked when UBLK_DEV_F_MLOCK_IO_BUFFER is set"
                 );
             }
-
-            // Submit initial prep command - any error will exit the function
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
 
             loop {
                 res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;

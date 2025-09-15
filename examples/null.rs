@@ -82,7 +82,6 @@ async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<()
         None
     } else {
         let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-        q.register_io_buf(tag, &buf);
         Some(buf)
     };
 
@@ -93,7 +92,8 @@ async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<()
     };
 
     // Submit initial prep command - any error will exit the function
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), res).await?;
+    // The IoBuf is automatically registered if provided
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, _buf.as_ref()).await?;
 
     loop {
         res = get_io_cmd_result(&q, tag);

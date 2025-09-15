@@ -256,10 +256,9 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
 
     let mut res = 0;
 
-    q.register_io_buf(tag, &buf);
-
     // Submit initial prep command - any error will exit the function
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+    // The IoBuf is automatically registered
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
 
     loop {
         // Use safe slice access for I/O operations

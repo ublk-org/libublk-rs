@@ -39,13 +39,10 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), libublk::UblkError> 
     let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
     let mut res = 0;
 
-    // Register IO buffer, so that buffer pages can be discarded
-    // when queue becomes idle
-    q.register_io_buf(tag, &buf);
-
     // Submit initial prep command to fetch first IO request
     // Any error (including queue down) will exit the function
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+    // The IoBuf is automatically registered
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
 
     loop {
         // Handle this incoming IO command

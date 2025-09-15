@@ -3341,13 +3341,13 @@ mod tests {
 
         let mut res = 0;
         let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-        q.register_io_buf(tag, &buf);
         let _buf = Some(buf);
         let iod = q.get_iod(tag);
         let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
 
         // Submit initial prep command and handle any errors (including queue down)
-        q.submit_io_prep_cmd(tag, buf_desc.clone(), res).await?;
+        // The IoBuf is automatically registered
+        q.submit_io_prep_cmd(tag, buf_desc.clone(), res, _buf.as_ref()).await?;
 
         loop {
             res = (iod.nr_sectors << 9) as i32;

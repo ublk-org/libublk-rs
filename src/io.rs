@@ -73,7 +73,7 @@
 //! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
 //!     let slice_desc = BufDesc::from_io_buf(&io_buf);
-//!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1).await?;
+//!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1, Some(&io_buf)).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -89,7 +89,7 @@
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
-//!     let result = queue.submit_io_prep_cmd(1, auto_desc, -1).await?;
+//!     let result = queue.submit_io_prep_cmd(1, auto_desc, -1, None).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -1412,12 +1412,14 @@ impl UblkQueue<'_> {
     ///
     /// This function submits a fetch request to get a new I/O command from the kernel.
     /// It should typically be called once outside of loops for better performance.
+    /// If an IoBuf is provided, it will be automatically registered for the given tag.
     ///
     /// # Arguments
     ///
     /// * `tag` - The tag ID for the I/O command
     /// * `buf_desc` - Buffer descriptor for the I/O operation
     /// * `result` - Result value (typically -1 for fetch operations)
+    /// * `io_buf` - Optional IoBuf to register for this tag
     ///
     /// # Returns
     ///
@@ -1429,7 +1431,13 @@ impl UblkQueue<'_> {
         tag: u16,
         buf_desc: BufDesc<'_>,
         result: i32,
+        io_buf: Option<&crate::helpers::IoBuf<u8>>,
     ) -> Result<i32, UblkError> {
+        // Register the IoBuf if provided
+        if let Some(buf) = io_buf {
+            self.register_io_buf(tag, buf);
+        }
+
         let future = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
         let res = future.await;
         if res == crate::sys::UBLK_IO_RES_ABORT {

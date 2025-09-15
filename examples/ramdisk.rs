@@ -83,7 +83,8 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
     let mut res = 0;
 
     // Submit initial prep command - any error will exit the function
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), res).await?;
+    // The IoBuf is automatically registered
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), res, Some(&buffer)).await?;
 
     loop {
         // Use safe slice access for memory operations
