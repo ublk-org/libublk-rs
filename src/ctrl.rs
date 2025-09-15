@@ -2491,9 +2491,15 @@ impl UblkCtrl {
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
     ///
+    /// Waits for all queue buffer registrations to complete before starting.
+    /// If any queue fails mlock, this method will fail immediately.
+    ///
     pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
         ctrl.prep_start_dev(dev)?;
+
+        // Wait for all queue buffer registrations to complete
+        dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
 
         if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             ctrl.start(unsafe { libc::getpid() as i32 })
@@ -2513,12 +2519,19 @@ impl UblkCtrl {
     /// Send parameter to driver, and flush json to storage, finally
     /// send START command
     ///
+    /// Waits for all queue buffer registrations to complete before starting.
+    /// If any queue fails mlock, this method will fail immediately.
+    ///
     /// This is the only one async API allowed without UBLK_CTRL_ASYNC_AWAIT
     ///
     pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.force_async = true;
+
+        // Wait for all queue buffer registrations to complete
+        dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
+
         let res = ctrl.start_dev_async(dev).await;
         ctrl.force_async = false;
         res

@@ -134,6 +134,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::{Arc, Condvar, Mutex};
 
 // Unified thread-local io_uring for all queue operations
 
@@ -660,6 +661,15 @@ pub struct UblkTgt {
     pub params: sys::ublk_params,
 }
 
+/// Buffer registration state for queue synchronization
+#[derive(Debug, Clone)]
+pub(crate) struct BufferRegState {
+    /// Number of queues that have completed buffer registration
+    pub registered_queues: usize,
+    /// Whether any queue has failed mlock
+    pub mlock_failed: bool,
+}
+
 /// For supporting ublk device IO path, and one thin layer of device
 /// abstract in handling IO level. Ublk device supports multiple queue(MQ),
 /// and each queue has its IO depth.
@@ -678,6 +688,9 @@ pub struct UblkDev {
 
     pub tgt: UblkTgt,
     tgt_json: Option<serde_json::Value>,
+
+    /// Synchronization for buffer registration completion
+    pub(crate) buf_reg_sync: Arc<(Mutex<BufferRegState>, Condvar)>,
 }
 
 unsafe impl Send for UblkDev {}
@@ -739,6 +752,13 @@ impl UblkDev {
             tgt,
             flags: ctrl.get_dev_flags(),
             tgt_json: None,
+            buf_reg_sync: Arc::new((
+                Mutex::new(BufferRegState {
+                    registered_queues: 0,
+                    mlock_failed: false,
+                }),
+                Condvar::new(),
+            )),
         };
 
         ops(&mut dev)?;
@@ -798,6 +818,42 @@ impl UblkDev {
             None => None,
             Some(val) => Some(val),
         }
+    }
+
+    /// Wait for all queues to complete buffer registration
+    pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
+        if (self.dev_info.flags & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64) != 0 {
+            return Ok(())
+        }
+
+        let (lock, cvar) = &*self.buf_reg_sync;
+        let mut state = lock.lock().unwrap();
+
+        while state.registered_queues < nr_hw_queues {
+            // Check for mlock failures
+            if state.mlock_failed {
+                return Err(UblkError::OtherError(-libc::EPERM));
+            }
+            state = cvar.wait(state).unwrap();
+        }
+
+        // Final check for mlock failures
+        if state.mlock_failed {
+            return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
+        Ok(())
+    }
+
+    /// Notify that a queue has completed buffer registration
+    pub fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
+        let (lock, cvar) = &*self.buf_reg_sync;
+        let mut state = lock.lock().unwrap();
+        state.registered_queues += 1;
+        if mlock_failed {
+            state.mlock_failed = true;
+        }
+        cvar.notify_all();
     }
 
     /// Return how many io slots, which is usually same with executor's
@@ -1181,6 +1237,8 @@ impl UblkQueue<'_> {
 
             if all_registered {
                 self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+                // Notify device that this queue completed buffer registration
+                self.dev.notify_buffer_registration_complete(self.is_mlock_failed());
             }
         }
     }
@@ -1232,7 +1290,6 @@ impl UblkQueue<'_> {
                 }
             }
         }
-
         self
     }
 
@@ -2732,6 +2789,56 @@ mod tests {
             assert!(permit2.is_some(), "Should have multiple permits available");
 
             println!("Optimized buffer registration synchronization test completed successfully");
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+    }
+
+    #[test]
+    fn test_buffer_registration_sync() {
+        use crate::ctrl::UblkCtrlBuilder;
+        use crate::UblkFlags;
+
+        // Test that our new synchronization mechanism works
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .nr_queues(2)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            // Test initial state
+            let (lock, _) = &*dev.buf_reg_sync;
+            let state = lock.lock().unwrap();
+            assert_eq!(state.registered_queues, 0);
+            assert_eq!(state.mlock_failed, false);
+            drop(state);
+
+            // Test notification of buffer registration without mlock failure
+            dev.notify_buffer_registration_complete(false);
+            let state = lock.lock().unwrap();
+            assert_eq!(state.registered_queues, 1);
+            assert_eq!(state.mlock_failed, false);
+            drop(state);
+
+            // Test notification of buffer registration with mlock failure
+            dev.notify_buffer_registration_complete(true);
+            let state = lock.lock().unwrap();
+            assert_eq!(state.registered_queues, 2);
+            assert_eq!(state.mlock_failed, true);
+            drop(state);
+
+            // Test that wait_for_buffer_registration fails when mlock_failed is true
+            let result = dev.wait_for_buffer_registration(2);
+            match result {
+                Err(crate::UblkError::OtherError(code)) => {
+                    assert_eq!(code, -libc::EPERM);
+                }
+                _ => panic!("Expected EPERM error for mlock failure"),
+            }
+
+            println!("Buffer registration synchronization test completed successfully");
             Ok(())
         };
 
