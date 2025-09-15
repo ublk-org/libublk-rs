@@ -10,9 +10,8 @@
 //! - **Device Abstraction**: `UblkDev` represents ublk device instances
 //! - **I/O Context**: `UblkIOCtx` provides context for handling I/O operations
 //!
-//! ## Device Creation Examples
+//! ## Device Creation Example
 //!
-//! ### Synchronous Device Creation
 //! ```no_run
 //! use libublk::ctrl::UblkCtrl;
 //! use libublk::io::UblkDev;
@@ -36,34 +35,6 @@
 //!     };
 //!
 //!     let dev = UblkDev::new("example".to_string(), tgt_init, &ctrl)?;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ### Asynchronous Device Creation
-//! ```no_run
-//! use libublk::ctrl_async::UblkCtrlAsync;
-//! use libublk::io::UblkDev;
-//! use libublk::UblkFlags;
-//!
-//! async fn example_async() -> Result<(), Box<dyn std::error::Error>> {
-//!     let ctrl = UblkCtrlAsync::new_async(
-//!         Some("example_async".to_string()),
-//!         -1, // Let driver allocate ID
-//!         1,  // nr_queues
-//!         64, // depth
-//!         4096, // io_buf_bytes
-//!         0,  // flags
-//!         0,  // tgt_flags
-//!         UblkFlags::UBLK_DEV_F_ADD_DEV
-//!     ).await?;
-//!
-//!     let tgt_init = |dev: &mut UblkDev| {
-//!         dev.set_default_params(1024 * 1024 * 1024); // 1GB
-//!         Ok(())
-//!     };
-//!
-//!     let dev = UblkDev::new_async("example_async".to_string(), tgt_init, &ctrl)?;
 //!     Ok(())
 //! }
 //! ```
@@ -866,7 +837,8 @@ impl UblkDev {
     /// using an async control device reference. The implementation
     /// reuses the existing sync code since device creation is mostly
     /// synchronous operations.
-    pub fn new_async<F>(
+    #[allow(dead_code)]
+    pub(crate) fn new_async<F>(
         tgt_name: String,
         ops: F,
         ctrl: &super::ctrl_async::UblkCtrlAsync,

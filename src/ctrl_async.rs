@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::ctrl::{UblkCtrlInner, UblkQueueAffinity};
 use super::ctrl::UblkCtrl;
 use super::io::UblkDev;
@@ -12,7 +14,7 @@ use std::fs;
 /// contains only async methods and enforces the UBLK_CTRL_ASYNC_AWAIT flag.
 ///
 /// For synchronous operations, use `UblkCtrl` instead.
-pub struct UblkCtrlAsync {
+pub(crate) struct UblkCtrlAsync {
     inner: RwLock<UblkCtrlInner>,
 }
 
