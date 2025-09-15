@@ -1400,6 +1400,10 @@ impl UblkQueue<'_> {
     ///
     /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_io_commit_cmd`] instead.
     ///
+    /// **IMPORTANT:** `UBLK_DEV_F_MLOCK_IO_BUFFER` is not supported with this deprecated API.
+    /// For mlock functionality, use the unified APIs: `submit_io_prep_cmd()`, `submit_io_commit_cmd()`,
+    /// `submit_fetch_commands_unified()` and `complete_io_cmd_unified()`.
+    ///
     /// When it is called 1st time on this tag, the `cmd_op` has to be
     /// UBLK_U_IO_FETCH_REQ, otherwise it is UBLK_U_IO_COMMIT_AND_FETCH_REQ.
     ///
@@ -1759,6 +1763,10 @@ impl UblkQueue<'_> {
     /// Submit all commands for fetching IO
     ///
     /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_fetch_commands_unified`] instead.
+    ///
+    /// **IMPORTANT:** `UBLK_DEV_F_MLOCK_IO_BUFFER` is not supported with this deprecated API.
+    /// For mlock functionality, use the unified APIs: `submit_io_prep_cmd()`, `submit_io_commit_cmd()`,
+    /// `submit_fetch_commands_unified()` and `complete_io_cmd_unified()`.
     ///
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
