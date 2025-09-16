@@ -230,7 +230,7 @@ impl UblkCtrlAsync {
             e
         })?;
 
-        UblkCtrl::dump_device_info(&ctrl, &p);
+        ctrl.dump_device_info(&p);
         ctrl.dump_from_json();
         Ok(())
     }
