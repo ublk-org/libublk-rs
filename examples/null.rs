@@ -12,6 +12,7 @@ bitflags! {
         const ASYNC = 0b00000001;
         const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00000100;
+        const ZERO_COPY = 0b00001000;
     }
 }
 
@@ -37,6 +38,38 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
 
     q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
         .unwrap();
+}
+
+fn q_sync_zc_fn(qid: u16, dev: &UblkDev) {
+    let auto_buf_reg_list_rc = Rc::new(
+        (0..dev.dev_info.queue_depth)
+            .map(|tag| libublk::sys::ublk_auto_buf_reg {
+                index: tag,
+                flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    let auto_buf_reg_list = auto_buf_reg_list_rc.clone();
+    let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+        let bytes = get_io_cmd_result(q, tag);
+        let buf_desc = BufDesc::AutoReg(auto_buf_reg_list[tag as usize]);
+        q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+            .unwrap();
+    };
+
+    let queue = match UblkQueue::new(qid, dev)
+        .unwrap()
+        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc)) {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("submit_fetch_commands_unified failed: {}", e);
+            return;
+        }
+    };
+
+    queue.wait_and_handle_io(io_handler);
 }
 
 fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
@@ -74,25 +107,30 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
     queue.wait_and_handle_io(io_handler);
 }
 
-async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<(), UblkError> {
+async fn __null_io_task(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    buf: Option<&IoBuf<u8>>,
+    user_copy: bool,
+) -> Result<(), UblkError> {
     let mut res = 0;
-    // Use IoBuf with slice-based access for memory safety
-    let _buf = if user_copy {
-        None
-    } else {
-        let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-        Some(buf)
+    let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
+        index: tag,
+        flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
+        ..Default::default()
     };
 
-    let buf_desc = if user_copy {
-        BufDesc::Slice(&[])
-    } else {
-        BufDesc::Slice(_buf.as_ref().unwrap().as_slice())
+    let buf_desc = match buf {
+        Some(io_buf) => {
+            q.register_io_buf(tag, &io_buf);
+            BufDesc::Slice(io_buf.as_slice())
+        }
+        None if user_copy => BufDesc::Slice(&[]),
+        _ => BufDesc::AutoReg(auto_buf_reg),
     };
 
     // Submit initial prep command - any error will exit the function
-    // The IoBuf is automatically registered if provided
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, _buf.as_ref()).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), res, buf).await?;
 
     loop {
         res = get_io_cmd_result(&q, tag);
@@ -101,7 +139,25 @@ async fn null_io_task(q: &UblkQueue<'_>, tag: u16, user_copy: bool) -> Result<()
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
+async fn null_io_task(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    user_copy: bool,
+    zero_copy: bool,
+) -> Result<(), UblkError> {
+    if zero_copy && q.support_auto_buf_zc() {
+        __null_io_task(q, tag, None, user_copy).await
+    } else {
+        let buf = if user_copy {
+            None
+        } else {
+            Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
+        };
+        __null_io_task(q, tag, buf.as_ref(), user_copy).await
+    }
+}
+
+fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool) {
     let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
     let exe = smol::LocalExecutor::new();
     let mut f_vec = Vec::new();
@@ -110,7 +166,7 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            match null_io_task(&q, tag, user_copy).await {
+            match null_io_task(&q, tag, user_copy, zero_copy).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
                 Err(e) =>
                     log::error!("null_io_task failed for tag {}: {}", tag, e)
@@ -125,12 +181,19 @@ fn __null_add(
     id: i32,
     nr_queues: u32,
     depth: u32,
-    ctrl_flags: u64,
+    mut ctrl_flags: u64,
     buf_size: u32,
     flags: NullFlags,
 ) {
     let aio = flags.intersects(NullFlags::ASYNC);
     let oneshot = flags.intersects(NullFlags::ONESHOT);
+    let zero_copy = flags.intersects(NullFlags::ZERO_COPY);
+
+    // Add AUTO_BUF_REG flag if zero copy is enabled
+    if zero_copy {
+        ctrl_flags |= libublk::sys::UBLK_F_AUTO_BUF_REG as u64;
+    }
+
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name("example_null")
         .id(id)
@@ -155,11 +218,16 @@ fn __null_add(
 
     // Now start this ublk target
     if aio {
-        let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, user_copy);
+        let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, user_copy, zero_copy);
         ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
     } else {
-        let q_sync_handler = move |qid, dev: &_| q_sync_fn(qid, dev, user_copy);
-        ctrl.run_target(tgt_init, q_sync_handler, wh).unwrap();
+        if zero_copy {
+            let q_sync_handler = move |qid, dev: &_| q_sync_zc_fn(qid, dev);
+            ctrl.run_target(tgt_init, q_sync_handler, wh).unwrap();
+        } else {
+            let q_sync_handler = move |qid, dev: &_| q_sync_fn(qid, dev, user_copy);
+            ctrl.run_target(tgt_init, q_sync_handler, wh).unwrap();
+        }
     }
 }
 
@@ -210,7 +278,7 @@ fn main() {
                     Arg::new("depth")
                         .long("depth")
                         .short('d')
-                        .default_value("64")
+                        .default_value("128")
                         .help("queue depth: max in-flight io commands")
                         .action(ArgAction::Set),
                 )
@@ -254,6 +322,13 @@ fn main() {
                         .short('a')
                         .action(ArgAction::SetTrue)
                         .help("use async/await to handle IO command"),
+                )
+                .arg(
+                    Arg::new("zero_copy")
+                        .long("zero-copy")
+                        .short('z')
+                        .action(ArgAction::SetTrue)
+                        .help("enable zero copy via UBLK_F_AUTO_BUF_REG"),
                 ),
         )
         .subcommand(
@@ -294,7 +369,7 @@ fn main() {
                 .get_one::<String>("depth")
                 .unwrap()
                 .parse::<u32>()
-                .unwrap_or(64);
+                .unwrap_or(128);
             let buf_size = add_matches
                 .get_one::<String>("buf_size")
                 .unwrap()
@@ -310,6 +385,9 @@ fn main() {
             };
             if add_matches.get_flag("oneshot") {
                 flags |= NullFlags::ONESHOT;
+            };
+            if add_matches.get_flag("zero_copy") {
+                flags |= NullFlags::ZERO_COPY;
             };
             let ctrl_flags: u64 = if add_matches.get_flag("user_copy") {
                 libublk::sys::UBLK_F_USER_COPY as u64
