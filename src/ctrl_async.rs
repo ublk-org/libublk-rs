@@ -74,6 +74,9 @@ impl UblkCtrlAsync {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrlAsync, UblkError> {
+        if !dev_flags.intersects(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
+            return Err(UblkError::InvalidVal);
+        }
         UblkCtrl::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(
@@ -521,7 +524,7 @@ mod tests {
             // Test new_async with basic parameters
             let result = UblkCtrlBuilder::default()
                 .name("test_async")
-                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
                 .build_async()
                 .await;
 
@@ -656,7 +659,6 @@ mod tests {
             .name("test_async")
             .dev_flags(
                 UblkFlags::UBLK_DEV_F_ADD_DEV
-                    | UblkFlags::UBLK_CTRL_ASYNC_AWAIT
                     | if mlock_fail {
                         UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER
                     } else {
@@ -755,7 +757,6 @@ mod tests {
         }));
     }
 
-    /// Test UBLK_CTRL_ASYNC_AWAIT flag enforcement
     #[test]
     fn test_ctrl_async_await_flag_enforcement() {
         // Test with async flag support using a sync runtime context
@@ -764,53 +765,12 @@ mod tests {
         let exe = exe_rc.clone();
 
         let job = exe_rc.spawn(async move {
-            // Test with UBLK_CTRL_ASYNC_AWAIT flag set - should allow async but reject sync
             let ctrl_async = UblkCtrlBuilder::default()
                 .name("test_async_flag")
-                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_CTRL_ASYNC_AWAIT)
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
                 .build_async()
                 .await
                 .unwrap();
-
-            // Test with flag NOT set - should allow sync but reject async
-            let ctrl_sync = UblkCtrlBuilder::default()
-                .name("test_sync_flag")
-                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
-                .build()
-                .unwrap();
-
-            // Verify flags are set correctly
-            assert!(ctrl_async
-                .get_dev_flags()
-                .contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT));
-            assert!(!ctrl_sync
-                .get_dev_flags()
-                .contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT));
-
-            // Test sync API that should be rejected when UBLK_CTRL_ASYNC_AWAIT is set
-            {
-                let mut params = crate::sys::ublk_params {
-                    ..Default::default()
-                };
-                let sync_result = UblkCtrl::new_simple(ctrl_async.dev_info().dev_id as i32)
-                    .unwrap()
-                    .get_params(&mut params);
-
-                // Sync should work fine since we're using a different UblkCtrl instance
-                match sync_result {
-                    Ok(_) => {
-                        println!("✓ Sync API works on UblkCtrl even when async device exists");
-                    }
-                    Err(_) => {
-                        println!("✓ Sync API may fail due to device state, but not flag enforcement");
-                    }
-                }
-            }
-
-            // Test async API that should be rejected when UBLK_CTRL_ASYNC_AWAIT is NOT set
-            // Note: Since we moved async methods to UblkCtrlAsync, we can't test this exact scenario
-            // but the separation itself ensures proper enforcement
-            println!("✓ Async API enforcement achieved through type separation");
 
             // Test async API that should work when UBLK_CTRL_ASYNC_AWAIT is set
             {

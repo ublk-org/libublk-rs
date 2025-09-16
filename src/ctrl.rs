@@ -725,7 +725,7 @@ impl UblkCtrlBuilder<'_> {
             self.io_buf_bytes,
             self.ctrl_flags,
             self.ctrl_target_flags,
-            self.dev_flags,
+            self.dev_flags | UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT,
         )
         .await
     }
@@ -768,7 +768,11 @@ pub(crate) struct UblkCtrlInner {
 
 /// Affinity management helpers
 impl UblkCtrlInner {
-    async fn get_queue_affinity_effective_async(
+   /// enable async/await API enforcement: when set, only async/await control
+   /// APIs can be used; when not set, only synchronous control APIs can be used
+   pub(crate) const UBLK_CTRL_ASYNC_AWAIT:UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_3;
+
+   async fn get_queue_affinity_effective_async(
         &mut self,
         qid: u16,
     ) -> Result<UblkQueueAffinity, UblkError> {
@@ -1323,7 +1327,7 @@ impl UblkCtrlInner {
 
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce async/await API usage: async methods can only be used when UBLK_CTRL_ASYNC_AWAIT is set
-        if !self.force_async && !self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+        if !self.force_async && !self.dev_flags.contains(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
             log::warn!("Warn: async cmd {:x} is run from sync context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
@@ -1347,7 +1351,7 @@ impl UblkCtrlInner {
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce non-async API usage: sync methods can only be used when UBLK_CTRL_ASYNC_AWAIT is NOT set
-        if !self.force_sync && self.dev_flags.contains(UblkFlags::UBLK_CTRL_ASYNC_AWAIT) {
+        if !self.force_sync && self.dev_flags.contains(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
             log::warn!("Warn: sync cmd {:x} is run from async context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
@@ -2008,6 +2012,11 @@ impl UblkCtrl {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
+
+        if dev_flags.intersects(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
+            return Err(UblkError::InvalidVal);
+        }
+
         Self::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(UblkCtrlInner::new_with_params(
