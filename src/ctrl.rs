@@ -725,7 +725,7 @@ impl UblkCtrlBuilder<'_> {
             self.io_buf_bytes,
             self.ctrl_flags,
             self.ctrl_target_flags,
-            self.dev_flags | UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT,
+            self.dev_flags,
         )
         .await
     }
@@ -1950,12 +1950,12 @@ impl UblkCtrlInner {
     ) -> Result<(), UblkError> {
         Self::validate_param((flags & !Self::UBLK_DRV_F_ALL) == 0)?;
 
+        Self::validate_param(!dev_flags.intersects(crate::ublk_internal_flags_all!()))?;
+
         if !Path::new(CTRL_PATH).exists() {
             eprintln!("Please run `modprobe ublk_drv` first");
             return Err(UblkError::OtherError(-libc::ENOENT));
         }
-
-        Self::validate_param(!dev_flags.intersects(UblkFlags::UBLK_DEV_F_INTERNAL_0))?;
 
         // Check mlock feature compatibility
         if dev_flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {

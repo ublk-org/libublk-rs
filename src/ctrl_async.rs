@@ -73,9 +73,7 @@ impl UblkCtrlAsync {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrlAsync, UblkError> {
-        if !dev_flags.intersects(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
-            return Err(UblkError::InvalidVal);
-        }
+
         UblkCtrlInner::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(
@@ -87,7 +85,7 @@ impl UblkCtrlAsync {
                 io_buf_bytes,
                 flags,
                 tgt_flags,
-                dev_flags,
+                dev_flags | UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT,
             )
             .await?,
         );

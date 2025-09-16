@@ -54,6 +54,17 @@ bitflags! {
     }
 }
 
+macro_rules! ublk_internal_flags_all {
+    () => {
+        UblkFlags::UBLK_DEV_F_INTERNAL_0
+        | UblkFlags::UBLK_DEV_F_INTERNAL_1
+        | UblkFlags::UBLK_DEV_F_INTERNAL_2
+        | UblkFlags::UBLK_DEV_F_INTERNAL_3
+    };
+}
+
+pub(crate) use ublk_internal_flags_all;
+
 /// Ublk Fat completion result
 pub enum UblkFatRes {
     /// Batch completion
