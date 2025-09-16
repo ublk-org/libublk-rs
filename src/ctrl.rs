@@ -924,6 +924,11 @@ impl Drop for UblkCtrlInner {
 }
 
 impl UblkCtrlInner {
+    /// char device and block device name may change according to system policy,
+    /// such udev may rename it in its own namespaces.
+    const CDEV_PATH: &'static str = "/dev/ublkc";
+    pub(crate) const BDEV_PATH: &'static str = "/dev/ublkb";
+
     const UBLK_CTRL_DEV_DELETED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_2;
     const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
         | sys::UBLK_F_URING_CMD_COMP_IN_TASK
@@ -1172,7 +1177,7 @@ impl UblkCtrlInner {
     }
 
     pub(crate) fn get_cdev_path(&self) -> String {
-        format!("{}{}", UblkCtrl::CDEV_PATH, self.dev_info.dev_id)
+        format!("{}{}", UblkCtrlInner::CDEV_PATH, self.dev_info.dev_id)
     }
 
     pub(crate) fn for_add_dev(&self) -> bool {
@@ -2003,11 +2008,6 @@ impl UblkCtrlInner {
 }
 
 impl UblkCtrl {
-    /// char device and block device name may change according to system policy,
-    /// such udev may rename it in its own namespaces.
-    const CDEV_PATH: &'static str = "/dev/ublkc";
-    pub(crate) const BDEV_PATH: &'static str = "/dev/ublkb";
-
     fn get_inner(&self) -> std::sync::RwLockReadGuard<'_, UblkCtrlInner> {
         self.inner.read().unwrap_or_else(|poisoned| {
             eprintln!("Warning: RwLock poisoned, recovering");
@@ -2095,7 +2095,7 @@ impl UblkCtrl {
 
     /// Return ublk block device path
     pub fn get_bdev_path(&self) -> String {
-        format!("{}{}", Self::BDEV_PATH, self.get_inner().dev_info.dev_id)
+        format!("{}{}", UblkCtrlInner::BDEV_PATH, self.get_inner().dev_info.dev_id)
     }
 
     /// Get queue's pthread id from exported json file for this device

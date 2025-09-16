@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use super::ctrl::{UblkCtrlInner, UblkQueueAffinity};
-use super::ctrl::UblkCtrl;
 use super::io::UblkDev;
 use super::{sys, UblkError, UblkFlags};
 use std::path::Path;
@@ -131,7 +130,7 @@ impl UblkCtrlAsync {
 
     /// Return ublk block device path
     pub fn get_bdev_path(&self) -> String {
-        format!("{}{}", UblkCtrl::BDEV_PATH, self.get_inner().dev_info.dev_id)
+        format!("{}{}", UblkCtrlInner::BDEV_PATH, self.get_inner().dev_info.dev_id)
     }
 
     /// Get queue's pthread id from exported json file for this device
