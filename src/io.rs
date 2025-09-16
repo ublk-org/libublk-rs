@@ -1005,6 +1005,11 @@ impl UblkQueueState {
     }
 
     #[inline(always)]
+    fn sub_cmd_inflight(&mut self, val: u32) {
+        self.cmd_inflight -= val;
+    }
+
+    #[inline(always)]
     fn dec_cmd_inflight(&mut self) {
         self.cmd_inflight -= 1;
     }
@@ -2261,6 +2266,16 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    fn update_state_batch(&self, cnt: u32, aborted: bool) {
+            let mut state = self.state.borrow_mut();
+
+            state.sub_cmd_inflight(cnt);
+            if aborted {
+                state.mark_stopping();
+            }
+    }
+
+    #[inline(always)]
     fn handle_cqe<F>(&self, mut ops: F, e: &UblkIOCtx)
     where
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),
@@ -2580,21 +2595,32 @@ impl UblkQueue<'_> {
         match self.wait_ios(to_wait) {
             Err(r) => Err(r),
             Ok(done) => {
+                let mut cmd_cnt = 0;
+                let mut aborted = false;
+
                 for i in 0..done {
                     let cqe = {
                         match with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                             ring.completion().next()
                         }) {
-                            None => return Err(UblkError::OtherError(-libc::EINVAL)),
+                            None => {
+                                if cmd_cnt > 0 { self.update_state_batch(cmd_cnt, aborted);}
+                                return Err(UblkError::OtherError(-libc::EINVAL));
+                            }
                             Some(r) => r,
                         }
                     };
+
                     let user_data = cqe.user_data();
                     if UblkIOCtx::is_io_command(user_data) {
-                        self.update_state(&cqe);
+                        cmd_cnt += 1;
+                        if cqe.result() == sys::UBLK_IO_RES_ABORT {
+                            aborted = true;
+                        }
                     }
                     wake_handler(user_data, &cqe, i == done - 1);
                 }
+                if cmd_cnt > 0 { self.update_state_batch(cmd_cnt, aborted);}
                 Ok(done)
             }
         }
