@@ -253,18 +253,16 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
-    let mut res = 0;
-
     // Submit initial prep command - any error will exit the function
     // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
 
     loop {
         // Use safe slice access for I/O operations
         // IoBuf's as_mut_slice() provides bounds-checked access eliminating
         // the need for unsafe pointer operations in the I/O handler
         let io_slice = buf.as_mut_slice();
-        res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
+        let res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
 
         // Any error (including QueueIsDown) will break the loop by exiting the function
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;

@@ -80,18 +80,16 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
     // IoBuf provides slice-based access through Deref/DerefMut traits
     let mut buffer = IoBuf::<u8>::new(buf_size);
 
-    let mut res = 0;
-
     // Submit initial prep command - any error will exit the function
     // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), res, Some(&buffer)).await?;
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), 0, Some(&buffer)).await?;
 
     loop {
         // Use safe slice access for memory operations
         // IoBuf's as_mut_slice() provides bounds-checked access
         // This eliminates the need for unsafe pointer operations
         let io_slice = buffer.as_mut_slice();
-        res = handle_io(&q, tag, io_slice, ramdisk_storage);
+        let res = handle_io(&q, tag, io_slice, ramdisk_storage);
 
         // Any error (including QueueIsDown) will break the loop by exiting the function
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), res).await?;

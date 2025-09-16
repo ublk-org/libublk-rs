@@ -32,27 +32,21 @@ async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
     (q.get_iod(tag).nr_sectors << 9) as i32
 }
 
-// implement whole ublk IO level protocol
 async fn io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), libublk::UblkError> {
     // IO buffer for exchange data with /dev/ublkbN
     let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
     let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
-    let mut res = 0;
 
-    // Submit initial prep command to fetch first IO request
-    // Any error (including queue down) will exit the function
-    // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf)).await?;
+    // Submit initial prep command for setup IO forward
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
 
     loop {
-        // Handle this incoming IO command
-        res = handle_io_cmd(&q, tag).await;
+        // Handle this incoming IO command, whole IO logic
+        let res = handle_io_cmd(&q, tag).await;
 
         // Commit result and fetch next IO request
-        // Any error (including queue down) will exit the function
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
     }
-    Ok(())
 }
 
 fn q_fn(qid: u16, dev: &UblkDev) {
@@ -62,7 +56,6 @@ fn q_fn(qid: u16, dev: &UblkDev) {
 
     for tag in 0..dev.dev_info.queue_depth {
         let q = q_rc.clone();
-
         f_vec.push(exe.spawn(async move { io_task(&q, tag).await }));
     }
 

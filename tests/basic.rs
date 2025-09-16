@@ -199,20 +199,17 @@ mod integration {
             dev_data: &Arc<Mutex<DevData>>,
         ) -> Result<(), UblkError> {
             let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-            let mut res = 0;
 
             // Submit initial prep command - any error will exit the function
-            // The IoBuf is automatically registered
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf))
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
                 .await?;
 
             loop {
-                res = handle_io_cmd(&q, tag).await;
+                let res = handle_io_cmd(&q, tag).await;
                 {
                     let mut guard = dev_data.lock().unwrap();
                     (*guard).done += 1;
                 }
-
                 // Any error (including QueueIsDown) will break the loop by exiting the function
                 q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
                     .await?;
@@ -320,7 +317,6 @@ mod integration {
             bad_buf_idx: bool,
             fallback: bool,
         ) -> Result<(), UblkError> {
-            let mut res = 0;
             let buf_index = if !bad_buf_idx { tag } else { depth + 1 };
 
             // Create auto buffer registration data with fallback support
@@ -336,11 +332,11 @@ mod integration {
 
             // Submit initial prep command - any error will exit the function
             // AutoReg doesn't use IoBuf, so pass None
-            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res, None)
+            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), 0, None)
                 .await?;
 
             loop {
-                res = handle_io_cmd(&q, tag).await;
+                let res = handle_io_cmd(&q, tag).await;
 
                 // Any error (including QueueIsDown) will break the loop by exiting the function
                 q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_buf_reg), res)
@@ -502,11 +498,10 @@ mod integration {
             mlock_enabled: bool,
         ) -> Result<(), UblkError> {
             let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
-            let mut res = 0;
 
             // Submit initial prep command - any error will exit the function
             // The IoBuf is automatically registered
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), res, Some(&buf))
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
                 .await?;
 
             // If mlock is enabled, verify the buffer is mlocked after registration
@@ -518,8 +513,7 @@ mod integration {
             }
 
             loop {
-                res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
-
+                let res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
                 // Any error (including QueueIsDown) will break the loop by exiting the function
                 q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
                     .await?;

@@ -612,7 +612,6 @@ mod tests {
         use crate::helpers::IoBuf;
         use crate::BufDesc;
 
-        let mut res = 0;
         let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
         let _buf = Some(buf);
         let iod = q.get_iod(tag);
@@ -620,10 +619,10 @@ mod tests {
 
         // Submit initial prep command and handle any errors (including queue down)
         // The IoBuf is automatically registered
-        q.submit_io_prep_cmd(tag, buf_desc.clone(), res, _buf.as_ref()).await?;
+        q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, _buf.as_ref()).await?;
 
         loop {
-            res = (iod.nr_sectors << 9) as i32;
+            let res = (iod.nr_sectors << 9) as i32;
             // Any error (including QueueIsDown) will break the loop
             q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
         }
