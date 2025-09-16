@@ -925,6 +925,17 @@ impl Drop for UblkCtrlInner {
 
 impl UblkCtrlInner {
     const UBLK_CTRL_DEV_DELETED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_2;
+    const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
+        | sys::UBLK_F_URING_CMD_COMP_IN_TASK
+        | sys::UBLK_F_NEED_GET_DATA
+        | sys::UBLK_F_USER_RECOVERY
+        | sys::UBLK_F_USER_RECOVERY_REISSUE
+        | sys::UBLK_F_UNPRIVILEGED_DEV
+        | sys::UBLK_F_CMD_IOCTL_ENCODE
+        | sys::UBLK_F_USER_COPY
+        | sys::UBLK_F_ZONED
+        | sys::UBLK_F_AUTO_BUF_REG) as u64;
+
     /// Create device info structure from parameters
     fn create_device_info(
         id: i32,
@@ -1897,87 +1908,12 @@ impl UblkCtrlInner {
         );
     }
 
-}
-
-impl UblkCtrl {
-    /// char device and block device name may change according to system policy,
-    /// such udev may rename it in its own namespaces.
-    const CDEV_PATH: &'static str = "/dev/ublkc";
-    pub(crate) const BDEV_PATH: &'static str = "/dev/ublkb";
-
-    const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
-        | sys::UBLK_F_URING_CMD_COMP_IN_TASK
-        | sys::UBLK_F_NEED_GET_DATA
-        | sys::UBLK_F_USER_RECOVERY
-        | sys::UBLK_F_USER_RECOVERY_REISSUE
-        | sys::UBLK_F_UNPRIVILEGED_DEV
-        | sys::UBLK_F_CMD_IOCTL_ENCODE
-        | sys::UBLK_F_USER_COPY
-        | sys::UBLK_F_ZONED
-        | sys::UBLK_F_AUTO_BUF_REG) as u64;
-
-    fn get_inner(&self) -> std::sync::RwLockReadGuard<'_, UblkCtrlInner> {
-        self.inner.read().unwrap_or_else(|poisoned| {
-            eprintln!("Warning: RwLock poisoned, recovering");
-            poisoned.into_inner()
-        })
-    }
-
-    fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<'_, UblkCtrlInner> {
-        self.inner.write().unwrap_or_else(|poisoned| {
-            eprintln!("Warning: RwLock poisoned, recovering");
-            poisoned.into_inner()
-        })
-    }
-
-    pub fn get_name(&self) -> String {
-        let inner = self.get_inner();
-
-        match &inner.name {
-            Some(name) => name.clone(),
-            None => "none".to_string(),
-        }
-    }
-
-    pub(crate) fn get_dev_flags(&self) -> UblkFlags {
-        self.get_inner().dev_flags
-    }
-
-    /// Consolidated error handling helpers
-
-    /// Convert system call result to UblkError::OtherError
-    fn sys_result_to_error(res: i32) -> Result<i32, UblkError> {
-        if res >= 0 {
-            Ok(res)
-        } else {
-            Err(UblkError::OtherError(res))
-        }
-    }
-
     /// Validate input parameter and return InvalidVal error if condition fails
     fn validate_param(condition: bool) -> Result<(), UblkError> {
         if condition {
             Ok(())
         } else {
             Err(UblkError::InvalidVal)
-        }
-    }
-
-    /// Validate queue ID bounds
-    fn validate_queue_id(qid: u16, max_queues: u16) -> Result<(), UblkError> {
-        if (qid as usize) < (max_queues as usize) {
-            Ok(())
-        } else {
-            Err(UblkError::OtherError(-libc::EINVAL))
-        }
-    }
-
-    /// Check if thread ID is valid (non-zero)
-    fn validate_thread_id(tid: i32) -> Result<(), UblkError> {
-        if tid != 0 {
-            Ok(())
-        } else {
-            Err(UblkError::OtherError(-libc::ESRCH))
         }
     }
 
@@ -2036,6 +1972,69 @@ impl UblkCtrl {
         Ok(())
     }
 
+    /// Consolidated error handling helpers
+
+    /// Convert system call result to UblkError::OtherError
+    fn sys_result_to_error(res: i32) -> Result<i32, UblkError> {
+        if res >= 0 {
+            Ok(res)
+        } else {
+            Err(UblkError::OtherError(res))
+        }
+    }
+
+    /// Validate queue ID bounds
+    fn validate_queue_id(qid: u16, max_queues: u16) -> Result<(), UblkError> {
+        if (qid as usize) < (max_queues as usize) {
+            Ok(())
+        } else {
+            Err(UblkError::OtherError(-libc::EINVAL))
+        }
+    }
+
+    /// Check if thread ID is valid (non-zero)
+    fn validate_thread_id(tid: i32) -> Result<(), UblkError> {
+        if tid != 0 {
+            Ok(())
+        } else {
+            Err(UblkError::OtherError(-libc::ESRCH))
+        }
+    }
+}
+
+impl UblkCtrl {
+    /// char device and block device name may change according to system policy,
+    /// such udev may rename it in its own namespaces.
+    const CDEV_PATH: &'static str = "/dev/ublkc";
+    pub(crate) const BDEV_PATH: &'static str = "/dev/ublkb";
+
+    fn get_inner(&self) -> std::sync::RwLockReadGuard<'_, UblkCtrlInner> {
+        self.inner.read().unwrap_or_else(|poisoned| {
+            eprintln!("Warning: RwLock poisoned, recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    fn get_inner_mut(&self) -> std::sync::RwLockWriteGuard<'_, UblkCtrlInner> {
+        self.inner.write().unwrap_or_else(|poisoned| {
+            eprintln!("Warning: RwLock poisoned, recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    pub fn get_name(&self) -> String {
+        let inner = self.get_inner();
+
+        match &inner.name {
+            Some(name) => name.clone(),
+            None => "none".to_string(),
+        }
+    }
+
+    pub(crate) fn get_dev_flags(&self) -> UblkFlags {
+        self.get_inner().dev_flags
+    }
+
     pub fn new(
         name: Option<String>,
         id: i32,
@@ -2051,7 +2050,7 @@ impl UblkCtrl {
             return Err(UblkError::InvalidVal);
         }
 
-        Self::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
+        UblkCtrlInner::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(UblkCtrlInner::new_with_params(
             name,
@@ -2277,12 +2276,12 @@ impl UblkCtrl {
         let inner = self.get_inner();
 
         // Validate queue ID
-        Self::validate_queue_id(qid, inner.queue_tids.len() as u16)?;
+        UblkCtrlInner::validate_queue_id(qid, inner.queue_tids.len() as u16)?;
 
         let tid = inner.queue_tids[qid as usize];
 
         // Check if the thread has been configured (tid != 0)
-        Self::validate_thread_id(tid)?;
+        UblkCtrlInner::validate_thread_id(tid)?;
 
         // Use sched_getaffinity to get the actual thread affinity
         let result = unsafe {
@@ -2296,7 +2295,7 @@ impl UblkCtrl {
         if result == 0 {
             Ok(0)
         } else {
-            Self::sys_result_to_error(-unsafe { *libc::__errno_location() })
+            UblkCtrlInner::sys_result_to_error(-unsafe { *libc::__errno_location() })
         }
     }
 
