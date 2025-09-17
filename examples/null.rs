@@ -121,7 +121,7 @@ async fn __null_io_task(
 
     let buf_desc = match buf {
         Some(io_buf) => {
-            q.register_io_buf(tag, &io_buf);
+            // Note: submit_io_prep_cmd will automatically register the buffer
             BufDesc::Slice(io_buf.as_slice())
         }
         None if user_copy => BufDesc::Slice(&[]),

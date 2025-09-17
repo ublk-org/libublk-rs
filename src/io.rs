@@ -910,8 +910,11 @@ impl UblkDev {
 
     /// Wait for all queues to complete buffer registration
     pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
-        if (self.dev_info.flags & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64) != 0 {
-            return Ok(())
+        if (self.dev_info.flags
+            & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64)
+            != 0
+        {
+            return Ok(());
         }
 
         let (lock, cvar) = &*self.buf_reg_sync;
@@ -1307,7 +1310,11 @@ impl UblkQueue<'_> {
     /// * `Ok(())` if validation passes or MLOCK is not enabled
     /// * `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match
     #[inline(always)]
-    fn validate_mlock_buffer_consistency(&self, tag: u16, buf_desc: &BufDesc) -> Result<(), UblkError> {
+    fn validate_mlock_buffer_consistency(
+        &self,
+        tag: u16,
+        buf_desc: &BufDesc,
+    ) -> Result<(), UblkError> {
         if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
             if let BufDesc::Slice(slice) = buf_desc {
                 if !slice.is_empty() {
@@ -1328,9 +1335,11 @@ impl UblkQueue<'_> {
         self.state.borrow().is_mlock_failed()
     }
 
-    /// Register IO buffer, so that pages in this buffer can
+    /// **DEPRECATED:** Register IO buffer, so that pages in this buffer can
     /// be discarded in case queue becomes idle
-    pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
+    ///
+    /// Internal implementation of register_io_buf without deprecation warnings
+    fn register_io_buf_internal(&self, tag: u16, buf: &IoBuf<u8>) {
         if self.support_auto_buf_zc() {
             return;
         }
@@ -1362,9 +1371,25 @@ impl UblkQueue<'_> {
             if all_registered {
                 self.buf_reg_semaphore.add_permits(self.q_depth as usize);
                 // Notify device that this queue completed buffer registration
-                self.dev.notify_buffer_registration_complete(self.is_mlock_failed());
+                self.dev
+                    .notify_buffer_registration_complete(self.is_mlock_failed());
             }
         }
+    }
+
+    /// **DEPRECATED:** Register IO buffer, so that pages in this buffer can
+    /// be discarded in case queue becomes idle
+    ///
+    /// This method is deprecated in favor of the unified buffer management
+    /// provided by [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_fetch_commands_unified`].
+    /// These methods handle buffer registration automatically and provide better
+    /// integration with the async I/O workflow.
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use `submit_io_prep_cmd` and `submit_fetch_commands_unified` instead for automatic buffer registration"
+    )]
+    pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
+        self.register_io_buf_internal(tag, buf);
     }
 
     /// Wait for all buffer registrations to complete
@@ -1410,7 +1435,7 @@ impl UblkQueue<'_> {
         if !self.support_auto_buf_zc() {
             if let Some(b) = bufs {
                 for tag in 0..self.q_depth {
-                    self.register_io_buf(tag.try_into().unwrap(), &b[tag as usize]);
+                    self.register_io_buf_internal(tag.try_into().unwrap(), &b[tag as usize]);
                 }
             }
         }
@@ -1728,7 +1753,7 @@ impl UblkQueue<'_> {
 
         // Register the IoBuf if provided and acquire permit
         if let Some(buf) = io_buf {
-            self.register_io_buf(tag, buf);
+            self.register_io_buf_internal(tag, buf);
             // Wait for all buffer registrations to complete before submitting prep commands
             // This ensures that the effect is similar to submit_fetch_commands_unified()
             self.wait_for_all_buffer_registrations().await;
@@ -2267,12 +2292,12 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn update_state_batch(&self, cnt: u32, aborted: bool) {
-            let mut state = self.state.borrow_mut();
+        let mut state = self.state.borrow_mut();
 
-            state.sub_cmd_inflight(cnt);
-            if aborted {
-                state.mark_stopping();
-            }
+        state.sub_cmd_inflight(cnt);
+        if aborted {
+            state.mark_stopping();
+        }
     }
 
     #[inline(always)]
@@ -2604,7 +2629,9 @@ impl UblkQueue<'_> {
                             ring.completion().next()
                         }) {
                             None => {
-                                if cmd_cnt > 0 { self.update_state_batch(cmd_cnt, aborted);}
+                                if cmd_cnt > 0 {
+                                    self.update_state_batch(cmd_cnt, aborted);
+                                }
                                 return Err(UblkError::OtherError(-libc::EINVAL));
                             }
                             Some(r) => r,
@@ -2620,7 +2647,9 @@ impl UblkQueue<'_> {
                     }
                     wake_handler(user_data, &cqe, i == done - 1);
                 }
-                if cmd_cnt > 0 { self.update_state_batch(cmd_cnt, aborted);}
+                if cmd_cnt > 0 {
+                    self.update_state_batch(cmd_cnt, aborted);
+                }
                 Ok(done)
             }
         }
@@ -2908,7 +2937,7 @@ mod tests {
             let buf3 = IoBuf::<u8>::new(4096);
             let buf4 = IoBuf::<u8>::new(4096);
 
-            q.register_io_buf(0, &buf1);
+            q.register_io_buf_internal(0, &buf1);
             assert_eq!(
                 *q.buf_reg_counter.borrow(),
                 1,
@@ -2919,7 +2948,7 @@ mod tests {
                 "Should have no permits until all buffers registered"
             );
 
-            q.register_io_buf(1, &buf2);
+            q.register_io_buf_internal(1, &buf2);
             assert_eq!(
                 *q.buf_reg_counter.borrow(),
                 2,
@@ -2930,7 +2959,7 @@ mod tests {
                 "Should have no permits until all buffers registered"
             );
 
-            q.register_io_buf(2, &buf3);
+            q.register_io_buf_internal(2, &buf3);
             assert_eq!(
                 *q.buf_reg_counter.borrow(),
                 3,
@@ -2942,7 +2971,7 @@ mod tests {
             );
 
             // Register the last buffer - this should add all permits
-            q.register_io_buf(3, &buf4);
+            q.register_io_buf_internal(3, &buf4);
             assert_eq!(
                 *q.buf_reg_counter.borrow(),
                 4,
