@@ -2767,9 +2767,9 @@ mod tests {
         assert!(ctrl.dev_info().ublksrv_flags == 0xbeef as u64);
     }
 
-    fn __test_ublk_session<T>(w_fn: T) -> String
+    fn __test_ublk_session<T>(mut w_fn: T) -> String
     where
-        T: Fn(&UblkCtrl) + Send + Sync + Clone + 'static,
+        T: FnMut(&UblkCtrl) + Send + Sync + Clone + 'static,
     {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
@@ -2841,9 +2841,16 @@ mod tests {
     /// test for_each_dev_id
     #[test]
     fn test_ublk_for_each_dev_id() {
-        // Create one ublk device
-        let handle = std::thread::spawn(|| {
-            let cdev = __test_ublk_session(|ctrl: &UblkCtrl| {
+        use std::sync::{atomic::AtomicI32, atomic::Ordering, Arc};
+
+        // Create one ublk device and capture its device ID
+        let created_dev_id = Arc::new(AtomicI32::new(-1));
+        let created_dev_id_clone = created_dev_id.clone();
+
+        let handle = std::thread::spawn(move || {
+            let cdev = __test_ublk_session(move |ctrl: &UblkCtrl| {
+                // Capture the device ID of the device we created
+                created_dev_id_clone.store(ctrl.dev_info().dev_id as i32, Ordering::Relaxed);
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 ctrl.kill_dev().unwrap();
             });
@@ -2855,17 +2862,20 @@ mod tests {
         let cnt_arc = Rc::new(Cell::new(0));
         let cnt = cnt_arc.clone();
 
-        //count all existed ublk devices
+        // Only count the device we created in this test
         UblkCtrl::for_each_dev_id(move |dev_id| {
-            let ctrl = UblkCtrl::new_simple(dev_id as i32).unwrap();
-            cnt.set(cnt.get() + 1);
+            let target_dev_id = created_dev_id.load(Ordering::Relaxed);
+            if target_dev_id >= 0 && dev_id == target_dev_id as u32 {
+                let ctrl = UblkCtrl::new_simple(dev_id as i32).unwrap();
+                cnt.set(cnt.get() + 1);
 
-            let dev_path = ctrl.get_cdev_path();
-            assert!(Path::new(&dev_path).exists() == true);
+                let dev_path = ctrl.get_cdev_path();
+                assert!(Path::new(&dev_path).exists() == true);
+            }
         });
 
-        // we created one
-        assert!(cnt_arc.get() > 0);
+        // we should have found exactly one device (the one we created)
+        assert_eq!(cnt_arc.get(), 1);
 
         handle.join().unwrap();
     }
