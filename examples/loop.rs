@@ -238,7 +238,8 @@ fn q_fn(qid: u16, dev: &UblkDev) {
 
     let queue = match UblkQueue::new(qid, dev)
         .unwrap()
-        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))) {
+        .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
+    {
         Ok(q) => q,
         Err(e) => {
             log::error!("submit_fetch_commands_unified failed: {}", e);
@@ -255,7 +256,8 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
 
     // Submit initial prep command - any error will exit the function
     // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf)).await?;
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+        .await?;
 
     loop {
         // Use safe slice access for I/O operations
@@ -265,7 +267,8 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
         let res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
 
         // Any error (including QueueIsDown) will break the loop by exiting the function
-        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res).await?;
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
+            .await?;
     }
 }
 
@@ -280,8 +283,7 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
         f_vec.push(exe.spawn(async move {
             match lo_io_task(&q, tag).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) =>
-                    log::error!("lo_io_task failed for tag {}: {}", tag, e),
+                Err(e) => log::error!("lo_io_task failed for tag {}: {}", tag, e),
             }
         }));
     }

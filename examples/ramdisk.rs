@@ -82,7 +82,8 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
 
     // Submit initial prep command - any error will exit the function
     // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), 0, Some(&buffer)).await?;
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), 0, Some(&buffer))
+        .await?;
 
     loop {
         // Use safe slice access for memory operations
@@ -92,7 +93,8 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
         let res = handle_io(&q, tag, io_slice, ramdisk_storage);
 
         // Any error (including QueueIsDown) will break the loop by exiting the function
-        q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), res).await?;
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), res)
+            .await?;
     }
 }
 
@@ -189,8 +191,7 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
             let storage_slice = unsafe { std::slice::from_raw_parts_mut(storage_ptr, storage_len) };
             match io_task(&q_clone, tag, storage_slice).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) =>
-                    log::error!("io_task failed for tag {}: {}", tag, e)
+                Err(e) => log::error!("io_task failed for tag {}: {}", tag, e),
             }
         }));
     }

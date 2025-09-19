@@ -3,9 +3,9 @@
 use super::ctrl::{UblkCtrlInner, UblkQueueAffinity};
 use super::io::UblkDev;
 use super::{sys, UblkError, UblkFlags};
+use std::fs;
 use std::path::Path;
 use std::sync::RwLock;
-use std::fs;
 
 /// Async version of ublk control device
 ///
@@ -73,7 +73,6 @@ impl UblkCtrlAsync {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrlAsync, UblkError> {
-
         UblkCtrlInner::validate_new_params(flags, dev_flags, id, nr_queues, depth, io_buf_bytes)?;
 
         let inner = RwLock::new(
@@ -128,7 +127,11 @@ impl UblkCtrlAsync {
 
     /// Return ublk block device path
     pub fn get_bdev_path(&self) -> String {
-        format!("{}{}", UblkCtrlInner::BDEV_PATH, self.get_inner().dev_info.dev_id)
+        format!(
+            "{}{}",
+            UblkCtrlInner::BDEV_PATH,
+            self.get_inner().dev_info.dev_id
+        )
     }
 
     /// Get queue's pthread id from exported json file for this device
@@ -592,7 +595,8 @@ mod tests {
             }
 
             // Test new_simple_async
-            let result_simple = UblkCtrlAsync::new_simple_async(ctrl.dev_info().dev_id as i32).await;
+            let result_simple =
+                UblkCtrlAsync::new_simple_async(ctrl.dev_info().dev_id as i32).await;
             match result_simple {
                 Ok(_ctrl) => println!("✓ new_simple_async: Successfully created simple device"),
                 Err(_e) => {
@@ -619,7 +623,8 @@ mod tests {
 
         // Submit initial prep command and handle any errors (including queue down)
         // The IoBuf is automatically registered
-        q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, _buf.as_ref()).await?;
+        q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, _buf.as_ref())
+            .await?;
 
         loop {
             let res = (iod.nr_sectors << 9) as i32;

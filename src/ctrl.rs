@@ -768,11 +768,11 @@ pub(crate) struct UblkCtrlInner {
 
 /// Affinity management helpers
 impl UblkCtrlInner {
-   /// enable async/await API enforcement: when set, only async/await control
-   /// APIs can be used; when not set, only synchronous control APIs can be used
-   pub(crate) const UBLK_CTRL_ASYNC_AWAIT:UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_3;
+    /// enable async/await API enforcement: when set, only async/await control
+    /// APIs can be used; when not set, only synchronous control APIs can be used
+    pub(crate) const UBLK_CTRL_ASYNC_AWAIT: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_3;
 
-   async fn get_queue_affinity_effective_async(
+    async fn get_queue_affinity_effective_async(
         &mut self,
         qid: u16,
     ) -> Result<UblkQueueAffinity, UblkError> {
@@ -1343,7 +1343,11 @@ impl UblkCtrlInner {
 
     async fn ublk_ctrl_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce async/await API usage: async methods can only be used when UBLK_CTRL_ASYNC_AWAIT is set
-        if !self.force_async && !self.dev_flags.contains(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
+        if !self.force_async
+            && !self
+                .dev_flags
+                .contains(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT)
+        {
             log::warn!("Warn: async cmd {:x} is run from sync context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
@@ -1367,7 +1371,11 @@ impl UblkCtrlInner {
 
     fn ublk_ctrl_cmd(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         // Enforce non-async API usage: sync methods can only be used when UBLK_CTRL_ASYNC_AWAIT is NOT set
-        if !self.force_sync && self.dev_flags.contains(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
+        if !self.force_sync
+            && self
+                .dev_flags
+                .contains(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT)
+        {
             log::warn!("Warn: sync cmd {:x} is run from async context", data.cmd_op);
             return Err(UblkError::OtherError(-libc::EPERM));
         }
@@ -1597,7 +1605,10 @@ impl UblkCtrlInner {
 
     /// Retrieve this device's parameter from ublk driver by
     /// sending command in async/.await
-    pub(crate) async fn get_params_async(&mut self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
+    pub(crate) async fn get_params_async(
+        &mut self,
+        params: &mut sys::ublk_params,
+    ) -> Result<i32, UblkError> {
         let data = Self::prepare_get_params_cmd(params);
         self.ublk_ctrl_cmd_async(&data).await
     }
@@ -1624,7 +1635,10 @@ impl UblkCtrlInner {
     ///
     /// Note: device parameter has to send to driver before starting
     /// this device
-    pub(crate) async fn set_params_async(&mut self, params: &sys::ublk_params) -> Result<i32, UblkError> {
+    pub(crate) async fn set_params_async(
+        &mut self,
+        params: &sys::ublk_params,
+    ) -> Result<i32, UblkError> {
         let mut p = *params;
 
         p.len = core::mem::size_of::<sys::ublk_params>() as u32;
@@ -2045,7 +2059,6 @@ impl UblkCtrl {
         tgt_flags: u64,
         dev_flags: UblkFlags,
     ) -> Result<UblkCtrl, UblkError> {
-
         if dev_flags.intersects(UblkCtrlInner::UBLK_CTRL_ASYNC_AWAIT) {
             return Err(UblkError::InvalidVal);
         }
@@ -2073,8 +2086,6 @@ impl UblkCtrl {
         Self::new(None, id, 0, 0, 0, 0, 0, UblkFlags::empty())
     }
 
-
-
     /// Return current device info
     pub fn dev_info(&self) -> sys::ublksrv_ctrl_dev_info {
         self.get_inner().dev_info
@@ -2095,7 +2106,11 @@ impl UblkCtrl {
 
     /// Return ublk block device path
     pub fn get_bdev_path(&self) -> String {
-        format!("{}{}", UblkCtrlInner::BDEV_PATH, self.get_inner().dev_info.dev_id)
+        format!(
+            "{}{}",
+            UblkCtrlInner::BDEV_PATH,
+            self.get_inner().dev_info.dev_id
+        )
     }
 
     /// Get queue's pthread id from exported json file for this device
@@ -2162,7 +2177,6 @@ impl UblkCtrl {
         Ok(0)
     }
 
-
     pub fn dump(&self) {
         let mut ctrl = self.get_inner_mut();
         let mut p = sys::ublk_params {
@@ -2183,7 +2197,6 @@ impl UblkCtrl {
         ctrl.dump_from_json();
         println!("\tublksrv_flags: 0x{:x}", ctrl.dev_info.ublksrv_flags);
     }
-
 
     pub fn run_dir() -> String {
         String::from("/run/ublksrvd")
@@ -2211,7 +2224,6 @@ impl UblkCtrl {
         self.get_inner_mut().read_dev_info()
     }
 
-
     /// Retrieve this device's parameter from ublk driver by
     /// sending command
     ///
@@ -2219,7 +2231,6 @@ impl UblkCtrl {
     pub fn get_params(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         self.get_inner_mut().get_params(params)
     }
-
 
     /// Send this device's parameter to ublk driver
     ///
@@ -2229,13 +2240,11 @@ impl UblkCtrl {
         self.get_inner_mut().set_params(params)
     }
 
-
     /// Retrieving the specified queue's affinity from ublk driver
     ///
     pub fn get_queue_affinity(&self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
         self.get_inner_mut().get_queue_affinity(q, bm)
     }
-
 
     /// Set single CPU affinity for a specific queue
     ///
@@ -2320,7 +2329,6 @@ impl UblkCtrl {
         }
     }
 
-
     /// Start ublk device
     ///
     /// # Arguments:
@@ -2390,7 +2398,6 @@ impl UblkCtrl {
         ctrl.stop()
     }
 
-
     /// Kill this device
     ///
     /// Preferred method for target code to stop & delete device,
@@ -2402,7 +2409,6 @@ impl UblkCtrl {
     pub fn kill_dev(&self) -> Result<i32, UblkError> {
         self.get_inner_mut().stop()
     }
-
 
     /// Remove this device and its exported json file
     ///
@@ -2434,7 +2440,6 @@ impl UblkCtrl {
         Ok(0)
     }
 
-
     /// Calculate queue affinity based on device settings
     ///
     /// This function calculates the appropriate CPU affinity for a queue,
@@ -2450,7 +2455,6 @@ impl UblkCtrl {
                 affinity
             })
     }
-
 
     /// Set queue thread affinity using thread ID
     ///
@@ -2469,7 +2473,6 @@ impl UblkCtrl {
             );
         }
     }
-
 
     /// Initialize queue thread and return tid
     ///
@@ -2715,7 +2718,6 @@ mod tests {
         assert_eq!(inner.queue_selected_cpus[1], 0); // Should be initialized to 0
     }
 
-
     #[test]
     fn test_get_queue_effective_affinity() {
         let ctrl = UblkCtrlBuilder::default()
@@ -2801,7 +2803,8 @@ mod tests {
 
             let queue = match UblkQueue::new(qid, dev)
                 .unwrap()
-                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs))) {
+                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs)))
+            {
                 Ok(q) => q,
                 Err(e) => {
                     log::error!("submit_fetch_commands_unified failed: {}", e);
@@ -2951,11 +2954,4 @@ mod tests {
         println!("  - Single CPU affinity creation: PASS");
         println!("  - Random CPU selection: PASS (selected CPU {})", cpu);
     }
-
-
-
-
-
-
-
 }

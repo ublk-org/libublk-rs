@@ -174,7 +174,8 @@ pub fn ublk_run_ctrl_task<T>(
     task: &smol::Task<T>,
 ) -> Result<(), UblkError> {
     let mut pr: IoUring<squeue::Entry, cqueue::Entry> = IoUring::builder().build(4)?;
-    let ctrl_fd = crate::ctrl::with_ctrl_ring_internal!(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
+    let ctrl_fd =
+        crate::ctrl::with_ctrl_ring_internal!(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
     let q_fd = q.as_raw_fd();
     let mut poll_q = true;
     let mut poll_ctrl = true;
@@ -211,7 +212,10 @@ pub fn ublk_run_ctrl_task<T>(
         }
 
         ublk_process_queue_io(exe, q, 0)?;
-        let entry = crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| ublk_try_reap_cqe(ring, 0));
+        let entry =
+            crate::ctrl::with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
+                ublk_try_reap_cqe(ring, 0)
+            });
         if let Some(cqe) = entry {
             ublk_wake_task(cqe.user_data(), &cqe);
             while exe.try_tick() {}
