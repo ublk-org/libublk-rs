@@ -1,9 +1,14 @@
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
+use io_uring::{squeue, IoUring};
 use libublk::helpers::IoBuf;
-use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
-use libublk::uring_async::ublk_wait_and_handle_ios;
+use libublk::io::{
+    with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
+};
+use libublk::uring_async::{ublk_wait_and_handle_ios, ublk_wake_task};
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::rc::Rc;
 
 bitflags! {
@@ -13,6 +18,7 @@ bitflags! {
         const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00000100;
         const ZERO_COPY = 0b00001000;
+        const USE_READABLE = 0b010000;
     }
 }
 
@@ -61,7 +67,8 @@ fn q_sync_zc_fn(qid: u16, dev: &UblkDev) {
 
     let queue = match UblkQueue::new(qid, dev)
         .unwrap()
-        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc)) {
+        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc))
+    {
         Ok(q) => q,
         Err(e) => {
             log::error!("submit_fetch_commands_unified failed: {}", e);
@@ -156,9 +163,73 @@ async fn null_io_task(
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool) {
+async fn __reap_events(q: &UblkQueue<'_>) -> Result<bool, UblkError> {
+    libublk::io::with_queue_ring_mut(q, |r: &mut IoUring<squeue::Entry>| {
+        let mut res = false;
+        loop {
+            match r.completion().next() {
+                Some(cqe) => {
+                    let user_data = cqe.user_data();
+                    ublk_wake_task(user_data, &cqe);
+                    res = cqe.result() == libublk::sys::UBLK_IO_RES_ABORT;
+                }
+                _ => break,
+            };
+        }
+        Ok(res)
+    })
+}
+
+async fn reap_events(
+    exe: &smol::LocalExecutor<'_>,
+    q: &UblkQueue<'_>,
+    async_uring: &smol::Async<std::fs::File>,
+) -> Result<bool, UblkError> {
+    log::info!("before readable tid {}", unsafe { libc::gettid() });
+    with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
+    async_uring
+        .readable()
+        .await
+        .map_err(|_| UblkError::OtherError(-libc::EIO))?;
+    log::info!("after readable {}", unsafe { libc::gettid() });
+    let res = __reap_events(q).await?;
+    while exe.try_tick() {}
+    Ok(res)
+}
+
+async fn handle_uring_events<T>(
+    exe: &smol::LocalExecutor<'_>,
+    q: &UblkQueue<'_>,
+    tasks: Vec<smol::Task<T>>,
+) -> Result<(), UblkError> {
+    let uring_fd = with_queue_ring(q, |ring| ring.as_raw_fd());
+    let file = unsafe { File::from_raw_fd(uring_fd) };
+    let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
+
+    smol::future::yield_now().await;
+    loop {
+        let aborted = reap_events(exe, q, &async_uring).await?;
+        if aborted {
+            if tasks.iter().all(|task| task.is_finished()) {
+                break;
+            }
+        }
+    }
+
+    // Prevent the File wrapper from closing the fd when dropped
+    // since the original io_uring instance still owns it
+    let _ = async_uring.into_inner().map(|f| {
+        use std::os::fd::IntoRawFd;
+        f.into_raw_fd()
+    });
+
+    Ok(())
+}
+
+fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool, readable: bool) {
     let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-    let exe = smol::LocalExecutor::new();
+    let exe_rc = Rc::new(smol::LocalExecutor::new());
+    let exe = exe_rc.clone();
     let mut f_vec = Vec::new();
 
     for tag in 0..dev.dev_info.queue_depth as u16 {
@@ -167,13 +238,25 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool) {
         f_vec.push(exe.spawn(async move {
             match null_io_task(&q, tag, user_copy, zero_copy).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) =>
-                    log::error!("null_io_task failed for tag {}: {}", tag, e)
+                Err(e) => log::error!("null_io_task failed for tag {}: {}", tag, e),
             }
         }));
     }
-    ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+
+    if readable {
+        let q = q_rc.clone();
+        let exe2 = exe_rc.clone();
+        let real_exe = exe.spawn(async move {
+            if let Err(e) = handle_uring_events(&exe2, &q, f_vec).await {
+                log::error!("handle_uring_events failed: {}", e);
+            }
+        });
+
+        smol::block_on(exe_rc.run(async move { real_exe.await }));
+    } else {
+        ublk_wait_and_handle_ios(&exe, &q_rc);
+        smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+    }
 }
 
 fn __null_add(
@@ -187,6 +270,7 @@ fn __null_add(
     let aio = flags.intersects(NullFlags::ASYNC);
     let oneshot = flags.intersects(NullFlags::ONESHOT);
     let zero_copy = flags.intersects(NullFlags::ZERO_COPY);
+    let use_readable = flags.intersects(NullFlags::USE_READABLE);
 
     // Add AUTO_BUF_REG flag if zero copy is enabled
     if zero_copy {
@@ -217,7 +301,8 @@ fn __null_add(
 
     // Now start this ublk target
     if aio {
-        let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, user_copy, zero_copy);
+        let q_async_handler =
+            move |qid, dev: &_| q_async_fn(qid, dev, user_copy, zero_copy, use_readable);
         ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
     } else {
         if zero_copy {
@@ -328,6 +413,12 @@ fn main() {
                         .short('z')
                         .action(ArgAction::SetTrue)
                         .help("enable zero copy via UBLK_F_AUTO_BUF_REG"),
+                )
+                .arg(
+                    Arg::new("use_readable")
+                        .long("use_readable")
+                        .action(ArgAction::SetTrue)
+                        .help("use readable polling and drain all tasks from f_vec"),
                 ),
         )
         .subcommand(
@@ -387,6 +478,9 @@ fn main() {
             };
             if add_matches.get_flag("zero_copy") {
                 flags |= NullFlags::ZERO_COPY;
+            };
+            if add_matches.get_flag("use_readable") {
+                flags |= NullFlags::USE_READABLE;
             };
             let ctrl_flags: u64 = if add_matches.get_flag("user_copy") {
                 libublk::sys::UBLK_F_USER_COPY as u64
