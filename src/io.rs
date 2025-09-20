@@ -1012,11 +1012,6 @@ impl UblkQueueState {
         self.cmd_inflight -= val;
     }
 
-    #[inline(always)]
-    fn dec_cmd_inflight(&mut self) {
-        self.cmd_inflight -= 1;
-    }
-
     fn mark_stopping(&mut self) {
         self.state |= Self::UBLK_QUEUE_STOPPING;
     }
@@ -2279,18 +2274,6 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn update_state(&self, cqe: &cqueue::Entry) {
-        if !UblkIOCtx::is_target_io(cqe.user_data()) {
-            let mut state = self.state.borrow_mut();
-
-            state.dec_cmd_inflight();
-            if cqe.result() == sys::UBLK_IO_RES_ABORT {
-                state.mark_stopping();
-            }
-        }
-    }
-
-    #[inline(always)]
     fn update_state_batch(&self, cnt: u32, aborted: bool) {
         let mut state = self.state.borrow_mut();
 
@@ -2341,48 +2324,10 @@ impl UblkQueue<'_> {
             return;
         }
 
-        self.update_state(e.0);
-
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
             ops(self, tag as u16, e);
         }
-    }
-
-    #[inline(always)]
-    fn reap_one_event<F>(&self, ops: F, idx: i32, cnt: i32) -> usize
-    where
-        F: FnMut(&UblkQueue, u16, &UblkIOCtx),
-    {
-        if idx >= cnt {
-            return 0;
-        }
-
-        let cqe = {
-            match with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
-                .completion()
-                .next())
-            {
-                None => return 0,
-                Some(r) => r,
-            }
-        };
-
-        let ctx = UblkIOCtx(
-            &cqe,
-            if idx == 0 {
-                UblkIOCtx::UBLK_IO_F_FIRST
-            } else {
-                0
-            } | if idx + 1 == cnt {
-                UblkIOCtx::UBLK_IO_F_LAST
-            } else {
-                0
-            },
-        );
-        self.handle_cqe(ops, &ctx);
-
-        1
     }
 
     fn discard_io_pages(&self) {
@@ -2548,30 +2493,6 @@ impl UblkQueue<'_> {
     /// context, `Ok(UblkIORes::Result)` has to be returned from the queue/
     /// io_uring context. One approach is to use eventfd to wakeup & notify
     /// ublk queue/io_uring. Here, eventfd can be thought as one special target
-    /// IO. Inside IO closure, eventfd is queued by io_uring opcode::PollAdd.
-    /// Once target IO handling is done, write(eventfd) can wakeup/notify ublk
-    /// queue & io_uring, then IO closure can get chance to handle all completed
-    /// IOs. Unfortunately, each IO command(originated from ublk driver) can
-    /// only use its own `UblkIOCtx` to complete itself. But one eventfd is
-    /// often reused for the whole queue, so normally multiple IOs are completed
-    /// when handling single eventfd CQE. Here IO completion batch feature is
-    /// provided, and target code can return UblkFatRes::BatchRes(batch) to
-    /// cover each completed IO(tag, result) in io closure. Then, all these
-    /// added IOs will be completed automatically.
-    pub(crate) fn process_ios<F>(&self, mut ops: F, to_wait: usize) -> Result<i32, UblkError>
-    where
-        F: FnMut(&UblkQueue, u16, &UblkIOCtx),
-    {
-        match self.wait_ios(to_wait) {
-            Err(r) => Err(r),
-            Ok(done) => {
-                for idx in 0..done {
-                    self.reap_one_event(&mut ops, idx, done);
-                }
-                Ok(0)
-            }
-        }
-    }
 
     /// Wait and handle incoming IO
     ///
@@ -2587,7 +2508,30 @@ impl UblkQueue<'_> {
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),
     {
         loop {
-            match self.process_ios(&mut ops, 1) {
+            let mut is_first = true;
+            let result = self.flush_and_wake_io_tasks(
+                |user_data, cqe, is_last| {
+                    if UblkIOCtx::is_io_command(user_data) {
+                        let ctx = UblkIOCtx(
+                            cqe,
+                            if is_first {
+                                is_first = false;
+                                UblkIOCtx::UBLK_IO_F_FIRST
+                            } else {
+                                0
+                            } | if is_last {
+                                UblkIOCtx::UBLK_IO_F_LAST
+                            } else {
+                                0
+                            },
+                        );
+                        self.handle_cqe(&mut ops, &ctx);
+                    }
+                },
+                1,
+            );
+
+            match result {
                 Err(_) => break,
                 _ => continue,
             }
@@ -2611,11 +2555,11 @@ impl UblkQueue<'_> {
     /// This API is useful if user needs target specific batch handling.
     pub fn flush_and_wake_io_tasks<F>(
         &self,
-        wake_handler: F,
+        mut wake_handler: F,
         to_wait: usize,
     ) -> Result<i32, UblkError>
     where
-        F: Fn(u64, &cqueue::Entry, bool),
+        F: FnMut(u64, &cqueue::Entry, bool),
     {
         match self.wait_ios(to_wait) {
             Err(r) => Err(r),
