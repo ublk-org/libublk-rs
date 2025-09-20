@@ -1444,7 +1444,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn __queue_io_cmd(
+    fn __queue_io_cmd_no_state(
         &self,
         r: &mut IoUring<squeue::Entry>,
         tag: u16,
@@ -1454,11 +1454,6 @@ impl UblkQueue<'_> {
         user_data: u64,
         res: i32,
     ) -> i32 {
-        let mut state = self.state.borrow_mut();
-        if state.is_stopping() {
-            return 0;
-        }
-
         let io_cmd = sys::ublksrv_io_cmd {
             tag,
             addr: buf_addr,
@@ -1492,20 +1487,43 @@ impl UblkQueue<'_> {
                 }
             }
         }
+        1
+    }
+    #[inline(always)]
+    fn __queue_io_cmd(
+        &self,
+        r: &mut IoUring<squeue::Entry>,
+        tag: u16,
+        cmd_op: u32,
+        buf_addr: u64,
+        sqe_addr: Option<u64>,
+        data: u64,
+        res: i32,
+    ) -> i32 {
+        {
+            let state = self.state.borrow();
+            if state.is_stopping() {
+                return 0;
+            }
 
+            log::trace!(
+                "{}: (qid {} flags {:x} tag {} cmd_op {}) state {:?} buf_addr {:x}",
+                "queue_io_cmd",
+                self.q_id,
+                self.flags,
+                tag,
+                cmd_op,
+                state,
+                buf_addr,
+            );
+        }
+        let res = self.__queue_io_cmd_no_state(r, tag, cmd_op, buf_addr, sqe_addr, data, res);
+        if res != 1 {
+            return res;
+        }
+
+        let mut state = self.state.borrow_mut();
         state.inc_cmd_inflight();
-
-        log::trace!(
-            "{}: (qid {} flags {:x} tag {} cmd_op {}) stopping {} buf_addr {:x}/{:x}",
-            "queue_io_cmd",
-            self.q_id,
-            self.flags,
-            tag,
-            cmd_op,
-            state.is_stopping(),
-            io_cmd.addr,
-            buf_addr,
-        );
 
         1
     }
