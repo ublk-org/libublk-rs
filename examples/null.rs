@@ -5,7 +5,7 @@ use libublk::helpers::IoBuf;
 use libublk::io::{
     with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
-use libublk::uring_async::{ublk_wait_and_handle_ios, ublk_wake_task};
+use libublk::uring_async::ublk_wake_task;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -183,14 +183,22 @@ async fn __reap_events(q: &UblkQueue<'_>) -> Result<bool, UblkError> {
 async fn reap_events(
     exe: &smol::LocalExecutor<'_>,
     q: &UblkQueue<'_>,
-    async_uring: &smol::Async<std::fs::File>,
+    async_uring: &Option<smol::Async<std::fs::File>>,
 ) -> Result<bool, UblkError> {
     log::info!("before readable tid {}", unsafe { libc::gettid() });
-    with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
-    async_uring
-        .readable()
-        .await
-        .map_err(|_| UblkError::OtherError(-libc::EIO))?;
+
+    match async_uring {
+        Some(async_file) => {
+            with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
+            async_file
+                .readable()
+                .await
+                .map_err(|_| UblkError::OtherError(-libc::EIO))?;
+        }
+        None => {
+            with_queue_ring_mut(q, |r| r.submit_and_wait(1))?;
+        }
+    }
     log::info!("after readable {}", unsafe { libc::gettid() });
     let res = __reap_events(q).await?;
     while exe.try_tick() {}
@@ -201,10 +209,15 @@ async fn handle_uring_events<T>(
     exe: &smol::LocalExecutor<'_>,
     q: &UblkQueue<'_>,
     tasks: Vec<smol::Task<T>>,
+    smol_readable: bool,
 ) -> Result<(), UblkError> {
     let uring_fd = with_queue_ring(q, |ring| ring.as_raw_fd());
-    let file = unsafe { File::from_raw_fd(uring_fd) };
-    let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
+    let async_uring = if smol_readable {
+        let file = unsafe { File::from_raw_fd(uring_fd) };
+        Some(smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?)
+    } else {
+        None
+    };
 
     smol::future::yield_now().await;
     loop {
@@ -218,10 +231,12 @@ async fn handle_uring_events<T>(
 
     // Prevent the File wrapper from closing the fd when dropped
     // since the original io_uring instance still owns it
-    let _ = async_uring.into_inner().map(|f| {
-        use std::os::fd::IntoRawFd;
-        f.into_raw_fd()
-    });
+    if let Some(async_file) = async_uring {
+        let _ = async_file.into_inner().map(|f| {
+            use std::os::fd::IntoRawFd;
+            f.into_raw_fd()
+        });
+    }
 
     Ok(())
 }
@@ -243,20 +258,15 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool, readabl
         }));
     }
 
-    if readable {
-        let q = q_rc.clone();
-        let exe2 = exe_rc.clone();
-        let real_exe = exe.spawn(async move {
-            if let Err(e) = handle_uring_events(&exe2, &q, f_vec).await {
-                log::error!("handle_uring_events failed: {}", e);
-            }
-        });
+    let q = q_rc.clone();
+    let exe2 = exe_rc.clone();
+    let real_exe = exe.spawn(async move {
+        if let Err(e) = handle_uring_events(&exe2, &q, f_vec, readable).await {
+            log::error!("handle_uring_events failed: {}", e);
+        }
+    });
 
-        smol::block_on(exe_rc.run(async move { real_exe.await }));
-    } else {
-        ublk_wait_and_handle_ios(&exe, &q_rc);
-        smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
-    }
+    smol::block_on(exe_rc.run(async move { real_exe.await }));
 }
 
 fn __null_add(
