@@ -49,6 +49,18 @@ bitflags! {
         /// It is required for ublk to be used as swap disk
         const UBLK_DEV_F_MLOCK_IO_BUFFER = 0b00100000;
 
+        /// disable IO statistics tracking: when set, the library will not
+        /// track queue state for performance optimization. This flag should
+        /// only be used with async/await code paths in case of zero copy,
+        /// user copy or UBLK_DEV_F_MLOCK_IO_BUFFER, in which there aren't
+        /// user io buffer pages for discarding, which depends on io counting.
+        ///
+        /// When this flag is set, enter_queue_idle() and exit_queue_idle()
+        /// are not supported, which means user IO buffer pages cannot be
+        /// discarded. However, this is not needed for zero copy, user copy,
+        /// and UBLK_DEV_F_MLOCK_IO_BUFFER configurations.
+        const UBLK_DEV_F_NO_IO_STAT = 0b01000000;
+
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
         const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;

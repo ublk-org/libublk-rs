@@ -1123,6 +1123,12 @@ impl UblkQueue<'_> {
         self.flags.intersects(Self::UBLK_QUEUE_IOCTL_ENCODE)
     }
 
+    /// Check if queue state updates are needed
+    #[inline(always)]
+    fn need_update_state(&self) -> bool {
+        !self.flags.intersects(UblkFlags::UBLK_DEV_F_NO_IO_STAT)
+    }
+
     /// New one ublk queue
     ///
     /// # Arguments:
@@ -1530,8 +1536,10 @@ impl UblkQueue<'_> {
             return res;
         }
 
-        let mut state = self.state.borrow_mut();
-        state.inc_cmd_inflight();
+        if self.need_update_state() {
+            let mut state = self.state.borrow_mut();
+            state.inc_cmd_inflight();
+        }
 
         1
     }
@@ -1955,6 +1963,11 @@ impl UblkQueue<'_> {
         note = "Use `submit_fetch_commands_unified` instead, removed in 0.6"
     )]
     pub fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
+        assert!(
+            !self.flags.intersects(UblkFlags::UBLK_DEV_F_NO_IO_STAT),
+            "UBLK_DEV_F_NO_IO_STAT should only be used with async/await code paths, not with deprecated APIs"
+        );
+
         for i in 0..self.q_depth {
             let buf_addr = match bufs {
                 Some(b) => b[i as usize].as_mut_ptr(),
@@ -1999,6 +2012,10 @@ impl UblkQueue<'_> {
         self,
         buf_reg_data_list: &[sys::ublk_auto_buf_reg],
     ) -> Self {
+        assert!(
+            !self.flags.intersects(UblkFlags::UBLK_DEV_F_NO_IO_STAT),
+            "UBLK_DEV_F_NO_IO_STAT should only be used with async/await code paths, not with deprecated APIs"
+        );
         assert!(
             self.support_auto_buf_zc(),
             "Auto buffer registration not supported"
@@ -2313,11 +2330,15 @@ impl UblkQueue<'_> {
 
     #[inline(always)]
     fn update_state_batch(&self, cnt: u32, aborted: bool) {
-        let mut state = self.state.borrow_mut();
+        if aborted || self.need_update_state() {
+            let mut state = self.state.borrow_mut();
 
-        state.sub_cmd_inflight(cnt);
-        if aborted {
-            state.mark_stopping();
+            if self.need_update_state() {
+                state.sub_cmd_inflight(cnt);
+            }
+            if aborted {
+                state.mark_stopping();
+            }
         }
     }
 
@@ -2417,6 +2438,9 @@ impl UblkQueue<'_> {
     }
 
     /// Return inflight IOs being handled by target code
+    ///
+    /// **Note:** This function will return incorrect results when `UBLK_DEV_F_NO_IO_STAT`
+    /// flag is set, as queue state tracking is disabled for performance optimization.
     #[deprecated(
         since = "0.5.0",
         note = "will be removed in 0.6.0 - it is easier for target code to count inflight IOs themselves"
@@ -3044,6 +3068,21 @@ mod tests {
             )
             .await
             .unwrap();
+        });
+
+        smol::block_on(exe_rc.run(async move {
+            let _ = ublk_join_tasks(&exe, vec![io_task]);
+        }));
+    }
+    #[test]
+    fn test_no_io_stat() {
+        let exe_rc = Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
+
+        let io_task = exe_rc.spawn(async {
+            device_handler_async(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_NO_IO_STAT)
+                .await
+                .unwrap();
         });
 
         smol::block_on(exe_rc.run(async move {

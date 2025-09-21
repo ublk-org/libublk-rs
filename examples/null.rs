@@ -13,6 +13,7 @@ bitflags! {
         const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00000100;
         const ZERO_COPY = 0b00001000;
+        const NO_IO_STAT = 0b00100000;
     }
 }
 
@@ -61,7 +62,8 @@ fn q_sync_zc_fn(qid: u16, dev: &UblkDev) {
 
     let queue = match UblkQueue::new(qid, dev)
         .unwrap()
-        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc)) {
+        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc))
+    {
         Ok(q) => q,
         Err(e) => {
             log::error!("submit_fetch_commands_unified failed: {}", e);
@@ -167,8 +169,7 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool) {
         f_vec.push(exe.spawn(async move {
             match null_io_task(&q, tag, user_copy, zero_copy).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) =>
-                    log::error!("null_io_task failed for tag {}: {}", tag, e)
+                Err(e) => log::error!("null_io_task failed for tag {}: {}", tag, e),
             }
         }));
     }
@@ -187,10 +188,21 @@ fn __null_add(
     let aio = flags.intersects(NullFlags::ASYNC);
     let oneshot = flags.intersects(NullFlags::ONESHOT);
     let zero_copy = flags.intersects(NullFlags::ZERO_COPY);
+    let no_io_stat = flags.intersects(NullFlags::NO_IO_STAT);
 
     // Add AUTO_BUF_REG flag if zero copy is enabled
     if zero_copy {
         ctrl_flags |= libublk::sys::UBLK_F_AUTO_BUF_REG as u64;
+    }
+
+    // NO_IO_STAT is only supported with async/await code path
+    if no_io_stat && !aio {
+        panic!("UBLK_DEV_F_NO_IO_STAT is only supported with async/await mode (--async)");
+    }
+
+    let mut dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY;
+    if no_io_stat && aio {
+        dev_flags |= UblkFlags::UBLK_DEV_F_NO_IO_STAT;
     }
 
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
@@ -200,7 +212,7 @@ fn __null_add(
         .nr_queues(nr_queues.try_into().unwrap())
         .io_buf_bytes(buf_size)
         .ctrl_flags(ctrl_flags)
-        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+        .dev_flags(dev_flags)
         .build()
         .unwrap();
     let tgt_init = |dev: &mut UblkDev| {
@@ -328,6 +340,12 @@ fn main() {
                         .short('z')
                         .action(ArgAction::SetTrue)
                         .help("enable zero copy via UBLK_F_AUTO_BUF_REG"),
+                )
+                .arg(
+                    Arg::new("no_io_stat")
+                        .long("no-io-stat")
+                        .action(ArgAction::SetTrue)
+                        .help("enable UBLK_DEV_F_NO_IO_STAT (requires --async)"),
                 ),
         )
         .subcommand(
@@ -387,6 +405,9 @@ fn main() {
             };
             if add_matches.get_flag("zero_copy") {
                 flags |= NullFlags::ZERO_COPY;
+            };
+            if add_matches.get_flag("no_io_stat") {
+                flags |= NullFlags::NO_IO_STAT;
             };
             let ctrl_flags: u64 = if add_matches.get_flag("user_copy") {
                 libublk::sys::UBLK_F_USER_COPY as u64
