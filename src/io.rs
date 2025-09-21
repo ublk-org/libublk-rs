@@ -1048,6 +1048,8 @@ pub struct UblkQueue<'a> {
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
     pub dev: &'a UblkDev,
+    /// Cached device flags from dev.dev_info.flags for performance optimization
+    dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
     state: RefCell<UblkQueueState>,
     /// Semaphore to coordinate buffer registrations
@@ -1212,6 +1214,7 @@ impl UblkQueue<'_> {
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
             dev,
+            dev_flags: dev.dev_info.flags,
             state: RefCell::new(UblkQueueState {
                 cmd_inflight: 0,
                 state: 0,
@@ -1674,7 +1677,7 @@ impl UblkQueue<'_> {
         result: i32,
     ) -> Result<UblkUringOpFuture, UblkError> {
         // Validate buffer descriptor compatibility with device capabilities
-        buf_desc.validate_compatibility(self.dev.dev_info.flags)?;
+        buf_desc.validate_compatibility(self.dev_flags)?;
 
         // Dispatch to appropriate method based on buffer descriptor type
         let future = match buf_desc {
@@ -1962,8 +1965,7 @@ impl UblkQueue<'_> {
             };
 
             assert!(
-                ((self.dev.dev_info.flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0)
-                    == bufs.is_none()
+                ((self.dev_flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0) == bufs.is_none()
             );
             with_queue_ring_mut_internal!(|ring| {
                 self.queue_io_cmd(
@@ -2085,7 +2087,7 @@ impl UblkQueue<'_> {
             }
             BufDescList::AutoRegs(auto_reg_slice) => {
                 // AutoReg operations require UBLK_F_AUTO_BUF_REG
-                if (self.dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0 {
+                if (self.dev_flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0 {
                     return Err(UblkError::OtherError(-libc::ENOTSUP));
                 }
 
@@ -2271,7 +2273,7 @@ impl UblkQueue<'_> {
         res: Result<UblkIORes, UblkError>,
     ) -> Result<(), UblkError> {
         // Validate buffer descriptor compatibility with device capabilities
-        buf_desc.validate_compatibility(self.dev.dev_info.flags)?;
+        buf_desc.validate_compatibility(self.dev_flags)?;
 
         // Buffer validation for UBLK_DEV_F_MLOCK_IO_BUFFER
         self.validate_mlock_buffer_consistency(tag, &buf_desc)?;
