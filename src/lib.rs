@@ -13,6 +13,8 @@ pub mod ctrl_async;
 pub mod helpers;
 pub mod io;
 pub mod sys;
+#[cfg(test)]
+pub mod test_helpers;
 pub mod uring_async;
 
 // Re-export important types for unified buffer management

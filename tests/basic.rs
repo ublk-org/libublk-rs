@@ -16,15 +16,6 @@ mod integration {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    #[ctor::ctor]
-    fn init_logger() {
-        let _ = env_logger::builder()
-            .format_target(false)
-            .format_timestamp(None)
-            .is_test(true)
-            .try_init();
-    }
-
     fn run_ublk_disk_sanity_test(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
         use std::os::unix::fs::PermissionsExt;
         let dev_path = ctrl.get_cdev_path();
