@@ -1380,8 +1380,8 @@ impl UblkQueue<'_> {
     /// These methods handle buffer registration automatically and provide better
     /// integration with the async I/O workflow.
     #[deprecated(
-        since = "0.8.0",
-        note = "Use `submit_io_prep_cmd` and `submit_fetch_commands_unified` instead for automatic buffer registration"
+        since = "0.5.0",
+        note = "Use `submit_io_prep_cmd` and `submit_fetch_commands_unified` instead, removed in 0.6"
     )]
     pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
         self.register_io_buf_internal(tag, buf);
@@ -1578,8 +1578,8 @@ impl UblkQueue<'_> {
     /// In case of zoned, `buf_addr` can be the returned LBA for zone append
     /// command.
     #[deprecated(
-        since = "0.8.0",
-        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead"
+        since = "0.5.0",
+        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead, removed in 0.6"
     )]
     #[inline]
     pub fn submit_io_cmd(
@@ -1606,8 +1606,8 @@ impl UblkQueue<'_> {
     /// When auto buffer registration is enabled, buf_addr should be set to the encoded
     /// auto buffer registration data instead of the actual buffer address.
     #[deprecated(
-        since = "0.8.0",
-        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead"
+        since = "0.5.0",
+        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead, removed in 0.6"
     )]
     #[inline]
     pub fn submit_io_cmd_with_auto_buf_reg(
@@ -1942,7 +1942,10 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
-    #[deprecated(since = "0.8.0", note = "Use `submit_fetch_commands_unified` instead")]
+    #[deprecated(
+        since = "0.5.0",
+        note = "Use `submit_fetch_commands_unified` instead, removed in 0.6"
+    )]
     pub fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
         for i in 0..self.q_depth {
             let buf_addr = match bufs {
@@ -1980,7 +1983,10 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO.
-    #[deprecated(since = "0.8.0", note = "Use `submit_fetch_commands_unified` instead")]
+    #[deprecated(
+        since = "0.5.0",
+        note = "Use `submit_fetch_commands_unified` instead, removed in 0.6"
+    )]
     pub fn submit_fetch_commands_with_auto_buf_reg(
         self,
         buf_reg_data_list: &[sys::ublk_auto_buf_reg],
@@ -2105,7 +2111,10 @@ impl UblkQueue<'_> {
     ///
     /// When calling this API, target code has to make sure that thread-local QUEUE_RING
     /// won't be borrowed.
-    #[deprecated(since = "0.8.0", note = "Use `complete_io_cmd_unified` instead")]
+    #[deprecated(
+        since = "0.5.0",
+        note = "Use `complete_io_cmd_unified` instead, removed in 0.6"
+    )]
     #[inline]
     pub fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
         with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
@@ -2168,7 +2177,10 @@ impl UblkQueue<'_> {
     /// This method supports zero-copy operations when UBLK_F_AUTO_BUF_REG is enabled.
     /// The buffer is automatically registered using the provided registration data.
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
-    #[deprecated(since = "0.8.0", note = "Use `complete_io_cmd_unified` instead")]
+    #[deprecated(
+        since = "0.5.0",
+        note = "Use `complete_io_cmd_unified` instead, removed in 0.6"
+    )]
     #[inline]
     pub fn complete_io_cmd_with_auto_buf_reg(
         &self,
