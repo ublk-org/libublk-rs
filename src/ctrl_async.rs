@@ -656,17 +656,10 @@ mod tests {
         }
     }
 
-    async fn device_handler_async(mlock_fail: bool) -> Result<(), UblkError> {
+    async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), UblkError> {
         let ctrl = UblkCtrlBuilder::default()
             .name("test_async")
-            .dev_flags(
-                UblkFlags::UBLK_DEV_F_ADD_DEV
-                    | if mlock_fail {
-                        UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER
-                    } else {
-                        UblkFlags::empty()
-                    },
-            )
+            .dev_flags(dev_flags)
             .depth(8)
             .build_async()
             .await
@@ -688,7 +681,7 @@ mod tests {
             let exe = smol::LocalExecutor::new();
             let mut f_vec: Vec<smol::Task<()>> = Vec::new();
 
-            if mlock_fail {
+            if dev_flags.contains(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
                 q.mark_mlock_failed();
             }
 
@@ -732,7 +725,9 @@ mod tests {
 
         for _ in 0..64 {
             fvec.push(exe_rc.spawn(async {
-                device_handler_async(false).await.unwrap();
+                device_handler_async(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                    .await
+                    .unwrap();
             }));
         }
 
@@ -751,7 +746,11 @@ mod tests {
         let exe = exe_rc.clone();
 
         let io_task = exe_rc.spawn(async {
-            device_handler_async(true).await.unwrap();
+            device_handler_async(
+                UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER,
+            )
+            .await
+            .unwrap();
         });
 
         smol::block_on(exe_rc.run(async move {
