@@ -2397,6 +2397,10 @@ impl UblkQueue<'_> {
     }
 
     /// Return inflight IOs being handled by target code
+    #[deprecated(
+        since = "0.5.0",
+        note = "will be removed in 0.6.0 - it is easier for target code to count inflight IOs themselves"
+    )]
     #[inline]
     pub fn get_inflight_nr_io(&self) -> u32 {
         self.q_depth - self.state.borrow().get_nr_cmd_inflight()
