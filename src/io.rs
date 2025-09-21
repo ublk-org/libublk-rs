@@ -1236,7 +1236,11 @@ impl UblkQueue<'_> {
         self.state.borrow().is_stopping()
     }
 
-    // Manipulate immutable queue uring
+    /// Manipulate immutable queue uring
+    #[deprecated(
+        since = "0.5.0",
+        note = "removed in 0.6.0 - use with_queue_ring() instead"
+    )]
     pub fn uring_op<R, H>(&self, op_handler: H) -> Result<R, UblkError>
     where
         H: Fn(&IoUring<squeue::Entry>) -> Result<R, UblkError>,
@@ -1244,7 +1248,11 @@ impl UblkQueue<'_> {
         with_queue_ring_internal!(|uring: &IoUring<squeue::Entry>| op_handler(uring))
     }
 
-    // Manipulate mutable queue uring
+    /// Manipulate mutable queue uring
+    #[deprecated(
+        since = "0.5.0",
+        note = "removed in 0.6.0 - use with_queue_ring_mut() instead"
+    )]
     pub fn uring_op_mut<R, H>(&self, op_handler: H) -> Result<R, UblkError>
     where
         H: Fn(&mut IoUring<squeue::Entry>) -> Result<R, UblkError>,
@@ -2637,7 +2645,7 @@ impl UblkQueue<'_> {
 #[cfg(test)]
 mod tests {
     use crate::ctrl::UblkCtrlBuilder;
-    use crate::io::{BufDesc, UblkDev, UblkQueue};
+    use crate::io::{with_queue_ring, with_queue_ring_mut, BufDesc, UblkDev, UblkQueue};
     use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
 
@@ -2662,14 +2670,14 @@ mod tests {
         let tgt_init = |dev: &mut _| {
             let q = UblkQueue::new(0, dev)?;
 
-            q.uring_op(|ring: &_| {
+            with_queue_ring(&q, |ring: &_| {
                 // unregister_files() might fail if no files are registered - that's OK
                 let _ = ring.submitter().unregister_files();
                 ring.submitter()
                     .register_files(&dev.tgt.fds)
                     .map_err(UblkError::IOError)
             })?;
-            q.uring_op_mut(|ring: &mut _| -> Result<usize, UblkError> {
+            with_queue_ring_mut(&q, |ring: &mut _| -> Result<usize, UblkError> {
                 __submit_uring_nop(ring)
             })?;
 
