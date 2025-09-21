@@ -226,6 +226,120 @@ pub fn ublk_run_ctrl_task<T>(
     Ok(())
 }
 
+/// Abstract uring task runner that doesn't depend on specific async executor
+///
+/// # Arguments:
+///
+/// * `q`: UblkQueue instance
+/// * `run_ops`: Closure to run executor operations (replaces `while exe.try_tick() {}`)
+/// * `is_done`: Closure to check if all tasks are finished (replaces task checking)
+/// * `poll_uring`: Async closure for uring polling logic (replaces async_uring handling)
+/// * `waker_ops`: Closure to handle CQE waking operations
+///
+/// This API abstracts the common uring event handling pattern from handle_uring_events(),
+/// making it executor-agnostic and more flexible for different use cases.
+///
+/// # Examples:
+///
+/// ```no_run
+/// use libublk::{run_uring_tasks, UblkError, ublk_reap_events_with_handler};
+/// use libublk::uring_async::ublk_wake_task;
+/// use libublk::io::with_queue_ring_mut;
+///
+/// async fn example_usage(q: &libublk::io::UblkQueue<'_>, exe: &smol::LocalExecutor<'_>, tasks: Vec<smol::Task<()>>) -> Result<(), UblkError> {
+///     // Basic usage with smol executor
+///     let run_ops = || {
+///         while exe.try_tick() {}
+///     };
+///     let is_done = || tasks.iter().all(|task| task.is_finished());
+///     let poll_uring = || async { Ok(()) }; // Simplified for example
+///     let reap_event_ops = || {
+///         with_queue_ring_mut(q, |r| {
+///             ublk_reap_events_with_handler(r, |cqe| {
+///                 ublk_wake_task(cqe.user_data(), cqe);
+///             })
+///         })
+///     };
+///
+///     run_uring_tasks(poll_uring, reap_event_ops, run_ops, is_done).await?;
+///     Ok(())
+/// }
+///
+/// async fn example_custom_polling(q: &libublk::io::UblkQueue<'_>) -> Result<(), UblkError> {
+///     // Alternative: Custom polling with async file
+///     let run_ops = || {};
+///     let is_done = || true; // Example condition
+///     let poll_uring = || async {
+///         libublk::io::with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
+///         Ok(())
+///     };
+///     let reap_event_ops = || {
+///         with_queue_ring_mut(q, |r| {
+///             ublk_reap_events_with_handler(r, |cqe| {
+///                 ublk_wake_task(cqe.user_data(), cqe);
+///             })
+///         })
+///     };
+///     run_uring_tasks(poll_uring, reap_event_ops, run_ops, is_done).await?;
+///     Ok(())
+/// }
+/// ```
+pub async fn run_uring_tasks<R, I, P, F, W>(
+    mut poll_uring: P,
+    reap_event_ops: W,
+    run_ops: R,
+    is_done: I,
+) -> Result<(), UblkError>
+where
+    R: Fn(),
+    I: Fn() -> bool,
+    P: FnMut() -> F,
+    F: std::future::Future<Output = Result<(), UblkError>>,
+    W: Fn() -> Result<bool, UblkError>,
+{
+    loop {
+        poll_uring().await?;
+        let aborted = reap_event_ops()?;
+        run_ops();
+
+        if aborted && is_done() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Reap completion queue entries and handle them with a custom closure
+pub fn ublk_reap_events_with_handler<T, F>(
+    ring: &mut io_uring::IoUring<T>,
+    mut cqe_handler: F,
+) -> Result<bool, UblkError>
+where
+    T: io_uring::squeue::EntryMarker,
+    F: FnMut(&io_uring::cqueue::Entry),
+{
+    let mut aborted = false;
+    loop {
+        match ring.completion().next() {
+            Some(cqe) => {
+                cqe_handler(&cqe);
+                if cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
+                    aborted = true;
+                }
+            }
+            _ => break,
+        };
+    }
+    Ok(aborted)
+}
+
+pub fn ublk_reap_io_events<F>(q: &UblkQueue<'_>, waker_ops: F) -> Result<bool, UblkError>
+where
+    F: FnMut(&io_uring::cqueue::Entry),
+{
+    crate::io::with_queue_ring_mut(q, |r| ublk_reap_events_with_handler(r, waker_ops))
+}
+
 /// Wait and handle incoming IO command
 ///
 /// # Arguments:

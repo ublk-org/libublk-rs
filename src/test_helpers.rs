@@ -8,8 +8,9 @@
 
 use crate::ctrl::UblkCtrlBuilder;
 use crate::io::{UblkDev, UblkQueue};
-use crate::uring_async::ublk_wake_task;
+use crate::uring_async::{ublk_reap_events_with_handler, ublk_wake_task};
 use crate::{UblkError, UblkFlags};
+use io_uring::{squeue, IoUring};
 use std::rc::Rc;
 
 #[ctor::ctor]
@@ -138,7 +139,6 @@ pub(crate) fn ublk_join_tasks<T>(
     exe: &smol::LocalExecutor,
     tasks: Vec<smol::Task<T>>,
 ) -> Result<(), UblkError> {
-    use io_uring::{squeue, IoUring};
     loop {
         // Check if all tasks are finished
         if tasks.iter().all(|task| task.is_finished()) {
@@ -154,12 +154,10 @@ pub(crate) fn ublk_join_tasks<T>(
             if let Err(e) = r.submit_and_wait(0) {
                 log::error!("submit control ring failed: {}", e);
             }
-            loop {
-                match r.completion().next() {
-                    Some(cqe) => ublk_wake_task(cqe.user_data(), &cqe),
-                    _ => break,
-                };
-            }
+
+            let _ = ublk_reap_events_with_handler(r, |cqe| {
+                ublk_wake_task(cqe.user_data(), cqe);
+            });
         });
     }
     Ok(())

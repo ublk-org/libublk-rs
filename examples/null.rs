@@ -1,11 +1,10 @@
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
-use io_uring::{squeue, IoUring};
 use libublk::helpers::IoBuf;
 use libublk::io::{
     with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
-use libublk::uring_async::ublk_wake_task;
+use libublk::uring_async::{ublk_reap_io_events, ublk_wake_task};
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -163,28 +162,10 @@ async fn null_io_task(
     }
 }
 
-async fn __reap_events(q: &UblkQueue<'_>) -> Result<bool, UblkError> {
-    libublk::io::with_queue_ring_mut(q, |r: &mut IoUring<squeue::Entry>| {
-        let mut res = false;
-        loop {
-            match r.completion().next() {
-                Some(cqe) => {
-                    let user_data = cqe.user_data();
-                    ublk_wake_task(user_data, &cqe);
-                    res = cqe.result() == libublk::sys::UBLK_IO_RES_ABORT;
-                }
-                _ => break,
-            };
-        }
-        Ok(res)
-    })
-}
-
-async fn reap_events(
-    exe: &smol::LocalExecutor<'_>,
+async fn poll_events(
     q: &UblkQueue<'_>,
     async_uring: &Option<smol::Async<std::fs::File>>,
-) -> Result<bool, UblkError> {
+) -> Result<(), UblkError> {
     log::info!("before readable tid {}", unsafe { libc::gettid() });
 
     match async_uring {
@@ -200,9 +181,7 @@ async fn reap_events(
         }
     }
     log::info!("after readable {}", unsafe { libc::gettid() });
-    let res = __reap_events(q).await?;
-    while exe.try_tick() {}
-    Ok(res)
+    Ok(())
 }
 
 async fn handle_uring_events<T>(
@@ -220,14 +199,13 @@ async fn handle_uring_events<T>(
     };
 
     smol::future::yield_now().await;
-    loop {
-        let aborted = reap_events(exe, q, &async_uring).await?;
-        if aborted {
-            if tasks.iter().all(|task| task.is_finished()) {
-                break;
-            }
-        }
-    }
+
+    // Use the new run_uring_tasks API
+    let poll_uring = || async { poll_events(q, &async_uring).await };
+    let reap_event = || ublk_reap_io_events(q, |cqe| ublk_wake_task(cqe.user_data(), cqe));
+    let run_ops = || while exe.try_tick() {};
+    let is_done = || tasks.iter().all(|task| task.is_finished());
+    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
 
     // Prevent the File wrapper from closing the fd when dropped
     // since the original io_uring instance still owns it
