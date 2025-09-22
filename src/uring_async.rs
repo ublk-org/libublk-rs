@@ -233,8 +233,8 @@ pub fn ublk_run_ctrl_task<T>(
 /// * `q`: UblkQueue instance
 /// * `run_ops`: Closure to run executor operations (replaces `while exe.try_tick() {}`)
 /// * `is_done`: Closure to check if all tasks are finished (replaces task checking)
-/// * `poll_uring`: Async closure for uring polling logic (replaces async_uring handling)
-/// * `waker_ops`: Closure to handle CQE waking operations
+/// * `poll_uring`: Async closure for uring polling logic - returns bool indicating timeout
+/// * `reap_event_ops`: Closure to handle CQE reaping operations - receives timeout bool
 ///
 /// This API abstracts the common uring event handling pattern from handle_uring_events(),
 /// making it executor-agnostic and more flexible for different use cases.
@@ -252,8 +252,8 @@ pub fn ublk_run_ctrl_task<T>(
 ///         while exe.try_tick() {}
 ///     };
 ///     let is_done = || tasks.iter().all(|task| task.is_finished());
-///     let poll_uring = || async { Ok(()) }; // Simplified for example
-///     let reap_event_ops = || {
+///     let poll_uring = || async { Ok(false) }; // Simplified for example - no timeout
+///     let reap_event_ops = |poll_timeout| {
 ///         with_queue_ring_mut(q, |r| {
 ///             ublk_reap_events_with_handler(r, |cqe| {
 ///                 ublk_wake_task(cqe.user_data(), cqe);
@@ -271,9 +271,9 @@ pub fn ublk_run_ctrl_task<T>(
 ///     let is_done = || true; // Example condition
 ///     let poll_uring = || async {
 ///         libublk::io::with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
-///         Ok(())
+///         Ok(false) // Return false for no timeout
 ///     };
-///     let reap_event_ops = || {
+///     let reap_event_ops = |poll_timeout| {
 ///         with_queue_ring_mut(q, |r| {
 ///             ublk_reap_events_with_handler(r, |cqe| {
 ///                 ublk_wake_task(cqe.user_data(), cqe);
@@ -294,12 +294,12 @@ where
     R: Fn(),
     I: Fn() -> bool,
     P: FnMut() -> F,
-    F: std::future::Future<Output = Result<(), UblkError>>,
-    W: Fn() -> Result<bool, UblkError>,
+    F: std::future::Future<Output = Result<bool, UblkError>>,
+    W: Fn(bool) -> Result<bool, UblkError>,
 {
     loop {
-        poll_uring().await?;
-        let aborted = reap_event_ops()?;
+        let poll_timeout = poll_uring().await?;
+        let aborted = reap_event_ops(poll_timeout)?;
         run_ops();
 
         if aborted && is_done() {
@@ -340,28 +340,41 @@ where
     crate::io::with_queue_ring_mut(q, |r| ublk_reap_events_with_handler(r, waker_ops))
 }
 
-/// Reap completion queue entries with queue state update
+/// Reap completion queue entries with queue state update and idle management
 ///
 /// This function combines the basic functionality of `ublk_reap_io_events()` with
 /// queue state management similar to what `flush_and_wake_io_tasks()` does.
 /// It processes completion queue entries and updates the queue state by:
 /// - Counting IO commands completed
 /// - Detecting abort conditions
+/// - Managing queue idle state based on poll timeout
 /// - Calling the provided waker_ops closure for each completion
 ///
 /// # Arguments
 ///
 /// * `q`: UblkQueue instance
+/// * `poll_timeout`: Boolean indicating if polling timeout occurred
 /// * `waker_ops`: Closure called for each completion queue entry
 ///
 /// # Returns
 ///
 /// Returns `Ok(aborted)` where `aborted` indicates if any IO command was aborted,
 /// or an error if the operation failed.
-pub fn ublk_reap_io_events_with_update_queue<F>(q: &UblkQueue<'_>, mut waker_ops: F) -> Result<bool, UblkError>
+pub fn ublk_reap_io_events_with_update_queue<F>(
+    q: &UblkQueue<'_>,
+    poll_timeout: bool,
+    mut waker_ops: F,
+) -> Result<bool, UblkError>
 where
     F: FnMut(&io_uring::cqueue::Entry),
 {
+    // Handle queue idle state based on poll timeout
+    if poll_timeout {
+        q.enter_queue_idle();
+    } else {
+        q.exit_queue_idle();
+    }
+
     crate::io::with_queue_ring_mut(q, |ring| {
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
@@ -388,6 +401,7 @@ where
         // Update queue state if we processed any IO commands
         if cmd_cnt > 0 {
             q.update_state_batch(cmd_cnt, aborted);
+            q.exit_queue_idle();
         }
 
         result

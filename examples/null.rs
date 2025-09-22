@@ -165,23 +165,31 @@ async fn null_io_task(
 async fn poll_events(
     q: &UblkQueue<'_>,
     async_uring: &Option<smol::Async<std::fs::File>>,
-) -> Result<(), UblkError> {
+) -> Result<bool, UblkError> {
     log::info!("before readable tid {}", unsafe { libc::gettid() });
 
-    match async_uring {
+    let res = match async_uring {
         Some(async_file) => {
             with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
             async_file
                 .readable()
                 .await
                 .map_err(|_| UblkError::OtherError(-libc::EIO))?;
+            Ok(false)
         }
-        None => {
-            with_queue_ring_mut(q, |r| r.submit_and_wait(1))?;
-        }
-    }
+        None => with_queue_ring_mut(q, |r| {
+            let ts = io_uring::types::Timespec::new().sec(20 as u64);
+            let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+            let ret = r.submitter().submit_with_args(1, &args);
+            match ret {
+                Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => Ok(true),
+                Err(err) => Err(UblkError::IOError(err)),
+                Ok(_) => Ok(false),
+            }
+        }),
+    };
     log::info!("after readable {}", unsafe { libc::gettid() });
-    Ok(())
+    res // No timeout occurred
 }
 
 async fn handle_uring_events<T>(
@@ -202,8 +210,11 @@ async fn handle_uring_events<T>(
 
     // Use the new run_uring_tasks API
     let poll_uring = || async { poll_events(q, &async_uring).await };
-    let reap_event =
-        || ublk_reap_io_events_with_update_queue(q, |cqe| ublk_wake_task(cqe.user_data(), cqe));
+    let reap_event = |poll_timeout| {
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, |cqe| {
+            ublk_wake_task(cqe.user_data(), cqe)
+        })
+    };
     let run_ops = || while exe.try_tick() {};
     let is_done = || tasks.iter().all(|task| task.is_finished());
     libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
