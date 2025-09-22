@@ -93,6 +93,7 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
     // Use the new async method directly
     let dev_arc = &std::sync::Arc::new(UblkDev::new_async(ctrl.get_name(), tgt_init, &ctrl)?);
     let dev = dev_arc.clone();
+    let dev_id = dev.dev_info.dev_id;
     assert!(dev_arc.dev_info.nr_hw_queues == 1);
 
     // Todo: support to handle multiple queues in one thread context
@@ -124,8 +125,9 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
     // may hang in Drop() of UblkCtrlInner.
     ctrl.del_dev_async_await().await?;
 
-    qh.join()
-        .unwrap_or_else(|_| eprintln!("dev-{} join queue thread failed", dev_arc.dev_info.dev_id));
+    if let Err(e) = smol::unblock(move || qh.join()).await {
+        eprintln!("dev-{} join queue thread failed {:?}", dev_id, e);
+    }
     Ok(())
 }
 
@@ -147,16 +149,18 @@ pub(crate) fn ublk_join_tasks<T>(
         while exe.try_tick() {}
 
         // Handle control uring events
-        let entry =
-            crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-                match r.submit_and_wait(0) {
-                    Err(_) => None,
-                    _ => r.completion().next(),
-                }
-            });
-        if let Some(cqe) = entry {
-            ublk_wake_task(cqe.user_data(), &cqe);
-        }
+        crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+            /* convert to smol::Async() readable & eventfd */
+            if let Err(e) = r.submit_and_wait(0) {
+                log::error!("submit control ring failed: {}", e);
+            }
+            loop {
+                match r.completion().next() {
+                    Some(cqe) => ublk_wake_task(cqe.user_data(), &cqe),
+                    _ => break,
+                };
+            }
+        });
     }
     Ok(())
 }
