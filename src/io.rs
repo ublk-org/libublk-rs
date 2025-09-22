@@ -2388,7 +2388,7 @@ impl UblkQueue<'_> {
         }
     }
 
-    fn enter_queue_idle(&self) {
+    pub(crate) fn enter_queue_idle(&self) -> bool {
         let mut state = self.state.borrow_mut();
         let empty = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
             .submission()
@@ -2410,11 +2410,13 @@ impl UblkQueue<'_> {
             );
             state.set_idle(true);
             self.discard_io_pages();
+            return true;
         }
+        return false;
     }
 
     #[inline]
-    fn exit_queue_idle(&self) {
+    pub(crate) fn exit_queue_idle(&self) -> bool {
         let idle = { self.state.borrow().is_idle() };
 
         if idle {
@@ -2424,7 +2426,9 @@ impl UblkQueue<'_> {
                 self.q_id
             );
             self.state.borrow_mut().set_idle(false);
+            return true;
         }
+        return false;
     }
 
     /// Return inflight IOs being handled by target code
