@@ -656,7 +656,7 @@ impl<'a> UblkIOCtx<'a> {
     /// Check if this userdata is from IO command which is from
     /// ublk driver
     #[inline(always)]
-    fn is_io_command(user_data: u64) -> bool {
+    pub(crate) fn is_io_command(user_data: u64) -> bool {
         (user_data & (1_u64 << 63)) == 0
     }
 }
@@ -2314,9 +2314,18 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn update_state_batch(&self, cnt: u32, aborted: bool) {
+    pub(crate) fn update_state_batch(&self, cnt: u32, aborted: bool) {
         let mut state = self.state.borrow_mut();
 
+        log::trace!(
+            "{}: (qid {} flags {:x} cnt {} aborted {} state {:?}",
+            "update_state_batch",
+            self.q_id,
+            self.flags,
+            cnt,
+            aborted,
+            state,
+        );
         state.sub_cmd_inflight(cnt);
         if aborted {
             state.mark_stopping();

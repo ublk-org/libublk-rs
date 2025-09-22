@@ -340,6 +340,60 @@ where
     crate::io::with_queue_ring_mut(q, |r| ublk_reap_events_with_handler(r, waker_ops))
 }
 
+/// Reap completion queue entries with queue state update
+///
+/// This function combines the basic functionality of `ublk_reap_io_events()` with
+/// queue state management similar to what `flush_and_wake_io_tasks()` does.
+/// It processes completion queue entries and updates the queue state by:
+/// - Counting IO commands completed
+/// - Detecting abort conditions
+/// - Calling the provided waker_ops closure for each completion
+///
+/// # Arguments
+///
+/// * `q`: UblkQueue instance
+/// * `waker_ops`: Closure called for each completion queue entry
+///
+/// # Returns
+///
+/// Returns `Ok(aborted)` where `aborted` indicates if any IO command was aborted,
+/// or an error if the operation failed.
+pub fn ublk_reap_io_events_with_update_queue<F>(q: &UblkQueue<'_>, mut waker_ops: F) -> Result<bool, UblkError>
+where
+    F: FnMut(&io_uring::cqueue::Entry),
+{
+    crate::io::with_queue_ring_mut(q, |ring| {
+        let mut cmd_cnt = 0u32;
+        let mut aborted = false;
+
+        // Builtin closure for counting commands and detecting aborts
+        let builtin_closure = |cqe: &io_uring::cqueue::Entry| {
+            let user_data = cqe.user_data();
+
+            // Count IO commands and check for abort
+            if crate::io::UblkIOCtx::is_io_command(user_data) {
+                cmd_cnt += 1;
+                if cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
+                    aborted = true;
+                }
+            }
+
+            // Call the passed waker_ops closure
+            waker_ops(cqe);
+        };
+
+        // Reap events with our combined handler
+        let result = ublk_reap_events_with_handler(ring, builtin_closure);
+
+        // Update queue state if we processed any IO commands
+        if cmd_cnt > 0 {
+            q.update_state_batch(cmd_cnt, aborted);
+        }
+
+        result
+    })
+}
+
 /// Wait and handle incoming IO command
 ///
 /// # Arguments:

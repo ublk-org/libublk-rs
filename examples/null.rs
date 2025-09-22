@@ -4,7 +4,7 @@ use libublk::helpers::IoBuf;
 use libublk::io::{
     with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
-use libublk::uring_async::{ublk_reap_io_events, ublk_wake_task};
+use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task};
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -202,7 +202,8 @@ async fn handle_uring_events<T>(
 
     // Use the new run_uring_tasks API
     let poll_uring = || async { poll_events(q, &async_uring).await };
-    let reap_event = || ublk_reap_io_events(q, |cqe| ublk_wake_task(cqe.user_data(), cqe));
+    let reap_event =
+        || ublk_reap_io_events_with_update_queue(q, |cqe| ublk_wake_task(cqe.user_data(), cqe));
     let run_ops = || while exe.try_tick() {};
     let is_done = || tasks.iter().all(|task| task.is_finished());
     libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
