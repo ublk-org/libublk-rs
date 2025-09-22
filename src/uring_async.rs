@@ -408,6 +408,24 @@ where
     })
 }
 
+pub fn uring_poll_fn<T>(
+    r: &mut io_uring::IoUring<T>,
+    timeout_secs: usize,
+) -> Result<bool, UblkError>
+where
+    T: io_uring::squeue::EntryMarker,
+{
+    let ts = io_uring::types::Timespec::new().sec(timeout_secs as u64);
+    let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+    let ret = r.submitter().submit_with_args(1, &args);
+
+    match ret {
+        Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => Ok(true),
+        Err(err) => Err(UblkError::IOError(err)),
+        Ok(_) => Ok(false),
+    }
+}
+
 /// Wait and handle incoming IO command
 ///
 /// # Arguments:

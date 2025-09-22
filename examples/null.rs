@@ -4,7 +4,7 @@ use libublk::helpers::IoBuf;
 use libublk::io::{
     with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
-use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task};
+use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task, uring_poll_fn};
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -177,16 +177,7 @@ async fn poll_events(
                 .map_err(|_| UblkError::OtherError(-libc::EIO))?;
             Ok(false)
         }
-        None => with_queue_ring_mut(q, |r| {
-            let ts = io_uring::types::Timespec::new().sec(20 as u64);
-            let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-            let ret = r.submitter().submit_with_args(1, &args);
-            match ret {
-                Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => Ok(true),
-                Err(err) => Err(UblkError::IOError(err)),
-                Ok(_) => Ok(false),
-            }
-        }),
+        None => with_queue_ring_mut(q, |r| uring_poll_fn(r, 20)),
     };
     log::info!("after readable {}", unsafe { libc::gettid() });
     res // No timeout occurred
