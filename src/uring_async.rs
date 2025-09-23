@@ -1,5 +1,6 @@
 use crate::io::UblkQueue;
 use crate::UblkError;
+use crate::UblkUringData;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
@@ -46,7 +47,7 @@ impl Future for UblkUringOpFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
-            let key = ((self.user_data & !(1_u64 << 63)) >> 16) as usize;
+            let key = ((self.user_data & !(UblkUringData::Target as u64)) >> 16) as usize;
             match map.get_mut(key) {
                 None => {
                     log::trace!("uring: null slab {:x}", self.user_data);
@@ -83,7 +84,7 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
             cqe.user_data(),
             cqe.result()
         );
-        let data = ((data & !(1_u64 << 63)) >> 16) as usize;
+        let data = ((data & !(UblkUringData::Target as u64)) >> 16) as usize;
         if let Some(fd) = map.get_mut(data) {
             fd.result = Some(cqe.result());
             if let Some(w) = &fd.waker {

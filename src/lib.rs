@@ -26,6 +26,13 @@ pub use ctrl::ublk_init_ctrl_task_ring;
 // Re-export async utilities
 pub use uring_async::{run_uring_tasks, ublk_reap_events_with_handler, ublk_reap_io_events};
 
+/// Ublk io_uring user_data constants
+#[repr(u64)]
+pub enum UblkUringData {
+    /// Target IO bit flag - indicates user_data is from target IO
+    Target = 1_u64 << 63,
+}
+
 bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
     /// UblkFlags: top 8bits are reserved for internal use

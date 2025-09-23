@@ -157,6 +157,7 @@ use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
+use crate::UblkUringData;
 use async_lock::Semaphore;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
@@ -617,7 +618,10 @@ impl<'a> UblkIOCtx<'a> {
         assert!((tgt_data >> 16) == 0);
 
         let op = op & 0xff;
-        tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
+        tag as u64
+            | (op << 16) as u64
+            | (tgt_data << 24) as u64
+            | if is_target_io { UblkUringData::Target as u64 } else { 0 }
     }
 
     /// Build userdata for async io_uring OP
@@ -650,14 +654,14 @@ impl<'a> UblkIOCtx<'a> {
     /// Check if this userdata is from target IO
     #[inline(always)]
     fn is_target_io(user_data: u64) -> bool {
-        (user_data & (1_u64 << 63)) != 0
+        (user_data & UblkUringData::Target as u64) != 0
     }
 
     /// Check if this userdata is from IO command which is from
     /// ublk driver
     #[inline(always)]
     pub(crate) fn is_io_command(user_data: u64) -> bool {
-        (user_data & (1_u64 << 63)) == 0
+        (user_data & UblkUringData::Target as u64) == 0
     }
 }
 
@@ -1845,7 +1849,7 @@ impl UblkQueue<'_> {
 
     #[inline]
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(1_u64 << 63);
+        let f = UblkUringOpFuture::new(UblkUringData::Target as u64);
         let sqe = sqe.user_data(f.user_data);
 
         loop {
