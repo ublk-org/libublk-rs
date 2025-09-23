@@ -428,14 +428,18 @@ where
 
 pub fn uring_poll_fn<T>(
     r: &mut io_uring::IoUring<T>,
-    timeout_secs: usize,
+    timeout: Option<io_uring::types::Timespec>,
+    to_wait: usize,
 ) -> Result<bool, UblkError>
 where
     T: io_uring::squeue::EntryMarker,
 {
-    let ts = io_uring::types::Timespec::new().sec(timeout_secs as u64);
-    let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-    let ret = r.submitter().submit_with_args(1, &args);
+    let ret = if let Some(ts) = timeout {
+        let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+        r.submitter().submit_with_args(to_wait, &args)
+    } else {
+        r.submit_and_wait(to_wait)
+    };
 
     match ret {
         Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => Ok(true),

@@ -171,7 +171,12 @@ async fn handle_uring_events_default<T>(
     tasks: Vec<smol::Task<T>>,
 ) -> Result<(), UblkError> {
     // Use default uring polling (no smol::Async)
-    let poll_uring = || async { with_queue_ring_mut(q, |r| uring_poll_fn(r, 20)) };
+    let poll_uring = || async {
+        with_queue_ring_mut(q, |r| {
+            let timeout = Some(io_uring::types::Timespec::new().sec(20));
+            uring_poll_fn(r, timeout, 1)
+        })
+    };
     let reap_event = |poll_timeout| {
         ublk_reap_io_events_with_update_queue(q, poll_timeout, None, |cqe| {
             ublk_wake_task(cqe.user_data(), cqe)
