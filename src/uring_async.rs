@@ -348,13 +348,14 @@ where
 /// It processes completion queue entries and updates the queue state by:
 /// - Counting IO commands completed
 /// - Detecting abort conditions
-/// - Managing queue idle state based on poll timeout
+/// - Managing queue idle state based on poll timeout and timeout CQEs
 /// - Calling the provided waker_ops closure for each completion
 ///
 /// # Arguments
 ///
 /// * `q`: UblkQueue instance
 /// * `poll_timeout`: Boolean indicating if polling timeout occurred
+/// * `timeout_data`: Optional timeout user_data to check for timeout CQEs
 /// * `waker_ops`: Closure called for each completion queue entry
 ///
 /// # Returns
@@ -364,25 +365,32 @@ where
 pub fn ublk_reap_io_events_with_update_queue<F>(
     q: &UblkQueue<'_>,
     poll_timeout: bool,
+    timeout_data: Option<u64>,
     mut waker_ops: F,
 ) -> Result<bool, UblkError>
 where
     F: FnMut(&io_uring::cqueue::Entry),
 {
-    // Handle queue idle state based on poll timeout
-    if poll_timeout {
-        q.enter_queue_idle();
-    } else {
-        q.exit_queue_idle();
-    }
-
     crate::io::with_queue_ring_mut(q, |ring| {
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
+        let mut has_timeout = poll_timeout;
 
-        // Builtin closure for counting commands and detecting aborts
+        // Builtin closure for counting commands and detecting aborts and timeouts
         let builtin_closure = |cqe: &io_uring::cqueue::Entry| {
             let user_data = cqe.user_data();
+
+            // Check if this is a timeout CQE
+            if let Some(timeout_user_data) = timeout_data {
+                log::debug!("Timeout CQE received, result: {}", cqe.result());
+                if user_data == timeout_user_data && cqe.result() == -libc::ETIME {
+                    has_timeout = true;
+                } else {
+                    has_timeout = false;
+                }
+            } else {
+                has_timeout = false;
+            }
 
             // Count IO commands and check for abort
             if crate::io::UblkIOCtx::is_io_command(user_data) {
@@ -392,12 +400,21 @@ where
                 }
             }
 
-            // Call the passed waker_ops closure
+            // Call the passed waker_ops closure for non-timeout events
             waker_ops(cqe);
         };
 
         // Reap events with our combined handler
         let result = ublk_reap_events_with_handler(ring, builtin_closure);
+
+        // Handle queue idle state based on CQE types received
+        if has_timeout {
+            if ring.submission().is_empty() {
+                q.enter_queue_idle();
+            }
+        } else {
+            q.exit_queue_idle();
+        }
 
         // Update queue state if we processed any IO commands
         if cmd_cnt > 0 {

@@ -31,6 +31,9 @@ pub use uring_async::{run_uring_tasks, ublk_reap_events_with_handler, ublk_reap_
 pub enum UblkUringData {
     /// Target IO bit flag - indicates user_data is from target IO
     Target = 1_u64 << 63,
+    /// Non-async IO bit flag - indicates it is from one non-async IO in
+    /// async/.await code path, should only be used in async/.await
+    NonAsync = 1_u64 << 62,
 }
 
 bitflags! {

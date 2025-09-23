@@ -5,6 +5,7 @@ use libublk::io::{
     with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
 use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task, uring_poll_fn};
+use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -172,7 +173,7 @@ async fn handle_uring_events_default<T>(
     // Use default uring polling (no smol::Async)
     let poll_uring = || async { with_queue_ring_mut(q, |r| uring_poll_fn(r, 20)) };
     let reap_event = |poll_timeout| {
-        ublk_reap_io_events_with_update_queue(q, poll_timeout, |cqe| {
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, None, |cqe| {
             ublk_wake_task(cqe.user_data(), cqe)
         })
     };
@@ -183,16 +184,29 @@ async fn handle_uring_events_default<T>(
     Ok(())
 }
 
-/// Handle uring events using smol::Async() readable polling
-/// This function wraps the uring fd in smol::Async for async polling
+/// Handle uring events using smol::Async() readable polling with timeout-based queue idle management
+/// This function wraps the uring fd in smol::Async for async polling and submits timeout SQEs
+/// to enable queue idle functionality. When timeout CQEs are received, the queue enters idle state.
 async fn handle_uring_events_smol_readable<T>(
     exe: &smol::LocalExecutor<'_>,
     q: &UblkQueue<'_>,
     tasks: Vec<smol::Task<T>>,
 ) -> Result<(), UblkError> {
+    use io_uring::{opcode, types};
+
+    const TIMEOUT_USER_DATA: u64 = UblkUringData::Target as u64 | UblkUringData::NonAsync as u64;
+    const TIMEOUT_SECS: u64 = 20;
+
     let uring_fd = with_queue_ring(q, |ring| ring.as_raw_fd());
     let file = unsafe { File::from_raw_fd(uring_fd) };
     let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
+
+    let ts = types::Timespec::new().sec(TIMEOUT_SECS);
+    let timeout_e = opcode::Timeout::new(&ts)
+        .flags(io_uring::types::TimeoutFlags::MULTISHOT)
+        .build()
+        .user_data(TIMEOUT_USER_DATA);
+    q.ublk_submit_sqe_sync(timeout_e)?;
 
     // Use smol::Async readable polling
     let poll_uring = || async {
@@ -203,11 +217,15 @@ async fn handle_uring_events_smol_readable<T>(
             .map_err(|_| UblkError::OtherError(-libc::EIO))?;
         Ok(false) // smol::Async doesn't timeout
     };
+
     let reap_event = |poll_timeout| {
-        ublk_reap_io_events_with_update_queue(q, poll_timeout, |cqe| {
-            ublk_wake_task(cqe.user_data(), cqe)
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, Some(TIMEOUT_USER_DATA), |cqe| {
+            // Handle normal CQEs by waking tasks
+            // Timeout CQEs are handled internally by ublk_reap_io_events_with_update_queue
+            ublk_wake_task(cqe.user_data(), cqe);
         })
     };
+
     let run_ops = || while exe.try_tick() {};
     let is_done = || tasks.iter().all(|task| task.is_finished());
 

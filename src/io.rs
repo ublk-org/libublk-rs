@@ -621,7 +621,11 @@ impl<'a> UblkIOCtx<'a> {
         tag as u64
             | (op << 16) as u64
             | (tgt_data << 24) as u64
-            | if is_target_io { UblkUringData::Target as u64 } else { 0 }
+            | if is_target_io {
+                UblkUringData::Target as u64
+            } else {
+                0
+            }
     }
 
     /// Build userdata for async io_uring OP
@@ -2394,16 +2398,12 @@ impl UblkQueue<'_> {
 
     pub(crate) fn enter_queue_idle(&self) -> bool {
         let mut state = self.state.borrow_mut();
-        let empty = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
-            .submission()
-            .is_empty());
 
         // don't enter idle if mlock buffers is enabled
         if !self
             .dev
             .flags
             .intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER)
-            && empty
             && state.get_nr_cmd_inflight() == self.q_depth
             && !state.is_idle()
         {
@@ -2507,7 +2507,11 @@ impl UblkQueue<'_> {
                 Ok(nr_cqes)
             }
             Err(UblkError::UringTimeout) => {
-                self.enter_queue_idle();
+                with_queue_ring_mut_internal!(|r: &mut IoUring<io_uring::squeue::Entry>| {
+                    if r.submission().is_empty() {
+                        self.enter_queue_idle();
+                    }
+                });
                 Ok(0)
             }
             Err(err) => Err(err),
