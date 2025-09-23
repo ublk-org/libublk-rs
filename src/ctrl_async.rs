@@ -584,9 +584,6 @@ mod tests {
         let exe = exe_rc.clone();
         let mut fvec = Vec::new();
 
-        //support 64 devices
-        crate::ctrl::init_ctrl_task_ring_default(64 * 2).unwrap();
-
         for _ in 0..64 {
             fvec.push(exe_rc.spawn(async {
                 device_handler_async(UblkFlags::UBLK_DEV_F_ADD_DEV)

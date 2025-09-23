@@ -135,30 +135,31 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
 /// Block on all tasks in the executor until they are finished
 ///
 /// Utility function for managing task execution in tests.
+/// Implemented using run_uring_tasks(), ublk_reap_events_with_handler() and uring_poll_fn().
 pub(crate) fn ublk_join_tasks<T>(
     exe: &smol::LocalExecutor,
     tasks: Vec<smol::Task<T>>,
 ) -> Result<(), UblkError> {
-    loop {
-        // Check if all tasks are finished
-        if tasks.iter().all(|task| task.is_finished()) {
-            break;
-        }
+    //support 64 devices
+    crate::ctrl::init_ctrl_task_ring_default(64 * 2).unwrap();
 
-        // Drive the executor to make progress on tasks
-        while exe.try_tick() {}
+    smol::block_on(async {
+        let poll_uring = || async {
+            crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+                crate::uring_async::uring_poll_fn(r, None, 0)
+            })
+        };
+        let reap_event = |_poll_timeout| {
+            crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+                ublk_reap_events_with_handler(r, |cqe| {
+                    ublk_wake_task(cqe.user_data(), cqe);
+                })
+            })?;
+            Ok(true)
+        };
+        let run_ops = || while exe.try_tick() {};
+        let is_done = || tasks.iter().all(|task| task.is_finished());
 
-        // Handle control uring events
-        crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-            /* convert to smol::Async() readable & eventfd */
-            if let Err(e) = r.submit_and_wait(0) {
-                log::error!("submit control ring failed: {}", e);
-            }
-
-            let _ = ublk_reap_events_with_handler(r, |cqe| {
-                ublk_wake_task(cqe.user_data(), cqe);
-            });
-        });
-    }
-    Ok(())
+        crate::uring_async::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
+    })
 }
