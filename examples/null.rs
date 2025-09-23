@@ -162,25 +162,65 @@ async fn null_io_task(
     }
 }
 
-async fn poll_events(
+/// Handle uring events using default uring polling via with_queue_ring_mut()
+/// This function uses uring_poll_fn() for timeout-based polling without smol::Async
+async fn handle_uring_events_default<T>(
+    exe: &smol::LocalExecutor<'_>,
     q: &UblkQueue<'_>,
-    async_uring: &Option<smol::Async<std::fs::File>>,
-) -> Result<bool, UblkError> {
-    log::info!("before readable tid {}", unsafe { libc::gettid() });
-
-    let res = match async_uring {
-        Some(async_file) => {
-            with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
-            async_file
-                .readable()
-                .await
-                .map_err(|_| UblkError::OtherError(-libc::EIO))?;
-            Ok(false)
-        }
-        None => with_queue_ring_mut(q, |r| uring_poll_fn(r, 20)),
+    tasks: Vec<smol::Task<T>>,
+) -> Result<(), UblkError> {
+    // Use default uring polling (no smol::Async)
+    let poll_uring = || async { with_queue_ring_mut(q, |r| uring_poll_fn(r, 20)) };
+    let reap_event = |poll_timeout| {
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, |cqe| {
+            ublk_wake_task(cqe.user_data(), cqe)
+        })
     };
-    log::info!("after readable {}", unsafe { libc::gettid() });
-    res // No timeout occurred
+    let run_ops = || while exe.try_tick() {};
+    let is_done = || tasks.iter().all(|task| task.is_finished());
+
+    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
+    Ok(())
+}
+
+/// Handle uring events using smol::Async() readable polling
+/// This function wraps the uring fd in smol::Async for async polling
+async fn handle_uring_events_smol_readable<T>(
+    exe: &smol::LocalExecutor<'_>,
+    q: &UblkQueue<'_>,
+    tasks: Vec<smol::Task<T>>,
+) -> Result<(), UblkError> {
+    let uring_fd = with_queue_ring(q, |ring| ring.as_raw_fd());
+    let file = unsafe { File::from_raw_fd(uring_fd) };
+    let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
+
+    // Use smol::Async readable polling
+    let poll_uring = || async {
+        with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
+        async_uring
+            .readable()
+            .await
+            .map_err(|_| UblkError::OtherError(-libc::EIO))?;
+        Ok(false) // smol::Async doesn't timeout
+    };
+    let reap_event = |poll_timeout| {
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, |cqe| {
+            ublk_wake_task(cqe.user_data(), cqe)
+        })
+    };
+    let run_ops = || while exe.try_tick() {};
+    let is_done = || tasks.iter().all(|task| task.is_finished());
+
+    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
+
+    // Prevent the File wrapper from closing the fd when dropped
+    // since the original io_uring instance still owns it
+    let _ = async_uring.into_inner().map(|f| {
+        use std::os::fd::IntoRawFd;
+        f.into_raw_fd()
+    });
+
+    Ok(())
 }
 
 async fn handle_uring_events<T>(
@@ -189,37 +229,12 @@ async fn handle_uring_events<T>(
     tasks: Vec<smol::Task<T>>,
     smol_readable: bool,
 ) -> Result<(), UblkError> {
-    let uring_fd = with_queue_ring(q, |ring| ring.as_raw_fd());
-    let async_uring = if smol_readable {
-        let file = unsafe { File::from_raw_fd(uring_fd) };
-        Some(smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?)
-    } else {
-        None
-    };
-
     smol::future::yield_now().await;
-
-    // Use the new run_uring_tasks API
-    let poll_uring = || async { poll_events(q, &async_uring).await };
-    let reap_event = |poll_timeout| {
-        ublk_reap_io_events_with_update_queue(q, poll_timeout, |cqe| {
-            ublk_wake_task(cqe.user_data(), cqe)
-        })
-    };
-    let run_ops = || while exe.try_tick() {};
-    let is_done = || tasks.iter().all(|task| task.is_finished());
-    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
-
-    // Prevent the File wrapper from closing the fd when dropped
-    // since the original io_uring instance still owns it
-    if let Some(async_file) = async_uring {
-        let _ = async_file.into_inner().map(|f| {
-            use std::os::fd::IntoRawFd;
-            f.into_raw_fd()
-        });
+    if smol_readable {
+        handle_uring_events_smol_readable(exe, q, tasks).await
+    } else {
+        handle_uring_events_default(exe, q, tasks).await
     }
-
-    Ok(())
 }
 
 fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool, readable: bool) {
