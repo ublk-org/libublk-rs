@@ -59,6 +59,89 @@ macro_rules! with_ctrl_ring_mut_internal {
 pub(crate) use with_ctrl_ring_internal;
 pub(crate) use with_ctrl_ring_mut_internal;
 
+/// Execute a closure with access to the thread-local control ring
+///
+/// This function provides access to the control ring for read-only operations.
+/// The control ring must be initialized first via `ublk_init_ctrl_task_ring()`
+/// or by creating a `UblkCtrl` instance.
+///
+/// # Arguments
+/// * `closure` - A closure that receives `&IoUring<squeue::Entry128>` and returns `T`
+///
+/// # Returns
+/// The result of executing the closure
+///
+/// # Panics
+/// Panics if the control ring is not initialized
+///
+/// # Examples
+/// ```no_run
+/// use libublk::{with_ctrl_ring, ublk_init_ctrl_task_ring};
+/// use io_uring::{IoUring, squeue};
+/// use std::os::fd::AsRawFd;
+///
+/// // Initialize the control ring first
+/// ublk_init_ctrl_task_ring(|ring_opt| {
+///     if ring_opt.is_none() {
+///         *ring_opt = Some(IoUring::<squeue::Entry128>::builder().build(32)?);
+///     }
+///     Ok(())
+/// })?;
+///
+/// // Now access it read-only
+/// let fd = with_ctrl_ring(|ring| ring.as_raw_fd());
+/// println!("Control ring fd: {}", fd);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn with_ctrl_ring<T, F>(closure: F) -> T
+where
+    F: FnOnce(&IoUring<squeue::Entry128>) -> T,
+{
+    with_ctrl_ring_internal!(closure)
+}
+
+/// Execute a closure with mutable access to the thread-local control ring
+///
+/// This function provides access to the control ring for read-write operations.
+/// The control ring must be initialized first via `ublk_init_ctrl_task_ring()`
+/// or by creating a `UblkCtrl` instance.
+///
+/// # Arguments
+/// * `closure` - A closure that receives `&mut IoUring<squeue::Entry128>` and returns `T`
+///
+/// # Returns
+/// The result of executing the closure
+///
+/// # Panics
+/// Panics if the control ring is not initialized
+///
+/// # Examples
+/// ```no_run
+/// use libublk::{with_ctrl_ring_mut, ublk_init_ctrl_task_ring};
+/// use io_uring::{IoUring, squeue};
+///
+/// // Initialize the control ring first
+/// ublk_init_ctrl_task_ring(|ring_opt| {
+///     if ring_opt.is_none() {
+///         *ring_opt = Some(IoUring::<squeue::Entry128>::builder().build(32)?);
+///     }
+///     Ok(())
+/// })?;
+///
+/// // Now access it with mutable access
+/// with_ctrl_ring_mut(|ring| {
+///     // Perform operations that need mutable access
+///     ring.submission().sync();
+/// });
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn with_ctrl_ring_mut<T, F>(closure: F) -> T
+where
+    F: FnOnce(&mut IoUring<squeue::Entry128>) -> T,
+{
+    with_ctrl_ring_mut_internal!(closure)
+}
+
 /// Initialize the thread-local control ring using a custom closure
 ///
 /// This API allows users to customize the io_uring initialization for control operations.

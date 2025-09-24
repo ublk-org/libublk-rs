@@ -20,8 +20,8 @@ pub mod uring_async;
 // Re-export important types for unified buffer management
 pub use io::{ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, BufDesc, BufDescList};
 
-// Re-export control ring initialization
-pub use ctrl::ublk_init_ctrl_task_ring;
+// Re-export control ring initialization and access
+pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
 
 // Re-export async utilities
 pub use uring_async::{run_uring_tasks, ublk_reap_events_with_handler, ublk_reap_io_events, wait_and_handle_io_events};
