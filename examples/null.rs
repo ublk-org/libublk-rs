@@ -239,7 +239,6 @@ async fn handle_uring_events<T>(
     tasks: Vec<smol::Task<T>>,
     smol_readable: bool,
 ) -> Result<(), UblkError> {
-    smol::future::yield_now().await;
     if smol_readable {
         handle_uring_events_smol_readable(exe, q, tasks).await
     } else {

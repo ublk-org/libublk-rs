@@ -292,7 +292,6 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
         let run_ops = || while exe.try_tick() {};
         let done = || f_vec.iter().all(|task| task.is_finished());
 
-        smol::future::yield_now().await;
         if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
             log::error!("handle_uring_events failed: {}", e);
         }

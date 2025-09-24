@@ -298,6 +298,7 @@ where
     F: std::future::Future<Output = Result<bool, UblkError>>,
     W: Fn(bool) -> Result<bool, UblkError>,
 {
+    run_ops();
     loop {
         let (poll_timeout, failed) = match poll_uring().await {
             Ok(t) => (t, false),

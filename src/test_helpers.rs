@@ -115,7 +115,6 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
             let run_ops = || while exe.try_tick() {};
             let done = || f_vec.iter().all(|task| task.is_finished());
 
-            smol::future::yield_now().await;
             if let Err(e) = crate::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
                 log::error!("handle_uring_events failed: {}", e);
             }

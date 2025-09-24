@@ -211,7 +211,6 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         let run_ops = || while exec.try_tick() {};
         let done = || f_vec.iter().all(|task| task.is_finished());
 
-        smol::future::yield_now().await;
         if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
             log::error!("handle_uring_events failed: {}", e);
         }
