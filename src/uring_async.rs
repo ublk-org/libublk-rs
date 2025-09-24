@@ -430,6 +430,64 @@ where
     })
 }
 
+/// Wait and handle I/O events for a ublk queue with customizable polling and completion callbacks
+///
+/// This function provides a high-level interface for handling I/O events on a ublk queue.
+/// It uses the underlying `run_uring_tasks` infrastructure with default uring polling via
+/// `with_queue_ring_mut()` and `uring_poll_fn()`.
+///
+/// # Parameters
+/// * `q` - The UblkQueue to handle events for
+/// * `idle_secs` - Timeout in seconds for uring polling (None for no timeout)
+/// * `run_ops` - Closure called periodically to run operations (e.g., executor tick)
+/// * `is_done` - Closure that returns true when event handling should stop
+///
+/// # Returns
+/// Returns `Ok(())` when `is_done()` returns true, or an error if I/O operations fail.
+///
+/// # Example
+/// ```rust,no_run
+/// use libublk::uring_async::wait_and_handle_io_events;
+/// use libublk::io::UblkQueue;
+/// use libublk::UblkError;
+///
+/// async fn handle_events(q: &UblkQueue<'_>) -> Result<(), UblkError> {
+///     let run_ops = || {
+///         // Run executor or other periodic operations
+///     };
+///     let is_done = || {
+///         // Check if we should stop handling events
+///         false
+///     };
+///
+///     wait_and_handle_io_events(q, Some(20), run_ops, is_done).await
+/// }
+/// ```
+pub async fn wait_and_handle_io_events<R, I>(
+    q: &UblkQueue<'_>,
+    idle_secs: Option<u64>,
+    run_ops: R,
+    is_done: I,
+) -> Result<(), UblkError>
+where
+    R: Fn(),
+    I: Fn() -> bool,
+{
+    // Use default uring polling (no smol::Async)
+    let poll_uring = || async {
+        let timeout = idle_secs.map(|secs| io_uring::types::Timespec::new().sec(secs));
+        uring_poll_io_fn::<io_uring::squeue::Entry>(q, timeout, 1)
+    };
+
+    let reap_event = |poll_timeout| {
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, None, |cqe| {
+            ublk_wake_task(cqe.user_data(), cqe)
+        })
+    };
+
+    run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
+}
+
 pub fn uring_poll_fn<T>(
     r: &mut io_uring::IoUring<T>,
     timeout: Option<io_uring::types::Timespec>,

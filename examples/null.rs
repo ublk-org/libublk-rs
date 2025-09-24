@@ -4,9 +4,7 @@ use libublk::helpers::IoBuf;
 use libublk::io::{
     with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
-use libublk::uring_async::{
-    ublk_reap_io_events_with_update_queue, ublk_wake_task, uring_poll_io_fn,
-};
+use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task};
 use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::fs::File;
@@ -166,27 +164,16 @@ async fn null_io_task(
 }
 
 /// Handle uring events using default uring polling via with_queue_ring_mut()
-/// This function uses uring_poll_fn() for timeout-based polling without smol::Async
+/// This function uses the new wait_and_handle_io_events API for simplified event handling
 async fn handle_uring_events_default<T>(
     exe: &smol::LocalExecutor<'_>,
     q: &UblkQueue<'_>,
     tasks: Vec<smol::Task<T>>,
 ) -> Result<(), UblkError> {
-    // Use default uring polling (no smol::Async)
-    let poll_uring = || async {
-        let timeout = Some(io_uring::types::Timespec::new().sec(20));
-        uring_poll_io_fn::<io_uring::squeue::Entry>(q, timeout, 1)
-    };
-    let reap_event = |poll_timeout| {
-        ublk_reap_io_events_with_update_queue(q, poll_timeout, None, |cqe| {
-            ublk_wake_task(cqe.user_data(), cqe)
-        })
-    };
     let run_ops = || while exe.try_tick() {};
     let is_done = || tasks.iter().all(|task| task.is_finished());
 
-    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
-    Ok(())
+    libublk::wait_and_handle_io_events(q, Some(20), run_ops, is_done).await
 }
 
 /// Handle uring events using smol::Async() readable polling with timeout-based queue idle management
