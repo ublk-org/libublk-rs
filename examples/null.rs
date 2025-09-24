@@ -2,7 +2,7 @@ use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
 use libublk::io::{
-    with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
+    with_task_io_ring, with_task_io_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
 use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task};
 use libublk::UblkUringData;
@@ -189,7 +189,7 @@ async fn handle_uring_events_smol_readable<T>(
     const TIMEOUT_USER_DATA: u64 = UblkUringData::Target as u64 | UblkUringData::NonAsync as u64;
     const TIMEOUT_SECS: u64 = 20;
 
-    let uring_fd = with_queue_ring(q, |ring| ring.as_raw_fd());
+    let uring_fd = with_task_io_ring(|ring| ring.as_raw_fd());
     let file = unsafe { File::from_raw_fd(uring_fd) };
     let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
 
@@ -202,7 +202,7 @@ async fn handle_uring_events_smol_readable<T>(
 
     // Use smol::Async readable polling
     let poll_uring = || async {
-        with_queue_ring_mut(q, |r| r.submit_and_wait(0))?;
+        with_task_io_ring_mut(|r| r.submit_and_wait(0))?;
         async_uring
             .readable()
             .await

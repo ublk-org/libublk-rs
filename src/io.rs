@@ -252,6 +252,10 @@ pub(crate) use with_queue_ring_mut_internal;
 /// # Ok(())
 /// # }
 /// ```
+#[deprecated(
+    since = "0.5.0",
+    note = "use with_task_io_ring() instead - the UblkQueue parameter is unnecessary"
+)]
 pub fn with_queue_ring<F, R>(_queue: &UblkQueue, f: F) -> R
 where
     F: FnOnce(&IoUring<squeue::Entry>) -> R,
@@ -275,7 +279,61 @@ where
 /// # Ok(())
 /// # }
 /// ```
+#[deprecated(
+    since = "0.5.0",
+    note = "use with_task_io_ring_mut() instead - the UblkQueue parameter is unnecessary"
+)]
 pub fn with_queue_ring_mut<F, R>(_queue: &UblkQueue, f: F) -> R
+where
+    F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
+{
+    with_queue_ring_mut_internal!(f)
+}
+
+/// Access the thread-local queue ring with immutable reference
+///
+/// This function provides direct access to the thread-local IO ring without
+/// requiring a UblkQueue parameter, making it more convenient for use cases
+/// where the queue reference is not readily available.
+///
+/// # Arguments
+/// * `f` - Closure that receives immutable reference to the IoUring
+///
+/// # Example
+/// ```no_run
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// libublk::io::with_task_io_ring(|ring| {
+///     println!("SQ entries: {}", ring.params().sq_entries());
+/// });
+/// # Ok(())
+/// # }
+/// ```
+pub fn with_task_io_ring<F, R>(f: F) -> R
+where
+    F: FnOnce(&IoUring<squeue::Entry>) -> R,
+{
+    with_queue_ring_internal!(f)
+}
+
+/// Access the thread-local queue ring with mutable reference
+///
+/// This function provides direct access to the thread-local IO ring without
+/// requiring a UblkQueue parameter, making it more convenient for use cases
+/// where the queue reference is not readily available.
+///
+/// # Arguments
+/// * `f` - Closure that receives mutable reference to the IoUring
+///
+/// # Example
+/// ```no_run
+/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// libublk::io::with_task_io_ring_mut(|ring| {
+///     ring.submit_and_wait(1)
+/// })?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn with_task_io_ring_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
 {
@@ -2717,7 +2775,7 @@ impl UblkQueue<'_> {
 #[cfg(test)]
 mod tests {
     use crate::ctrl::UblkCtrlBuilder;
-    use crate::io::{with_queue_ring, with_queue_ring_mut, BufDesc, UblkDev, UblkQueue};
+    use crate::io::{with_task_io_ring, with_task_io_ring_mut, BufDesc, UblkDev, UblkQueue};
     use crate::test_helpers::{device_handler_async, ublk_join_tasks};
     use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
@@ -2741,19 +2799,20 @@ mod tests {
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut _| {
-            let q = UblkQueue::new(0, dev)?;
-
-            with_queue_ring(&q, |ring: &_| {
+        let tgt_init = |dev: &mut UblkDev| {
+            let _q = UblkQueue::new(0, dev)?;
+            with_task_io_ring(|ring: &IoUring<io_uring::squeue::Entry>| {
                 // unregister_files() might fail if no files are registered - that's OK
                 let _ = ring.submitter().unregister_files();
                 ring.submitter()
                     .register_files(&dev.tgt.fds)
                     .map_err(UblkError::IOError)
             })?;
-            with_queue_ring_mut(&q, |ring: &mut _| -> Result<usize, UblkError> {
-                __submit_uring_nop(ring)
-            })?;
+            with_task_io_ring_mut(
+                |ring: &mut IoUring<io_uring::squeue::Entry>| -> Result<usize, UblkError> {
+                    __submit_uring_nop(ring)
+                },
+            )?;
 
             Ok(())
         };
@@ -2894,23 +2953,22 @@ mod tests {
 
     #[test]
     fn test_with_queue_ring_api() {
-        use crate::{io::init_task_ring_default, with_queue_ring, with_queue_ring_mut};
+        use crate::{io::init_task_ring_default, with_task_io_ring, with_task_io_ring_mut};
 
         let ctrl = UblkCtrlBuilder::default()
             .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut _| {
+        let tgt_init = |_dev: &mut UblkDev| {
             init_task_ring_default(16, 32)?;
-            let q = UblkQueue::new(0, dev)?;
 
-            // Test with_queue_ring() - read-only access
-            let sq_entries = with_queue_ring(&q, |ring| ring.params().sq_entries());
+            // Test with_task_io_ring() - read-only access
+            let sq_entries = with_task_io_ring(|ring| ring.params().sq_entries());
             assert!(sq_entries == 16, "Should have 16 sq_entries");
 
-            // Test with_queue_ring_mut() - mutable access
-            let cq_entries = with_queue_ring_mut(&q, |ring| ring.params().cq_entries());
+            // Test with_task_io_ring_mut() - mutable access
+            let cq_entries = with_task_io_ring_mut(|ring| ring.params().cq_entries());
             assert!(cq_entries == 32, "Should have 32 cq_entries");
 
             Ok(())

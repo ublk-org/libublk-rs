@@ -18,7 +18,11 @@ pub mod test_helpers;
 pub mod uring_async;
 
 // Re-export important types for unified buffer management
-pub use io::{ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, BufDesc, BufDescList};
+#[allow(deprecated)]
+pub use io::{
+    ublk_init_task_ring, with_queue_ring, with_queue_ring_mut,
+    with_task_io_ring, with_task_io_ring_mut, BufDesc, BufDescList
+};
 
 // Re-export control ring initialization and access
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
