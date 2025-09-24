@@ -157,6 +157,7 @@ use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
+use crate::UblkUringData;
 use async_lock::Semaphore;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
@@ -617,7 +618,14 @@ impl<'a> UblkIOCtx<'a> {
         assert!((tgt_data >> 16) == 0);
 
         let op = op & 0xff;
-        tag as u64 | (op << 16) as u64 | (tgt_data << 24) as u64 | ((is_target_io as u64) << 63)
+        tag as u64
+            | (op << 16) as u64
+            | (tgt_data << 24) as u64
+            | if is_target_io {
+                UblkUringData::Target as u64
+            } else {
+                0
+            }
     }
 
     /// Build userdata for async io_uring OP
@@ -650,14 +658,14 @@ impl<'a> UblkIOCtx<'a> {
     /// Check if this userdata is from target IO
     #[inline(always)]
     fn is_target_io(user_data: u64) -> bool {
-        (user_data & (1_u64 << 63)) != 0
+        (user_data & UblkUringData::Target as u64) != 0
     }
 
     /// Check if this userdata is from IO command which is from
     /// ublk driver
     #[inline(always)]
-    fn is_io_command(user_data: u64) -> bool {
-        (user_data & (1_u64 << 63)) == 0
+    pub(crate) fn is_io_command(user_data: u64) -> bool {
+        (user_data & UblkUringData::Target as u64) == 0
     }
 }
 
@@ -962,7 +970,7 @@ impl Drop for UblkDev {
 }
 
 #[derive(Debug, Clone, Default)]
-struct UblkQueueState {
+pub(crate) struct UblkQueueState {
     cmd_inflight: u32,
     state: u32,
 }
@@ -988,12 +996,12 @@ impl UblkQueueState {
     }
 
     #[inline(always)]
-    fn is_stopping(&self) -> bool {
+    pub(crate) fn is_stopping(&self) -> bool {
         (self.state & Self::UBLK_QUEUE_STOPPING) != 0
     }
 
     #[inline(always)]
-    fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         (self.state & Self::UBLK_QUEUE_IDLE) != 0
     }
 
@@ -1051,7 +1059,7 @@ pub struct UblkQueue<'a> {
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
-    state: RefCell<UblkQueueState>,
+    pub(crate) state: RefCell<UblkQueueState>,
     /// Semaphore to coordinate buffer registrations
     /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
     buf_reg_semaphore: Semaphore,
@@ -1234,6 +1242,10 @@ impl UblkQueue<'_> {
         self.state.borrow().is_idle()
     }
 
+    // Return if queue is stopping
+    fn mark_stopping(&self) {
+        self.state.borrow_mut().mark_stopping()
+    }
     // Return if queue is stopping
     pub fn is_stopping(&self) -> bool {
         self.state.borrow().is_stopping()
@@ -1785,16 +1797,24 @@ impl UblkQueue<'_> {
 
         // Check if mlock failed and fail immediately if so, but only for FETCH_REQ operations
         if self.is_mlock_failed() {
+            self.mark_stopping();
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
-        let future =
-            self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
-        let res = future.await;
-        if res == crate::sys::UBLK_IO_RES_ABORT {
-            Err(UblkError::QueueIsDown)
-        } else {
-            Ok(res)
+        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
+        match f {
+            Ok(future) => {
+                let res = future.await;
+                if res == crate::sys::UBLK_IO_RES_ABORT {
+                    Err(UblkError::QueueIsDown)
+                } else {
+                    Ok(res)
+                }
+            }
+            Err(e) => {
+                self.mark_stopping();
+                Err(e)
+            }
         }
     }
 
@@ -1829,23 +1849,32 @@ impl UblkQueue<'_> {
     ) -> Result<i32, UblkError> {
         // Buffer validation for UBLK_DEV_F_MLOCK_IO_BUFFER
         self.validate_mlock_buffer_consistency(tag, &buf_desc)?;
-        let future = self.submit_io_cmd_unified(
+        let f = self.submit_io_cmd_unified(
             tag,
             crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
             buf_desc,
             result,
-        )?;
-        let res = future.await;
-        if res == crate::sys::UBLK_IO_RES_ABORT {
-            Err(UblkError::QueueIsDown)
-        } else {
-            Ok(res)
+        );
+
+        match f {
+            Ok(future) => {
+                let res = future.await;
+                if res == crate::sys::UBLK_IO_RES_ABORT {
+                    Err(UblkError::QueueIsDown)
+                } else {
+                    Ok(res)
+                }
+            }
+            Err(e) => {
+                self.mark_stopping();
+                Err(e)
+            }
         }
     }
 
     #[inline]
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(1_u64 << 63);
+        let f = UblkUringOpFuture::new(UblkUringData::Target as u64);
         let sqe = sqe.user_data(f.user_data);
 
         loop {
@@ -2314,9 +2343,18 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
-    fn update_state_batch(&self, cnt: u32, aborted: bool) {
+    pub(crate) fn update_state_batch(&self, cnt: u32, aborted: bool) {
         let mut state = self.state.borrow_mut();
 
+        log::trace!(
+            "{}: (qid {} flags {:x} cnt {} aborted {} state {:?}",
+            "update_state_batch",
+            self.q_id,
+            self.flags,
+            cnt,
+            aborted,
+            state,
+        );
         state.sub_cmd_inflight(cnt);
         if aborted {
             state.mark_stopping();
@@ -2379,18 +2417,14 @@ impl UblkQueue<'_> {
         }
     }
 
-    fn enter_queue_idle(&self) {
+    pub(crate) fn enter_queue_idle(&self) -> bool {
         let mut state = self.state.borrow_mut();
-        let empty = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
-            .submission()
-            .is_empty());
 
         // don't enter idle if mlock buffers is enabled
         if !self
             .dev
             .flags
             .intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER)
-            && empty
             && state.get_nr_cmd_inflight() == self.q_depth
             && !state.is_idle()
         {
@@ -2401,11 +2435,13 @@ impl UblkQueue<'_> {
             );
             state.set_idle(true);
             self.discard_io_pages();
+            return true;
         }
+        return false;
     }
 
     #[inline]
-    fn exit_queue_idle(&self) {
+    pub(crate) fn exit_queue_idle(&self) -> bool {
         let idle = { self.state.borrow().is_idle() };
 
         if idle {
@@ -2415,7 +2451,9 @@ impl UblkQueue<'_> {
                 self.q_id
             );
             self.state.borrow_mut().set_idle(false);
+            return true;
         }
+        return false;
     }
 
     /// Return inflight IOs being handled by target code
@@ -2490,7 +2528,11 @@ impl UblkQueue<'_> {
                 Ok(nr_cqes)
             }
             Err(UblkError::UringTimeout) => {
-                self.enter_queue_idle();
+                with_queue_ring_mut_internal!(|r: &mut IoUring<io_uring::squeue::Entry>| {
+                    if r.submission().is_empty() {
+                        self.enter_queue_idle();
+                    }
+                });
                 Ok(0)
             }
             Err(err) => Err(err),
