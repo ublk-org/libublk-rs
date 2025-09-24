@@ -334,11 +334,13 @@ where
     Ok(aborted)
 }
 
-pub fn ublk_reap_io_events<F>(q: &UblkQueue<'_>, waker_ops: F) -> Result<bool, UblkError>
+pub fn ublk_reap_io_events<F>(waker_ops: F) -> Result<bool, UblkError>
 where
     F: FnMut(&io_uring::cqueue::Entry),
 {
-    crate::io::with_queue_ring_mut(q, |r| ublk_reap_events_with_handler(r, waker_ops))
+    crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        ublk_reap_events_with_handler(r, waker_ops)
+    })
 }
 
 /// Reap completion queue entries with queue state update and idle management
@@ -371,7 +373,7 @@ pub fn ublk_reap_io_events_with_update_queue<F>(
 where
     F: FnMut(&io_uring::cqueue::Entry),
 {
-    crate::io::with_queue_ring_mut(q, |ring| {
+    crate::io::with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
         let mut has_timeout = poll_timeout;
