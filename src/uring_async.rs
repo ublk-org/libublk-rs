@@ -299,11 +299,15 @@ where
     W: Fn(bool) -> Result<bool, UblkError>,
 {
     loop {
-        let poll_timeout = poll_uring().await?;
+        let (poll_timeout, failed) = match poll_uring().await {
+            Ok(t) => (t, false),
+            _ => (false, true),
+        };
+
         let aborted = reap_event_ops(poll_timeout)?;
         run_ops();
 
-        if aborted && is_done() {
+        if (aborted || failed) && is_done() {
             break;
         }
     }
@@ -408,7 +412,6 @@ where
 
         // Reap events with our combined handler
         let result = ublk_reap_events_with_handler(ring, builtin_closure);
-
         // Handle queue idle state based on CQE types received
         if has_timeout {
             if ring.submission().is_empty() {
@@ -421,7 +424,6 @@ where
         // Update queue state if we processed any IO commands
         if cmd_cnt > 0 {
             q.update_state_batch(cmd_cnt, aborted);
-            q.exit_queue_idle();
         }
 
         result
@@ -448,6 +450,25 @@ where
         Err(err) => Err(UblkError::IOError(err)),
         Ok(_) => Ok(false),
     }
+}
+
+pub fn uring_poll_io_fn<T>(
+    q: &UblkQueue,
+    timeout: Option<io_uring::types::Timespec>,
+    to_wait: usize,
+) -> Result<bool, UblkError>
+where
+    T: io_uring::squeue::EntryMarker,
+{
+    crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        let stopping = q.is_stopping();
+        let res = uring_poll_fn(r, timeout, if stopping { 0 } else { to_wait });
+        if stopping {
+            Err(UblkError::QueueIsDown)
+        } else {
+            res
+        }
+    })
 }
 
 /// Wait and handle incoming IO command

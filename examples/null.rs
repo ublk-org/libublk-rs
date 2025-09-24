@@ -4,7 +4,9 @@ use libublk::helpers::IoBuf;
 use libublk::io::{
     with_queue_ring, with_queue_ring_mut, BufDescList, UblkDev, UblkIOCtx, UblkQueue,
 };
-use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task, uring_poll_fn};
+use libublk::uring_async::{
+    ublk_reap_io_events_with_update_queue, ublk_wake_task, uring_poll_io_fn,
+};
 use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use std::fs::File;
@@ -172,10 +174,8 @@ async fn handle_uring_events_default<T>(
 ) -> Result<(), UblkError> {
     // Use default uring polling (no smol::Async)
     let poll_uring = || async {
-        with_queue_ring_mut(q, |r| {
-            let timeout = Some(io_uring::types::Timespec::new().sec(20));
-            uring_poll_fn(r, timeout, 1)
-        })
+        let timeout = Some(io_uring::types::Timespec::new().sec(20));
+        uring_poll_io_fn::<io_uring::squeue::Entry>(q, timeout, 1)
     };
     let reap_event = |poll_timeout| {
         ublk_reap_io_events_with_update_queue(q, poll_timeout, None, |cqe| {

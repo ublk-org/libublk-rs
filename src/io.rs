@@ -970,7 +970,7 @@ impl Drop for UblkDev {
 }
 
 #[derive(Debug, Clone, Default)]
-struct UblkQueueState {
+pub(crate) struct UblkQueueState {
     cmd_inflight: u32,
     state: u32,
 }
@@ -996,12 +996,12 @@ impl UblkQueueState {
     }
 
     #[inline(always)]
-    fn is_stopping(&self) -> bool {
+    pub(crate) fn is_stopping(&self) -> bool {
         (self.state & Self::UBLK_QUEUE_STOPPING) != 0
     }
 
     #[inline(always)]
-    fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         (self.state & Self::UBLK_QUEUE_IDLE) != 0
     }
 
@@ -1059,7 +1059,7 @@ pub struct UblkQueue<'a> {
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
-    state: RefCell<UblkQueueState>,
+    pub(crate) state: RefCell<UblkQueueState>,
     /// Semaphore to coordinate buffer registrations
     /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
     buf_reg_semaphore: Semaphore,
@@ -1242,6 +1242,10 @@ impl UblkQueue<'_> {
         self.state.borrow().is_idle()
     }
 
+    // Return if queue is stopping
+    fn mark_stopping(&self) {
+        self.state.borrow_mut().mark_stopping()
+    }
     // Return if queue is stopping
     pub fn is_stopping(&self) -> bool {
         self.state.borrow().is_stopping()
@@ -1793,16 +1797,24 @@ impl UblkQueue<'_> {
 
         // Check if mlock failed and fail immediately if so, but only for FETCH_REQ operations
         if self.is_mlock_failed() {
+            self.mark_stopping();
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
-        let future =
-            self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result)?;
-        let res = future.await;
-        if res == crate::sys::UBLK_IO_RES_ABORT {
-            Err(UblkError::QueueIsDown)
-        } else {
-            Ok(res)
+        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
+        match f {
+            Ok(future) => {
+                let res = future.await;
+                if res == crate::sys::UBLK_IO_RES_ABORT {
+                    Err(UblkError::QueueIsDown)
+                } else {
+                    Ok(res)
+                }
+            }
+            Err(e) => {
+                self.mark_stopping();
+                Err(e)
+            }
         }
     }
 
@@ -1837,17 +1849,26 @@ impl UblkQueue<'_> {
     ) -> Result<i32, UblkError> {
         // Buffer validation for UBLK_DEV_F_MLOCK_IO_BUFFER
         self.validate_mlock_buffer_consistency(tag, &buf_desc)?;
-        let future = self.submit_io_cmd_unified(
+        let f = self.submit_io_cmd_unified(
             tag,
             crate::sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
             buf_desc,
             result,
-        )?;
-        let res = future.await;
-        if res == crate::sys::UBLK_IO_RES_ABORT {
-            Err(UblkError::QueueIsDown)
-        } else {
-            Ok(res)
+        );
+
+        match f {
+            Ok(future) => {
+                let res = future.await;
+                if res == crate::sys::UBLK_IO_RES_ABORT {
+                    Err(UblkError::QueueIsDown)
+                } else {
+                    Ok(res)
+                }
+            }
+            Err(e) => {
+                self.mark_stopping();
+                Err(e)
+            }
         }
     }
 
