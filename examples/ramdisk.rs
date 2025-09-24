@@ -1,4 +1,4 @@
-use io_uring::{squeue, IoUring};
+use io_uring::IoUring;
 use libublk::ctrl::UblkCtrl;
 use libublk::ctrl_async::UblkCtrlAsync;
 ///! # Example of ramdisk
@@ -122,19 +122,7 @@ fn read_dev_id(efd: i32) -> Result<i32, Error> {
     return Ok((i64::from_le_bytes(buffer) - 1) as i32);
 }
 
-/// Poll and handle both QUEUE_RING and CTRL_URING using smol::Async().readable()
-///
-/// This function allows polling uring events from both QUEUE_RING and CTRL_URING
-/// in a single async task context using smol::Async().readable(). It uses
-/// `reap_event_ops` to check both rings for available CQEs.
-///
-/// # Arguments
-/// * `q` - UblkQueue instance to get QUEUE_RING file descriptor
-/// * `run_ops` - Closure called periodically to run operations (e.g., executor tick)
-/// * `is_done` - Closure that returns true when event handling should stop
-///
-/// # Returns
-/// Returns `Ok(())` when `is_done()` returns true, or an error if I/O operations fail.
+/// Poll and handle both QUEUE_RING and CTRL_URING concurrently
 async fn poll_and_handle_rings<R, I>(
     run_ops: R,
     is_done: I,
@@ -144,74 +132,64 @@ where
     R: Fn(),
     I: Fn() -> bool,
 {
-    // Get file descriptors for both rings
-    let queue_fd = libublk::io::with_task_io_ring(|ring: &IoUring<squeue::Entry>| ring.as_raw_fd());
-    let ctrl_fd =
-        libublk::ctrl::with_ctrl_ring(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
-
-    // Create smol::Async wrappers for both rings
-    let queue_file = unsafe { File::from_raw_fd(queue_fd) };
-    let ctrl_file = unsafe { File::from_raw_fd(ctrl_fd) };
-    let async_queue =
-        smol::Async::new(queue_file).map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
-    let async_ctrl =
-        smol::Async::new(ctrl_file).map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
-
-    // Polling function that checks both rings for readability
-    let poll_both_rings = || async {
-        // Submit and wait to trigger events on both rings
-        libublk::io::with_task_io_ring_mut(|ring: &mut IoUring<squeue::Entry>| {
-            ring.submit_and_wait(0)
-        })?;
-        libublk::ctrl::with_ctrl_ring_mut(|ring: &mut IoUring<squeue::Entry128>| {
-            ring.submit_and_wait(0)
-        })?;
-
-        // Then wait for either ring to be readable
-        let queue_readable = async_queue.readable();
-        let ctrl_readable = async_ctrl.readable();
-
-        // Use smol's built-in race functionality
-        match smol::future::race(queue_readable, ctrl_readable).await {
-            Ok(_) => Ok(false), // No timeout for smol::Async polling
-            Err(e) => Err(UblkError::IOError(e)),
-        }
+    // Helper to create async wrapper for file descriptor
+    let create_async_wrapper = |fd: i32| -> Result<smol::Async<File>, UblkError> {
+        let file = unsafe { File::from_raw_fd(fd) };
+        smol::Async::new(file).map_err(|_| UblkError::OtherError(-libc::EINVAL))
     };
 
-    // Event reaping function that checks both rings
+    // Get file descriptors and create async wrappers
+    let queue_fd = libublk::io::with_task_io_ring(|ring| ring.as_raw_fd());
+    let ctrl_fd = libublk::ctrl::with_ctrl_ring(|ring| ring.as_raw_fd());
+    let async_queue = create_async_wrapper(queue_fd)?;
+    let async_ctrl = create_async_wrapper(ctrl_fd)?;
+
+    // Polling function for both rings
+    let poll_both_rings = || async {
+        // Submit and wait on both rings
+        libublk::io::with_task_io_ring_mut(|ring| ring.submit_and_wait(0))?;
+        libublk::ctrl::with_ctrl_ring_mut(|ring| ring.submit_and_wait(0))?;
+
+        // Wait for either ring to become readable
+        smol::future::race(async_queue.readable(), async_ctrl.readable())
+            .await
+            .map(|_| false) // No timeout
+            .map_err(UblkError::IOError)
+    };
+
+    // Helper to handle events from a ring
+    let handle_ring_events = |cqe: &io_uring::cqueue::Entry| {
+        ublk_wake_task(cqe.user_data(), cqe);
+        cqe.result() == libublk::sys::UBLK_IO_RES_ABORT
+    };
+
+    // Event reaping function for both rings
     let reap_events = |_poll_timeout| {
         let mut aborted = check_done;
 
-        // Reap events from QUEUE_RING
-        let queue_result =
-            libublk::io::with_task_io_ring_mut(|ring: &mut IoUring<squeue::Entry>| {
-                ublk_reap_events_with_handler(ring, |cqe| {
-                    ublk_wake_task(cqe.user_data(), cqe);
-                    if cqe.result() == libublk::sys::UBLK_IO_RES_ABORT {
-                        aborted = true;
-                    }
-                })
-            });
+        // Reap events from both rings
+        let queue_result = libublk::io::with_task_io_ring_mut(|ring| {
+            ublk_reap_events_with_handler(ring, |cqe| {
+                if handle_ring_events(cqe) {
+                    aborted = true;
+                }
+            })
+        });
 
-        // Reap events from CTRL_URING
-        let ctrl_result =
-            libublk::ctrl::with_ctrl_ring_mut(|ring: &mut IoUring<squeue::Entry128>| {
-                ublk_reap_events_with_handler(ring, |cqe| {
-                    ublk_wake_task(cqe.user_data(), cqe);
-                    if cqe.result() == libublk::sys::UBLK_IO_RES_ABORT {
-                        aborted = true;
-                    }
-                })
-            });
+        let ctrl_result = libublk::ctrl::with_ctrl_ring_mut(|ring| {
+            ublk_reap_events_with_handler(ring, |cqe| {
+                if handle_ring_events(cqe) {
+                    aborted = true;
+                }
+            })
+        });
 
-        // Return error if either ring had issues, otherwise return abort status
         queue_result.and(ctrl_result).map(|_| aborted)
     };
 
     run_uring_tasks(poll_both_rings, reap_events, run_ops, is_done).await?;
 
-    // Prevent the File wrappers from closing the fds when dropped
-    // since the original io_uring instances still own them
+    // Prevent file descriptors from being closed when async wrappers are dropped
     let _ = async_queue.into_inner().map(|f| {
         use std::os::fd::IntoRawFd;
         f.into_raw_fd()
