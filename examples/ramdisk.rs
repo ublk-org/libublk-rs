@@ -1,5 +1,6 @@
 use io_uring::{squeue, IoUring};
 use libublk::ctrl::UblkCtrl;
+use libublk::ctrl_async::UblkCtrlAsync;
 ///! # Example of ramdisk
 ///
 /// Serves for covering recovery test[`test_ublk_ramdisk_recovery`],
@@ -9,9 +10,7 @@ use libublk::ctrl::UblkCtrl;
 ///
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::{
-    run_uring_tasks, ublk_reap_events_with_handler, ublk_run_ctrl_task, ublk_wake_task,
-};
+use libublk::uring_async::{run_uring_tasks, ublk_reap_events_with_handler, ublk_wake_task};
 use libublk::{BufDesc, UblkError, UblkFlags};
 use std::fs::File;
 use std::io::{Error, ErrorKind};
@@ -103,31 +102,7 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
     }
 }
 
-/// Start device in async IO task, in which both control and io rings
-/// are driven in current context
-fn start_dev_fn(
-    exe: &smol::LocalExecutor,
-    ctrl_rc: &Rc<UblkCtrl>,
-    dev_arc: &Arc<UblkDev>,
-    q: &UblkQueue,
-) -> Result<i32, UblkError> {
-    let ctrl_clone = ctrl_rc.clone();
-    let dev_clone = dev_arc.clone();
-
-    // Start device in one dedicated io task
-    let task = exe.spawn(async move {
-        let r = ctrl_clone.configure_queue(&dev_clone, 0, unsafe { libc::gettid() });
-        if r.is_err() {
-            r
-        } else {
-            ctrl_clone.start_dev_async(&dev_clone).await
-        }
-    });
-    ublk_run_ctrl_task(exe, q, &task)?;
-    smol::block_on(exe.run(task))
-}
-
-fn write_dev_id(ctrl: &UblkCtrl, efd: i32) -> Result<i32, Error> {
+fn write_dev_id(ctrl: &UblkCtrlAsync, efd: i32) -> Result<i32, Error> {
     // Can't write 0 to eventfd file, otherwise the read() side may
     // not be waken up
     let dev_id = ctrl.dev_info().dev_id as u64 + 1;
@@ -160,7 +135,11 @@ fn read_dev_id(efd: i32) -> Result<i32, Error> {
 ///
 /// # Returns
 /// Returns `Ok(())` when `is_done()` returns true, or an error if I/O operations fail.
-async fn poll_and_handle_rings<R, I>(run_ops: R, is_done: I) -> Result<(), UblkError>
+async fn poll_and_handle_rings<R, I>(
+    run_ops: R,
+    is_done: I,
+    check_done: bool,
+) -> Result<(), UblkError>
 where
     R: Fn(),
     I: Fn() -> bool,
@@ -201,7 +180,7 @@ where
 
     // Event reaping function that checks both rings
     let reap_events = |_poll_timeout| {
-        let mut aborted = false;
+        let mut aborted = check_done;
 
         // Reap events from QUEUE_RING
         let queue_result =
@@ -245,6 +224,57 @@ where
     Ok(())
 }
 
+/// Create UblkCtrl using UblkCtrlBuilder::build_async() with smol executor
+///
+/// This function demonstrates how to create a UblkCtrl device using the async builder
+/// pattern with a smol::LocalExecutor. It uses the poll_and_handle_rings pattern
+/// to handle both control and I/O operations asynchronously.
+///
+/// # Arguments
+/// * `executor` - Reference to smol::LocalExecutor for task execution
+/// * `dev_id` - Device ID to assign (-1 for auto-allocation)
+/// * `dev_flags` - Device flags to configure the device
+///
+/// # Returns
+/// Result containing the created UblkCtrlAsync instance or an error
+fn create_ublk_ctrl_async(
+    exe_rc: Rc<smol::LocalExecutor>,
+    dev_id: i32,
+    dev_flags: UblkFlags,
+) -> Result<UblkCtrlAsync, UblkError> {
+    let ctrl_done = Rc::new(std::cell::RefCell::new(false));
+    let ctrl_done_clone = ctrl_done.clone();
+    let exe = exe_rc.clone();
+
+    let ctrl_task = exe.spawn(async move {
+        let result = libublk::ctrl::UblkCtrlBuilder::default()
+            .name("async_ramdisk")
+            .id(dev_id)
+            .nr_queues(1_u16)
+            .depth(128_u16)
+            .dev_flags(dev_flags)
+            .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
+            .build_async()
+            .await;
+        *ctrl_done_clone.borrow_mut() = true;
+        result
+    });
+
+    let exe2 = exe_rc.clone();
+    let event_task = exe.spawn(async move {
+        let run_ops = || {
+            while exe2.try_tick() {}
+        };
+        let is_done = || *ctrl_done.borrow();
+        poll_and_handle_rings(run_ops, is_done, true).await
+    });
+
+    smol::block_on(exe_rc.run(async {
+        let (ctrl_result, _) = futures::join!(ctrl_task, event_task);
+        ctrl_result
+    }))
+}
+
 ///run this ramdisk ublk daemon completely in single context with
 ///async control command, no need Rust async any more
 fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool, efd: i32) {
@@ -253,24 +283,34 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
     } else {
         UblkFlags::UBLK_DEV_F_RECOVER_DEV
     };
-    let ctrl = Rc::new(
-        libublk::ctrl::UblkCtrlBuilder::default()
-            .name("example_ramdisk")
-            .id(dev_id)
-            .nr_queues(1_u16)
-            .depth(128_u16)
-            .dev_flags(dev_flags)
-            .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
-            .build()
-            .unwrap(),
-    );
+
+    let _ = libublk::io::ublk_init_task_ring(|cell| {
+        use std::cell::RefCell;
+        if cell.get().is_none() {
+            let ring = IoUring::<io_uring::squeue::Entry, io_uring::cqueue::Entry>::builder()
+                .setup_cqsize(128)
+                .setup_coop_taskrun()
+                .build(128)
+                .map_err(UblkError::IOError)?;
+
+            cell.set(RefCell::new(ring))
+                .map_err(|_| UblkError::OtherError(-libc::EEXIST))?;
+        }
+        Ok(())
+    });
+
+    // Create executor temporarily for control creation
+    let exec_rc = Rc::new(smol::LocalExecutor::new());
+    let ctrl = Rc::new(create_ublk_ctrl_async(exec_rc, dev_id, dev_flags).unwrap());
+
+    log::info!("device is created:: {:?}", &ctrl.dev_info());
 
     let tgt_init = |dev: &mut UblkDev| {
         dev.set_default_params(size);
         Ok(())
     };
-    let dev_arc = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
-    let dev_clone = dev_arc.clone();
+    let dev_rc = Arc::new(UblkDev::new_async(ctrl.get_name(), tgt_init, &ctrl).unwrap());
+    let dev_clone = dev_rc.clone();
     let q_rc = Rc::new(UblkQueue::new(0, &dev_clone).unwrap());
     let exec_rc = Rc::new(smol::LocalExecutor::new());
     let exec = exec_rc.clone();
@@ -300,21 +340,23 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         }));
     }
 
-    // start device via async task
-    let res = start_dev_fn(&exec, &ctrl, &dev_arc, &q_rc);
-    match res {
-        Ok(_) => {
-            write_dev_id(&ctrl, efd).expect("Failed to write dev_id");
-
-            // Handle I/O events using the new dual ring polling API
+    let ctrl_clone = ctrl.clone();
+    let dev_clone = dev_rc.clone();
+    f_vec.push(exec.spawn(async move {
+        let r = ctrl_clone
+            .configure_queue_async(&dev_clone, 0, unsafe { libc::gettid() })
+            .await
+            .unwrap();
+        if r >= 0 {
+            ctrl_clone.start_dev_async(&dev_clone).await.unwrap();
+            write_dev_id(&ctrl_clone, efd).expect("Failed to write dev_id");
         }
-        _ => eprintln!("device can't be started"),
-    }
+    }));
     smol::block_on(exec_rc.run(async move {
         let run_ops = || while exec.try_tick() {};
         let done = || f_vec.iter().all(|task| task.is_finished());
 
-        if let Err(e) = poll_and_handle_rings(run_ops, done).await {
+        if let Err(e) = poll_and_handle_rings(run_ops, done, false).await {
             log::error!("poll_and_handle_rings failed: {}", e);
         }
     }));
