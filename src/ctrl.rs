@@ -714,9 +714,7 @@ impl UblkCtrlBuilder<'_> {
             self.dev_flags,
         )
     }
-
-    #[allow(dead_code)]
-    pub(crate) async fn build_async(self) -> Result<super::ctrl_async::UblkCtrlAsync, UblkError> {
+    pub async fn build_async(self) -> Result<super::ctrl_async::UblkCtrlAsync, UblkError> {
         super::ctrl_async::UblkCtrlAsync::new_async(
             Some(self.name.to_string()),
             self.id,
