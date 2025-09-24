@@ -101,7 +101,8 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
     let qh = std::thread::spawn(move || {
         let q_rc = Rc::new(UblkQueue::new(0 as u16, &dev).unwrap());
         let q = q_rc.clone();
-        let exe = smol::LocalExecutor::new();
+        let exe_rc = Rc::new(smol::LocalExecutor::new());
+        let exe = exe_rc.clone();
         let mut f_vec: Vec<smol::Task<()>> = Vec::new();
 
         if dev_flags.contains(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
@@ -110,8 +111,15 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
 
         q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
 
-        crate::uring_async::ublk_wait_and_handle_ios(&exe, &q_rc);
-        smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+        smol::block_on(exe_rc.run(async move {
+            let run_ops = || while exe.try_tick() {};
+            let done = || f_vec.iter().all(|task| task.is_finished());
+
+            smol::future::yield_now().await;
+            if let Err(e) = crate::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
+                log::error!("handle_uring_events failed: {}", e);
+            }
+        }));
     });
 
     // Avoid to leak device

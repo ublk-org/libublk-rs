@@ -51,7 +51,8 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), libublk::UblkError> 
 
 fn q_fn(qid: u16, dev: &UblkDev) {
     let q_rc = std::rc::Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-    let exe = smol::LocalExecutor::new();
+    let exe_rc = std::rc::Rc::new(smol::LocalExecutor::new());
+    let exe = exe_rc.clone();
     let mut f_vec = Vec::new();
 
     for tag in 0..dev.dev_info.queue_depth {
@@ -60,8 +61,15 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     }
 
     // Drive smol executor, won't exit until queue is dead
-    libublk::uring_async::ublk_wait_and_handle_ios(&exe, &q_rc);
-    smol::block_on(exe.run(async { futures::future::join_all(f_vec).await }));
+    smol::block_on(exe_rc.run(async move {
+        let run_ops = || while exe.try_tick() {};
+        let done = || f_vec.iter().all(|task| task.is_finished());
+
+        smol::future::yield_now().await;
+        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
+            log::error!("handle_uring_events failed: {}", e);
+        }
+    }));
 }
 
 fn main() {

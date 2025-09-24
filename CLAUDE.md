@@ -33,7 +33,7 @@ libublk-rs is a Rust library for building Linux ublk (userspace block) target de
 
 3. **Async Support (`src/uring_async.rs`)**:
    - `UblkUringOpFuture` - io_uring integration
-   - `ublk_wait_and_handle_ios()` - Main event loop driver
+   - `wait_and_handle_io_events()` - Main event loop driver
 
 4. **System Bindings (`src/sys.rs`, `src/bindings.rs`)**:
    - Low-level kernel interface definitions

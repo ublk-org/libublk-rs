@@ -169,7 +169,8 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
     let dev_arc = Arc::new(UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap());
     let dev_clone = dev_arc.clone();
     let q_rc = Rc::new(UblkQueue::new(0, &dev_clone).unwrap());
-    let exec = smol::LocalExecutor::new();
+    let exec_rc = Rc::new(smol::LocalExecutor::new());
+    let exec = exec_rc.clone();
 
     // spawn async io tasks
     let mut f_vec = Vec::new();
@@ -202,11 +203,19 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         Ok(_) => {
             write_dev_id(&ctrl, efd).expect("Failed to write dev_id");
 
-            libublk::uring_async::ublk_wait_and_handle_ios(&exec, &q_rc);
+            // Handle I/O events using the new API
         }
         _ => eprintln!("device can't be started"),
     }
-    smol::block_on(exec.run(async { futures::future::join_all(f_vec).await }));
+    smol::block_on(exec_rc.run(async move {
+        let run_ops = || while exec.try_tick() {};
+        let done = || f_vec.iter().all(|task| task.is_finished());
+
+        smol::future::yield_now().await;
+        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
+            log::error!("handle_uring_events failed: {}", e);
+        }
+    }));
 }
 
 fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {
