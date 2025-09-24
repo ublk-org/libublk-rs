@@ -1,3 +1,4 @@
+use io_uring::{squeue, IoUring};
 use libublk::ctrl::UblkCtrl;
 ///! # Example of ramdisk
 ///
@@ -8,9 +9,13 @@ use libublk::ctrl::UblkCtrl;
 ///
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::ublk_run_ctrl_task;
+use libublk::uring_async::{
+    run_uring_tasks, ublk_reap_events_with_handler, ublk_run_ctrl_task, ublk_wake_task,
+};
 use libublk::{BufDesc, UblkError, UblkFlags};
+use std::fs::File;
 use std::io::{Error, ErrorKind};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -142,6 +147,104 @@ fn read_dev_id(efd: i32) -> Result<i32, Error> {
     return Ok((i64::from_le_bytes(buffer) - 1) as i32);
 }
 
+/// Poll and handle both QUEUE_RING and CTRL_URING using smol::Async().readable()
+///
+/// This function allows polling uring events from both QUEUE_RING and CTRL_URING
+/// in a single async task context using smol::Async().readable(). It uses
+/// `reap_event_ops` to check both rings for available CQEs.
+///
+/// # Arguments
+/// * `q` - UblkQueue instance to get QUEUE_RING file descriptor
+/// * `run_ops` - Closure called periodically to run operations (e.g., executor tick)
+/// * `is_done` - Closure that returns true when event handling should stop
+///
+/// # Returns
+/// Returns `Ok(())` when `is_done()` returns true, or an error if I/O operations fail.
+async fn poll_and_handle_rings<R, I>(run_ops: R, is_done: I) -> Result<(), UblkError>
+where
+    R: Fn(),
+    I: Fn() -> bool,
+{
+    // Get file descriptors for both rings
+    let queue_fd = libublk::io::with_task_io_ring(|ring: &IoUring<squeue::Entry>| ring.as_raw_fd());
+    let ctrl_fd =
+        libublk::ctrl::with_ctrl_ring(|ring: &IoUring<squeue::Entry128>| ring.as_raw_fd());
+
+    // Create smol::Async wrappers for both rings
+    let queue_file = unsafe { File::from_raw_fd(queue_fd) };
+    let ctrl_file = unsafe { File::from_raw_fd(ctrl_fd) };
+    let async_queue =
+        smol::Async::new(queue_file).map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
+    let async_ctrl =
+        smol::Async::new(ctrl_file).map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
+
+    // Polling function that checks both rings for readability
+    let poll_both_rings = || async {
+        // Submit and wait to trigger events on both rings
+        libublk::io::with_task_io_ring_mut(|ring: &mut IoUring<squeue::Entry>| {
+            ring.submit_and_wait(0)
+        })?;
+        libublk::ctrl::with_ctrl_ring_mut(|ring: &mut IoUring<squeue::Entry128>| {
+            ring.submit_and_wait(0)
+        })?;
+
+        // Then wait for either ring to be readable
+        let queue_readable = async_queue.readable();
+        let ctrl_readable = async_ctrl.readable();
+
+        // Use smol's built-in race functionality
+        match smol::future::race(queue_readable, ctrl_readable).await {
+            Ok(_) => Ok(false), // No timeout for smol::Async polling
+            Err(e) => Err(UblkError::IOError(e)),
+        }
+    };
+
+    // Event reaping function that checks both rings
+    let reap_events = |_poll_timeout| {
+        let mut aborted = false;
+
+        // Reap events from QUEUE_RING
+        let queue_result =
+            libublk::io::with_task_io_ring_mut(|ring: &mut IoUring<squeue::Entry>| {
+                ublk_reap_events_with_handler(ring, |cqe| {
+                    ublk_wake_task(cqe.user_data(), cqe);
+                    if cqe.result() == libublk::sys::UBLK_IO_RES_ABORT {
+                        aborted = true;
+                    }
+                })
+            });
+
+        // Reap events from CTRL_URING
+        let ctrl_result =
+            libublk::ctrl::with_ctrl_ring_mut(|ring: &mut IoUring<squeue::Entry128>| {
+                ublk_reap_events_with_handler(ring, |cqe| {
+                    ublk_wake_task(cqe.user_data(), cqe);
+                    if cqe.result() == libublk::sys::UBLK_IO_RES_ABORT {
+                        aborted = true;
+                    }
+                })
+            });
+
+        // Return error if either ring had issues, otherwise return abort status
+        queue_result.and(ctrl_result).map(|_| aborted)
+    };
+
+    run_uring_tasks(poll_both_rings, reap_events, run_ops, is_done).await?;
+
+    // Prevent the File wrappers from closing the fds when dropped
+    // since the original io_uring instances still own them
+    let _ = async_queue.into_inner().map(|f| {
+        use std::os::fd::IntoRawFd;
+        f.into_raw_fd()
+    });
+    let _ = async_ctrl.into_inner().map(|f| {
+        use std::os::fd::IntoRawFd;
+        f.into_raw_fd()
+    });
+
+    Ok(())
+}
+
 ///run this ramdisk ublk daemon completely in single context with
 ///async control command, no need Rust async any more
 fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool, efd: i32) {
@@ -203,7 +306,7 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         Ok(_) => {
             write_dev_id(&ctrl, efd).expect("Failed to write dev_id");
 
-            // Handle I/O events using the new API
+            // Handle I/O events using the new dual ring polling API
         }
         _ => eprintln!("device can't be started"),
     }
@@ -211,8 +314,8 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         let run_ops = || while exec.try_tick() {};
         let done = || f_vec.iter().all(|task| task.is_finished());
 
-        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-            log::error!("handle_uring_events failed: {}", e);
+        if let Err(e) = poll_and_handle_rings(run_ops, done).await {
+            log::error!("poll_and_handle_rings failed: {}", e);
         }
     }));
 }
