@@ -202,30 +202,72 @@ where
     Ok(())
 }
 
+/// Generic function to run ublk async uring tasks with local executor
+///
+/// This function allocates a local executor and runs the provided async task
+/// along with the required event handling for ublk operations. It provides
+/// a reusable pattern for async ublk operations.
+///
+/// # Arguments
+/// * `task` - Async closure or block that returns a Result<T, UblkError>
+///
+/// # Returns
+/// Result containing the task result or an error
+///
+/// # Type Parameters
+/// * `T` - Return type of the async task
+/// * `F` - Future type returned by the async task
+/// * `Fut` - Function type that produces the future
+fn ublk_uring_run_async_task<T, F, Fut>(task: Fut) -> Result<T, UblkError>
+where
+    F: std::future::Future<Output = Result<T, UblkError>>,
+    Fut: FnOnce() -> F,
+{
+    let exe_rc = Rc::new(smol::LocalExecutor::new());
+    let task_done = Rc::new(std::cell::RefCell::new(false));
+    let task_done_clone = task_done.clone();
+    let exe = exe_rc.clone();
+
+    // Create the main task with the provided async block/closure
+    let main_task = exe.spawn(async move {
+        let result = task().await;
+        *task_done_clone.borrow_mut() = true;
+        result
+    });
+
+    // Create the event handling task
+    let exe2 = exe_rc.clone();
+    let exe3 = exe_rc.clone();
+    let event_task = exe3.spawn(async move {
+        let run_ops = || {
+            while exe2.try_tick() {}
+        };
+        let is_done = || *task_done.borrow();
+        poll_and_handle_rings(run_ops, is_done, true).await
+    });
+
+    // Run both tasks concurrently
+    smol::block_on(exe_rc.run(async {
+        let (task_result, _) = futures::join!(main_task, event_task);
+        task_result
+    }))
+}
+
 /// Create UblkCtrl using UblkCtrlBuilder::build_async() with smol executor
 ///
 /// This function demonstrates how to create a UblkCtrl device using the async builder
-/// pattern with a smol::LocalExecutor. It uses the poll_and_handle_rings pattern
-/// to handle both control and I/O operations asynchronously.
+/// pattern. It now uses the generic ublk_uring_run_async_task() function for
+/// consistent async task execution patterns.
 ///
 /// # Arguments
-/// * `executor` - Reference to smol::LocalExecutor for task execution
 /// * `dev_id` - Device ID to assign (-1 for auto-allocation)
 /// * `dev_flags` - Device flags to configure the device
 ///
 /// # Returns
 /// Result containing the created UblkCtrlAsync instance or an error
-fn create_ublk_ctrl_async(
-    exe_rc: Rc<smol::LocalExecutor>,
-    dev_id: i32,
-    dev_flags: UblkFlags,
-) -> Result<UblkCtrlAsync, UblkError> {
-    let ctrl_done = Rc::new(std::cell::RefCell::new(false));
-    let ctrl_done_clone = ctrl_done.clone();
-    let exe = exe_rc.clone();
-
-    let ctrl_task = exe.spawn(async move {
-        let result = libublk::ctrl::UblkCtrlBuilder::default()
+fn create_ublk_ctrl_async(dev_id: i32, dev_flags: UblkFlags) -> Result<UblkCtrlAsync, UblkError> {
+    ublk_uring_run_async_task(|| async move {
+        libublk::ctrl::UblkCtrlBuilder::default()
             .name("async_ramdisk")
             .id(dev_id)
             .nr_queues(1_u16)
@@ -233,24 +275,8 @@ fn create_ublk_ctrl_async(
             .dev_flags(dev_flags)
             .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
             .build_async()
-            .await;
-        *ctrl_done_clone.borrow_mut() = true;
-        result
-    });
-
-    let exe2 = exe_rc.clone();
-    let event_task = exe.spawn(async move {
-        let run_ops = || {
-            while exe2.try_tick() {}
-        };
-        let is_done = || *ctrl_done.borrow();
-        poll_and_handle_rings(run_ops, is_done, true).await
-    });
-
-    smol::block_on(exe_rc.run(async {
-        let (ctrl_result, _) = futures::join!(ctrl_task, event_task);
-        ctrl_result
-    }))
+            .await
+    })
 }
 
 ///run this ramdisk ublk daemon completely in single context with
@@ -277,9 +303,8 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         Ok(())
     });
 
-    // Create executor temporarily for control creation
-    let exec_rc = Rc::new(smol::LocalExecutor::new());
-    let ctrl = Rc::new(create_ublk_ctrl_async(exec_rc, dev_id, dev_flags).unwrap());
+    // Create the control using the generic async task runner
+    let ctrl = Rc::new(create_ublk_ctrl_async(dev_id, dev_flags).unwrap());
 
     log::info!("device is created:: {:?}", &ctrl.dev_info());
 
