@@ -344,18 +344,9 @@ where
     Ok(aborted)
 }
 
-pub fn ublk_reap_io_events<F>(waker_ops: F) -> Result<bool, UblkError>
-where
-    F: FnMut(&io_uring::cqueue::Entry),
-{
-    crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-        ublk_reap_events_with_handler(r, waker_ops)
-    })
-}
-
 /// Reap completion queue entries with queue state update and idle management
 ///
-/// This function combines the basic functionality of `ublk_reap_io_events()` with
+/// This function combines the basic functionality of reaping io events with
 /// queue state management similar to what `flush_and_wake_io_tasks()` does.
 /// It processes completion queue entries and updates the queue state by:
 /// - Counting IO commands completed
@@ -494,7 +485,7 @@ where
     run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
 }
 
-pub fn uring_poll_fn<T>(
+pub(crate) fn uring_poll_fn<T>(
     r: &mut io_uring::IoUring<T>,
     timeout: Option<io_uring::types::Timespec>,
     to_wait: usize,
@@ -516,7 +507,7 @@ where
     }
 }
 
-pub fn uring_poll_io_fn<T>(
+fn uring_poll_io_fn<T>(
     q: &UblkQueue,
     timeout: Option<io_uring::types::Timespec>,
     to_wait: usize,
