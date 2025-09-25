@@ -129,6 +129,10 @@ fn ublk_process_queue_io(
 }
 
 /// Run one task in this local Executor until the task is finished
+#[deprecated(
+    since = "0.5.0",
+    note = "use run_uring_tasks() with custom polling logic instead"
+)]
 pub fn ublk_run_task<T, F>(
     exe: &smol::LocalExecutor,
     task: &smol::Task<T>,
@@ -157,6 +161,7 @@ pub fn ublk_run_io_task<T>(
         Ok(())
     };
 
+    #[allow(deprecated)]
     ublk_run_task(exe, task, handler)
 }
 
@@ -541,6 +546,10 @@ where
 /// Wait and handle any incoming cqe until queue is down.
 ///
 /// This should be the only foreground thing done in queue thread.
+#[deprecated(
+    since = "0.5.0",
+    note = "use wait_and_handle_io_events() instead for better async integration"
+)]
 pub fn ublk_wait_and_handle_ios(exe: &smol::LocalExecutor, q: &UblkQueue) {
     loop {
         while exe.try_tick() {}
