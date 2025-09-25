@@ -2682,23 +2682,21 @@ impl UblkQueue<'_> {
         loop {
             let mut is_first = true;
             let result = self.flush_and_wake_io_tasks(
-                |user_data, cqe, is_last| {
-                    if UblkIOCtx::is_io_command(user_data) {
-                        let ctx = UblkIOCtx(
-                            cqe,
-                            if is_first {
-                                is_first = false;
-                                UblkIOCtx::UBLK_IO_F_FIRST
-                            } else {
-                                0
-                            } | if is_last {
-                                UblkIOCtx::UBLK_IO_F_LAST
-                            } else {
-                                0
-                            },
-                        );
-                        self.handle_cqe(&mut ops, &ctx);
-                    }
+                |_user_data, cqe, is_last| {
+                    let ctx = UblkIOCtx(
+                        cqe,
+                        if is_first {
+                            is_first = false;
+                            UblkIOCtx::UBLK_IO_F_FIRST
+                        } else {
+                            0
+                        } | if is_last {
+                            UblkIOCtx::UBLK_IO_F_LAST
+                        } else {
+                            0
+                        },
+                    );
+                    self.handle_cqe(&mut ops, &ctx);
                 },
                 1,
             );
