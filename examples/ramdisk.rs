@@ -237,8 +237,7 @@ where
 
     // Create the event handling task
     let exe2 = exe_rc.clone();
-    let exe3 = exe_rc.clone();
-    let event_task = exe3.spawn(async move {
+    let event_task = exe_rc.spawn(async move {
         let run_ops = || {
             while exe2.try_tick() {}
         };
