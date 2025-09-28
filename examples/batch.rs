@@ -1,4 +1,4 @@
-use async_lock::{Mutex, Semaphore};
+use async_lock::Mutex;
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
@@ -27,81 +27,68 @@ thread_local! {
     static BATCH_CONTEXT: Cell<i32> = Cell::new(-1);
 }
 
-// Batch coordination infrastructure
+// Batch coordination infrastructure - OPTIMIZED: No more semaphore!
 struct BatchCoordinator {
-    registered_tasks: Cell<u32>,
-    completed_tasks: Cell<u32>,
-    phase1_semaphore: Semaphore,
+    current_write_batch: Vec<u16>,   // Write tags for this batch
     phase2_flush_mutex: Mutex<bool>, // true when flush is complete
 }
 
 impl BatchCoordinator {
-    fn new() -> Self {
-        log::info!("Created coordinator");
+    fn new(write_tags: Vec<u16>) -> Self {
+        let write_batch_size = write_tags.len();
+        log::info!(
+            "Created coordinator with {} write tasks: {:?}",
+            write_batch_size,
+            write_tags
+        );
 
         Self {
-            registered_tasks: Cell::new(0),
-            completed_tasks: Cell::new(0),
-            phase1_semaphore: Semaphore::new(0),
+            current_write_batch: write_tags,
             phase2_flush_mutex: Mutex::new(false), // false = flush not done yet
         }
     }
 
-    async fn register_task(&self, tag: u16) -> Result<(), UblkError> {
-        let task_count = self.registered_tasks.get() + 1;
-        self.registered_tasks.set(task_count);
-        log::info!("Task {} registered {}", tag, task_count,);
-
-        // Wait for phase 1 completion signal from run_ops
-        self.phase1_semaphore.acquire().await;
-
-        log::info!("Task {} proceeding to phase 2", tag);
-        Ok(())
+    // Remove tag from batch and return true if batch is now empty
+    fn remove_write_tag(&mut self, tag: u16) -> bool {
+        if let Some(pos) = self.current_write_batch.iter().position(|&x| x == tag) {
+            self.current_write_batch.remove(pos);
+        }
+        self.current_write_batch.is_empty()
     }
 
+    // Tag of all RAID1 write IOs in this batch can be retrieved from `current_write_batch`,
+    // then member disk's LBA & sectors can be figured out, either mark bitmap or flush
+    // LBA ranges to journal.
     async fn flush_resync_bits(&self, tag: u16) -> Result<(), UblkError> {
         // Phase 2: Simulate RAID1 resync bit flush - only one task does the actual flush
         let mut flush_done = self.phase2_flush_mutex.lock().await;
         if !*flush_done {
             // This task wins the race and performs the flush
-            log::info!("Task {} performing resync bit flush to disk", tag);
             // Simulate flush operation (in real RAID1, this would be disk I/O)
             *flush_done = true;
-            log::info!("Task {} completed resync bit flush", tag);
-        } else {
-            // Another task already completed the flush, just proceed
-            log::info!("Task {} found resync bits already flushed", tag);
+            log::info!(
+                "Task {} completed resync bit flush for {:?}",
+                tag,
+                &self.current_write_batch
+            );
         }
         Ok(())
     }
 
-    async fn mark_task_complete(&self, tag: u16) -> Result<bool, UblkError> {
-        let completed = self.completed_tasks.get() + 1;
-        self.completed_tasks.set(completed);
-        let registered = self.registered_tasks.get();
+    async fn mark_task_complete(&mut self, tag: u16) -> Result<bool, UblkError> {
+        log::debug!("Task {} completed", tag);
 
-        log::info!("Task {} completed ({}/{})", tag, completed, registered);
-
-        // Return true if this is the last registered task
-        Ok(completed == registered)
-    }
-
-    fn signal_phase1_complete(&self) {
-        let registered = self.registered_tasks.get();
-        log::info!(
-            "Signaling phase 1 complete for {} registered tasks",
-            registered
-        );
-
-        // Add permits to allow all registered tasks to proceed
-        self.phase1_semaphore.add_permits(registered as usize);
+        Ok(self.remove_write_tag(tag))
     }
 }
 
-// Per-queue batch management state
+// Per-queue batch management state - OPTIMIZED: Added write tag collection
 struct QueueBatchState {
     queue_id: u16,
     coordinators: Slab<BatchCoordinator>,
+
+    // Tags collected in current reap cycle
+    pending_write_tags: RefCell<Vec<u16>>,
 }
 
 impl QueueBatchState {
@@ -109,11 +96,28 @@ impl QueueBatchState {
         Self {
             queue_id,
             coordinators: Slab::new(),
+            pending_write_tags: RefCell::new(Vec::new()),
         }
     }
 
-    fn create_coordinator(&mut self) -> u32 {
-        let coordinator = BatchCoordinator::new();
+    // Called from reap_event when write I/O command is detected
+    fn add_write_tag(&self, tag: u16) {
+        self.pending_write_tags.borrow_mut().push(tag);
+    }
+
+    fn create_coordinator(&mut self) -> Option<u32> {
+        // Transfer all pending write tags to the coordinator
+        let write_tags = self
+            .pending_write_tags
+            .borrow_mut()
+            .drain(..)
+            .collect::<Vec<_>>();
+
+        if write_tags.is_empty() {
+            return None;
+        }
+
+        let coordinator = BatchCoordinator::new(write_tags);
         let context_id = self.coordinators.insert(coordinator) as u32;
 
         log::info!(
@@ -121,7 +125,7 @@ impl QueueBatchState {
             self.queue_id,
             context_id
         );
-        context_id
+        Some(context_id)
     }
 
     fn get_coordinator(&self, context_id: u32) -> Option<&BatchCoordinator> {
@@ -143,128 +147,97 @@ impl QueueBatchState {
     }
 }
 
-// Function to handle batch coordination logic
 fn run_batch_coordination(
     exe: &smol::LocalExecutor<'_>,
     batch_state: &Rc<RefCell<QueueBatchState>>,
 ) {
     let queue_id = batch_state.borrow().queue_id;
+    // Create coordinator if we have pending write operations
+    if let Some(context_id) = batch_state.borrow_mut().create_coordinator() {
+        BATCH_CONTEXT.with(|c| c.set(context_id as i32));
 
-    // Phase 1: Before running tasks, create batch coordinator
-    let context_id = batch_state.borrow_mut().create_coordinator();
-    BATCH_CONTEXT.with(|c| c.set(context_id as i32));
-
-    log::info!(
-        "Queue {}: Batch coordination starting (context_id={})",
-        queue_id,
-        context_id
-    );
-
-    // Run all tasks - they will register with the coordinator
-    while exe.try_tick() {}
-
-    // Phase 2: After task registration, check if any tasks registered
-    let has_registered_tasks = {
-        let batch_state_ref = batch_state.borrow();
-        if let Some(coordinator) = batch_state_ref.get_coordinator(context_id) {
-            let registered = coordinator.registered_tasks.get();
-            if registered > 0 {
-                coordinator.signal_phase1_complete();
-                true
-            } else {
-                log::info!(
-                    "Queue {}: No tasks registered, skipping coordination phases",
-                    queue_id
-                );
-                false
-            }
-        } else {
-            false
-        }
-    };
-
-    while exe.try_tick() {}
-    if !has_registered_tasks {
-        // No tasks registered, clean up the coordinator immediately
-        batch_state.borrow_mut().remove_coordinator(context_id);
+        log::info!(
+            "Queue {}: Processing write batch (context_id={})",
+            queue_id,
+            context_id
+        );
     }
 
+    // Now the context batch coordinator is prepared, run io tasks
+    while exe.try_tick() {}
+
     BATCH_CONTEXT.with(|c| c.set(-1));
-    log::info!(
-        "Queue {}: Batch coordination completed (context_id={})",
-        queue_id,
-        context_id
-    );
 }
 
-// Function to handle batch coordination for individual tasks
 async fn handle_task_batch_coordination(
     tag: u16,
     batch_state: &Rc<RefCell<QueueBatchState>>,
+    q: &UblkQueue<'_>,
 ) -> Result<Option<u32>, UblkError> {
     let queue_id = batch_state.borrow().queue_id;
-    // Check if we have batch coordination
+
+    // First check if current I/O operation is a write
+    let iod = q.get_iod(tag);
+
+    if !is_write_operation(iod) {
+        // Not a write operation - proceed immediately without coordination
+        return Ok(None);
+    }
+
+    // Get active coordinator context
     let coordinator_opt = BATCH_CONTEXT.with(|c| {
         let context_id = c.get();
         if context_id >= 0 {
-            batch_state
-                .borrow()
-                .get_coordinator(context_id as u32)
-                .map(|_coord| context_id as u32)
+            Some(context_id as u32)
         } else {
             None
         }
     });
 
     if let Some(context_id) = coordinator_opt {
-        log::info!(
-            "Queue {}: Task {} participating in batch coordination (context_id={})",
+        log::debug!(
+            "Queue {}: Write task {} participating in batch (context_id={}, op={})",
             queue_id,
             tag,
-            context_id
+            context_id,
+            iod.op_flags & 0xff
         );
+
         let batch_state_ref = batch_state.borrow();
         let coordinator = batch_state_ref.get_coordinator(context_id).unwrap();
-
-        // Phase 1: Register with coordinator and wait for phase 1 completion
-        coordinator.register_task(tag).await?;
 
         // Phase 2: Flush resync bits (only one task does actual flush)
         coordinator.flush_resync_bits(tag).await?;
 
-        log::info!("Queue {}: Task {} performing I/O operation", queue_id, tag);
-
-        // Return batch info for cleanup later
         Ok(Some(context_id))
     } else {
-        log::error!(
-            "Queue {}: Task {} doesn't have batch coordination",
-            queue_id,
-            tag,
-        );
-        // No batch coordination
+        // No active coordinator - proceed without coordination
         Ok(None)
     }
 }
 
-// Function to handle batch completion and cleanup
+// OPTIMIZED: Function to handle batch completion - simplified!
 async fn complete_task_batch_coordination(
     tag: u16,
     context_id: u32,
     batch_state: &Rc<RefCell<QueueBatchState>>,
 ) -> Result<(), UblkError> {
     let queue_id = batch_state.borrow().queue_id;
-    // Phase 3: Mark task completion
-    let is_last = {
-        let batch_state_ref = batch_state.borrow();
-        let coordinator = batch_state_ref.get_coordinator(context_id).unwrap();
+
+    // Mark task complete and check if batch is empty
+    let is_batch_empty = {
+        let mut batch_state_ref = batch_state.borrow_mut();
+        let coordinator = batch_state_ref
+            .coordinators
+            .get_mut(context_id as usize)
+            .unwrap();
+
         coordinator.mark_task_complete(tag).await?
     };
 
-    if is_last {
-        // This is the last task, signal cleanup
+    if is_batch_empty {
         log::info!(
-            "Queue {}: Task {} last task in batch, triggering cleanup",
+            "Queue {}: Write task {} completed batch, triggering cleanup",
             queue_id,
             tag
         );
@@ -279,6 +252,35 @@ fn get_io_cmd_result(q: &UblkQueue, tag: u16) -> i32 {
     let iod = q.get_iod(tag);
     let bytes = (iod.nr_sectors << 9) as i32;
     bytes
+}
+
+// Helper function to check if an I/O operation is a write
+#[inline]
+fn is_write_operation(iod: &libublk::sys::ublksrv_io_desc) -> bool {
+    let op_type = iod.op_flags & 0xff; // Extract operation type
+    op_type == libublk::sys::UBLK_IO_OP_WRITE
+        || op_type == libublk::sys::UBLK_IO_OP_WRITE_SAME
+        || op_type == libublk::sys::UBLK_IO_OP_WRITE_ZEROES
+        || op_type == libublk::sys::UBLK_IO_OP_ZONE_APPEND
+}
+
+// Function to handle write tag collection from CQE
+#[inline]
+fn collect_write_tags_from_cqe(
+    user_data: u64,
+    q: &UblkQueue<'_>,
+    batch_state: &Rc<RefCell<QueueBatchState>>,
+) {
+    // Check if this is an I/O command (not target operations) by checking Target bit
+    if (user_data & libublk::UblkUringData::Target as u64) == 0 {
+        let tag = libublk::io::UblkIOCtx::user_data_to_tag(user_data) as u16;
+        let iod = q.get_iod(tag);
+
+        // Collect write command tags for batch coordination
+        if is_write_operation(iod) {
+            batch_state.borrow().add_write_tag(tag);
+        }
+    }
 }
 
 // Batch-aware I/O task function
@@ -309,7 +311,7 @@ async fn batch_io_task(
 
     loop {
         // Handle batch coordination (if active)
-        let context_id_opt = handle_task_batch_coordination(tag, &batch_state).await?;
+        let context_id_opt = handle_task_batch_coordination(tag, &batch_state, &q).await?;
 
         // Perform I/O operation
         let res = get_io_cmd_result(&q, tag);
@@ -330,12 +332,28 @@ async fn handle_uring_events_default<T>(
     tasks: Vec<smol::Task<T>>,
     batch_state: Rc<RefCell<QueueBatchState>>,
 ) -> Result<(), UblkError> {
+    // Use the same pattern as wait_and_handle_io_events
+    let poll_uring = || async {
+        let timeout = Some(io_uring::types::Timespec::new().sec(20));
+        libublk::uring_poll_io_fn::<io_uring::squeue::Entry>(q, timeout, 1)
+    };
+
+    let reap_event = |poll_timeout| {
+        ublk_reap_io_events_with_update_queue(q, poll_timeout, None, |cqe| {
+            let user_data = cqe.user_data();
+
+            collect_write_tags_from_cqe(user_data, q, &batch_state);
+
+            // Wake the task as usual
+            ublk_wake_task(user_data, cqe);
+        })
+    };
     let run_ops = || {
         run_batch_coordination(exe, &batch_state);
     };
     let is_done = || tasks.iter().all(|task| task.is_finished());
 
-    libublk::wait_and_handle_io_events(q, Some(20), run_ops, is_done).await
+    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
 }
 
 async fn handle_uring_events_smol_readable<T>(
@@ -371,7 +389,11 @@ async fn handle_uring_events_smol_readable<T>(
 
     let reap_event = |poll_timeout| {
         ublk_reap_io_events_with_update_queue(q, poll_timeout, Some(TIMEOUT_USER_DATA), |cqe| {
-            ublk_wake_task(cqe.user_data(), cqe);
+            let user_data = cqe.user_data();
+
+            collect_write_tags_from_cqe(user_data, q, &batch_state);
+
+            ublk_wake_task(user_data, cqe);
         })
     };
 
