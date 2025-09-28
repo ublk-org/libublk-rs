@@ -11,7 +11,6 @@ use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 bitflags! {
     #[derive(Default)]
@@ -30,8 +29,8 @@ thread_local! {
 
 // Batch coordination infrastructure
 struct BatchCoordinator {
-    registered_tasks: AtomicU32,
-    completed_tasks: AtomicU32,
+    registered_tasks: Cell<u32>,
+    completed_tasks: Cell<u32>,
     phase1_semaphore: Semaphore,
     phase2_flush_mutex: Mutex<bool>, // true when flush is complete
 }
@@ -41,15 +40,16 @@ impl BatchCoordinator {
         log::info!("Created coordinator");
 
         Self {
-            registered_tasks: AtomicU32::new(0),
-            completed_tasks: AtomicU32::new(0),
+            registered_tasks: Cell::new(0),
+            completed_tasks: Cell::new(0),
             phase1_semaphore: Semaphore::new(0),
             phase2_flush_mutex: Mutex::new(false), // false = flush not done yet
         }
     }
 
     async fn register_task(&self, tag: u16) -> Result<(), UblkError> {
-        let task_count = self.registered_tasks.fetch_add(1, Ordering::SeqCst) + 1;
+        let task_count = self.registered_tasks.get() + 1;
+        self.registered_tasks.set(task_count);
         log::info!("Task {} registered {}", tag, task_count,);
 
         // Wait for phase 1 completion signal from run_ops
@@ -76,8 +76,9 @@ impl BatchCoordinator {
     }
 
     async fn mark_task_complete(&self, tag: u16) -> Result<bool, UblkError> {
-        let completed = self.completed_tasks.fetch_add(1, Ordering::SeqCst) + 1;
-        let registered = self.registered_tasks.load(Ordering::SeqCst);
+        let completed = self.completed_tasks.get() + 1;
+        self.completed_tasks.set(completed);
+        let registered = self.registered_tasks.get();
 
         log::info!("Task {} completed ({}/{})", tag, completed, registered);
 
@@ -86,7 +87,7 @@ impl BatchCoordinator {
     }
 
     fn signal_phase1_complete(&self) {
-        let registered = self.registered_tasks.load(Ordering::SeqCst);
+        let registered = self.registered_tasks.get();
         log::info!(
             "Signaling phase 1 complete for {} registered tasks",
             registered
@@ -166,7 +167,7 @@ fn run_batch_coordination(
     let has_registered_tasks = {
         let batch_state_ref = batch_state.borrow();
         if let Some(coordinator) = batch_state_ref.get_coordinator(context_id) {
-            let registered = coordinator.registered_tasks.load(Ordering::SeqCst);
+            let registered = coordinator.registered_tasks.get();
             if registered > 0 {
                 coordinator.signal_phase1_complete();
                 true
@@ -222,20 +223,14 @@ async fn handle_task_batch_coordination(
             tag,
             context_id
         );
+        let batch_state_ref = batch_state.borrow();
+        let coordinator = batch_state_ref.get_coordinator(context_id).unwrap();
 
         // Phase 1: Register with coordinator and wait for phase 1 completion
-        {
-            let batch_state_ref = batch_state.borrow();
-            let coordinator = batch_state_ref.get_coordinator(context_id).unwrap();
-            coordinator.register_task(tag).await?;
-        }
+        coordinator.register_task(tag).await?;
 
         // Phase 2: Flush resync bits (only one task does actual flush)
-        {
-            let batch_state_ref = batch_state.borrow();
-            let coordinator = batch_state_ref.get_coordinator(context_id).unwrap();
-            coordinator.flush_resync_bits(tag).await?;
-        }
+        coordinator.flush_resync_bits(tag).await?;
 
         log::info!("Queue {}: Task {} performing I/O operation", queue_id, tag);
 
