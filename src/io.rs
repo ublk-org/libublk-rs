@@ -1873,6 +1873,7 @@ impl UblkQueue<'_> {
             }
         }
 
+        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
         // Register the IoBuf if provided and acquire permit
         if let Some(buf) = io_buf {
             self.register_io_buf_internal(tag, buf);
@@ -1887,7 +1888,6 @@ impl UblkQueue<'_> {
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
-        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
         match f {
             Ok(future) => {
                 let res = future.await;
