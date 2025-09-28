@@ -30,7 +30,6 @@ thread_local! {
 
 // Batch coordination infrastructure
 struct BatchCoordinator {
-    batch_id: u32,
     registered_tasks: AtomicU32,
     completed_tasks: AtomicU32,
     phase1_semaphore: Semaphore,
@@ -38,11 +37,10 @@ struct BatchCoordinator {
 }
 
 impl BatchCoordinator {
-    fn new(batch_id: u32) -> Self {
-        log::info!("Batch {}: Created coordinator", batch_id);
+    fn new() -> Self {
+        log::info!("Created coordinator");
 
         Self {
-            batch_id,
             registered_tasks: AtomicU32::new(0),
             completed_tasks: AtomicU32::new(0),
             phase1_semaphore: Semaphore::new(0),
@@ -52,21 +50,12 @@ impl BatchCoordinator {
 
     async fn register_task(&self, tag: u16) -> Result<(), UblkError> {
         let task_count = self.registered_tasks.fetch_add(1, Ordering::SeqCst) + 1;
-        log::info!(
-            "Batch {}: Task {} registered {}",
-            self.batch_id,
-            tag,
-            task_count,
-        );
+        log::info!("Task {} registered {}", tag, task_count,);
 
         // Wait for phase 1 completion signal from run_ops
         self.phase1_semaphore.acquire().await;
 
-        log::info!(
-            "Batch {}: Task {} proceeding to phase 2",
-            self.batch_id,
-            tag
-        );
+        log::info!("Task {} proceeding to phase 2", tag);
         Ok(())
     }
 
@@ -75,25 +64,13 @@ impl BatchCoordinator {
         let mut flush_done = self.phase2_flush_mutex.lock().await;
         if !*flush_done {
             // This task wins the race and performs the flush
-            log::info!(
-                "Batch {}: Task {} performing resync bit flush to disk",
-                self.batch_id,
-                tag
-            );
+            log::info!("Task {} performing resync bit flush to disk", tag);
             // Simulate flush operation (in real RAID1, this would be disk I/O)
             *flush_done = true;
-            log::info!(
-                "Batch {}: Task {} completed resync bit flush",
-                self.batch_id,
-                tag
-            );
+            log::info!("Task {} completed resync bit flush", tag);
         } else {
             // Another task already completed the flush, just proceed
-            log::info!(
-                "Batch {}: Task {} found resync bits already flushed",
-                self.batch_id,
-                tag
-            );
+            log::info!("Task {} found resync bits already flushed", tag);
         }
         Ok(())
     }
@@ -102,13 +79,7 @@ impl BatchCoordinator {
         let completed = self.completed_tasks.fetch_add(1, Ordering::SeqCst) + 1;
         let registered = self.registered_tasks.load(Ordering::SeqCst);
 
-        log::info!(
-            "Batch {}: Task {} completed ({}/{})",
-            self.batch_id,
-            tag,
-            completed,
-            registered
-        );
+        log::info!("Task {} completed ({}/{})", tag, completed, registered);
 
         // Return true if this is the last registered task
         Ok(completed == registered)
@@ -117,8 +88,7 @@ impl BatchCoordinator {
     fn signal_phase1_complete(&self) {
         let registered = self.registered_tasks.load(Ordering::SeqCst);
         log::info!(
-            "Batch {}: Signaling phase 1 complete for {} registered tasks",
-            self.batch_id,
+            "Signaling phase 1 complete for {} registered tasks",
             registered
         );
 
@@ -131,7 +101,6 @@ impl BatchCoordinator {
 struct QueueBatchState {
     queue_id: u16,
     coordinators: Slab<BatchCoordinator>,
-    next_batch_id: u32,
 }
 
 impl QueueBatchState {
@@ -139,22 +108,17 @@ impl QueueBatchState {
         Self {
             queue_id,
             coordinators: Slab::new(),
-            next_batch_id: 1,
         }
     }
 
     fn create_coordinator(&mut self) -> u32 {
-        let batch_id = self.next_batch_id;
-        self.next_batch_id += 1;
-
-        let coordinator = BatchCoordinator::new(batch_id);
+        let coordinator = BatchCoordinator::new();
         let context_id = self.coordinators.insert(coordinator) as u32;
 
         log::info!(
-            "Queue {}: Created batch coordinator: context_id={}, batch_id={}",
+            "Queue {}: Created batch coordinator: context_id={}",
             self.queue_id,
-            context_id,
-            batch_id
+            context_id
         );
         context_id
     }
@@ -167,10 +131,9 @@ impl QueueBatchState {
         if self.coordinators.contains(context_id as usize) {
             let coordinator = self.coordinators.remove(context_id as usize);
             log::info!(
-                "Queue {}: Removed batch coordinator: context_id={}, batch_id={}",
+                "Queue {}: Removed batch coordinator: context_id={}",
                 self.queue_id,
-                context_id,
-                coordinator.batch_id
+                context_id
             );
             Some(coordinator)
         } else {
@@ -246,19 +209,18 @@ async fn handle_task_batch_coordination(
             batch_state
                 .borrow()
                 .get_coordinator(context_id as u32)
-                .map(|coord| (context_id as u32, coord.batch_id))
+                .map(|_coord| context_id as u32)
         } else {
             None
         }
     });
 
-    if let Some((context_id, batch_id)) = coordinator_opt {
+    if let Some(context_id) = coordinator_opt {
         log::info!(
-            "Queue {}: Task {} participating in batch coordination (context_id={}, batch_id={})",
+            "Queue {}: Task {} participating in batch coordination (context_id={})",
             queue_id,
             tag,
-            context_id,
-            batch_id
+            context_id
         );
 
         // Phase 1: Register with coordinator and wait for phase 1 completion
@@ -275,12 +237,7 @@ async fn handle_task_batch_coordination(
             coordinator.flush_resync_bits(tag).await?;
         }
 
-        log::info!(
-            "Queue {}: Task {} performing I/O operation (batch_id={})",
-            queue_id,
-            tag,
-            batch_id
-        );
+        log::info!("Queue {}: Task {} performing I/O operation", queue_id, tag);
 
         // Return batch info for cleanup later
         Ok(Some(context_id))
@@ -311,18 +268,10 @@ async fn complete_task_batch_coordination(
 
     if is_last {
         // This is the last task, signal cleanup
-        let batch_id = {
-            let batch_state_ref = batch_state.borrow();
-            batch_state_ref
-                .get_coordinator(context_id)
-                .unwrap()
-                .batch_id
-        };
         log::info!(
-            "Queue {}: Task {} last task in batch {}, triggering cleanup",
+            "Queue {}: Task {} last task in batch, triggering cleanup",
             queue_id,
-            tag,
-            batch_id
+            tag
         );
         batch_state.borrow_mut().remove_coordinator(context_id);
     }
