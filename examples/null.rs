@@ -265,13 +265,11 @@ fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool, readabl
 
     let q = q_rc.clone();
     let exe2 = exe_rc.clone();
-    let real_exe = exe.spawn(async move {
+    smol::block_on(exe_rc.run(async move {
         if let Err(e) = handle_uring_events(&exe2, &q, f_vec, readable).await {
             log::error!("handle_uring_events failed: {}", e);
         }
-    });
-
-    smol::block_on(exe_rc.run(async move { real_exe.await }));
+    }));
 }
 
 fn __null_add(
