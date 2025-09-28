@@ -507,7 +507,7 @@ where
     }
 }
 
-fn uring_poll_io_fn<T>(
+pub fn uring_poll_io_fn<T>(
     q: &UblkQueue,
     timeout: Option<io_uring::types::Timespec>,
     to_wait: usize,
