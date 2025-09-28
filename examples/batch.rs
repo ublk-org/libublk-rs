@@ -18,6 +18,7 @@ bitflags! {
     struct BatchFlags: u32 {
         const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00000100;
+        const ZERO_COPY = 0b00001000;
         const USE_READABLE = 0b010000;
     }
 }
@@ -342,10 +343,21 @@ async fn batch_io_task(
     tag: u16,
     buf: Option<&IoBuf<u8>>,
     batch_state: Rc<RefCell<QueueBatchState>>,
+    zero_copy: bool,
 ) -> Result<(), UblkError> {
+    let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
+        index: tag,
+        flags: libublk::sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
+        ..Default::default()
+    };
+
     let buf_desc = match buf {
-        Some(io_buf) => BufDesc::Slice(io_buf.as_slice()),
-        None => BufDesc::Slice(&[]),
+        Some(io_buf) => {
+            // Note: submit_io_prep_cmd will automatically register the buffer
+            BufDesc::Slice(io_buf.as_slice())
+        }
+        None if zero_copy => BufDesc::AutoReg(auto_buf_reg),
+        _ => BufDesc::Slice(&[]),
     };
 
     // Submit initial prep command
@@ -449,7 +461,7 @@ async fn handle_uring_events<T>(
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, readable: bool) {
+fn q_async_fn(qid: u16, dev: &UblkDev, zero_copy: bool, readable: bool) {
     let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let batch_state_rc = Rc::new(RefCell::new(QueueBatchState::new(qid)));
@@ -463,8 +475,12 @@ fn q_async_fn(qid: u16, dev: &UblkDev, readable: bool) {
         let batch_state = batch_state_rc.clone();
 
         f_vec.push(exe.spawn(async move {
-            let buf = Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize));
-            match batch_io_task(&q, tag, buf.as_ref(), batch_state).await {
+            let buf = if zero_copy && q.support_auto_buf_zc() {
+                None
+            } else {
+                Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
+            };
+            match batch_io_task(&q, tag, buf.as_ref(), batch_state, zero_copy).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
                 Err(e) => log::error!("batch_io_task failed for tag {}: {}", tag, e),
             }
@@ -485,12 +501,18 @@ fn __batch_add(
     id: i32,
     nr_queues: u32,
     depth: u32,
-    ctrl_flags: u64,
+    mut ctrl_flags: u64,
     buf_size: u32,
     flags: BatchFlags,
 ) {
     let oneshot = flags.intersects(BatchFlags::ONESHOT);
+    let zero_copy = flags.intersects(BatchFlags::ZERO_COPY);
     let use_readable = flags.intersects(BatchFlags::USE_READABLE);
+
+    // Add AUTO_BUF_REG flag if zero copy is enabled
+    if zero_copy {
+        ctrl_flags |= libublk::sys::UBLK_F_AUTO_BUF_REG as u64;
+    }
 
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name("example_batch")
@@ -516,7 +538,7 @@ fn __batch_add(
     };
 
     // Always run in async mode for batch coordination
-    let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, use_readable);
+    let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, zero_copy, use_readable);
     ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
 }
 
@@ -600,6 +622,13 @@ fn main() {
                         .help("create, dump and remove device automatically"),
                 )
                 .arg(
+                    Arg::new("zero_copy")
+                        .long("zero-copy")
+                        .short('z')
+                        .action(ArgAction::SetTrue)
+                        .help("enable zero copy via UBLK_F_AUTO_BUF_REG"),
+                )
+                .arg(
                     Arg::new("use_readable")
                         .long("use_readable")
                         .action(ArgAction::SetTrue)
@@ -657,6 +686,9 @@ fn main() {
             };
             if add_matches.get_flag("oneshot") {
                 flags |= BatchFlags::ONESHOT;
+            };
+            if add_matches.get_flag("zero_copy") {
+                flags |= BatchFlags::ZERO_COPY;
             };
             if add_matches.get_flag("use_readable") {
                 flags |= BatchFlags::USE_READABLE;
