@@ -3,9 +3,12 @@ use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
 use libublk::io::{with_task_io_ring, with_task_io_ring_mut, UblkDev, UblkQueue};
-use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task};
+use libublk::uring_async::{
+    ublk_reap_io_events_with_update_queue, ublk_submit_sqe_async, ublk_wake_task,
+};
 use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags};
+use rand::Rng;
 use slab::Slab;
 use std::cell::{Cell, RefCell};
 use std::fs::File;
@@ -283,6 +286,21 @@ fn collect_write_tags_from_cqe(
     }
 }
 
+async fn simulate_io_with_delay(tag: u16, io_delay_us: u32) {
+    let mut rng = rand::thread_rng();
+    let delay_us = rng.gen_range(0..=io_delay_us);
+    let timeout_spec = io_uring::types::Timespec::new()
+        .sec(0)
+        .nsec(delay_us * 1000);
+    let timeout_sqe = io_uring::opcode::Timeout::new(&timeout_spec as *const _).build();
+    let user_data =
+        UblkUringData::Target as u64 | UblkUringData::NonAsync as u64 | (tag + 1) as u64;
+
+    // Use io-uring timeout instead of smol::timer, which may not wakeup us, even
+    // readble() doesn't work too.
+    let _ = ublk_submit_sqe_async(timeout_sqe, user_data).await;
+}
+
 // Batch-aware I/O task function
 async fn batch_io_task(
     q: &UblkQueue<'_>,
@@ -290,6 +308,7 @@ async fn batch_io_task(
     buf: Option<&IoBuf<u8>>,
     batch_state: Rc<RefCell<QueueBatchState>>,
     zero_copy: bool,
+    io_delay_us: u32,
 ) -> Result<(), UblkError> {
     let auto_buf_reg = libublk::sys::ublk_auto_buf_reg {
         index: tag,
@@ -312,6 +331,11 @@ async fn batch_io_task(
     loop {
         // Handle batch coordination (if active)
         let context_id_opt = handle_task_batch_coordination(tag, &batch_state, &q).await?;
+
+        // Apply random delay to simulate real workload
+        if io_delay_us > 0 {
+            simulate_io_with_delay(tag, io_delay_us).await;
+        }
 
         // Perform I/O operation
         let res = get_io_cmd_result(&q, tag);
@@ -427,7 +451,7 @@ async fn handle_uring_events<T>(
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, zero_copy: bool, readable: bool) {
+fn q_async_fn(qid: u16, dev: &UblkDev, zero_copy: bool, readable: bool, io_delay_us: u32) {
     let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let batch_state_rc = Rc::new(RefCell::new(QueueBatchState::new(qid)));
@@ -446,7 +470,7 @@ fn q_async_fn(qid: u16, dev: &UblkDev, zero_copy: bool, readable: bool) {
             } else {
                 Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
             };
-            match batch_io_task(&q, tag, buf.as_ref(), batch_state, zero_copy).await {
+            match batch_io_task(&q, tag, buf.as_ref(), batch_state, zero_copy, io_delay_us).await {
                 Err(UblkError::QueueIsDown) | Ok(_) => {}
                 Err(e) => log::error!("batch_io_task failed for tag {}: {}", tag, e),
             }
@@ -470,6 +494,7 @@ fn __batch_add(
     mut ctrl_flags: u64,
     buf_size: u32,
     flags: BatchFlags,
+    io_delay_us: u32,
 ) {
     let oneshot = flags.intersects(BatchFlags::ONESHOT);
     let zero_copy = flags.intersects(BatchFlags::ZERO_COPY);
@@ -504,7 +529,8 @@ fn __batch_add(
     };
 
     // Always run in async mode for batch coordination
-    let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, zero_copy, use_readable);
+    let q_async_handler =
+        move |qid, dev: &_| q_async_fn(qid, dev, zero_copy, use_readable, io_delay_us);
     ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
 }
 
@@ -515,16 +541,33 @@ fn batch_add(
     ctrl_flags: u64,
     buf_size: u32,
     flags: BatchFlags,
+    io_delay_us: u32,
 ) {
     if flags.intersects(BatchFlags::FOREGROUND) {
-        __batch_add(id, nr_queues, depth, ctrl_flags, buf_size, flags);
+        __batch_add(
+            id,
+            nr_queues,
+            depth,
+            ctrl_flags,
+            buf_size,
+            flags,
+            io_delay_us,
+        );
     } else {
         let daemonize = daemonize::Daemonize::new()
             .stdout(daemonize::Stdio::keep())
             .stderr(daemonize::Stdio::keep());
 
         match daemonize.start() {
-            Ok(_) => __batch_add(id, nr_queues, depth, ctrl_flags, buf_size, flags),
+            Ok(_) => __batch_add(
+                id,
+                nr_queues,
+                depth,
+                ctrl_flags,
+                buf_size,
+                flags,
+                io_delay_us,
+            ),
             _ => panic!(),
         }
     }
@@ -599,6 +642,13 @@ fn main() {
                         .long("use_readable")
                         .action(ArgAction::SetTrue)
                         .help("use readable polling"),
+                )
+                .arg(
+                    Arg::new("io_delay")
+                        .long("io-delay")
+                        .default_value("0")
+                        .help("maximum random IO delay in microseconds (0 = disabled)")
+                        .action(ArgAction::Set),
                 ),
         )
         .subcommand(
@@ -660,7 +710,13 @@ fn main() {
                 flags |= BatchFlags::USE_READABLE;
             };
 
-            batch_add(id, nr_queues, depth, 0, buf_size, flags);
+            let io_delay_us = add_matches
+                .get_one::<String>("io_delay")
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+
+            batch_add(id, nr_queues, depth, 0, buf_size, flags, io_delay_us);
         }
         Some(("del", add_matches)) => {
             let id = add_matches
