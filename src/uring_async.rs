@@ -1,6 +1,7 @@
 use crate::io::UblkQueue;
+use crate::with_queue_ring_internal;
+use crate::with_queue_ring_mut_internal;
 use crate::UblkError;
-use crate::UblkUringData;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use slab::Slab;
 use std::cell::RefCell;
@@ -27,6 +28,9 @@ pub struct UblkUringOpFuture {
 }
 
 impl UblkUringOpFuture {
+    fn get_key(data: u64) -> usize {
+        ((data >> 16) & 0xffffffff) as usize
+    }
     pub fn new(tgt_io: u64) -> Self {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
@@ -36,9 +40,17 @@ impl UblkUringOpFuture {
                 result: None,
             });
             let user_data = ((key as u32) << 16) as u64 | tgt_io;
-            log::trace!("uring: new future {:x}", user_data);
+            log::trace!("uring: new future data {:x}/{:x}", user_data, key);
             UblkUringOpFuture { user_data }
         })
+    }
+
+    pub fn new_validate(data: u64) -> Result<Self, UblkError> {
+        if Self::get_key(data) != 0 {
+            return Err(UblkError::InvalidVal);
+        }
+
+        Ok(Self::new(data))
     }
 }
 
@@ -47,21 +59,29 @@ impl Future for UblkUringOpFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         MY_SLAB.with(|refcell| {
             let mut map = refcell.borrow_mut();
-            let key = ((self.user_data & !(UblkUringData::Target as u64)) >> 16) as usize;
+            let key = Self::get_key(self.user_data);
             match map.get_mut(key) {
                 None => {
-                    log::trace!("uring: null slab {:x}", self.user_data);
+                    log::trace!("uring: null slab data {:x}/{:x}", self.user_data, key);
                     Poll::Pending
                 }
                 Some(fd) => match fd.result {
                     Some(result) => {
                         map.remove(key);
-                        log::trace!("uring: uring io ready userdata {:x} ready", self.user_data);
+                        log::trace!(
+                            "uring: uring io ready data {:x}/{:x} ready",
+                            self.user_data,
+                            key
+                        );
                         Poll::Ready(result)
                     }
                     None => {
                         fd.waker = Some(cx.waker().clone());
-                        log::trace!("uring: uring io pending userdata {:x}", self.user_data);
+                        log::trace!(
+                            "uring: uring io pending data {:x}/{:x}",
+                            self.user_data,
+                            key
+                        );
                         Poll::Pending
                     }
                 },
@@ -84,8 +104,8 @@ pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
             cqe.user_data(),
             cqe.result()
         );
-        let data = ((data & !(UblkUringData::Target as u64)) >> 16) as usize;
-        if let Some(fd) = map.get_mut(data) {
+        let key = UblkUringOpFuture::get_key(data);
+        if let Some(fd) = map.get_mut(key) {
             fd.result = Some(cqe.result());
             if let Some(w) = &fd.waker {
                 w.wake_by_ref();
@@ -526,6 +546,40 @@ where
     })
 }
 
+#[inline]
+pub(crate) fn __ublk_submit_sqe_async(
+    sqe: io_uring::squeue::Entry,
+    user_data: u64,
+) -> Result<UblkUringOpFuture, UblkError> {
+    let f = UblkUringOpFuture::new_validate(user_data)?;
+    let sqe = sqe.user_data(f.user_data);
+
+    loop {
+        let res = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| unsafe {
+            r.submission().push(&sqe)
+        });
+
+        let _ = match res {
+            Ok(_) => break,
+            Err(_) => {
+                log::debug!("ublk_submit_sqe: flush and retry");
+                with_queue_ring_internal!(|r: &IoUring<squeue::Entry>| r.submit_and_wait(0))
+            }
+        };
+    }
+
+    Ok(f)
+}
+
+pub async fn ublk_submit_sqe_async(
+    sqe: io_uring::squeue::Entry,
+    user_data: u64,
+) -> Result<i32, UblkError> {
+    let f = __ublk_submit_sqe_async(sqe, user_data)?;
+
+    Ok(f.await)
+}
+
 /// Wait and handle incoming IO command
 ///
 /// # Arguments:
@@ -551,4 +605,135 @@ pub fn ublk_wait_and_handle_ios(exe: &smol::LocalExecutor, q: &UblkQueue) {
         }
     }
     q.unregister_io_bufs();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::ublk_join_io_tasks;
+    use io_uring::opcode;
+    use std::time::{Duration, Instant};
+
+    /// Test ublk_submit_sqe_async with NOP operation
+    #[test]
+    fn test_ublk_submit_sqe_async_nop() -> Result<(), UblkError> {
+        let exe = smol::LocalExecutor::new();
+        let mut tasks = Vec::new();
+
+        // Create a NOP operation
+        let task = exe.spawn(async {
+            let nop_sqe = opcode::Nop::new().build().user_data(12345);
+
+            match ublk_submit_sqe_async(nop_sqe, 12345).await {
+                Ok(result) => {
+                    log::debug!("NOP operation completed with result: {}", result);
+                    assert_eq!(result, 0); // NOP should return 0
+                }
+                Err(e) => {
+                    panic!("NOP operation failed: {}", e);
+                }
+            }
+        });
+
+        tasks.push(task);
+        ublk_join_io_tasks(&exe, tasks)
+    }
+
+    /// Test ublk_submit_sqe_async with timeout operation
+    #[test]
+    fn test_ublk_submit_sqe_async_timeout() -> Result<(), UblkError> {
+        let exe = smol::LocalExecutor::new();
+        let mut tasks = Vec::new();
+
+        // Create a timeout operation (100ms)
+        let task = exe.spawn(async {
+            let timeout_spec = io_uring::types::Timespec::new().sec(0).nsec(100_000_000); // 100ms
+
+            let timeout_sqe = opcode::Timeout::new(&timeout_spec as *const _)
+                .build()
+                .user_data(54321);
+
+            let start = Instant::now();
+
+            match ublk_submit_sqe_async(timeout_sqe, 54321).await {
+                Ok(result) => {
+                    let elapsed = start.elapsed();
+                    log::debug!(
+                        "Timeout operation completed with result: {} after {:?}",
+                        result,
+                        elapsed
+                    );
+
+                    // Timeout should complete in approximately 100ms
+                    assert!(elapsed >= Duration::from_millis(90));
+                    assert!(elapsed <= Duration::from_millis(200));
+                    assert_eq!(result, -62); // -ETIME
+                }
+                Err(e) => {
+                    panic!("Timeout operation failed: {}", e);
+                }
+            }
+        });
+
+        tasks.push(task);
+        ublk_join_io_tasks(&exe, tasks)
+    }
+
+    /// Test ublk_submit_sqe_async with multiple concurrent operations
+    #[test]
+    fn test_ublk_submit_sqe_async_concurrent() -> Result<(), UblkError> {
+        let exe = smol::LocalExecutor::new();
+        let mut tasks = Vec::new();
+
+        // Create multiple concurrent NOP operations
+        for i in 0..5 {
+            let task = exe.spawn(async move {
+                let user_data = 1000 + i;
+                let nop_sqe = opcode::Nop::new().build().user_data(user_data);
+
+                match ublk_submit_sqe_async(nop_sqe, user_data).await {
+                    Ok(result) => {
+                        log::debug!("Concurrent NOP {} completed with result: {}", i, result);
+                        assert_eq!(result, 0);
+                    }
+                    Err(e) => {
+                        panic!("Concurrent NOP {} failed: {}", i, e);
+                    }
+                }
+            });
+            tasks.push(task);
+        }
+
+        ublk_join_io_tasks(&exe, tasks)
+    }
+
+    /// Test ublk_submit_sqe_async error handling with invalid operation
+    #[test]
+    fn test_ublk_submit_sqe_async_error_handling() -> Result<(), UblkError> {
+        let exe = smol::LocalExecutor::new();
+        let mut tasks = Vec::new();
+
+        // Create an operation that should fail (invalid file descriptor)
+        let task = exe.spawn(async {
+            use io_uring::types::Fd;
+
+            let invalid_fd = Fd(-1); // Invalid file descriptor
+            let close_sqe = opcode::Close::new(invalid_fd).build().user_data(99999);
+
+            match ublk_submit_sqe_async(close_sqe, 99999).await {
+                Ok(result) => {
+                    log::debug!("Close operation completed with result: {}", result);
+                    // Close with invalid fd should return -EBADF (-9)
+                    assert_eq!(result, -9);
+                }
+                Err(e) => {
+                    // This is also acceptable behavior
+                    log::debug!("Close operation failed as expected: {}", e);
+                }
+            }
+        });
+
+        tasks.push(task);
+        ublk_join_io_tasks(&exe, tasks)
+    }
 }

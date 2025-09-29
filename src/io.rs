@@ -359,7 +359,7 @@ where
 }
 
 /// Internal function to initialize the queue ring with default parameters
-fn init_task_ring_default(sq_depth: u32, cq_depth: u32) -> Result<(), UblkError> {
+pub(crate) fn init_task_ring_default(sq_depth: u32, cq_depth: u32) -> Result<(), UblkError> {
     ublk_init_task_ring(|cell| {
         if cell.get().is_none() {
             let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
@@ -1958,28 +1958,8 @@ impl UblkQueue<'_> {
         }
     }
 
-    #[inline]
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(UblkUringData::Target as u64);
-        let sqe = sqe.user_data(f.user_data);
-
-        loop {
-            let res = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| unsafe {
-                ring.submission().push(&sqe)
-            });
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("ublk_submit_sqe: flush and retry");
-                    with_queue_ring_internal!(|ring: &IoUring<squeue::Entry>| ring
-                        .submit_and_wait(0)
-                        .unwrap());
-                }
-            }
-        }
-
-        f
+        crate::uring_async::__ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).unwrap()
     }
 
     #[inline]
