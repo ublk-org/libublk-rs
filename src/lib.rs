@@ -28,7 +28,9 @@ pub use io::{
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
 
 // Re-export async utilities
-pub use uring_async::{run_uring_tasks, ublk_reap_events_with_handler, wait_and_handle_io_events};
+pub use uring_async::{
+    run_uring_tasks, ublk_reap_events_with_handler, uring_poll_io_fn, wait_and_handle_io_events,
+};
 
 /// Ublk io_uring user_data constants
 #[repr(u64)]

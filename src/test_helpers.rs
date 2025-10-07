@@ -170,3 +170,35 @@ pub(crate) fn ublk_join_tasks<T>(
         crate::uring_async::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
     })
 }
+
+/// Block on all I/O tasks in the executor until they are finished
+///
+/// Similar to ublk_join_tasks() but uses QUEUE_RING for I/O operations
+/// instead of control ring operations.
+pub(crate) fn ublk_join_io_tasks<T>(
+    exe: &smol::LocalExecutor,
+    tasks: Vec<smol::Task<T>>,
+) -> Result<(), UblkError> {
+    // Initialize task ring for I/O operations
+    crate::io::init_task_ring_default(64, 64)?;
+
+    smol::block_on(async {
+        let poll_uring = || async {
+            crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+                crate::uring_async::uring_poll_fn(r, None, 0)
+            })
+        };
+        let reap_event = |_poll_timeout| {
+            crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+                ublk_reap_events_with_handler(r, |cqe| {
+                    ublk_wake_task(cqe.user_data(), cqe);
+                })
+            })?;
+            Ok(true)
+        };
+        let run_ops = || while exe.try_tick() {};
+        let is_done = || tasks.iter().all(|task| task.is_finished());
+
+        crate::uring_async::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
+    })
+}
