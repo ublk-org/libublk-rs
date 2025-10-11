@@ -5,6 +5,7 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
+use libublk::uring_async::ublk_submit_sqe_async;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use serde::Serialize;
 use std::os::unix::fs::FileTypeExt;
@@ -171,7 +172,9 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, io_slice: &mut [u8]
         // for kernel interface compatibility. The slice ensures we have valid bounds.
         let buf_addr = io_slice.as_mut_ptr();
         let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
-        let res = q.ublk_submit_sqe(sqe).await;
+        let res = ublk_submit_sqe_async(sqe, libublk::UblkUringData::Target as u64)
+            .await
+            .unwrap_or(-libc::EIO);
         if res != -(libc::EAGAIN) {
             return res;
         }
