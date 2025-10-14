@@ -571,6 +571,59 @@ pub(crate) fn __ublk_submit_sqe_async(
     Ok(f)
 }
 
+/// Submit an io_uring submission queue entry asynchronously
+///
+/// This function submits an io_uring SQE and returns a future that completes
+/// when the operation finishes.
+///
+/// # Arguments
+///
+/// * `sqe` - The io_uring submission queue entry to submit
+/// * `user_data` - User data to associate with this operation. This value is used
+///   to identify the operation when the completion queue entry is received.
+///
+/// # Important: Marking Target I/O Operations
+///
+/// **When issuing ublk uring_cmd operations in the same io_uring context as the queue's
+/// thread-local ring, you MUST set the `UblkUringData::Target` bit in the `user_data` parameter.**
+///
+/// This is critical for proper operation classification:
+/// - `UblkUringData::Target` bit set: Indicates this is a target I/O operation
+/// - `UblkUringData::Target` bit NOT set: Indicates this is a ublk I/O command from the driver
+///
+/// The library uses this bit to distinguish between:
+/// 1. **IO commands from ublk driver** - Commands originating from `/dev/ublkbN` that need to be
+///    handled by the target implementation
+/// 2. **Target IO operations** - IO operations submitted by the target code itself (e.g., reads/writes
+///    to backing storage, uring_cmd operations for ublk communication)
+///
+/// # Example
+///
+/// ```no_run
+/// use libublk::uring_async::ublk_submit_sqe_async;
+/// use libublk::UblkUringData;
+/// use io_uring::opcode;
+///
+/// async fn example() -> Result<(), libublk::UblkError> {
+///     // When submitting a ublk uring_cmd in the same io_uring context,
+///     // mark it as target I/O by setting the Target bit
+///     let sqe = opcode::Nop::new().build();
+///     let result = ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).await?;
+///
+///     println!("Operation completed with result: {}", result);
+///     Ok(())
+/// }
+/// ```
+///
+/// # Returns
+///
+/// Returns `Ok(i32)` with the operation result on success, or `Err(UblkError)` on failure.
+///
+/// # Errors
+///
+/// This function can return errors if:
+/// - The io_uring submission queue is full and cannot accept new entries
+/// - The user_data validation fails (see `UblkUringOpFuture::new_validate`)
 pub async fn ublk_submit_sqe_async(
     sqe: io_uring::squeue::Entry,
     user_data: u64,
