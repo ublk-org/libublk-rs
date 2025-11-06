@@ -408,11 +408,7 @@ where
                 log::debug!("Timeout CQE received, result: {}", cqe.result());
                 if user_data == timeout_user_data && cqe.result() == -libc::ETIME {
                     has_timeout = true;
-                } else {
-                    has_timeout = false;
                 }
-            } else {
-                has_timeout = false;
             }
 
             // Count IO commands and check for abort
