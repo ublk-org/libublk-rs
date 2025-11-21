@@ -28,14 +28,33 @@ scripts = ["utils/ublk_chown.sh"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+
+# IMPORTANT: CARGO.TOML SECTION ORDERING
+#
+# Cargo expects the general, high-level sections (like [dependencies],
+# [dev-dependencies], [build-dependencies], etc.) to be defined BEFORE
+# any target-specific sections.
+#
+# If general dependency definitions are placed AFTER any
+# [target.'cfg(...)'.dependencies] blocks, Cargo can misinterpret their scope,
+# leading to unexpected errors (like dependencies only being available for
+# a specific target, or incorrect feature merging).
+#
+# If you mess up the order, Cargo will make sure your build system spends a weekend
+# wandering the dependency graph, wondering where it all went wrong, and you'll lose your hair
+# trying to figure out why.
+#
+# 1. ALWAYS list ALL general [dependencies] first.
+# 2. THEN, define ALL conditional [target.'cfg(...)'.dependencies] blocks.
+
 [build-dependencies]
 bindgen = "0.69"
 regex = "1.8.3"
 anyhow = "1.0.66"
 
 [dependencies]
+
 libc = "0.2"
-io-uring = {version="=0.7.9"}
 serde = {version = "1.0.99", features = ["derive"]}
 serde_json = "1.0.79"
 bitmaps = "3.2.0"
@@ -61,3 +80,11 @@ daemonize = "0.5"
 env_logger = "0.9"
 futures = "0.3.31"
 rand = "0.8"
+
+
+# Put the conditional stuff at the bottom, order matters, see about comment
+[target.'cfg(not(target_arch = "s390x"))'.dependencies]
+io-uring = "^0.7"
+
+[target.'cfg(target_arch = "s390x")'.dependencies]
+io-uring = { version = "^0.7", features = ["bindgen"] }
