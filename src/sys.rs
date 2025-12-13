@@ -1,6 +1,2 @@
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(dead_code)]
-
-include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
+// Re-export all types and functions from libublk-rs-sys
+pub use libublk_rs_sys::*;

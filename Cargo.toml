@@ -47,12 +47,8 @@ scripts = ["utils/ublk_chown.sh"]
 # 1. ALWAYS list ALL general [dependencies] first.
 # 2. THEN, define ALL conditional [target.'cfg(...)'.dependencies] blocks.
 
-[build-dependencies]
-bindgen = "0.69"
-regex = "1.8.3"
-anyhow = "1.0.66"
-
 [dependencies]
+libublk-rs-sys = { path = "libublk-rs-sys", version = "0.1.0" }
 
 libc = "0.2"
 serde = {version = "1.0.99", features = ["derive"]}
