@@ -1,5 +1,8 @@
 /target
 /Cargo.lock
+# Ignore build artifacts in subdirectories
+**/target
+libublk-rs-sys/Cargo.lock
 /.claude
 /*.patch
 /temp
