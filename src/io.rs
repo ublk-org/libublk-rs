@@ -2475,12 +2475,10 @@ impl UblkQueue<'_> {
     }
 
     fn discard_io_pages(&self) {
-        let depth = self.q_depth;
-        let buf_size = self.dev.dev_info.max_io_buf_bytes as usize;
-        for i in 0..depth {
-            let buf_addr = self.get_io_buf_addr(i as u16);
-            unsafe { libc::madvise(buf_addr as *mut libc::c_void, buf_size, libc::MADV_DONTNEED) };
-        }
+        // madvise(MADV_DONTNEED) removed: it raced with the kernel posting
+        // CQEs for WRITE bios during the per-tag loop, causing silent data
+        // corruption (the daemon would read a zero page instead of bio data).
+        // See https://github.com/ublk-org/libublk-rs/issues/48
     }
 
     pub(crate) fn enter_queue_idle(&self) -> bool {
