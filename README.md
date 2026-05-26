@@ -138,6 +138,26 @@ installed under /usr/local/sbin or other directory which has to match
 with the udev rules.
 
 
+## Mount namespace caveat (container / Kubernetes pod)
+
+**The ublk daemon must not share a mount namespace with any process that
+uses the ublk block device** (mounts a filesystem on `/dev/ublkbN`,
+opens it for I/O, etc.).
+
+Reason: the ublk daemon serves I/O for `/dev/ublkbN`, so I/O on that
+device only makes forward progress while the daemon is alive. When the
+daemon shares a mount namespace with a client of its own device (e.g. a
+filesystem mounted on `/dev/ublkbN`), the daemon's exit can trigger an
+unmount that flushes I/O to the device — but the daemon is exiting and
+can no longer serve that I/O, so it self-deadlocks.
+
+Run the daemon in its own mount namespace, e.g. by calling
+`unshare(CLONE_NEWNS)` at startup or launching it under `unshare --mount`.
+See
+[`vmtest/tests/ublk-mntns-min.sh`](https://github.com/ming1/vmtest/blob/main/tests/ublk-mntns-min.sh)
+for a minimal reproducer of what goes wrong otherwise. Tracked at
+[libublk-rs#50](https://github.com/ublk-org/libublk-rs/issues/50).
+
 ## Test
 
 You can run the test of the library with ```cargo test```
