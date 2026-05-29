@@ -449,7 +449,11 @@ impl<'a> BufDesc<'a> {
     /// * `BufDesc::AutoReg` requires `UBLK_F_AUTO_BUF_REG` to be enabled
     /// * `BufDesc::ZonedAppendLba` requires `UBLK_F_ZONED` to be enabled
     /// * `BufDesc::RawAddress` is compatible with all device configurations (unsafe)
-    /// * `UBLK_F_AUTO_BUF_REG` and `UBLK_F_USER_COPY` cannot be used together
+    /// * `UBLK_F_AUTO_BUF_REG` and `UBLK_F_USER_COPY` cannot be combined except
+    ///   on zoned devices (`UBLK_F_ZONED`), where user-copy is required so the
+    ///   target can deliver `REPORT_ZONES` buffers back to the kernel via
+    ///   `pwrite()` while the regular data path still uses zero-copy / auto
+    ///   buffer registration.
     #[inline]
     pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
         let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
@@ -457,7 +461,7 @@ impl<'a> BufDesc<'a> {
         let has_zoned = (device_flags & sys::UBLK_F_ZONED as u64) != 0;
 
         // Check for invalid flag combination
-        if has_auto_buf_reg && has_user_copy {
+        if has_auto_buf_reg && has_user_copy && !has_zoned {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
 
@@ -1234,8 +1238,12 @@ impl UblkQueue<'_> {
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
 
+        // Reject `UBLK_F_AUTO_BUF_REG | UBLK_F_USER_COPY` except on zoned
+        // devices. Zoned targets need user-copy to satisfy REPORT_ZONES
+        // (REQ_OP_DRV_IN) requests via `pwrite()`.
         if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
             && (dev.dev_info.flags & sys::UBLK_F_USER_COPY as u64) != 0
+            && (dev.dev_info.flags & sys::UBLK_F_ZONED as u64) == 0
         {
             return Err(UblkError::InvalidVal);
         }
@@ -2852,6 +2860,25 @@ mod tests {
         match slice_desc.validate_compatibility(invalid_flags) {
             Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::EINVAL),
             _ => panic!("Expected EINVAL error"),
+        }
+
+        // Test with UBLK_F_USER_COPY and UBLK_F_AUTO_BUF_REG on zoned ublk
+        let zoned_zc_uc_flags =
+            (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY | sys::UBLK_F_ZONED) as u64;
+        assert!(auto_reg_desc
+            .validate_compatibility(zoned_zc_uc_flags)
+            .is_ok());
+        assert!(slice_desc.validate_compatibility(zoned_zc_uc_flags).is_ok());
+
+        // Test with UBLK_F_USER_COPY and UBLK_F_AUTO_BUF_REG on conventional ublk
+        let zc_uc_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
+        match slice_desc.validate_compatibility(zc_uc_flags) {
+            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::EINVAL),
+            other => panic!("Expected EINVAL, got {:?}", other),
+        }
+        match auto_reg_desc.validate_compatibility(zc_uc_flags) {
+            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::EINVAL),
+            other => panic!("Expected EINVAL, got {:?}", other),
         }
     }
 
