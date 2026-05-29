@@ -441,7 +441,6 @@ impl<'a> BufDesc<'a> {
     ///
     /// * `Ok(())` if the buffer descriptor is compatible with device capabilities
     /// * `Err(UblkError::OtherError(-libc::ENOTSUP))` if the buffer type is not supported
-    /// * `Err(UblkError::OtherError(-libc::EINVAL))` if the configuration is invalid
     ///
     /// # Validation Rules
     ///
@@ -449,17 +448,11 @@ impl<'a> BufDesc<'a> {
     /// * `BufDesc::AutoReg` requires `UBLK_F_AUTO_BUF_REG` to be enabled
     /// * `BufDesc::ZonedAppendLba` requires `UBLK_F_ZONED` to be enabled
     /// * `BufDesc::RawAddress` is compatible with all device configurations (unsafe)
-    /// * `UBLK_F_AUTO_BUF_REG` and `UBLK_F_USER_COPY` cannot be used together
     #[inline]
     pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
         let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
         let has_user_copy = (device_flags & sys::UBLK_F_USER_COPY as u64) != 0;
         let has_zoned = (device_flags & sys::UBLK_F_ZONED as u64) != 0;
-
-        // Check for invalid flag combination
-        if has_auto_buf_reg && has_user_copy {
-            return Err(UblkError::OtherError(-libc::EINVAL));
-        }
 
         match self {
             BufDesc::Slice(_) => {
@@ -1233,12 +1226,6 @@ impl UblkQueue<'_> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
-
-        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
-            && (dev.dev_info.flags & sys::UBLK_F_USER_COPY as u64) != 0
-        {
-            return Err(UblkError::InvalidVal);
-        }
 
         // Initialize the thread-local queue ring with default parameters
         // Users can call init_task_ring() before UblkQueue::new() to customize initialization
@@ -2838,21 +2825,10 @@ mod tests {
             .validate_compatibility(auto_buf_reg_flags)
             .is_ok());
 
-        // Test invalid combination of both flags
-        let invalid_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
-        assert!(slice_desc.validate_compatibility(invalid_flags).is_err());
-        assert!(auto_reg_desc.validate_compatibility(invalid_flags).is_err());
-
-        // Verify specific error codes
-        match slice_desc.validate_compatibility(auto_buf_reg_flags) {
-            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::ENOTSUP),
-            _ => panic!("Expected ENOTSUP error"),
-        }
-
-        match slice_desc.validate_compatibility(invalid_flags) {
-            Err(UblkError::OtherError(code)) => assert_eq!(code, -libc::EINVAL),
-            _ => panic!("Expected EINVAL error"),
-        }
+        // Test with UBLK_F_USER_COPY and UBLK_F_AUTO_BUF_REG
+        let zc_uc_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
+        assert!(slice_desc.validate_compatibility(zc_uc_flags).is_ok());
+        assert!(auto_reg_desc.validate_compatibility(zc_uc_flags).is_ok());
     }
 
     #[test]
