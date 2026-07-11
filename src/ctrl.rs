@@ -2565,7 +2565,7 @@ impl UblkCtrl {
         // Set IO flusher property for the queue thread
         unsafe {
             const PR_SET_IO_FLUSHER: i32 = 57; // include/uapi/linux/prctl.h
-            libc::prctl(PR_SET_IO_FLUSHER, 0, 0, 0, 0);
+            libc::prctl(PR_SET_IO_FLUSHER, 1, 0, 0, 0);
         }
 
         tid
@@ -2695,6 +2695,14 @@ mod tests {
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
+
+    #[test]
+    fn test_init_queue_thread_io_flusher() {
+        const PR_GET_IO_FLUSHER: i32 = 58; // include/uapi/linux/prctl.h
+
+        UblkCtrl::init_queue_thread();
+        assert_eq!(unsafe { libc::prctl(PR_GET_IO_FLUSHER, 0, 0, 0, 0) }, 1);
+    }
 
     #[test]
     fn test_ublk_get_features() {
