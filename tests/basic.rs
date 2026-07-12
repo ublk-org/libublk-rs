@@ -545,19 +545,16 @@ mod integration {
 
         //format as ext4 and mount over the created ublk-ramdisk
         {
-            let ext4_options = block_utils::Filesystem::Ext4 {
-                inode_size: 512,
-                stride: Some(2),
-                stripe_width: None,
-                reserved_blocks_percentage: 10,
+            let run = |cmd: &str, args: &[&str]| {
+                let status = std::process::Command::new(cmd).args(args).status().unwrap();
+                assert!(status.success(), "{} {:?} failed", cmd, args);
             };
-            block_utils::format_block_device(&Path::new(&dev_path), &ext4_options).unwrap();
+            run("mkfs.ext4", &["-q", "-F", "-I", "512", "-E", "stride=2", &dev_path]);
 
             let tmp_dir = tempfile::TempDir::new().unwrap();
-            let bdev = block_utils::get_device_info(Path::new(&dev_path)).unwrap();
-
-            block_utils::mount_device(&bdev, tmp_dir.path()).unwrap();
-            block_utils::unmount_device(tmp_dir.path()).unwrap();
+            let mnt = tmp_dir.path().to_str().unwrap();
+            run("mount", &[dev_path.as_str(), mnt]);
+            run("umount", &[mnt]);
         }
         ctrl.kill_dev().unwrap();
     }
