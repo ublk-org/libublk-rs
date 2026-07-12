@@ -272,7 +272,7 @@ pub fn ublk_run_ctrl_task<T>(
 /// use libublk::uring_async::ublk_wake_task;
 /// use libublk::io::with_queue_ring_mut;
 ///
-/// async fn example_usage(q: &libublk::io::UblkQueue<'_>, exe: &smol::LocalExecutor<'_>, tasks: Vec<smol::Task<()>>) -> Result<(), UblkError> {
+/// async fn example_usage(q: &libublk::io::UblkQueue, exe: &smol::LocalExecutor<'_>, tasks: Vec<smol::Task<()>>) -> Result<(), UblkError> {
 ///     // Basic usage with smol executor
 ///     let run_ops = || {
 ///         while exe.try_tick() {}
@@ -291,7 +291,7 @@ pub fn ublk_run_ctrl_task<T>(
 ///     Ok(())
 /// }
 ///
-/// async fn example_custom_polling(q: &libublk::io::UblkQueue<'_>) -> Result<(), UblkError> {
+/// async fn example_custom_polling(q: &libublk::io::UblkQueue) -> Result<(), UblkError> {
 ///     // Alternative: Custom polling with async file
 ///     let run_ops = || {};
 ///     let is_done = || true; // Example condition
@@ -386,7 +386,7 @@ where
 /// Returns `Ok(aborted)` where `aborted` indicates if any IO command was aborted,
 /// or an error if the operation failed.
 pub fn ublk_reap_io_events_with_update_queue<F>(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     poll_timeout: bool,
     timeout_data: Option<u64>,
     mut waker_ops: F,
@@ -464,7 +464,7 @@ where
 /// use libublk::io::UblkQueue;
 /// use libublk::UblkError;
 ///
-/// async fn handle_events(q: &UblkQueue<'_>) -> Result<(), UblkError> {
+/// async fn handle_events(q: &UblkQueue) -> Result<(), UblkError> {
 ///     let run_ops = || {
 ///         // Run executor or other periodic operations
 ///     };
@@ -477,7 +477,7 @@ where
 /// }
 /// ```
 pub async fn wait_and_handle_io_events<R, I>(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     idle_secs: Option<u64>,
     run_ops: R,
     is_done: I,

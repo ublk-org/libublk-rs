@@ -26,7 +26,7 @@ fn init_logger() {
 ///
 /// This function simulates the I/O operations of a null device,
 /// accepting all writes and returning zeros for reads.
-pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) -> Result<(), UblkError> {
+pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue) -> Result<(), UblkError> {
     use crate::helpers::IoBuf;
     use crate::BufDesc;
 
@@ -53,7 +53,7 @@ pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) -> Result<(), UblkE
 /// simulating concurrent I/O operations.
 pub(crate) fn q_async_fn<'a>(
     exe: &smol::LocalExecutor<'a>,
-    q_rc: &Rc<UblkQueue<'a>>,
+    q_rc: &Rc<UblkQueue>,
     depth: u16,
     f_vec: &mut Vec<smol::Task<()>>,
 ) {

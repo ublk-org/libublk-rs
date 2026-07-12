@@ -10,6 +10,7 @@ use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags};
 use rand::Rng;
 use slab::Slab;
+use std::sync::Arc;
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -175,7 +176,7 @@ fn run_batch_coordination(
 async fn handle_task_batch_coordination(
     tag: u16,
     batch_state: &Rc<RefCell<QueueBatchState>>,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
 ) -> Result<Option<u32>, UblkError> {
     let queue_id = batch_state.borrow().queue_id;
 
@@ -271,7 +272,7 @@ fn is_write_operation(iod: &libublk::sys::ublksrv_io_desc) -> bool {
 #[inline]
 fn collect_write_tags_from_cqe(
     user_data: u64,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     batch_state: &Rc<RefCell<QueueBatchState>>,
 ) {
     // Check if this is an I/O command (not target operations) by checking Target bit
@@ -303,7 +304,7 @@ async fn simulate_io_with_delay(tag: u16, io_delay_us: u32) {
 
 // Batch-aware I/O task function
 async fn batch_io_task(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     buf: Option<&IoBuf<u8>>,
     batch_state: Rc<RefCell<QueueBatchState>>,
@@ -352,7 +353,7 @@ async fn batch_io_task(
 
 async fn handle_uring_events_default<T>(
     exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tasks: Vec<smol::Task<T>>,
     batch_state: Rc<RefCell<QueueBatchState>>,
 ) -> Result<(), UblkError> {
@@ -382,7 +383,7 @@ async fn handle_uring_events_default<T>(
 
 async fn handle_uring_events_smol_readable<T>(
     exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tasks: Vec<smol::Task<T>>,
     batch_state: Rc<RefCell<QueueBatchState>>,
 ) -> Result<(), UblkError> {
@@ -439,7 +440,7 @@ async fn handle_uring_events_smol_readable<T>(
 
 async fn handle_uring_events<T>(
     exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tasks: Vec<smol::Task<T>>,
     batch_state: Rc<RefCell<QueueBatchState>>,
     smol_readable: bool,
@@ -451,8 +452,8 @@ async fn handle_uring_events<T>(
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, zero_copy: bool, readable: bool, io_delay_us: u32) {
-    let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, zero_copy: bool, readable: bool, io_delay_us: u32) {
+    let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let batch_state_rc = Rc::new(RefCell::new(QueueBatchState::new(qid)));
     let queue_depth = dev.dev_info.queue_depth;

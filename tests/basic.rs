@@ -65,7 +65,7 @@ mod integration {
         assert!(out.status.success() == success);
     }
 
-    fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &UblkDev)) {
+    fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &Arc<UblkDev>)) {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .nr_queues(2)
@@ -78,7 +78,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, _dev: &UblkDev| {
+        let q_fn = move |qid: u16, _dev: &Arc<UblkDev>| {
             q_handler(qid, _dev);
         };
 
@@ -95,7 +95,7 @@ mod integration {
     #[test]
     fn test_ublk_null() {
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue(qid: u16, dev: &UblkDev) {
+        fn null_handle_queue(qid: u16, dev: &Arc<UblkDev>) {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
             let bufs = bufs_rc.clone();
@@ -357,7 +357,7 @@ mod integration {
     fn test_ublk_null_comp_batch() {
         use libublk::UblkFatRes;
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue_batch(qid: u16, dev: &UblkDev) {
+        fn null_handle_queue_batch(qid: u16, dev: &Arc<UblkDev>) {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
             let bufs = bufs_rc.clone();
@@ -404,7 +404,7 @@ mod integration {
         // submit one io_uring Nop via io-uring crate and UringOpFuture, and
         // user_data has to unique among io tasks, also has to encode tag
         // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+        async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
@@ -418,7 +418,7 @@ mod integration {
         }
 
         async fn test_io_task(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             dev_data: &Arc<Mutex<DevData>>,
         ) -> Result<(), UblkError> {
@@ -469,8 +469,8 @@ mod integration {
 
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
-        let q_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
             let exe_rc = Rc::new(smol::LocalExecutor::new());
             let exe = exe_rc.clone();
             let mut f_vec = Vec::new();
@@ -522,7 +522,7 @@ mod integration {
     fn __test_ublk_null_zc(bad_buf_idx: bool, fallback: bool) {
         const IORING_NOP_INJECT_RESULT: u32 = 1u32 << 0;
         const IORING_NOP_FIXED_BUFFER: u32 = 1u32 << 3;
-        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+        async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
@@ -553,7 +553,7 @@ mod integration {
         }
 
         async fn test_auto_reg_io_task(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             depth: u16,
             bad_buf_idx: bool,
@@ -605,8 +605,8 @@ mod integration {
 
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
-        let q_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
             let exe_rc = Rc::new(smol::LocalExecutor::new());
             let exe = exe_rc.clone();
             let mut f_vec = Vec::new();
@@ -693,7 +693,7 @@ mod integration {
     fn __test_ublk_ramdisk(dev_flags: UblkFlags) {
         // async function to handle individual I/O commands using slice operations for safe buffer access
         async fn handle_io_cmd(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             ramdisk_addr: usize,
             io_buf: &mut [u8],
@@ -741,7 +741,7 @@ mod integration {
         }
 
         async fn test_ramdisk_io_task(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             ramdisk_addr: usize,
             mlock_enabled: bool,
@@ -786,8 +786,8 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
             let exe_rc = Rc::new(smol::LocalExecutor::new());
             let exe = exe_rc.clone();
             let mut f_vec = Vec::new();
@@ -837,7 +837,7 @@ mod integration {
     #[test]
     fn test_fn_mut_io_closure() {
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_queue_mut_io(qid: u16, dev: &UblkDev) {
+        fn null_queue_mut_io(qid: u16, dev: &Arc<UblkDev>) {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
             let bufs = bufs_rc.clone();
@@ -1229,7 +1229,7 @@ mod integration {
             );
         }
 
-        fn single_cpu_null_handle_queue(qid: u16, dev: &UblkDev) {
+        fn single_cpu_null_handle_queue(qid: u16, dev: &Arc<UblkDev>) {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
             let bufs = bufs_rc.clone();
@@ -1279,7 +1279,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             single_cpu_null_handle_queue(qid, dev);
         };
 
@@ -1317,7 +1317,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             // Create auto buffer registration data for each tag
             let mut buf_reg_data_list = Vec::with_capacity(depth as usize);
             let flags = if use_fallback {

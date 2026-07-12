@@ -7,6 +7,7 @@ use libublk::io::{
 use libublk::uring_async::{ublk_reap_io_events_with_update_queue, ublk_wake_task};
 use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
+use std::sync::Arc;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::rc::Rc;
@@ -46,7 +47,7 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
         .unwrap();
 }
 
-fn q_sync_zc_fn(qid: u16, dev: &UblkDev) {
+fn q_sync_zc_fn(qid: u16, dev: &Arc<UblkDev>) {
     let auto_buf_reg_list_rc = Rc::new(
         (0..dev.dev_info.queue_depth)
             .map(|tag| libublk::sys::ublk_auto_buf_reg {
@@ -79,7 +80,7 @@ fn q_sync_zc_fn(qid: u16, dev: &UblkDev) {
     queue.wait_and_handle_io(io_handler);
 }
 
-fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
+fn q_sync_fn(qid: u16, dev: &Arc<UblkDev>, user_copy: bool) {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
 
@@ -115,7 +116,7 @@ fn q_sync_fn(qid: u16, dev: &UblkDev, user_copy: bool) {
 }
 
 async fn __null_io_task(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     buf: Option<&IoBuf<u8>>,
     user_copy: bool,
@@ -146,7 +147,7 @@ async fn __null_io_task(
 }
 
 async fn null_io_task(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     user_copy: bool,
     zero_copy: bool,
@@ -167,7 +168,7 @@ async fn null_io_task(
 /// This function uses the new wait_and_handle_io_events API for simplified event handling
 async fn handle_uring_events_default<T>(
     exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tasks: Vec<smol::Task<T>>,
 ) -> Result<(), UblkError> {
     let run_ops = || while exe.try_tick() {};
@@ -181,7 +182,7 @@ async fn handle_uring_events_default<T>(
 /// to enable queue idle functionality. When timeout CQEs are received, the queue enters idle state.
 async fn handle_uring_events_smol_readable<T>(
     exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tasks: Vec<smol::Task<T>>,
 ) -> Result<(), UblkError> {
     use io_uring::{opcode, types};
@@ -235,7 +236,7 @@ async fn handle_uring_events_smol_readable<T>(
 
 async fn handle_uring_events<T>(
     exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tasks: Vec<smol::Task<T>>,
     smol_readable: bool,
 ) -> Result<(), UblkError> {
@@ -246,8 +247,8 @@ async fn handle_uring_events<T>(
     }
 }
 
-fn q_async_fn(qid: u16, dev: &UblkDev, user_copy: bool, zero_copy: bool, readable: bool) {
-    let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, user_copy: bool, zero_copy: bool, readable: bool) {
+    let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let exe = exe_rc.clone();
     let mut f_vec = Vec::new();

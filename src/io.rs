@@ -128,7 +128,7 @@
 //! use libublk::helpers::IoBuf;
 //! use libublk::sys;
 //!
-//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
 //!     let slice_desc = BufDesc::from_io_buf(&io_buf);
 //!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1, Some(&io_buf)).await?;
@@ -142,7 +142,7 @@
 //! use libublk::io::{BufDesc, UblkQueue};
 //! use libublk::sys;
 //!
-//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
 //!     let auto_reg = sys::ublk_auto_buf_reg {
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
@@ -1165,13 +1165,13 @@ impl UblkQueueState {
 ///
 /// So far, each queue is handled by one its own io_uring.
 ///
-pub struct UblkQueue<'a> {
+pub struct UblkQueue {
     flags: UblkFlags,
     q_id: u16,
     q_depth: u32,
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
-    pub dev: &'a UblkDev,
+    pub dev: Arc<UblkDev>,
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
@@ -1183,15 +1183,15 @@ pub struct UblkQueue<'a> {
     buf_reg_counter: RefCell<u32>,
 }
 
-impl AsRawFd for UblkQueue<'_> {
+impl AsRawFd for UblkQueue {
     fn as_raw_fd(&self) -> RawFd {
         with_queue_ring_internal!(|ring: &IoUring<squeue::Entry>| ring.as_raw_fd())
     }
 }
 
-impl Drop for UblkQueue<'_> {
+impl Drop for UblkQueue {
     fn drop(&mut self) {
-        let dev = self.dev;
+        let dev = &self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
         if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
@@ -1226,7 +1226,7 @@ fn round_up(val: u32, rnd: u32) -> u32 {
     (val + rnd - 1) & !(rnd - 1)
 }
 
-impl UblkQueue<'_> {
+impl UblkQueue {
     const UBLK_QUEUE_IDLE_SECS: u32 = 20;
     const UBLK_QUEUE_IOCTL_ENCODE: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_0;
     const UBLK_QUEUE_AUTO_BUF_REG: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_1;
@@ -1259,7 +1259,7 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
-    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
+    pub fn new(q_id: u16, dev: &Arc<UblkDev>) -> Result<UblkQueue, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
@@ -1331,7 +1331,7 @@ impl UblkQueue<'_> {
             q_id,
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
-            dev,
+            dev: Arc::clone(dev),
             dev_flags: dev.dev_info.flags,
             state: RefCell::new(UblkQueueState {
                 cmd_inflight: 0,
@@ -2812,25 +2812,22 @@ mod tests {
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut UblkDev| {
-            let _q = UblkQueue::new(0, dev)?;
-            with_task_io_ring(|ring: &IoUring<io_uring::squeue::Entry>| {
-                // unregister_files() might fail if no files are registered - that's OK
-                let _ = ring.submitter().unregister_files();
-                ring.submitter()
-                    .register_files(&dev.tgt.fds)
-                    .map_err(UblkError::IOError)
-            })?;
-            with_task_io_ring_mut(
-                |ring: &mut IoUring<io_uring::squeue::Entry>| -> Result<usize, UblkError> {
-                    __submit_uring_nop(ring)
-                },
-            )?;
-
-            Ok(())
-        };
-
-        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+        let dev = std::sync::Arc::new(UblkDev::new(ctrl.get_name(), |_| Ok(()), &ctrl).unwrap());
+        let _q = UblkQueue::new(0, &dev).unwrap();
+        with_task_io_ring(|ring: &IoUring<io_uring::squeue::Entry>| {
+            // unregister_files() might fail if no files are registered - that's OK
+            let _ = ring.submitter().unregister_files();
+            ring.submitter()
+                .register_files(&dev.tgt.fds)
+                .map_err(UblkError::IOError)
+        })
+        .unwrap();
+        with_task_io_ring_mut(
+            |ring: &mut IoUring<io_uring::squeue::Entry>| -> Result<usize, UblkError> {
+                __submit_uring_nop(ring)
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3096,8 +3093,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut _| {
-            let q = UblkQueue::new(0, dev)?;
+        let dev = std::sync::Arc::new(UblkDev::new(ctrl.get_name(), |_| Ok(()), &ctrl).unwrap());
+        {
+            let q = UblkQueue::new(0, &dev).unwrap();
 
             // Test that semaphore starts with 0 permits
             assert!(
@@ -3166,10 +3164,7 @@ mod tests {
             assert!(permit2.is_some(), "Should have multiple permits available");
 
             println!("Optimized buffer registration synchronization test completed successfully");
-            Ok(())
-        };
-
-        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+        }
     }
 
     #[test]

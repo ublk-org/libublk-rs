@@ -8,6 +8,7 @@ use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::uring_async::ublk_submit_sqe_async;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use serde::Serialize;
+use std::sync::Arc;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
@@ -154,7 +155,7 @@ fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_urin
 /// - Leverages IoBuf's slice methods for memory safety
 /// - Shows when slice-to-pointer conversion is necessary for libublk API calls
 /// - Maintains async/await patterns for high-performance I/O
-async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, io_slice: &mut [u8]) -> i32 {
+async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_slice: &mut [u8]) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
@@ -188,7 +189,7 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue<'_>, tag: u16, io_slice: &mut [u8]
 /// Note: This sync handler still uses raw pointers as it follows the traditional
 /// synchronous I/O pattern. The async handler above demonstrates the preferred
 /// slice-based approach for new implementations.
-fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, io_slice: &[u8]) {
+fn lo_handle_io_cmd_sync(q: &UblkQueue, tag: u16, i: &UblkIOCtx, io_slice: &[u8]) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
@@ -220,7 +221,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue<'_>, tag: u16, i: &UblkIOCtx, io_slice: &
     }
 }
 
-fn q_fn(qid: u16, dev: &UblkDev) {
+fn q_fn(qid: u16, dev: &Arc<UblkDev>) {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
 
@@ -252,7 +253,7 @@ fn q_fn(qid: u16, dev: &UblkDev) {
     queue.wait_and_handle_io(lo_io_handler);
 }
 
-async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
+async fn lo_io_task(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
     let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
@@ -274,8 +275,8 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
     }
 }
 
-fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
-    let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
+fn q_a_fn(qid: u16, dev: &Arc<UblkDev>, depth: u16) {
+    let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let exe = exe_rc.clone();
     let mut f_vec = Vec::new();

@@ -2788,7 +2788,7 @@ impl UblkCtrl {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, &Arc<UblkDev>) + Send + Sync + Clone + 'static,
     {
         use std::sync::mpsc;
 
@@ -2851,7 +2851,7 @@ impl UblkCtrl {
     pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<i32, UblkError>
     where
         T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, &Arc<UblkDev>) + Send + Sync + Clone + 'static,
         W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
     {
         let dev = &Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
@@ -2908,6 +2908,7 @@ mod tests {
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     #[test]
     fn test_init_queue_thread_io_flusher() {
@@ -3180,7 +3181,7 @@ mod tests {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(())
         };
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             use crate::BufDescList;
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();

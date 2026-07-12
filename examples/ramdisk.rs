@@ -77,7 +77,7 @@ fn handle_io(q: &UblkQueue, tag: u16, io_buf: &mut [u8], ramdisk_storage: &mut [
     bytes as i32
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Result<(), UblkError> {
+async fn io_task(q: &UblkQueue, tag: u16, ramdisk_storage: &mut [u8]) -> Result<(), UblkError> {
     let buf_size = q.dev.dev_info.max_io_buf_bytes as usize;
 
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
