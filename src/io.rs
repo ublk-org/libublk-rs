@@ -267,11 +267,7 @@ macro_rules! with_queue_ring_mut_internal {
     };
 }
 
-// Make internal macros available within the crate.
-// Only the mut variant needs a `crate::io::` path re-export; the immutable one
-// is reached via textual scope inside this file and via the `#[macro_export]`
-// crate-root path elsewhere.
-pub(crate) use with_queue_ring_mut_internal;
+// Make internal macros available within the crate
 
 /// Access the thread-local queue ring with immutable reference
 ///

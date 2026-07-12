@@ -56,7 +56,6 @@ serde_json = "1.0.79"
 bitmaps = "3.2.0"
 log = "0.4"
 thiserror = "1.0.43"
-smol = "2.0.2"
 tokio = { version = "1", features = ["rt"] }
 slab = "0.4.9"
 derive_setters = "0.1"

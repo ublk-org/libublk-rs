@@ -56,8 +56,6 @@ macro_rules! with_ctrl_ring_mut_internal {
 }
 
 // Make internal macros available within the crate
-pub(crate) use with_ctrl_ring_internal;
-pub(crate) use with_ctrl_ring_mut_internal;
 
 /// Execute a closure with access to the thread-local control ring
 ///
