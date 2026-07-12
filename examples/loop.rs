@@ -275,31 +275,11 @@ async fn lo_io_task(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     }
 }
 
-fn q_a_fn(qid: u16, dev: &Arc<UblkDev>, depth: u16) {
-    let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
-    let exe = exe_rc.clone();
-    let mut f_vec = Vec::new();
-
-    for tag in 0..depth {
-        let q = q_rc.clone();
-
-        f_vec.push(exe.spawn(async move {
-            match lo_io_task(&q, tag).await {
-                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!("lo_io_task failed for tag {}: {}", tag, e),
-            }
-        }));
-    }
-
-    smol::block_on(exe_rc.run(async move {
-        let run_ops = || while exe.try_tick() {};
-        let done = || f_vec.iter().all(|task| task.is_finished());
-
-        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-            log::error!("handle_uring_events failed: {}", e);
-        }
-    }));
+fn q_a_fn(qid: u16, dev: &Arc<UblkDev>) {
+    libublk::UblkRuntime::run_io_tasks(dev, qid, |q, tag| async move {
+        lo_io_task(&q, tag).await
+    })
+    .unwrap();
 }
 
 fn __loop_add(
@@ -348,7 +328,7 @@ fn __loop_add(
     };
 
     if aio {
-        ctrl.run_target(tgt_init, move |qid, dev: &_| q_a_fn(qid, dev, depth), wh)
+        ctrl.run_target(tgt_init, move |qid, dev: &_| q_a_fn(qid, dev), wh)
             .unwrap();
     } else {
         ctrl.run_target(tgt_init, move |qid, dev: &_| q_fn(qid, dev), wh)
