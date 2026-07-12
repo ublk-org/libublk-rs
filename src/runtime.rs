@@ -12,22 +12,12 @@
 //! the control ring fd, so control-command completions wake the parked
 //! thread promptly.
 
-use crate::uring_async::{has_pending_futures, ublk_reap_and_wake};
+use crate::op::{has_pending_ops, ublk_reap_and_wake, CTRL_POLL_DATA};
 use crate::UblkError;
 use io_uring::{opcode, types};
 use std::cell::Cell;
 use std::future::Future;
 use std::os::fd::AsRawFd;
-
-/// user_data of the PollAdd SQE bridging the control ring into the queue
-/// ring.
-///
-/// Contract shared by three sites: [`wait_for_cqe`] arms the PollAdd with
-/// this value, [`reap_queue_ring`] recognizes it to re-arm, and the future
-/// slab ignores it because its key bits (16..48) point at no slab entry.
-/// Any future change to the user_data encoding must keep this value
-/// outside the io-command and future-key spaces.
-const CTRL_POLL_DATA: u64 = u64::MAX;
 
 /// Backstop wait inside the park loop: bounds the damage of any missed
 /// wakeup without ever being the intended wake mechanism (CQEs wake the
@@ -115,7 +105,7 @@ fn park() {
         if reap_queue_ring() + reap_ctrl_ring() > 0 {
             return;
         }
-        if !has_pending_futures() {
+        if !has_pending_ops() {
             // Nothing a CQE could wake: let Tokio park normally so
             // cross-thread wakes (e.g. join handles) still work.
             return;
@@ -137,11 +127,10 @@ fn reap_queue_ring() -> usize {
         let mut ring = ring_cell.borrow_mut();
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
-        let n = ublk_reap_and_wake(&mut ring, |cqe| {
-            let data = cqe.user_data();
-            if data == CTRL_POLL_DATA {
+        let n = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
+            if cqe.user_data() == CTRL_POLL_DATA {
                 CTRL_POLL_ARMED.with(|armed| armed.set(false));
-            } else if crate::io::UblkIOCtx::is_io_command(data) {
+            } else if is_io_cmd {
                 cmd_cnt += 1;
                 if cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
                     aborted = true;
@@ -164,7 +153,7 @@ fn reap_ctrl_ring() -> usize {
         let Some(ring) = guard.as_mut() else {
             return 0;
         };
-        ublk_reap_and_wake(ring, |_| {})
+        ublk_reap_and_wake(ring, |_, _| {})
     })
 }
 

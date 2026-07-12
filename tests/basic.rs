@@ -7,7 +7,6 @@ mod integration {
         UblkDev, UblkIOCtx, UblkQueue,
     };
     use libublk::override_sqe;
-    use libublk::uring_async::ublk_submit_sqe_async;
     use libublk::{
         ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags, UblkIORes,
     };
@@ -401,19 +400,16 @@ mod integration {
 
     #[test]
     fn test_ublk_null_async() {
-        // submit one io_uring Nop via io-uring crate and UringOpFuture, and
-        // user_data has to unique among io tasks, also has to encode tag
-        // info, so please build user_data by UblkIOCtx::build_user_data_async()
+        // submit one io_uring Nop as a target IO: the op future is keyed
+        // by the op slab, no user_data encoding needed
         async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
-            let res = ublk_submit_sqe_async(
-                opcode::Nop::new().build(),
-                libublk::UblkUringData::Target as u64,
-            )
-            .await
-            .unwrap_or(0);
+            let res = match q.ublk_submit_sqe(opcode::Nop::new().build()) {
+                Ok(f) => f.await,
+                Err(_) => 0,
+            };
             bytes + res
         }
 
@@ -523,9 +519,10 @@ mod integration {
             override_sqe!(&mut sqe, len, bytes as u32);
             override_sqe!(&mut sqe, buf_index, tag);
 
-            let res = ublk_submit_sqe_async(sqe, libublk::UblkUringData::Target as u64)
-                .await
-                .unwrap_or(0);
+            let res = match q.ublk_submit_sqe(sqe) {
+                Ok(f) => f.await,
+                Err(_) => 0,
+            };
             res
         }
 

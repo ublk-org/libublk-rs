@@ -66,7 +66,7 @@ pub(crate) struct OpEntry {
 }
 
 std::thread_local! {
-    static OP_SLAB: RefCell<Slab<OpEntry>> = RefCell::new(Slab::new());
+    static OP_SLAB: RefCell<Slab<OpEntry>> = const { RefCell::new(Slab::new()) };
 }
 
 /// Whether any op is still in flight on this thread (park-loop guard).

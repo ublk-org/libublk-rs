@@ -12,11 +12,12 @@ pub mod ctrl;
 pub mod ctrl_async;
 pub mod helpers;
 pub mod io;
+mod op;
+pub mod ops;
 pub mod runtime;
 pub mod sys;
 #[cfg(test)]
 pub mod test_helpers;
-pub mod uring_async;
 
 // Re-export tokio so targets use the same runtime version as the library
 // (tasks are spawned with `tokio::task::spawn_local` inside

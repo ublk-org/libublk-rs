@@ -4,8 +4,6 @@ use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::tokio;
-use libublk::uring_async::ublk_submit_sqe_async;
-use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags};
 use rand::Rng;
 use slab::Slab;
@@ -249,19 +247,15 @@ fn is_write_operation(iod: &libublk::sys::ublksrv_io_desc) -> bool {
         || op_type == libublk::sys::UBLK_IO_OP_ZONE_APPEND
 }
 
-async fn simulate_io_with_delay(tag: u16, io_delay_us: u32) {
+async fn simulate_io_with_delay(_tag: u16, io_delay_us: u32) {
     let mut rng = rand::thread_rng();
     let delay_us = rng.gen_range(0..=io_delay_us);
-    let timeout_spec = io_uring::types::Timespec::new()
-        .sec(0)
-        .nsec(delay_us * 1000);
-    let timeout_sqe = io_uring::opcode::Timeout::new(&timeout_spec as *const _).build();
-    let user_data =
-        UblkUringData::Target as u64 | UblkUringData::NonAsync as u64 | (tag + 1) as u64;
 
-    // Use io-uring timeout instead of smol::timer, which may not wakeup us, even
-    // readble() doesn't work too.
-    let _ = ublk_submit_sqe_async(timeout_sqe, user_data).await;
+    // Use the ring timer instead of a timer thread: the queue ring is
+    // this thread's only wake source.
+    if let Ok(sleep) = libublk::ops::sleep(std::time::Duration::from_micros(delay_us as u64)) {
+        let _ = sleep.await;
+    }
 }
 
 // Batch-aware I/O task function

@@ -1,6 +1,7 @@
 use super::io::{UblkDev, UblkTgt};
-use super::uring_async::UblkUringOpFuture;
 use super::{sys, UblkError, UblkFlags};
+use crate::op::{Op, Resources};
+use crate::ops::RawOp;
 use bitmaps::Bitmap;
 use derive_setters::*;
 use io_uring::{opcode, squeue, types, IoUring};
@@ -1338,20 +1339,14 @@ impl UblkCtrlInner {
             .user_data(token)
     }
 
-    fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> UblkUringOpFuture {
+    fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<RawOp, UblkError> {
         let fd = self.file.as_raw_fd();
         let dev_id = self.dev_info.dev_id;
-        let f = UblkUringOpFuture::new(0);
-        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
-
-        unsafe {
-            with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
-                if let Err(e) = ring.submission().push(&sqe) {
-                    eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
-                }
-            })
-        }
-        f
+        let op = Op::submit_ctrl(
+            |token| self.ublk_ctrl_prep_cmd(fd, dev_id, data, token),
+            Resources::None,
+        )?;
+        Ok(RawOp::new(op))
     }
 
     fn ublk_submit_cmd(
@@ -1448,7 +1443,7 @@ impl UblkCtrlInner {
 
         for _ in 0..2 {
             let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
-            res = self.ublk_submit_cmd_async(&new_data).await;
+            res = self.ublk_submit_cmd_async(&new_data)?.await;
             new_data.unprep_un_privileged_dev_path(self, old_buf);
 
             trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
