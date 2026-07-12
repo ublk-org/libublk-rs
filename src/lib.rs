@@ -37,14 +37,13 @@ pub use io::{
 // Re-export control ring initialization and access
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
 
-/// Ublk io_uring user_data constants
+/// Ublk io_uring user_data constants, used by the legacy sync event
+/// loop's tag-encoded `user_data` (async ops are slab-keyed and carry no
+/// bit-encoded metadata)
 #[repr(u64)]
 pub enum UblkUringData {
     /// Target IO bit flag - indicates user_data is from target IO
     Target = 1_u64 << 63,
-    /// Non-async IO bit flag - indicates it is from one non-async IO in
-    /// async/.await code path, should only be used in async/.await
-    NonAsync = 1_u64 << 62,
 }
 
 bitflags! {

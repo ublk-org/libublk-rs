@@ -247,7 +247,7 @@ fn is_write_operation(iod: &libublk::sys::ublksrv_io_desc) -> bool {
         || op_type == libublk::sys::UBLK_IO_OP_ZONE_APPEND
 }
 
-async fn simulate_io_with_delay(_tag: u16, io_delay_us: u32) {
+async fn simulate_io_with_delay(io_delay_us: u32) {
     let mut rng = rand::thread_rng();
     let delay_us = rng.gen_range(0..=io_delay_us);
 
@@ -291,7 +291,7 @@ async fn batch_io_task(
 
         // Apply random delay to simulate real workload
         if io_delay_us > 0 {
-            simulate_io_with_delay(tag, io_delay_us).await;
+            simulate_io_with_delay(io_delay_us).await;
         }
 
         // Perform I/O operation

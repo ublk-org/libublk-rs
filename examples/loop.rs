@@ -172,7 +172,9 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_slice: &mut [u8]) ->
         // for kernel interface compatibility. The slice ensures we have valid bounds.
         let buf_addr = io_slice.as_mut_ptr();
         let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
-        let res = match q.ublk_submit_sqe(sqe) {
+        // SAFETY: the SQE references this tag's queue-slot buffer, which
+        // outlives the queue.
+        let res = match unsafe { q.ublk_submit_sqe(sqe) } {
             Ok(f) => f.await,
             Err(_) => -libc::EIO,
         };

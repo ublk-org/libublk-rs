@@ -12,12 +12,21 @@
 //! the control ring fd, so control-command completions wake the parked
 //! thread promptly.
 
-use crate::op::{has_pending_ops, ublk_reap_and_wake, CTRL_POLL_DATA};
+use crate::op::{has_pending_ops, ublk_reap_and_wake, RESERVED_USER_DATA_MIN};
 use crate::UblkError;
 use io_uring::{opcode, types};
 use std::cell::Cell;
 use std::future::Future;
 use std::os::fd::AsRawFd;
+
+/// user_data of the PollAdd SQE bridging the control ring into the queue
+/// ring: [`wait_for_cqe`] arms it, [`reap_queue_ring`] recognizes it to
+/// re-arm. It lies in the op slab's reserved range, so the reaper passes
+/// its CQE through without a slab lookup.
+const CTRL_POLL_DATA: u64 = u64::MAX;
+// Guards future edits of either constant.
+#[allow(clippy::absurd_extreme_comparisons)]
+const _: () = assert!(CTRL_POLL_DATA >= RESERVED_USER_DATA_MIN);
 
 /// Backstop wait inside the park loop: bounds the damage of any missed
 /// wakeup without ever being the intended wake mechanism (CQEs wake the

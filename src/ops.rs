@@ -92,38 +92,39 @@ impl Future for RawOp {
     }
 }
 
+/// Submit a resource-free SQE; its `user_data` is overwritten with the
+/// op key.
+fn submit_raw(sqe: squeue::Entry) -> Result<RawOp, UblkError> {
+    let op = Op::submit(|key| sqe.user_data(key), Resources::None)?;
+    Ok(RawOp::new(op))
+}
+
+/// Submit an SQE referencing `buf`, keeping the buffer alive in the op
+/// until the CQE hands it back; `user_data` is overwritten with the op
+/// key.
+fn submit_buf(sqe: squeue::Entry, buf: Box<[u8]>) -> Result<BufOp, UblkError> {
+    let op = Op::submit(|key| sqe.user_data(key), Resources::Buffer(buf))?;
+    Ok(BufOp { op })
+}
+
 /// Read from `file` at `offset` into an owned buffer.
 pub fn read_at(file: TgtFd, mut buf: Box<[u8]>, offset: u64) -> Result<BufOp, UblkError> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_mut_ptr();
-    let op = Op::submit(
-        |key| {
-            with_tgt_fd!(file, |fd| opcode::Read::new(fd, ptr, len)
-                .offset(offset)
-                .build()
-                .user_data(key))
-        },
-        Resources::Buffer(buf),
-        false,
-    )?;
-    Ok(BufOp { op })
+    let sqe = with_tgt_fd!(file, |fd| opcode::Read::new(fd, ptr, len)
+        .offset(offset)
+        .build());
+    submit_buf(sqe, buf)
 }
 
 /// Write `buf` to `file` at `offset`.
 pub fn write_at(file: TgtFd, buf: Box<[u8]>, offset: u64) -> Result<BufOp, UblkError> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_ptr();
-    let op = Op::submit(
-        |key| {
-            with_tgt_fd!(file, |fd| opcode::Write::new(fd, ptr, len)
-                .offset(offset)
-                .build()
-                .user_data(key))
-        },
-        Resources::Buffer(buf),
-        false,
-    )?;
-    Ok(BufOp { op })
+    let sqe = with_tgt_fd!(file, |fd| opcode::Write::new(fd, ptr, len)
+        .offset(offset)
+        .build());
+    submit_buf(sqe, buf)
 }
 
 /// Positional read into caller-managed memory (queue-slot buffers).
@@ -140,17 +141,9 @@ pub unsafe fn read_at_raw(
     len: u32,
     offset: u64,
 ) -> Result<RawOp, UblkError> {
-    let op = Op::submit(
-        |key| {
-            with_tgt_fd!(file, |fd| opcode::Read::new(fd, ptr, len)
-                .offset(offset)
-                .build()
-                .user_data(key))
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(with_tgt_fd!(file, |fd| opcode::Read::new(fd, ptr, len)
+        .offset(offset)
+        .build()))
 }
 
 /// Positional write from caller-managed memory.
@@ -164,17 +157,9 @@ pub unsafe fn write_at_raw(
     len: u32,
     offset: u64,
 ) -> Result<RawOp, UblkError> {
-    let op = Op::submit(
-        |key| {
-            with_tgt_fd!(file, |fd| opcode::Write::new(fd, ptr, len)
-                .offset(offset)
-                .build()
-                .user_data(key))
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(with_tgt_fd!(file, |fd| opcode::Write::new(fd, ptr, len)
+        .offset(offset)
+        .build()))
 }
 
 /// `fsync(2)` / `fdatasync(2)` via the ring.
@@ -184,17 +169,9 @@ pub fn fsync(file: TgtFd, datasync: bool) -> Result<RawOp, UblkError> {
     } else {
         types::FsyncFlags::empty()
     };
-    let op = Op::submit(
-        |key| {
-            with_tgt_fd!(file, |fd| opcode::Fsync::new(fd)
-                .flags(flags)
-                .build()
-                .user_data(key))
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(with_tgt_fd!(file, |fd| opcode::Fsync::new(fd)
+        .flags(flags)
+        .build()))
 }
 
 /// `sync_file_range(2)` via the ring (`flags` is the `SYNC_FILE_RANGE_*`
@@ -205,47 +182,31 @@ pub fn sync_file_range(
     len: u32,
     flags: u32,
 ) -> Result<RawOp, UblkError> {
-    let op = Op::submit(
-        |key| {
-            with_tgt_fd!(file, |fd| opcode::SyncFileRange::new(fd, len)
-                .offset(offset)
-                .flags(flags)
-                .build()
-                .user_data(key))
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(with_tgt_fd!(file, |fd| opcode::SyncFileRange::new(fd, len)
+        .offset(offset)
+        .flags(flags)
+        .build()))
 }
 
 /// `fallocate(2)` via the ring (`FALLOC_FL_*` modes: punch-hole,
 /// zero-range, ... — the file target's discard/write-zeroes primitive).
 pub fn fallocate(file: TgtFd, mode: i32, offset: u64, len: u64) -> Result<RawOp, UblkError> {
-    let op = Op::submit(
-        |key| {
-            with_tgt_fd!(file, |fd| opcode::Fallocate::new(fd, len)
-                .offset(offset)
-                .mode(mode)
-                .build()
-                .user_data(key))
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(with_tgt_fd!(file, |fd| opcode::Fallocate::new(fd, len)
+        .offset(offset)
+        .mode(mode)
+        .build()))
 }
 
 /// Future of a ring timer.
 pub struct Sleep {
-    op: Op,
+    op: RawOp,
 }
 
 impl Future for Sleep {
     type Output = Result<(), UblkError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (result, _) = ready!(self.op.poll_single(cx));
+        let result = ready!(Pin::new(&mut self.op).poll(cx));
         match result {
             // -ETIME is the normal "timer fired" completion.
             0 => Poll::Ready(Ok(())),
@@ -267,37 +228,27 @@ pub fn sleep(duration: Duration) -> Result<Sleep, UblkError> {
     let op = Op::submit(
         |key| opcode::Timeout::new(timespec_ptr).build().user_data(key),
         Resources::Timespec(timespec),
-        false,
     )?;
-    Ok(Sleep { op })
+    Ok(Sleep { op: RawOp::new(op) })
 }
 
 /// Wait for `fd` to become ready for the given `poll(2)` event mask
 /// (e.g. `libc::POLLIN`) via one-shot `IORING_OP_POLL_ADD`; completes
 /// with the returned events mask. Re-issue to wait again.
 pub fn poll_add(fd: RawFd, events: u32) -> Result<RawOp, UblkError> {
-    let op = Op::submit(
-        |key| {
-            opcode::PollAdd::new(types::Fd(fd), events)
-                .build()
-                .user_data(key)
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(opcode::PollAdd::new(types::Fd(fd), events).build())
 }
 
 /// Future resolving to one accepted connection.
 pub struct Accept {
-    op: Op,
+    op: RawOp,
 }
 
 impl Future for Accept {
     type Output = Result<OwnedFd, UblkError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (result, _) = ready!(self.op.poll_single(cx));
+        let result = ready!(Pin::new(&mut self.op).poll(cx));
         if result < 0 {
             return Poll::Ready(Err(UblkError::OtherError(result)));
         }
@@ -308,14 +259,8 @@ impl Future for Accept {
 
 /// Accept one connection on a listening socket.
 pub fn accept(fd: RawFd) -> Result<Accept, UblkError> {
-    let op = Op::submit(
-        |key| {
-            opcode::Accept::new(types::Fd(fd), std::ptr::null_mut(), std::ptr::null_mut())
-                .build()
-                .user_data(key)
-        },
-        Resources::None,
-        false,
+    let op = submit_raw(
+        opcode::Accept::new(types::Fd(fd), std::ptr::null_mut(), std::ptr::null_mut()).build(),
     )?;
     Ok(Accept { op })
 }
@@ -324,32 +269,14 @@ pub fn accept(fd: RawFd) -> Result<Accept, UblkError> {
 pub fn recv(fd: RawFd, mut buf: Box<[u8]>) -> Result<BufOp, UblkError> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_mut_ptr();
-    let op = Op::submit(
-        |key| {
-            opcode::Recv::new(types::Fd(fd), ptr, len)
-                .build()
-                .user_data(key)
-        },
-        Resources::Buffer(buf),
-        false,
-    )?;
-    Ok(BufOp { op })
+    submit_buf(opcode::Recv::new(types::Fd(fd), ptr, len).build(), buf)
 }
 
 /// Send an owned buffer on a socket.
 pub fn send(fd: RawFd, buf: Box<[u8]>) -> Result<BufOp, UblkError> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_ptr();
-    let op = Op::submit(
-        |key| {
-            opcode::Send::new(types::Fd(fd), ptr, len)
-                .build()
-                .user_data(key)
-        },
-        Resources::Buffer(buf),
-        false,
-    )?;
-    Ok(BufOp { op })
+    submit_buf(opcode::Send::new(types::Fd(fd), ptr, len).build(), buf)
 }
 
 /// Receive into caller-managed memory (queue-slot buffers).
@@ -358,16 +285,7 @@ pub fn send(fd: RawFd, buf: Box<[u8]>) -> Result<BufOp, UblkError> {
 ///
 /// Same contract as [`read_at_raw`].
 pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> Result<RawOp, UblkError> {
-    let op = Op::submit(
-        |key| {
-            opcode::Recv::new(types::Fd(fd), ptr, len)
-                .build()
-                .user_data(key)
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(opcode::Recv::new(types::Fd(fd), ptr, len).build())
 }
 
 /// Send from caller-managed memory.
@@ -376,16 +294,7 @@ pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> Result<RawOp, UblkE
 ///
 /// Same contract as [`read_at_raw`] (reads the buffer only).
 pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> Result<RawOp, UblkError> {
-    let op = Op::submit(
-        |key| {
-            opcode::Send::new(types::Fd(fd), ptr, len)
-                .build()
-                .user_data(key)
-        },
-        Resources::None,
-        false,
-    )?;
-    Ok(RawOp { op })
+    submit_raw(opcode::Send::new(types::Fd(fd), ptr, len).build())
 }
 
 /// Submit an arbitrary SQE on the queue ring — the escape hatch for
@@ -397,8 +306,7 @@ pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> Result<RawOp, Ubl
 /// Every pointer the SQE carries must remain valid until this op's CQE
 /// has been reaped — same contract as [`read_at_raw`].
 pub unsafe fn submit_sqe(sqe: squeue::Entry) -> Result<RawOp, UblkError> {
-    let op = Op::submit(|key| sqe.user_data(key), Resources::None, false)?;
-    Ok(RawOp { op })
+    submit_raw(sqe)
 }
 
 #[cfg(test)]

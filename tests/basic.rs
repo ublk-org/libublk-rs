@@ -406,7 +406,8 @@ mod integration {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
-            let res = match q.ublk_submit_sqe(opcode::Nop::new().build()) {
+            // SAFETY: NOP references no memory.
+            let res = match unsafe { q.ublk_submit_sqe(opcode::Nop::new().build()) } {
                 Ok(f) => f.await,
                 Err(_) => 0,
             };
@@ -441,9 +442,6 @@ mod integration {
             done: u64,
         }
 
-        // submit one io_uring Nop via io-uring crate and UringOpFuture, and
-        // user_data has to unique among io tasks, also has to encode tag
-        // info, so please build user_data by UblkIOCtx::build_user_data_async()
         let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
         let depth = 64_u16;
         let ctrl = UblkCtrlBuilder::default()
@@ -519,7 +517,9 @@ mod integration {
             override_sqe!(&mut sqe, len, bytes as u32);
             override_sqe!(&mut sqe, buf_index, tag);
 
-            let res = match q.ublk_submit_sqe(sqe) {
+            // SAFETY: the NOP references no caller memory (the fixed
+            // buffer is registered with the ring).
+            let res = match unsafe { q.ublk_submit_sqe(sqe) } {
                 Ok(f) => f.await,
                 Err(_) => 0,
             };

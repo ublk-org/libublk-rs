@@ -1739,7 +1739,8 @@ impl UblkQueue {
         sqe_addr: Option<u64>,
         result: i32,
     ) -> Result<RawOp, UblkError> {
-        if self.state.borrow().is_stopping() {
+        let mut state = self.state.borrow_mut();
+        if state.is_stopping() {
             return Err(UblkError::QueueIsDown);
         }
 
@@ -1752,12 +1753,11 @@ impl UblkQueue {
             buf_addr,
         );
 
-        let op = Op::submit(
+        let op = Op::submit_io_cmd(
             |key| self.build_io_cmd_sqe(tag, cmd_op, buf_addr, sqe_addr, result, key),
             Resources::None,
-            true,
         )?;
-        self.state.borrow_mut().inc_cmd_inflight();
+        state.inc_cmd_inflight();
         Ok(RawOp::new(op))
     }
 
@@ -1974,14 +1974,18 @@ impl UblkQueue {
 
     /// Submit one target-IO SQE on the queue ring, returning a future of
     /// its CQE result. The entry's `user_data` is overwritten with the op
-    /// key. Any memory the SQE references must stay valid until the CQE
-    /// is reaped — queue-slot buffers satisfy this by construction; see
-    /// [`crate::ops::submit_sqe`] for the full contract.
-    pub fn ublk_submit_sqe(
+    /// key.
+    ///
+    /// # Safety
+    ///
+    /// Any memory the SQE references must stay valid until the CQE is
+    /// reaped — queue-slot buffers satisfy this by construction; see
+    /// [`crate::ops::submit_sqe`] (which this delegates to) for the full
+    /// contract.
+    pub unsafe fn ublk_submit_sqe(
         &self,
         sqe: io_uring::squeue::Entry,
     ) -> Result<RawOp, UblkError> {
-        // SAFETY: contract documented above and upheld by the caller.
         unsafe { crate::ops::submit_sqe(sqe) }
     }
 
@@ -2018,7 +2022,6 @@ impl UblkQueue {
         let o = Op::submit(
             |key| self.build_io_cmd_sqe(tag, op, buf_index as u64, None, 0, key),
             Resources::None,
-            false,
         )?;
         Ok(RawOp::new(o))
     }
@@ -2700,6 +2703,11 @@ impl UblkQueue {
     /// Returns how many CQEs handled in this batch.
     ///
     /// This API is useful if user needs target specific batch handling.
+    ///
+    /// This is the legacy sync event loop over tag-encoded `user_data`;
+    /// it must not be mixed with slab-keyed async ops (`crate::ops`,
+    /// `UblkRuntime`) on the same queue thread — see the keyspace
+    /// contract in the `op` module.
     pub fn flush_and_wake_io_tasks<F>(
         &self,
         mut wake_handler: F,
