@@ -470,37 +470,14 @@ mod integration {
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
         let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
-            let exe = exe_rc.clone();
-            let mut f_vec = Vec::new();
-
             // `q_fn` closure implements Clone() Trait, so the captured
             // `dev_data` is cloned to `q_fn` context.
-            let _dev_data = Rc::new(dev_data);
-
-            for tag in 0..depth {
-                let q = q_rc.clone();
-                let __dev_data = _dev_data.clone();
-
-                f_vec.push(exe.spawn(async move {
-                    match test_io_task(&q, tag, &__dev_data).await {
-                        Err(UblkError::QueueIsDown) | Ok(_) => {}
-                        Err(e) => log::error!("test_io_task failed for tag {}: {}", tag, e),
-                    }
-                }));
-            }
-
-            smol::block_on(exe_rc.run(async move {
-                let run_ops = || while exe.try_tick() {};
-                let done = || f_vec.iter().all(|task| task.is_finished());
-
-                if let Err(e) =
-                    libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await
-                {
-                    log::error!("handle_uring_events failed: {}", e);
-                }
-            }));
+            let dev_data = dev_data.clone();
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+                let dev_data = dev_data.clone();
+                async move { test_io_task(&q, tag, &dev_data).await }
+            })
+            .unwrap();
         };
 
         // kick off our targets
@@ -606,34 +583,10 @@ mod integration {
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
         let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
-            let exe = exe_rc.clone();
-            let mut f_vec = Vec::new();
-
-            for tag in 0..depth {
-                let q = q_rc.clone();
-
-                f_vec.push(exe.spawn(async move {
-                    match test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await {
-                        Err(UblkError::QueueIsDown) | Ok(_) => {}
-                        Err(e) => {
-                            log::error!("test_auto_reg_io_task failed for tag {}: {}", tag, e)
-                        }
-                    }
-                }));
-            }
-
-            smol::block_on(exe_rc.run(async move {
-                let run_ops = || while exe.try_tick() {};
-                let done = || f_vec.iter().all(|task| task.is_finished());
-
-                if let Err(e) =
-                    libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await
-                {
-                    log::error!("handle_uring_events failed: {}", e);
-                }
-            }));
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| async move {
+                test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await
+            })
+            .unwrap();
         };
 
         // kick off our targets
@@ -787,36 +740,12 @@ mod integration {
         };
 
         let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
-            let exe = exe_rc.clone();
-            let mut f_vec = Vec::new();
-
             let mlock_enabled = dev.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
 
-            for tag in 0..depth {
-                let q = q_rc.clone();
-
-                f_vec.push(exe.spawn(async move {
-                    match test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await {
-                        Err(UblkError::QueueIsDown) | Ok(_) => {
-                            log::error!("test_ramdisk_io_task done: {}", tag);
-                        }
-                        Err(e) => log::error!("test_ramdisk_io_task failed for tag {}: {}", tag, e),
-                    }
-                }));
-            }
-
-            smol::block_on(exe_rc.run(async move {
-                let run_ops = || while exe.try_tick() {};
-                let done = || f_vec.iter().all(|task| task.is_finished());
-
-                if let Err(e) =
-                    libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await
-                {
-                    log::error!("handle_uring_events failed: {}", e);
-                }
-            }));
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| async move {
+                test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await
+            })
+            .unwrap();
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
