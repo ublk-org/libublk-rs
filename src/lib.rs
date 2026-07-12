@@ -12,10 +12,18 @@ pub mod ctrl;
 pub mod ctrl_async;
 pub mod helpers;
 pub mod io;
+pub mod runtime;
 pub mod sys;
 #[cfg(test)]
 pub mod test_helpers;
 pub mod uring_async;
+
+// Re-export tokio so targets use the same runtime version as the library
+// (tasks are spawned with `tokio::task::spawn_local` inside
+// `UblkRuntime::block_on`).
+pub use tokio;
+
+pub use runtime::UblkRuntime;
 
 // Re-export important types for unified buffer management
 #[allow(deprecated)]

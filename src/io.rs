@@ -194,6 +194,7 @@ use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 
 // Keep the batch transport as a child of `io` so it can share the private
@@ -210,6 +211,12 @@ std::thread_local! {
         OnceCell::new();
     static DEFERRED_QUEUE_CQES: RefCell<VecDeque<cqueue::Entry>> =
         const { RefCell::new(VecDeque::new()) };
+
+    /// State of the queue owned by this thread, registered by
+    /// `UblkQueue::new()` so the runtime park hook can account completed
+    /// io commands without holding a `&UblkQueue`.
+    pub(crate) static QUEUE_STATE: RefCell<Option<Rc<RefCell<UblkQueueState>>>> =
+        const { RefCell::new(None) };
 }
 
 pub(crate) fn defer_queue_cqe(cqe: cqueue::Entry) {
@@ -218,6 +225,17 @@ pub(crate) fn defer_queue_cqe(cqe: cqueue::Entry) {
 
 pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
     DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().pop_front())
+}
+
+/// Account `cnt` completed io commands against the thread's registered
+/// queue state; `aborted` marks the queue as stopping. Called from the
+/// runtime park hook when reaping io-command CQEs.
+pub(crate) fn update_queue_state(cnt: u32, aborted: bool) {
+    QUEUE_STATE.with(|cell| {
+        if let Some(state) = cell.borrow().as_ref() {
+            state.borrow_mut().account_io_cmds(cnt, aborted);
+        }
+    })
 }
 
 // Internal macro versions for backwards compatibility within the crate
@@ -1140,6 +1158,16 @@ impl UblkQueueState {
         self.state |= Self::UBLK_QUEUE_STOPPING;
     }
 
+    /// Account `cnt` completed io commands; `aborted` marks the queue as
+    /// stopping. The single accounting sink shared by the sync event loop
+    /// and the runtime park hook.
+    pub(crate) fn account_io_cmds(&mut self, cnt: u32, aborted: bool) {
+        self.sub_cmd_inflight(cnt);
+        if aborted {
+            self.mark_stopping();
+        }
+    }
+
     fn set_idle(&mut self, val: bool) {
         if val {
             self.state |= Self::UBLK_QUEUE_IDLE;
@@ -1175,7 +1203,7 @@ pub struct UblkQueue {
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
-    pub(crate) state: RefCell<UblkQueueState>,
+    pub(crate) state: Rc<RefCell<UblkQueueState>>,
     /// Semaphore to coordinate buffer registrations
     /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
     buf_reg_semaphore: Semaphore,
@@ -1193,6 +1221,13 @@ impl Drop for UblkQueue {
     fn drop(&mut self) {
         let dev = &self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
+
+        QUEUE_STATE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            if guard.as_ref().is_some_and(|s| Rc::ptr_eq(s, &self.state)) {
+                guard.take();
+            }
+        });
 
         if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
             .submitter()
@@ -1333,14 +1368,16 @@ impl UblkQueue {
             io_cmd_buf: io_cmd_buf as u64,
             dev: Arc::clone(dev),
             dev_flags: dev.dev_info.flags,
-            state: RefCell::new(UblkQueueState {
+            state: Rc::new(RefCell::new(UblkQueueState {
                 cmd_inflight: 0,
                 state: 0,
-            }),
+            })),
             bufs: RefCell::new(bufs),
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
         };
+
+        QUEUE_STATE.with(|cell| cell.borrow_mut().replace(Rc::clone(&q.state)));
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
@@ -2447,10 +2484,7 @@ impl UblkQueue {
             aborted,
             state,
         );
-        state.sub_cmd_inflight(cnt);
-        if aborted {
-            state.mark_stopping();
-        }
+        state.account_io_cmds(cnt, aborted);
     }
 
     #[inline(always)]

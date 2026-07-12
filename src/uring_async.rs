@@ -90,9 +90,40 @@ impl Future for UblkUringOpFuture {
     }
 }
 
+/// Whether any uring op future is still pending on this thread.
+pub(crate) fn has_pending_futures() -> bool {
+    MY_SLAB.with(|refcell| !refcell.borrow().is_empty())
+}
+
+/// Drain `ring`'s completion queue, waking the future behind each CQE.
+/// `per_cqe` runs first for every CQE (classification, bookkeeping).
+/// Returns the number of CQEs drained. The future slab is borrowed once
+/// for the whole batch rather than per CQE.
+pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> usize
+where
+    S: squeue::EntryMarker,
+    F: FnMut(&cqueue::Entry),
+{
+    MY_SLAB.with(|refcell| {
+        let mut map = refcell.borrow_mut();
+        let mut n = 0;
+        while let Some(cqe) = ring.completion().next() {
+            per_cqe(&cqe);
+            let key = UblkUringOpFuture::get_key(cqe.user_data());
+            if let Some(fd) = map.get_mut(key) {
+                fd.result = Some(cqe.result());
+                if let Some(w) = &fd.waker {
+                    w.wake_by_ref();
+                }
+            }
+            n += 1;
+        }
+        n
+    })
+}
+
 /// Wakeup the pending task, which will be marked as runnable
-/// by smol, and the task's future poll() will be run by smol
-/// executor's try_tick()
+/// by the executor, and the task's future poll() will be run
 #[inline]
 pub fn ublk_wake_task(data: u64, cqe: &cqueue::Entry) {
     MY_SLAB.with(|refcell| {
@@ -659,130 +690,81 @@ pub fn ublk_wait_and_handle_ios(exe: &smol::LocalExecutor, q: &UblkQueue) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::ublk_join_io_tasks;
+    use crate::runtime::UblkRuntime;
     use io_uring::opcode;
     use std::time::{Duration, Instant};
+
+    fn test_runtime() -> Result<UblkRuntime, UblkError> {
+        crate::io::init_task_ring_default(64, 64)?;
+        UblkRuntime::new()
+    }
 
     /// Test ublk_submit_sqe_async with NOP operation
     #[test]
     fn test_ublk_submit_sqe_async_nop() -> Result<(), UblkError> {
-        let exe = smol::LocalExecutor::new();
-        let mut tasks = Vec::new();
-
-        // Create a NOP operation
-        let task = exe.spawn(async {
-            let nop_sqe = opcode::Nop::new().build().user_data(12345);
-
-            match ublk_submit_sqe_async(nop_sqe, 12345).await {
-                Ok(result) => {
-                    log::debug!("NOP operation completed with result: {}", result);
-                    assert_eq!(result, 0); // NOP should return 0
-                }
-                Err(e) => {
-                    panic!("NOP operation failed: {}", e);
-                }
-            }
-        });
-
-        tasks.push(task);
-        ublk_join_io_tasks(&exe, tasks)
+        let rt = test_runtime()?;
+        rt.block_on(async {
+            let nop_sqe = opcode::Nop::new().build();
+            let result = ublk_submit_sqe_async(nop_sqe, 12345).await?;
+            assert_eq!(result, 0); // NOP should return 0
+            Ok(())
+        })
     }
 
     /// Test ublk_submit_sqe_async with timeout operation
     #[test]
     fn test_ublk_submit_sqe_async_timeout() -> Result<(), UblkError> {
-        let exe = smol::LocalExecutor::new();
-        let mut tasks = Vec::new();
-
-        // Create a timeout operation (100ms)
-        let task = exe.spawn(async {
+        let rt = test_runtime()?;
+        rt.block_on(async {
             let timeout_spec = io_uring::types::Timespec::new().sec(0).nsec(100_000_000); // 100ms
-
-            let timeout_sqe = opcode::Timeout::new(&timeout_spec as *const _)
-                .build()
-                .user_data(54321);
+            let timeout_sqe = opcode::Timeout::new(&timeout_spec as *const _).build();
 
             let start = Instant::now();
+            let result = ublk_submit_sqe_async(timeout_sqe, 54321).await?;
+            let elapsed = start.elapsed();
 
-            match ublk_submit_sqe_async(timeout_sqe, 54321).await {
-                Ok(result) => {
-                    let elapsed = start.elapsed();
-                    log::debug!(
-                        "Timeout operation completed with result: {} after {:?}",
-                        result,
-                        elapsed
-                    );
-
-                    // Timeout should complete in approximately 100ms
-                    assert!(elapsed >= Duration::from_millis(90));
-                    assert!(elapsed <= Duration::from_millis(200));
-                    assert_eq!(result, -62); // -ETIME
-                }
-                Err(e) => {
-                    panic!("Timeout operation failed: {}", e);
-                }
-            }
-        });
-
-        tasks.push(task);
-        ublk_join_io_tasks(&exe, tasks)
+            // Timeout should complete in approximately 100ms
+            assert!(elapsed >= Duration::from_millis(90));
+            assert!(elapsed <= Duration::from_millis(200));
+            assert_eq!(result, -62); // -ETIME
+            Ok(())
+        })
     }
 
     /// Test ublk_submit_sqe_async with multiple concurrent operations
     #[test]
     fn test_ublk_submit_sqe_async_concurrent() -> Result<(), UblkError> {
-        let exe = smol::LocalExecutor::new();
-        let mut tasks = Vec::new();
-
-        // Create multiple concurrent NOP operations
-        for i in 0..5 {
-            let task = exe.spawn(async move {
-                let user_data = 1000 + i;
-                let nop_sqe = opcode::Nop::new().build().user_data(user_data);
-
-                match ublk_submit_sqe_async(nop_sqe, user_data).await {
-                    Ok(result) => {
-                        log::debug!("Concurrent NOP {} completed with result: {}", i, result);
+        let rt = test_runtime()?;
+        rt.block_on(async {
+            let tasks: Vec<_> = (0..5)
+                .map(|i| {
+                    tokio::task::spawn_local(async move {
+                        let user_data = 1000 + i;
+                        let nop_sqe = opcode::Nop::new().build();
+                        let result = ublk_submit_sqe_async(nop_sqe, user_data).await.unwrap();
                         assert_eq!(result, 0);
-                    }
-                    Err(e) => {
-                        panic!("Concurrent NOP {} failed: {}", i, e);
-                    }
-                }
-            });
-            tasks.push(task);
-        }
-
-        ublk_join_io_tasks(&exe, tasks)
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
+        Ok(())
     }
 
     /// Test ublk_submit_sqe_async error handling with invalid operation
     #[test]
     fn test_ublk_submit_sqe_async_error_handling() -> Result<(), UblkError> {
-        let exe = smol::LocalExecutor::new();
-        let mut tasks = Vec::new();
-
-        // Create an operation that should fail (invalid file descriptor)
-        let task = exe.spawn(async {
+        let rt = test_runtime()?;
+        rt.block_on(async {
             use io_uring::types::Fd;
 
-            let invalid_fd = Fd(-1); // Invalid file descriptor
-            let close_sqe = opcode::Close::new(invalid_fd).build().user_data(99999);
-
-            match ublk_submit_sqe_async(close_sqe, 99999).await {
-                Ok(result) => {
-                    log::debug!("Close operation completed with result: {}", result);
-                    // Close with invalid fd should return -EBADF (-9)
-                    assert_eq!(result, -9);
-                }
-                Err(e) => {
-                    // This is also acceptable behavior
-                    log::debug!("Close operation failed as expected: {}", e);
-                }
-            }
-        });
-
-        tasks.push(task);
-        ublk_join_io_tasks(&exe, tasks)
+            let close_sqe = opcode::Close::new(Fd(-1)).build();
+            let result = ublk_submit_sqe_async(close_sqe, 9999).await?;
+            // Close with invalid fd should return -EBADF (-9)
+            assert_eq!(result, -9);
+            Ok(())
+        })
     }
 }
