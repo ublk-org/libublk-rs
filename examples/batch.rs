@@ -2,19 +2,16 @@ use async_lock::Mutex;
 use bitflags::bitflags;
 use clap::{Arg, ArgAction, Command};
 use libublk::helpers::IoBuf;
-use libublk::io::{with_task_io_ring, with_task_io_ring_mut, UblkDev, UblkQueue};
-use libublk::uring_async::{
-    ublk_reap_io_events_with_update_queue, ublk_submit_sqe_async, ublk_wake_task,
-};
+use libublk::io::{UblkDev, UblkQueue};
+use libublk::tokio;
+use libublk::uring_async::ublk_submit_sqe_async;
 use libublk::UblkUringData;
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags};
 use rand::Rng;
 use slab::Slab;
-use std::sync::Arc;
-use std::cell::{Cell, RefCell};
-use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 bitflags! {
     #[derive(Default)]
@@ -22,13 +19,7 @@ bitflags! {
         const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00000100;
         const ZERO_COPY = 0b00001000;
-        const USE_READABLE = 0b010000;
     }
-}
-
-// Thread-local storage for current batch context ID
-thread_local! {
-    static BATCH_CONTEXT: Cell<i32> = Cell::new(-1);
 }
 
 // Batch coordination infrastructure - OPTIMIZED: No more semaphore!
@@ -104,9 +95,17 @@ impl QueueBatchState {
         }
     }
 
-    // Called from reap_event when write I/O command is detected
+    // Called by a write task when its io command arrives
     fn add_write_tag(&self, tag: u16) {
         self.pending_write_tags.borrow_mut().push(tag);
+    }
+
+    // Coordinator (if any) whose batch still contains `tag`
+    fn find_coordinator_with_tag(&self, tag: u16) -> Option<u32> {
+        self.coordinators
+            .iter()
+            .find(|(_, c)| c.current_write_batch.contains(&tag))
+            .map(|(id, _)| id as u32)
     }
 
     fn create_coordinator(&mut self) -> Option<u32> {
@@ -151,28 +150,6 @@ impl QueueBatchState {
     }
 }
 
-fn run_batch_coordination(
-    exe: &smol::LocalExecutor<'_>,
-    batch_state: &Rc<RefCell<QueueBatchState>>,
-) {
-    let queue_id = batch_state.borrow().queue_id;
-    // Create coordinator if we have pending write operations
-    if let Some(context_id) = batch_state.borrow_mut().create_coordinator() {
-        BATCH_CONTEXT.with(|c| c.set(context_id as i32));
-
-        log::info!(
-            "Queue {}: Processing write batch (context_id={})",
-            queue_id,
-            context_id
-        );
-    }
-
-    // Now the context batch coordinator is prepared, run io tasks
-    while exe.try_tick() {}
-
-    BATCH_CONTEXT.with(|c| c.set(-1));
-}
-
 async fn handle_task_batch_coordination(
     tag: u16,
     batch_state: &Rc<RefCell<QueueBatchState>>,
@@ -188,36 +165,40 @@ async fn handle_task_batch_coordination(
         return Ok(None);
     }
 
-    // Get active coordinator context
-    let coordinator_opt = BATCH_CONTEXT.with(|c| {
-        let context_id = c.get();
-        if context_id >= 0 {
-            Some(context_id as u32)
-        } else {
-            None
+    // Register this write, then yield once so every write task woken in
+    // the same scheduling round registers too; the first task to resume
+    // groups all registered tags into one coordinator. Grouping is
+    // best-effort: if the scheduler resumes a yielded task before all
+    // woken write tasks have registered, the batch merely splits —
+    // correctness is unaffected, only the batch size.
+    batch_state.borrow().add_write_tag(tag);
+    tokio::task::yield_now().await;
+
+    let context_id = {
+        let mut state = batch_state.borrow_mut();
+        match state.find_coordinator_with_tag(tag) {
+            Some(context_id) => context_id,
+            None => state
+                .create_coordinator()
+                .expect("pending write tags include this task's tag"),
         }
-    });
+    };
 
-    if let Some(context_id) = coordinator_opt {
-        log::debug!(
-            "Queue {}: Write task {} participating in batch (context_id={}, op={})",
-            queue_id,
-            tag,
-            context_id,
-            iod.op_flags & 0xff
-        );
+    log::debug!(
+        "Queue {}: Write task {} participating in batch (context_id={}, op={})",
+        queue_id,
+        tag,
+        context_id,
+        iod.op_flags & 0xff
+    );
 
-        let batch_state_ref = batch_state.borrow();
-        let coordinator = batch_state_ref.get_coordinator(context_id).unwrap();
+    let batch_state_ref = batch_state.borrow();
+    let coordinator = batch_state_ref.get_coordinator(context_id).unwrap();
 
-        // Phase 2: Flush resync bits (only one task does actual flush)
-        coordinator.flush_resync_bits(tag).await?;
+    // Phase 2: Flush resync bits (only one task does actual flush)
+    coordinator.flush_resync_bits(tag).await?;
 
-        Ok(Some(context_id))
-    } else {
-        // No active coordinator - proceed without coordination
-        Ok(None)
-    }
+    Ok(Some(context_id))
 }
 
 // OPTIMIZED: Function to handle batch completion - simplified!
@@ -266,25 +247,6 @@ fn is_write_operation(iod: &libublk::sys::ublksrv_io_desc) -> bool {
         || op_type == libublk::sys::UBLK_IO_OP_WRITE_SAME
         || op_type == libublk::sys::UBLK_IO_OP_WRITE_ZEROES
         || op_type == libublk::sys::UBLK_IO_OP_ZONE_APPEND
-}
-
-// Function to handle write tag collection from CQE
-#[inline]
-fn collect_write_tags_from_cqe(
-    user_data: u64,
-    q: &UblkQueue,
-    batch_state: &Rc<RefCell<QueueBatchState>>,
-) {
-    // Check if this is an I/O command (not target operations) by checking Target bit
-    if (user_data & libublk::UblkUringData::Target as u64) == 0 {
-        let tag = libublk::io::UblkIOCtx::user_data_to_tag(user_data) as u16;
-        let iod = q.get_iod(tag);
-
-        // Collect write command tags for batch coordination
-        if is_write_operation(iod) {
-            batch_state.borrow().add_write_tag(tag);
-        }
-    }
 }
 
 async fn simulate_io_with_delay(tag: u16, io_delay_us: u32) {
@@ -351,141 +313,21 @@ async fn batch_io_task(
     }
 }
 
-async fn handle_uring_events_default<T>(
-    exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue,
-    tasks: Vec<smol::Task<T>>,
-    batch_state: Rc<RefCell<QueueBatchState>>,
-) -> Result<(), UblkError> {
-    // Use the same pattern as wait_and_handle_io_events
-    let poll_uring = || async {
-        let timeout = Some(io_uring::types::Timespec::new().sec(20));
-        libublk::uring_poll_io_fn::<io_uring::squeue::Entry>(q, timeout, 1)
-    };
-
-    let reap_event = |poll_timeout| {
-        ublk_reap_io_events_with_update_queue(q, poll_timeout, None, |cqe| {
-            let user_data = cqe.user_data();
-
-            collect_write_tags_from_cqe(user_data, q, &batch_state);
-
-            // Wake the task as usual
-            ublk_wake_task(user_data, cqe);
-        })
-    };
-    let run_ops = || {
-        run_batch_coordination(exe, &batch_state);
-    };
-    let is_done = || tasks.iter().all(|task| task.is_finished());
-
-    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
-}
-
-async fn handle_uring_events_smol_readable<T>(
-    exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue,
-    tasks: Vec<smol::Task<T>>,
-    batch_state: Rc<RefCell<QueueBatchState>>,
-) -> Result<(), UblkError> {
-    use io_uring::{opcode, types};
-
-    const TIMEOUT_USER_DATA: u64 = UblkUringData::Target as u64 | UblkUringData::NonAsync as u64;
-    const TIMEOUT_SECS: u64 = 20;
-
-    let uring_fd = with_task_io_ring(|ring| ring.as_raw_fd());
-    let file = unsafe { File::from_raw_fd(uring_fd) };
-    let async_uring = smol::Async::new(file).map_err(|_e| UblkError::OtherError(-libc::EINVAL))?;
-
-    let ts = types::Timespec::new().sec(TIMEOUT_SECS);
-    let timeout_e = opcode::Timeout::new(&ts)
-        .flags(io_uring::types::TimeoutFlags::MULTISHOT)
-        .build()
-        .user_data(TIMEOUT_USER_DATA);
-    q.ublk_submit_sqe_sync(timeout_e)?;
-
-    let poll_uring = || async {
-        with_task_io_ring_mut(|r| r.submit_and_wait(0))?;
-        async_uring
-            .readable()
-            .await
-            .map_err(|_| UblkError::OtherError(-libc::EIO))?;
-        Ok(false)
-    };
-
-    let reap_event = |poll_timeout| {
-        ublk_reap_io_events_with_update_queue(q, poll_timeout, Some(TIMEOUT_USER_DATA), |cqe| {
-            let user_data = cqe.user_data();
-
-            collect_write_tags_from_cqe(user_data, q, &batch_state);
-
-            ublk_wake_task(user_data, cqe);
-        })
-    };
-
-    let run_ops = || {
-        run_batch_coordination(exe, &batch_state);
-    };
-
-    let is_done = || tasks.iter().all(|task| task.is_finished());
-
-    libublk::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await?;
-
-    let _ = async_uring.into_inner().map(|f| {
-        use std::os::fd::IntoRawFd;
-        f.into_raw_fd()
-    });
-
-    Ok(())
-}
-
-async fn handle_uring_events<T>(
-    exe: &smol::LocalExecutor<'_>,
-    q: &UblkQueue,
-    tasks: Vec<smol::Task<T>>,
-    batch_state: Rc<RefCell<QueueBatchState>>,
-    smol_readable: bool,
-) -> Result<(), UblkError> {
-    if smol_readable {
-        handle_uring_events_smol_readable(exe, q, tasks, batch_state).await
-    } else {
-        handle_uring_events_default(exe, q, tasks, batch_state).await
-    }
-}
-
-fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, zero_copy: bool, readable: bool, io_delay_us: u32) {
-    let q_rc = Rc::new(UblkQueue::new(qid as u16, dev).unwrap());
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
+fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, zero_copy: bool, io_delay_us: u32) {
     let batch_state_rc = Rc::new(RefCell::new(QueueBatchState::new(qid)));
-    let queue_depth = dev.dev_info.queue_depth;
 
-    let exe = exe_rc.clone();
-    let mut f_vec = Vec::new();
-
-    for tag in 0..queue_depth as u16 {
-        let q = q_rc.clone();
+    libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
         let batch_state = batch_state_rc.clone();
-
-        f_vec.push(exe.spawn(async move {
+        async move {
             let buf = if zero_copy && q.support_auto_buf_zc() {
                 None
             } else {
                 Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
             };
-            match batch_io_task(&q, tag, buf.as_ref(), batch_state, zero_copy, io_delay_us).await {
-                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!("batch_io_task failed for tag {}: {}", tag, e),
-            }
-        }));
-    }
-
-    let q = q_rc.clone();
-    let exe2 = exe_rc.clone();
-    let batch_state = batch_state_rc.clone();
-    smol::block_on(exe_rc.run(async move {
-        if let Err(e) = handle_uring_events(&exe2, &q, f_vec, batch_state, readable).await {
-            log::error!("handle_uring_events failed: {}", e);
+            batch_io_task(&q, tag, buf.as_ref(), batch_state, zero_copy, io_delay_us).await
         }
-    }));
+    })
+    .unwrap();
 }
 
 fn __batch_add(
@@ -499,7 +341,6 @@ fn __batch_add(
 ) {
     let oneshot = flags.intersects(BatchFlags::ONESHOT);
     let zero_copy = flags.intersects(BatchFlags::ZERO_COPY);
-    let use_readable = flags.intersects(BatchFlags::USE_READABLE);
 
     // Add AUTO_BUF_REG flag if zero copy is enabled
     if zero_copy {
@@ -531,7 +372,7 @@ fn __batch_add(
 
     // Always run in async mode for batch coordination
     let q_async_handler =
-        move |qid, dev: &_| q_async_fn(qid, dev, zero_copy, use_readable, io_delay_us);
+        move |qid, dev: &_| q_async_fn(qid, dev, zero_copy, io_delay_us);
     ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
 }
 
@@ -639,12 +480,6 @@ fn main() {
                         .help("enable zero copy via UBLK_F_AUTO_BUF_REG"),
                 )
                 .arg(
-                    Arg::new("use_readable")
-                        .long("use_readable")
-                        .action(ArgAction::SetTrue)
-                        .help("use readable polling"),
-                )
-                .arg(
                     Arg::new("io_delay")
                         .long("io-delay")
                         .default_value("0")
@@ -706,9 +541,6 @@ fn main() {
             };
             if add_matches.get_flag("zero_copy") {
                 flags |= BatchFlags::ZERO_COPY;
-            };
-            if add_matches.get_flag("use_readable") {
-                flags |= BatchFlags::USE_READABLE;
             };
 
             let io_delay_us = add_matches
