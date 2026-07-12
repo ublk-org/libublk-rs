@@ -17,7 +17,11 @@ publish = true
 maintenance = { status = "actively-developed" }
 
 [features]
+default = ["tokio"]
 fat_complete = []
+# Built-in Tokio current-thread executor integration (UblkRuntime).
+# Disable to bring your own executor driven via libublk::reactor.
+tokio = ["dep:tokio"]
 
 [[bin]]
 name = "ublk_user_id"
@@ -56,7 +60,7 @@ serde_json = "1.0.79"
 bitmaps = "3.2.0"
 log = "0.4"
 thiserror = "1.0.43"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt"], optional = true }
 slab = "0.4.9"
 derive_setters = "0.1"
 bitflags = "2.4.1"

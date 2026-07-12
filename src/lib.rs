@@ -14,6 +14,8 @@ pub mod helpers;
 pub mod io;
 mod op;
 pub mod ops;
+pub mod reactor;
+#[cfg(feature = "tokio")]
 pub mod runtime;
 pub mod sys;
 #[cfg(test)]
@@ -22,8 +24,10 @@ pub mod test_helpers;
 // Re-export tokio so targets use the same runtime version as the library
 // (tasks are spawned with `tokio::task::spawn_local` inside
 // `UblkRuntime::block_on`).
+#[cfg(feature = "tokio")]
 pub use tokio;
 
+#[cfg(feature = "tokio")]
 pub use runtime::UblkRuntime;
 
 // Re-export important types for unified buffer management

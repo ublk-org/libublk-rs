@@ -1,0 +1,210 @@
+//! Executor-agnostic driving of the thread-local ublk io_urings.
+//!
+//! The op futures in [`crate::ops`] (and the async `UblkQueue`/`UblkCtrl`
+//! methods built on them) are plain futures: they need *some* code to
+//! flush SQEs, wait for CQEs, and wake them. This module is that code,
+//! independent of any executor:
+//!
+//! - [`reap_events`] — non-blocking: drain both thread-local rings and
+//!   wake the futures their CQEs complete.
+//! - [`wait_and_reap_events`] — blocking: park the thread inside
+//!   `io_uring_enter` until at least one future has been woken (or no
+//!   ops remain in flight).
+//! - [`has_pending_ops`] — whether any op is still in flight.
+//!
+//! # Integrating an executor
+//!
+//! Run tasks until none is runnable, then call [`wait_and_reap_events`];
+//! the woken futures make their tasks runnable again. With an executor
+//! exposing an idle/park hook, pass `wait_and_reap_events` as the hook —
+//! that is exactly what the built-in `UblkRuntime` (the `tokio` feature)
+//! does with Tokio's `on_thread_park`. With a hand-rolled loop:
+//!
+//! ```no_run
+//! # fn executor_has_runnable_tasks() -> bool { false }
+//! # fn run_runnable_tasks() {}
+//! # fn all_tasks_finished() -> bool { true }
+//! while !all_tasks_finished() {
+//!     while executor_has_runnable_tasks() {
+//!         run_runnable_tasks();
+//!     }
+//!     libublk::reactor::wait_and_reap_events();
+//! }
+//! ```
+//!
+//! A thread may own the per-queue ring, the control ring, or both. With
+//! both, the queue ring is the single park primitive and the control
+//! ring is bridged into it with a `PollAdd` on the control ring fd, so
+//! control-command completions wake the parked thread promptly.
+
+use crate::op::{ublk_reap_and_wake, RESERVED_USER_DATA_MIN};
+use io_uring::{opcode, types};
+use std::cell::Cell;
+use std::os::fd::AsRawFd;
+
+/// user_data of the PollAdd SQE bridging the control ring into the queue
+/// ring: [`wait_for_cqe`] arms it, [`reap_queue_ring`] recognizes it to
+/// re-arm. It lies in the op slab's reserved range, so the reaper passes
+/// its CQE through without a slab lookup.
+const CTRL_POLL_DATA: u64 = u64::MAX;
+// Guards future edits of either constant.
+#[allow(clippy::absurd_extreme_comparisons)]
+const _: () = assert!(CTRL_POLL_DATA >= RESERVED_USER_DATA_MIN);
+
+/// Backstop wait inside [`wait_and_reap_events`]: bounds the damage of
+/// any missed wakeup without ever being the intended wake mechanism
+/// (CQEs wake the park long before this).
+const PARK_SAFETY_SECS: u64 = 1;
+
+std::thread_local! {
+    /// Whether the control-ring PollAdd bridge is currently armed in the
+    /// queue ring.
+    static CTRL_POLL_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether any op is still in flight on this thread. When `false`, a
+/// [`wait_and_reap_events`] call would return immediately: there is
+/// nothing a CQE could wake.
+pub fn has_pending_ops() -> bool {
+    crate::op::has_pending_ops()
+}
+
+/// Drain both thread-local rings once, waking the future behind each
+/// CQE. Non-blocking. Returns the number of CQEs handled.
+pub fn reap_events() -> usize {
+    reap_queue_ring() + reap_ctrl_ring()
+}
+
+/// Park the thread until at least one op future has been woken: reap
+/// both rings, and while nothing was woken and ops remain in flight,
+/// flush pending SQEs and sleep in `io_uring_enter` (bounded by a 1s
+/// safety timeout per pass).
+///
+/// Returns immediately when no ops are in flight, so an executor may
+/// call this unconditionally from its idle hook: cross-thread wakes
+/// (channels, join handles) still get through because the thread only
+/// sleeps while a CQE is guaranteed to arrive and wake it.
+pub fn wait_and_reap_events() {
+    loop {
+        if reap_events() > 0 {
+            return;
+        }
+        if !has_pending_ops() {
+            // Nothing a CQE could wake: let the executor park normally
+            // so cross-thread wakes (e.g. join handles) still work.
+            return;
+        }
+        if !wait_for_cqe() {
+            return;
+        }
+    }
+}
+
+/// Drain the queue ring's completion queue, waking the future behind each
+/// CQE and doing the io-command accounting the explicit event loops used
+/// to do. Returns the number of CQEs handled.
+fn reap_queue_ring() -> usize {
+    let (n, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
+        let Some(ring_cell) = cell.get() else {
+            return (0, 0, false);
+        };
+        let mut ring = ring_cell.borrow_mut();
+        let mut cmd_cnt = 0u32;
+        let mut aborted = false;
+        let n = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
+            if cqe.user_data() == CTRL_POLL_DATA {
+                CTRL_POLL_ARMED.with(|armed| armed.set(false));
+            } else if is_io_cmd {
+                cmd_cnt += 1;
+                if cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
+                    aborted = true;
+                }
+            }
+        });
+        (n, cmd_cnt, aborted)
+    });
+    if cmd_cnt > 0 {
+        crate::io::update_queue_state(cmd_cnt, aborted);
+    }
+    n
+}
+
+/// Drain the control ring's completion queue, waking the future behind
+/// each CQE. Returns the number of CQEs handled.
+fn reap_ctrl_ring() -> usize {
+    crate::ctrl::CTRL_URING.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(ring) = guard.as_mut() else {
+            return 0;
+        };
+        ublk_reap_and_wake(ring, |_, _| {})
+    })
+}
+
+/// Flush pending SQEs and sleep in `io_uring_enter` until a CQE arrives
+/// (or the safety timeout fires). Returns `false` when the thread has no
+/// ring to wait on.
+fn wait_for_cqe() -> bool {
+    let has_queue = crate::io::QUEUE_RING.with(|cell| cell.get().is_some());
+    let has_ctrl = crate::ctrl::CTRL_URING.with(|cell| cell.borrow().is_some());
+
+    if has_ctrl {
+        // Flush control SQEs; when parking on the queue ring, also bridge
+        // control completions into it so they wake the sleep below.
+        let ctrl_fd = crate::ctrl::CTRL_URING.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let ring = guard.as_mut().unwrap();
+            let _ = ring.submit();
+            ring.as_raw_fd()
+        });
+        if has_queue && !CTRL_POLL_ARMED.with(|armed| armed.get()) {
+            let sqe = opcode::PollAdd::new(types::Fd(ctrl_fd), libc::POLLIN as _)
+                .build()
+                .user_data(CTRL_POLL_DATA);
+            let pushed = crate::io::QUEUE_RING.with(|cell| {
+                let ring_cell = cell.get().unwrap();
+                let mut ring = ring_cell.borrow_mut();
+                // SAFETY: the SQE references no user memory.
+                let pushed = unsafe { ring.submission().push(&sqe).is_ok() };
+                pushed
+            });
+            // If the SQ is full the safety timeout still bounds the wait.
+            CTRL_POLL_ARMED.with(|armed| armed.set(pushed));
+        }
+    }
+
+    let timeout = types::Timespec::new().sec(PARK_SAFETY_SECS);
+    let args = types::SubmitArgs::new().timespec(&timeout);
+    let res = if has_queue {
+        crate::io::QUEUE_RING.with(|cell| {
+            let ring_cell = cell.get().unwrap();
+            let ring = ring_cell.borrow_mut();
+            ring.submitter().submit_with_args(1, &args)
+        })
+    } else if has_ctrl {
+        crate::ctrl::CTRL_URING.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            let ring = guard.as_mut().unwrap();
+            ring.submitter().submit_with_args(1, &args)
+        })
+    } else {
+        // No ring on this thread: nothing a CQE wait could wake.
+        return false;
+    };
+
+    match res {
+        Ok(_) => true,
+        Err(ref err)
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::ETIME | libc::EINTR | libc::EBUSY)
+            ) =>
+        {
+            true
+        }
+        Err(err) => {
+            log::error!("ublk reactor: io_uring_enter failed: {}", err);
+            false
+        }
+    }
+}

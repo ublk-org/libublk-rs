@@ -43,10 +43,11 @@ The `build.rs` lives in `libublk-rs-sys/`, not the root.
      zero-copy). These are re-exported from the crate root — prefer them over
      raw pointers in new code.
 
-3. **Async Support (`src/uring_async.rs`)**:
-   - `UblkUringOpFuture` - io_uring integration
-   - `wait_and_handle_io_events()` - Main event loop driver
-   - `run_uring_tasks`, `ublk_reap_events_with_handler`, `uring_poll_io_fn`
+3. **Async Support (`src/op.rs`, `src/ops.rs`, `src/reactor.rs`, `src/runtime.rs`)**:
+   - `op.rs` - Slab-keyed single-shot op futures (SQE `user_data` = slab key)
+   - `ops.rs` - Typed async operation catalog (file/socket/timer/raw SQE)
+   - `reactor.rs` - Executor-agnostic ring driving (`reap_events`, `wait_and_reap_events`)
+   - `runtime.rs` - `UblkRuntime`: Tokio current-thread glue over the reactor (`tokio` feature)
 
 4. **System Bindings (`src/sys.rs`, `src/bindings.rs`, `libublk-rs-sys/`)**:
    - Low-level kernel interface definitions
@@ -76,8 +77,10 @@ The `build.rs` lives in `libublk-rs-sys/`, not the root.
 
 ### Features
 
+- `tokio` (default) - Built-in Tokio current-thread executor integration (`UblkRuntime`).
+  Disable to bring your own executor driven via `libublk::reactor`
+  (`reap_events` / `wait_and_reap_events` from the executor's idle hook)
 - `fat_complete` - Enables batch completion and zoned append operations
-- Default build includes basic functionality
 
 ### Device Flags
 
@@ -105,7 +108,7 @@ The examples demonstrate different target types:
 
 Key external dependencies:
 - `io-uring` - Linux io_uring interface
-- `smol` - Async runtime used in examples
+- `tokio` - Optional (default `tokio` feature): current-thread executor behind `UblkRuntime`
 - `serde` - Serialization for device parameters
 - `bindgen` - C header binding generation (build-time)
 
