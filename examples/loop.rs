@@ -218,8 +218,8 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue, tag: u16, i: &UblkIOCtx, io_slice: &[u8]
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
-        let sqe = __lo_make_io_sqe(op, off, bytes, io_slice.as_ptr() as *mut u8).user_data(data);
-        q.ublk_submit_sqe_sync(sqe).unwrap();
+        let sqe = __lo_make_io_sqe(op, off, bytes, io_slice.as_ptr() as *mut u8);
+        q.ublk_submit_sqe_sync(sqe, data).unwrap();
     }
 }
 

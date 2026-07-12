@@ -9,14 +9,17 @@
 //!
 //! # Keyspace contract
 //!
-//! On one queue thread the ring is drained either by the runtime reaper
-//! ([`ublk_reap_and_wake`], slab-keyed `user_data`) or by the legacy sync
-//! event loop (`UblkQueue::wait_and_handle_io`, tag-encoded `user_data`)
-//! — never both. Mixing slab-keyed ops into a queue driven by the sync
-//! loop (or vice versa) misroutes completions and corrupts the
-//! io-command accounting. `user_data` values at or above
+//! Every async *and* sync submission owns a slab entry, so the ring's
+//! `user_data` space has a single owner. Async entries hold a waker and
+//! resolve a future; sync entries instead carry the handler-facing word
+//! (the legacy tag-encoded `user_data`, see
+//! `UblkIOCtx::build_user_data`) that the queue's sync event loop
+//! delivers to its IO closure. Either reaper safely classifies any CQE
+//! through its entry — a queue still should not mix the two dispatch
+//! models, but misrouting degrades to a missed dispatch, never to
+//! corrupted accounting. `user_data` values at or above
 //! [`RESERVED_USER_DATA_MIN`] are sentinels that carry no op state; the
-//! reaper passes them through to its caller.
+//! reapers pass them through to their callers.
 //!
 //! # Cancellation contract
 //!
@@ -75,6 +78,10 @@ pub(crate) struct OpEntry {
     /// This op is a ublk io command (FETCH_REQ/COMMIT_AND_FETCH_REQ/...)
     /// whose completion the queue-state accounting must observe.
     is_io_cmd: bool,
+    /// `Some` marks a sync-mode entry: no future is attached, and the
+    /// stored word (legacy tag-encoded `user_data`) is delivered to the
+    /// sync event loop's handler in place of the on-ring slab key.
+    sync_data: Option<u64>,
     resources: Resources,
 }
 
@@ -115,6 +122,72 @@ fn push_ctrl_sqe(sqe: &squeue::Entry128) -> Result<(), UblkError> {
     crate::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| push_sqe(r, sqe))
 }
 
+fn insert_entry(resources: Resources, is_io_cmd: bool, sync_data: Option<u64>) -> usize {
+    OP_SLAB.with(|slab| {
+        slab.borrow_mut().insert(OpEntry {
+            result: None,
+            waker: None,
+            orphaned: false,
+            is_io_cmd,
+            sync_data,
+            resources,
+        })
+    })
+}
+
+/// Submit a sync-mode SQE on the queue ring: the slab entry carries
+/// `sync_data` (the handler-facing word) instead of a future, and is
+/// reclaimed by [`take_sync_entry`] when the queue's sync event loop
+/// drains the CQE. Any memory the SQE references must stay valid until
+/// then — sync targets use queue-slot buffers, which satisfy this by
+/// construction.
+pub(crate) fn submit_sync(
+    build: impl FnOnce(u64) -> squeue::Entry,
+    sync_data: u64,
+    is_io_cmd: bool,
+) -> Result<(), UblkError> {
+    let key = insert_entry(Resources::None, is_io_cmd, Some(sync_data));
+    if let Err(e) = push_queue_sqe(&build(key as u64)) {
+        OP_SLAB.with(|slab| slab.borrow_mut().remove(key));
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Resolve one CQE for the sync event loop: remove and return the sync
+/// entry behind `user_data` as `(handler_word, is_io_cmd)`.
+///
+/// Returns `None` for reserved sentinels, unknown keys, and op-future
+/// entries — the latter are completed and woken here exactly as
+/// [`ublk_reap_and_wake`] would, so a stray async op in a sync-driven
+/// queue is delivered to its future rather than corrupting state.
+pub(crate) fn take_sync_entry(user_data: u64, result: i32) -> Option<(u64, bool)> {
+    if user_data >= RESERVED_USER_DATA_MIN {
+        return None;
+    }
+    let key = user_data as usize;
+    OP_SLAB.with(|slab| {
+        let mut slab = slab.borrow_mut();
+        let Some(entry) = slab.get_mut(key) else {
+            debug_assert!(false, "CQE for unknown op {}", key);
+            return None;
+        };
+        if entry.sync_data.is_none() {
+            if entry.orphaned {
+                slab.remove(key);
+                return None;
+            }
+            entry.result = Some(result);
+            if let Some(waker) = entry.waker.take() {
+                waker.wake();
+            }
+            return None;
+        }
+        let entry = slab.remove(key);
+        Some((entry.sync_data.unwrap(), entry.is_io_cmd))
+    })
+}
+
 /// Handle to one submitted single-shot operation.
 ///
 /// Dropping it before completion orphans the slab entry and issues a
@@ -134,15 +207,7 @@ impl Op {
         is_io_cmd: bool,
         build_and_push: impl FnOnce(u64) -> Result<(), UblkError>,
     ) -> Result<Op, UblkError> {
-        let key = OP_SLAB.with(|slab| {
-            slab.borrow_mut().insert(OpEntry {
-                result: None,
-                waker: None,
-                orphaned: false,
-                is_io_cmd,
-                resources,
-            })
-        });
+        let key = insert_entry(resources, is_io_cmd, None);
         if let Err(e) = build_and_push(key as u64) {
             OP_SLAB.with(|slab| slab.borrow_mut().remove(key));
             return Err(e);
@@ -278,7 +343,11 @@ where
                 continue;
             };
             per_cqe(&cqe, entry.is_io_cmd);
-            if entry.orphaned {
+            if entry.orphaned || entry.sync_data.is_some() {
+                // Orphaned future, or a sync-mode entry drained by the
+                // runtime reaper (a queue should not mix the models; the
+                // sync handler is not available here, so the entry is
+                // only reclaimed and accounted).
                 slab.remove(key);
                 continue;
             }

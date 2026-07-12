@@ -635,7 +635,7 @@ macro_rules! override_sqe {
 /// UblkIOCtx & UblkQueue provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
 ///
-pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u32);
+pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u64, u32);
 
 impl<'a> UblkIOCtx<'a> {
     const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
@@ -660,33 +660,34 @@ impl<'a> UblkIOCtx<'a> {
     /// by passing `tag` via `Self::build_user_data()`
     #[inline(always)]
     pub fn get_tag(&self) -> u32 {
-        UblkIOCtx::user_data_to_tag(self.0.user_data())
+        UblkIOCtx::user_data_to_tag(self.1)
     }
 
-    /// Get this CQE's userdata
-    ///
+    /// Get this IO's userdata: the word built by [`Self::build_user_data`]
+    /// at submission (the on-ring `user_data` is a slab key resolved back
+    /// to this word before the IO closure runs)
     #[inline(always)]
     pub fn user_data(&self) -> u64 {
-        self.0.user_data()
+        self.1
     }
 
     /// Return false if it is one IO command from ublk driver, otherwise
     /// it is one target IO submitted from IO closure
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
-        Self::is_target_io(self.0.user_data())
+        Self::is_target_io(self.1)
     }
 
     /// if this IO represented by CQE is the last one in current batch
     #[inline(always)]
     pub fn is_last_cqe(&self) -> bool {
-        (self.1 & Self::UBLK_IO_F_LAST) != 0
+        (self.2 & Self::UBLK_IO_F_LAST) != 0
     }
 
     /// if this IO represented by CQE is the first one in current batch
     #[inline(always)]
     pub fn is_first_cqe(&self) -> bool {
-        (self.1 & Self::UBLK_IO_F_FIRST) != 0
+        (self.2 & Self::UBLK_IO_F_FIRST) != 0
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -714,7 +715,7 @@ impl<'a> UblkIOCtx<'a> {
                 | offset as u64)
     }
 
-    /// Build userdata for submitting io via io_uring
+    /// Build userdata describing one sync-mode io to the IO closure
     ///
     /// # Arguments:
     ///
@@ -724,7 +725,10 @@ impl<'a> UblkIOCtx<'a> {
     /// * `is_target_io`: if this userdata is for handling target io, false if
     ///         if it is only for ublk io command
     ///
-    /// The built userdata is passed to io_uring for parsing io result
+    /// The built word is handed to `ublk_submit_sqe_sync()` and delivered
+    /// back through `UblkIOCtx::user_data()` when the CQE arrives; it is
+    /// no longer the on-ring `user_data` (that is a slab key owned by the
+    /// op layer).
     ///
     #[inline(always)]
     #[allow(arithmetic_overflow)]
@@ -758,13 +762,6 @@ impl<'a> UblkIOCtx<'a> {
     #[inline(always)]
     fn is_target_io(user_data: u64) -> bool {
         (user_data & UblkUringData::Target as u64) != 0
-    }
-
-    /// Check if this userdata is from IO command which is from
-    /// ublk driver
-    #[inline(always)]
-    pub(crate) fn is_io_command(user_data: u64) -> bool {
-        (user_data & UblkUringData::Target as u64) == 0
     }
 }
 
@@ -1632,36 +1629,11 @@ impl UblkQueue {
         sqe
     }
 
-    #[inline(always)]
-    fn __queue_io_cmd_no_state(
-        &self,
-        r: &mut IoUring<squeue::Entry>,
-        tag: u16,
-        cmd_op: u32,
-        buf_addr: u64,
-        sqe_addr: Option<u64>,
-        user_data: u64,
-        res: i32,
-    ) -> i32 {
-        let sqe = self.build_io_cmd_sqe(tag, cmd_op, buf_addr, sqe_addr, res, user_data);
-
-        loop {
-            let res = unsafe { r.submission().push(&sqe) };
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("__queue_io_cmd: flush submission and retry");
-                    r.submit_and_wait(0).unwrap();
-                }
-            }
-        }
-        1
-    }
+    /// Queue one sync-mode ublk io command: a slab entry carries `data`
+    /// (the handler word) and the SQE's `user_data` is the entry's key.
     #[inline(always)]
     fn __queue_io_cmd(
         &self,
-        r: &mut IoUring<squeue::Entry>,
         tag: u16,
         cmd_op: u32,
         buf_addr: u64,
@@ -1686,9 +1658,14 @@ impl UblkQueue {
                 buf_addr,
             );
         }
-        let res = self.__queue_io_cmd_no_state(r, tag, cmd_op, buf_addr, sqe_addr, data, res);
-        if res != 1 {
-            return res;
+        if crate::op::submit_sync(
+            |key| self.build_io_cmd_sqe(tag, cmd_op, buf_addr, sqe_addr, res, key),
+            data,
+            true,
+        )
+        .is_err()
+        {
+            return 0;
         }
 
         let mut state = self.state.borrow_mut();
@@ -1698,28 +1675,14 @@ impl UblkQueue {
     }
 
     #[inline(always)]
-    fn queue_io_cmd(
-        &self,
-        r: &mut IoUring<squeue::Entry>,
-        tag: u16,
-        cmd_op: u32,
-        buf_addr: u64,
-        res: i32,
-    ) -> i32 {
+    fn queue_io_cmd(&self, tag: u16, cmd_op: u32, buf_addr: u64, res: i32) -> i32 {
         let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
-        self.__queue_io_cmd(r, tag, cmd_op, buf_addr, None, data, res)
+        self.__queue_io_cmd(tag, cmd_op, buf_addr, None, data, res)
     }
 
     #[inline(always)]
-    fn commit_and_queue_io_cmd(
-        &self,
-        r: &mut IoUring<squeue::Entry>,
-        tag: u16,
-        buf_addr: u64,
-        io_cmd_result: i32,
-    ) {
+    fn commit_and_queue_io_cmd(&self, tag: u16, buf_addr: u64, io_cmd_result: i32) {
         self.queue_io_cmd(
-            r,
             tag,
             sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
             buf_addr,
@@ -1989,25 +1952,18 @@ impl UblkQueue {
         unsafe { crate::ops::submit_sqe(sqe) }
     }
 
+    /// Submit one target-IO SQE for the sync event loop. `data` is the
+    /// handler word built by [`UblkIOCtx::build_user_data`] (with the
+    /// target bit set); it is delivered back to the IO closure via
+    /// `UblkIOCtx::user_data()` when the CQE arrives, while the on-ring
+    /// `user_data` is a slab key owned by the op layer.
     #[inline]
-    pub fn ublk_submit_sqe_sync(&self, sqe: io_uring::squeue::Entry) -> Result<(), UblkError> {
-        loop {
-            let res = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| unsafe {
-                ring.submission().push(&sqe)
-            });
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("ublk_submit_sqe: flush and retry");
-                    with_queue_ring_internal!(
-                        |ring: &IoUring<squeue::Entry>| ring.submit_and_wait(0)
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
+    pub fn ublk_submit_sqe_sync(
+        &self,
+        sqe: io_uring::squeue::Entry,
+        data: u64,
+    ) -> Result<(), UblkError> {
+        crate::op::submit_sync(|key| sqe.user_data(key), data, false)
     }
 
     fn submit_reg_unreg_io_buf(
@@ -2067,15 +2023,7 @@ impl UblkQueue {
             assert!(
                 ((self.dev_flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0) == bufs.is_none()
             );
-            with_queue_ring_mut_internal!(|ring| {
-                self.queue_io_cmd(
-                    ring,
-                    i as u16,
-                    sys::UBLK_U_IO_FETCH_REQ,
-                    buf_addr as u64,
-                    -1,
-                )
-            });
+            self.queue_io_cmd(i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr as u64, -1);
         }
         self
     }
@@ -2115,17 +2063,14 @@ impl UblkQueue {
             let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
             let data = UblkIOCtx::build_user_data(i as u16, sys::UBLK_U_IO_FETCH_REQ, 0, false);
 
-            with_queue_ring_mut_internal!(|ring| {
-                self.__queue_io_cmd(
-                    ring,
-                    i as u16,
-                    sys::UBLK_U_IO_FETCH_REQ,
-                    0,
-                    Some(auto_buf_addr),
-                    data,
-                    -1,
-                )
-            });
+            self.__queue_io_cmd(
+                i as u16,
+                sys::UBLK_U_IO_FETCH_REQ,
+                0,
+                Some(auto_buf_addr),
+                data,
+                -1,
+            );
         }
         self
     }
@@ -2204,9 +2149,7 @@ impl UblkQueue {
     fn __submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as u16) as u64;
-            with_queue_ring_mut_internal!(|ring| {
-                self.queue_io_cmd(ring, i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr, -1)
-            });
+            self.queue_io_cmd(i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr, -1);
         }
     }
 
@@ -2227,36 +2170,33 @@ impl UblkQueue {
     )]
     #[inline]
     pub fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            match res {
-                Ok(UblkIORes::Result(res))
-                | Err(UblkError::OtherError(res))
-                | Err(UblkError::UringIOError(res)) => {
-                    self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, res);
-                }
-                Err(UblkError::UringIoQueued) => {}
-                #[cfg(feature = "fat_complete")]
-                Ok(UblkIORes::FatRes(fat)) => match fat {
-                    UblkFatRes::BatchRes(ios) => {
-                        assert!(self.support_comp_batch());
-                        for item in ios {
-                            let tag = item.0;
-                            self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, item.1);
-                        }
-                    }
-                    UblkFatRes::ZonedAppendRes((res, lba)) => {
-                        self.commit_and_queue_io_cmd(r, tag, lba, res);
-                    }
-                },
-                _ => {}
+        match res {
+            Ok(UblkIORes::Result(res))
+            | Err(UblkError::OtherError(res))
+            | Err(UblkError::UringIOError(res)) => {
+                self.commit_and_queue_io_cmd(tag, buf_addr as u64, res);
             }
-        });
+            Err(UblkError::UringIoQueued) => {}
+            #[cfg(feature = "fat_complete")]
+            Ok(UblkIORes::FatRes(fat)) => match fat {
+                UblkFatRes::BatchRes(ios) => {
+                    assert!(self.support_comp_batch());
+                    for item in ios {
+                        let tag = item.0;
+                        self.commit_and_queue_io_cmd(tag, buf_addr as u64, item.1);
+                    }
+                }
+                UblkFatRes::ZonedAppendRes((res, lba)) => {
+                    self.commit_and_queue_io_cmd(tag, lba, res);
+                }
+            },
+            _ => {}
+        }
     }
 
     #[inline(always)]
     fn commit_and_queue_io_cmd_with_auto_buf_reg(
         &self,
-        r: &mut IoUring<squeue::Entry>,
         tag: u16,
         buf_reg_data: &sys::ublk_auto_buf_reg,
         io_cmd_result: i32,
@@ -2264,7 +2204,6 @@ impl UblkQueue {
         let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
         let data = UblkIOCtx::build_user_data(tag, sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ, 0, false);
         self.__queue_io_cmd(
-            r,
             tag,
             sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
             0,
@@ -2298,42 +2237,34 @@ impl UblkQueue {
         buf_reg_data: &sys::ublk_auto_buf_reg,
         res: Result<UblkIORes, UblkError>,
     ) {
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            match res {
-                Ok(UblkIORes::Result(res))
-                | Err(UblkError::OtherError(res))
-                | Err(UblkError::UringIOError(res)) => {
-                    self.commit_and_queue_io_cmd_with_auto_buf_reg(r, tag, buf_reg_data, res);
-                }
-                Err(UblkError::UringIoQueued) => {}
-                #[cfg(feature = "fat_complete")]
-                Ok(UblkIORes::FatRes(fat)) => match fat {
-                    UblkFatRes::BatchRes(ios) => {
-                        assert!(self.support_comp_batch());
-                        for item in ios {
-                            let tag = item.0;
-                            self.commit_and_queue_io_cmd_with_auto_buf_reg(
-                                r,
-                                tag,
-                                buf_reg_data,
-                                item.1,
-                            );
-                        }
-                    }
-                    UblkFatRes::ZonedAppendRes((res, lba)) => {
-                        let mut buf_reg_data_for_zoned = *buf_reg_data;
-                        buf_reg_data_for_zoned.index = (lba & 0xffff) as u16;
-                        self.commit_and_queue_io_cmd_with_auto_buf_reg(
-                            r,
-                            tag,
-                            &buf_reg_data_for_zoned,
-                            res,
-                        );
-                    }
-                },
-                _ => {}
+        match res {
+            Ok(UblkIORes::Result(res))
+            | Err(UblkError::OtherError(res))
+            | Err(UblkError::UringIOError(res)) => {
+                self.commit_and_queue_io_cmd_with_auto_buf_reg(tag, buf_reg_data, res);
             }
-        });
+            Err(UblkError::UringIoQueued) => {}
+            #[cfg(feature = "fat_complete")]
+            Ok(UblkIORes::FatRes(fat)) => match fat {
+                UblkFatRes::BatchRes(ios) => {
+                    assert!(self.support_comp_batch());
+                    for item in ios {
+                        let tag = item.0;
+                        self.commit_and_queue_io_cmd_with_auto_buf_reg(tag, buf_reg_data, item.1);
+                    }
+                }
+                UblkFatRes::ZonedAppendRes((res, lba)) => {
+                    let mut buf_reg_data_for_zoned = *buf_reg_data;
+                    buf_reg_data_for_zoned.index = (lba & 0xffff) as u16;
+                    self.commit_and_queue_io_cmd_with_auto_buf_reg(
+                        tag,
+                        &buf_reg_data_for_zoned,
+                        res,
+                    );
+                }
+            },
+            _ => {}
+        }
     }
 
     /// Complete one io command using unified buffer descriptor
@@ -2662,9 +2593,10 @@ impl UblkQueue {
         loop {
             let mut is_first = true;
             let result = self.flush_and_wake_io_tasks(
-                |_user_data, cqe, is_last| {
+                |user_data, cqe, is_last| {
                     let ctx = UblkIOCtx(
                         cqe,
+                        user_data,
                         if is_first {
                             is_first = false;
                             UblkIOCtx::UBLK_IO_F_FIRST
@@ -2694,7 +2626,10 @@ impl UblkQueue {
     ///
     /// # Arguments:
     ///
-    /// * `wake_handler`: handler for wakeup io tasks pending on this uring
+    /// * `wake_handler`: handler called per drained CQE with the handler
+    /// word stored at submission (`UblkIOCtx::build_user_data` format),
+    /// resolved through the op slab — the on-ring `user_data` is a slab
+    /// key, see the keyspace contract in the `op` module.
     ///
     /// * `to_wait`: passed to io_uring_enter(), wait until `to_wait` events
     /// are available. It won't block in waiting for events if `to_wait` is
@@ -2703,11 +2638,6 @@ impl UblkQueue {
     /// Returns how many CQEs handled in this batch.
     ///
     /// This API is useful if user needs target specific batch handling.
-    ///
-    /// This is the legacy sync event loop over tag-encoded `user_data`;
-    /// it must not be mixed with slab-keyed async ops (`crate::ops`,
-    /// `UblkRuntime`) on the same queue thread — see the keyspace
-    /// contract in the `op` module.
     pub fn flush_and_wake_io_tasks<F>(
         &self,
         mut wake_handler: F,
@@ -2748,14 +2678,21 @@ impl UblkQueue {
                         Some(r) => r,
                     };
 
-                    let user_data = cqe.user_data();
-                    if UblkIOCtx::is_io_command(user_data) {
+                    let Some((data, is_io_cmd)) =
+                        crate::op::take_sync_entry(cqe.user_data(), cqe.result())
+                    else {
+                        // Reserved sentinel or op-future CQE (delivered to
+                        // its future by take_sync_entry): nothing for the
+                        // sync handler.
+                        continue;
+                    };
+                    if is_io_cmd {
                         cmd_cnt += 1;
                         if cqe.result() == sys::UBLK_IO_RES_ABORT {
                             aborted = true;
                         }
                     }
-                    wake_handler(user_data, &cqe, i == done - 1);
+                    wake_handler(data, &cqe, i == done - 1);
                 }
                 if cmd_cnt > 0 {
                     self.update_state_batch(cmd_cnt, aborted);
