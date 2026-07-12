@@ -2823,10 +2823,9 @@ impl UblkQueue {
 mod tests {
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{with_task_io_ring, with_task_io_ring_mut, BufDesc, UblkDev, UblkQueue};
-    use crate::test_helpers::{device_handler_async, ublk_join_tasks};
+    use crate::test_helpers::device_handler_async;
     use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
-    use std::rc::Rc;
 
     fn __submit_uring_nop(ring: &mut IoUring<io_uring::squeue::Entry>) -> Result<usize, UblkError> {
         let nop_e = io_uring::opcode::Nop::new().build().user_data(0x42).into();
@@ -3286,19 +3285,12 @@ mod tests {
 
     #[test]
     fn test_mlock_failure() {
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-
-        let io_task = exe_rc.spawn(async {
+        crate::test_helpers::ublk_block_on_ctrl(async {
             device_handler_async(
                 UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER,
             )
             .await
             .unwrap();
         });
-
-        smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![io_task]);
-        }));
     }
 }
