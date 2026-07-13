@@ -51,6 +51,8 @@
 	_IOR('u', 0x13, struct ublksrv_ctrl_cmd)
 #define UBLK_U_CMD_DEL_DEV_ASYNC	\
 	_IOR('u', 0x14, struct ublksrv_ctrl_cmd)
+#define UBLK_U_CMD_QUIESCE_DEV		\
+	_IOWR('u', 0x16, struct ublksrv_ctrl_cmd)
 
 /*
  * 64bits are enough now, and it should be easy to extend in case of
@@ -241,6 +243,15 @@
  * successfully
  */
 #define UBLK_F_AUTO_BUF_REG 	(1ULL << 11)
+
+/*
+ * Control command `UBLK_U_CMD_QUIESCE_DEV` requests that the kernel stop
+ * accepting new I/O for a live device and cancel pending `uring_cmd`s so the
+ * userspace server can unwind and later recover or delete the device.
+ *
+ * This feature is only available when `UBLK_F_USER_RECOVERY` is also enabled.
+ */
+#define UBLK_F_QUIESCE		(1ULL << 12)
 
 /* device state */
 #define UBLK_S_DEV_DEAD	0

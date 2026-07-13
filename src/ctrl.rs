@@ -1650,6 +1650,11 @@ impl UblkCtrlInner {
         UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV)
     }
 
+    /// Prepare QUIESCE_DEV command data.
+    fn prepare_quiesce_cmd(timeout_ms: u64) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_QUIESCE_DEV, timeout_ms)
+    }
+
     /// Stop this device by sending command to ublk driver
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
@@ -1662,6 +1667,12 @@ impl UblkCtrlInner {
     pub(crate) async fn stop_async(&mut self) -> Result<i32, UblkError> {
         let data = Self::prepare_stop_cmd();
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Quiesce this device by sending command to the ublk driver.
+    fn quiesce(&mut self, timeout_ms: u64) -> Result<i32, UblkError> {
+        let data = Self::prepare_quiesce_cmd(timeout_ms);
+        self.ublk_ctrl_cmd(&data)
     }
 
     /// Prepare GET_PARAMS command data
@@ -2479,6 +2490,21 @@ impl UblkCtrl {
         ctrl.stop()
     }
 
+    /// Quiesce a live ublk device without deleting it.
+    ///
+    /// Requires the device to have been created with both
+    /// `UBLK_F_USER_RECOVERY` and `UBLK_F_QUIESCE`.
+    ///
+    /// On success, the kernel has stopped accepting new I/O and canceled
+    /// pending `uring_cmd`s for the current server. The serving process must
+    /// then unwind and close `/dev/ublkcN`, which allows the kernel to finish
+    /// transitioning the device into its recoverable no-server state.
+    ///
+    /// `timeout_ms = 0` means wait forever.
+    pub fn quiesce_dev(&self, timeout_ms: u64) -> Result<i32, UblkError> {
+        self.get_inner_mut().quiesce(timeout_ms)
+    }
+
     /// Kill this device
     ///
     /// Preferred method for target code to stop & delete device,
@@ -2688,6 +2714,7 @@ impl UblkCtrl {
 
 #[cfg(test)]
 mod tests {
+    use super::{UblkCtrlCmdData, UblkCtrlInner, CTRL_CMD_HAS_DATA};
     use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkError;
@@ -2710,6 +2737,17 @@ mod tests {
             Some(f) => eprintln!("features is {:04x}", f),
             None => eprintln!("not support GET_FEATURES, require linux v6.5"),
         }
+    }
+
+    #[test]
+    fn test_prepare_quiesce_cmd() {
+        let data: UblkCtrlCmdData = UblkCtrlInner::prepare_quiesce_cmd(1_234);
+
+        assert_eq!(data.cmd_op, crate::sys::UBLK_U_CMD_QUIESCE_DEV);
+        assert_eq!(data.flags, CTRL_CMD_HAS_DATA);
+        assert_eq!(data.data, 1_234);
+        assert_eq!(data.addr, 0);
+        assert_eq!(data.len, 0);
     }
 
     fn __test_add_ctrl_dev(del_async: bool) {
