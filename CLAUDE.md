@@ -9,7 +9,6 @@ libublk-rs is a Rust library for building Linux ublk (userspace block) target de
 ## Build Commands
 
 - `cargo build` - Build the library
-- `cargo build --features=fat_complete` - Build with fat completion feature
 - `cargo test` - Run tests
 - `cargo test --test basic <name>` - Run a single integration test by name (e.g. `cargo test --test basic test_ublk_null`)
 - `cargo test -- --nocapture` - Show stdout/stderr from tests (useful when device creation fails silently)
@@ -80,7 +79,6 @@ The `build.rs` lives in `libublk-rs-sys/`, not the root.
 - `tokio` (default) - Built-in Tokio current-thread executor integration (`UblkRuntime`).
   Disable to bring your own executor driven via `libublk::reactor`
   (`reap_events` / `wait_and_reap_events` from the executor's idle hook)
-- `fat_complete` - Enables batch completion and zoned append operations
 
 ### Device Flags
 

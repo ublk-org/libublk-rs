@@ -180,8 +180,6 @@
 //! }
 //! ```
 
-#[cfg(feature = "fat_complete")]
-use super::UblkFatRes;
 use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
 use crate::bindings;
 use crate::helpers::IoBuf;
@@ -628,9 +626,7 @@ macro_rules! override_sqe {
 ///
 /// If target won't use io_uring to handle IO, eventfd needs to be sent from
 /// the real handler context to wakeup ublk queue/io_uring context for
-/// driving the machinery. Eventfd gets minimized support with
-/// `dev_flags::UBLK_DEV_F_COMP_BATCH`, and native & generic IO offloading will
-/// be added soon.
+/// driving the machinery.
 ///
 /// UblkIOCtx & UblkQueue provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
@@ -1588,12 +1584,6 @@ impl UblkQueue {
         self
     }
 
-    #[inline(always)]
-    #[cfg(feature = "fat_complete")]
-    fn support_comp_batch(&self) -> bool {
-        self.flags.intersects(UblkFlags::UBLK_DEV_F_COMP_BATCH)
-    }
-
     /// Build the UringCmd16 SQE of one ublk io command.
     #[inline(always)]
     fn build_io_cmd_sqe(
@@ -2177,19 +2167,6 @@ impl UblkQueue {
                 self.commit_and_queue_io_cmd(tag, buf_addr as u64, res);
             }
             Err(UblkError::UringIoQueued) => {}
-            #[cfg(feature = "fat_complete")]
-            Ok(UblkIORes::FatRes(fat)) => match fat {
-                UblkFatRes::BatchRes(ios) => {
-                    assert!(self.support_comp_batch());
-                    for item in ios {
-                        let tag = item.0;
-                        self.commit_and_queue_io_cmd(tag, buf_addr as u64, item.1);
-                    }
-                }
-                UblkFatRes::ZonedAppendRes((res, lba)) => {
-                    self.commit_and_queue_io_cmd(tag, lba, res);
-                }
-            },
             _ => {}
         }
     }
@@ -2244,25 +2221,6 @@ impl UblkQueue {
                 self.commit_and_queue_io_cmd_with_auto_buf_reg(tag, buf_reg_data, res);
             }
             Err(UblkError::UringIoQueued) => {}
-            #[cfg(feature = "fat_complete")]
-            Ok(UblkIORes::FatRes(fat)) => match fat {
-                UblkFatRes::BatchRes(ios) => {
-                    assert!(self.support_comp_batch());
-                    for item in ios {
-                        let tag = item.0;
-                        self.commit_and_queue_io_cmd_with_auto_buf_reg(tag, buf_reg_data, item.1);
-                    }
-                }
-                UblkFatRes::ZonedAppendRes((res, lba)) => {
-                    let mut buf_reg_data_for_zoned = *buf_reg_data;
-                    buf_reg_data_for_zoned.index = (lba & 0xffff) as u16;
-                    self.commit_and_queue_io_cmd_with_auto_buf_reg(
-                        tag,
-                        &buf_reg_data_for_zoned,
-                        res,
-                    );
-                }
-            },
             _ => {}
         }
     }

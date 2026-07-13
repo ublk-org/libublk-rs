@@ -54,10 +54,6 @@ bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
     /// UblkFlags: top 8bits are reserved for internal use
     pub struct UblkFlags: u32 {
-        /// feature: support IO batch completion from single IO tag, typical
-        /// usecase is to complete IOs from eventfd CQE handler
-        const UBLK_DEV_F_COMP_BATCH = 0b00000001;
-
         /// tell UblkCtrl that we are adding one new device
         const UBLK_DEV_F_ADD_DEV = 0b00000010;
 
@@ -96,20 +92,6 @@ macro_rules! ublk_internal_flags_all {
 
 pub(crate) use ublk_internal_flags_all;
 
-/// Ublk Fat completion result
-pub enum UblkFatRes {
-    /// Batch completion
-    ///
-    /// Vector is returned, and each element(`tag`, `result`) describes one
-    /// io command completion result.
-    BatchRes(Vec<(u16, i32)>),
-
-    /// Zoned Append completion result
-    ///
-    /// (`result`, `returned lba`) is included in this result.
-    ZonedAppendRes((i32, u64)),
-}
-
 /// Ublk IO completion result
 ///
 /// Ok() part of io command completion result `Result<UblkIORes, UblkError>`
@@ -118,10 +100,6 @@ pub enum UblkIORes {
     ///
     /// Completion result of this io command
     Result(i32),
-
-    /// Fat completion result
-    #[cfg(feature = "fat_complete")]
-    FatRes(UblkFatRes),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -155,17 +133,9 @@ pub enum UblkError {
 mod libublk {
     use crate::{UblkError, UblkIORes};
 
-    #[cfg(not(feature = "fat_complete"))]
     #[test]
-    fn test_feature_fat_complete() {
+    fn test_io_res_size() {
         let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
         assert!(sz == 16);
-    }
-
-    #[cfg(feature = "fat_complete")]
-    #[test]
-    fn test_feature_fat_complete() {
-        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
-        assert!(sz == 32);
     }
 }

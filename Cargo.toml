@@ -18,7 +18,6 @@ maintenance = { status = "actively-developed" }
 
 [features]
 default = ["tokio"]
-fat_complete = []
 # Built-in Tokio current-thread executor integration (UblkRuntime).
 # Disable to bring your own executor driven via libublk::reactor.
 tokio = ["dep:tokio"]

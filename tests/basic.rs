@@ -350,54 +350,6 @@ mod integration {
         drop(ramdisk_buf);
     }
 
-    /// make one ublk-null and test if /dev/ublkbN can be created successfully
-    #[cfg(feature = "fat_complete")]
-    #[test]
-    fn test_ublk_null_comp_batch() {
-        use libublk::UblkFatRes;
-        /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue_batch(qid: u16, dev: &Arc<UblkDev>) {
-            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
-            let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
-            let bufs = bufs_rc.clone();
-
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                let iod = q.get_iod(tag);
-                let bytes = (iod.nr_sectors << 9) as i32;
-
-                let buf_desc = if user_copy {
-                    BufDesc::Slice(&[]) // Empty slice for user_copy mode
-                } else {
-                    BufDesc::Slice(bufs[tag as usize].as_slice())
-                };
-
-                let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)])));
-                q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
-            };
-
-            let queue = match UblkQueue::new(qid, dev)
-                .unwrap()
-                .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
-                    None
-                } else {
-                    Some(&bufs_rc)
-                })) {
-                Ok(q) => q,
-                Err(e) => {
-                    log::error!("submit_fetch_commands_unified failed: {}", e);
-                    return;
-                }
-            };
-
-            queue.wait_and_handle_io(io_handler);
-        }
-
-        __test_ublk_null(
-            UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_COMP_BATCH,
-            null_handle_queue_batch,
-        );
-    }
-
     #[test]
     fn test_ublk_null_async() {
         // submit one io_uring Nop as a target IO: the op future is keyed
