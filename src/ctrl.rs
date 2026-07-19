@@ -1022,7 +1022,8 @@ impl UblkCtrlInner {
         | sys::UBLK_F_USER_COPY
         | sys::UBLK_F_ZONED
         | sys::UBLK_F_AUTO_BUF_REG
-        | sys::UBLK_F_QUIESCE) as u64;
+        | sys::UBLK_F_QUIESCE
+        | sys::UBLK_F_BATCH_IO) as u64;
 
     /// Create device info structure from parameters
     fn create_device_info(
@@ -2798,6 +2799,14 @@ mod tests {
     fn test_quiesce_in_driver_flags() {
         assert_ne!(
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_QUIESCE as u64,
+            0
+        );
+    }
+
+    #[test]
+    fn test_batch_io_in_driver_flags() {
+        assert_ne!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_BATCH_IO as u64,
             0
         );
     }
