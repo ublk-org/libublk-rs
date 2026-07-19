@@ -195,6 +195,10 @@ use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex};
 
+#[path = "io_batch.rs"]
+mod batch;
+pub use batch::{UblkBatchCompletion, UblkBatchConfig, UblkBatchEvent, UblkBatchQueue};
+
 // Unified thread-local io_uring for all queue operations
 
 // Thread-local queue ring using OnceCell for conditional initialization
@@ -1461,9 +1465,11 @@ impl UblkQueue<'_> {
 
             if all_registered {
                 self.buf_reg_semaphore.add_permits(self.q_depth as usize);
-                // Notify device that this queue completed buffer registration
-                self.dev
-                    .notify_buffer_registration_complete(self.is_mlock_failed());
+                if self.dev_flags & sys::UBLK_F_BATCH_IO as u64 == 0 {
+                    // Notify device that this queue completed buffer registration
+                    self.dev
+                        .notify_buffer_registration_complete(self.is_mlock_failed());
+                }
             }
         }
     }
