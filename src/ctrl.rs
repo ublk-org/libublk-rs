@@ -1057,13 +1057,7 @@ impl UblkCtrlInner {
 
     /// Initialize queue data structures
     fn init_queue_data(nr_queues: u32) -> (Vec<i32>, Vec<usize>) {
-        let queue_tids = {
-            let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
-            unsafe {
-                tids.set_len(nr_queues as usize);
-            }
-            tids
-        };
+        let queue_tids = vec![0; nr_queues as usize];
         let queue_selected_cpus = vec![0; nr_queues as usize];
         (queue_tids, queue_selected_cpus)
     }
