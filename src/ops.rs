@@ -175,7 +175,7 @@ pub fn fsync(file: TgtFd, datasync: bool) -> Result<RawOp, UblkError> {
 }
 
 /// `sync_file_range(2)` via the ring (`flags` is the `SYNC_FILE_RANGE_*`
-/// bitset; 0 requests write-and-wait on most kernels' flush paths).
+/// bitset, passed through verbatim).
 pub fn sync_file_range(
     file: TgtFd,
     offset: u64,
@@ -230,6 +230,12 @@ pub fn sleep(duration: Duration) -> Result<Sleep, UblkError> {
         Resources::Timespec(timespec),
     )?;
     Ok(Sleep { op: RawOp::new(op) })
+}
+
+/// No-op via the ring (`IORING_OP_NOP`): completes immediately with 0 —
+/// an instant "target IO" for tests and benchmarks.
+pub fn nop() -> Result<RawOp, UblkError> {
+    submit_raw(opcode::Nop::new().build())
 }
 
 /// Wait for `fd` to become ready for the given `poll(2)` event mask

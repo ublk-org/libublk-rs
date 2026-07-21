@@ -5,6 +5,7 @@ use ilog::IntLog;
 use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
+use libublk::ops::{self, TgtFd};
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
 use serde::Serialize;
 use std::sync::Arc;
@@ -167,14 +168,22 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_slice: &mut [u8]) ->
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
 
-        // Convert slice to pointer only when required by libublk API
-        // This conversion is necessary because io_uring operations require raw pointers
-        // for kernel interface compatibility. The slice ensures we have valid bounds.
+        // Backing-file IO through the typed op catalog; the file is
+        // registered as fixed file 1 at target init.
+        // SAFETY: the raw ops reference this tag's queue-slot buffer,
+        // which outlives the queue.
         let buf_addr = io_slice.as_mut_ptr();
-        let sqe = __lo_make_io_sqe(op, off, bytes, buf_addr);
-        // SAFETY: the SQE references this tag's queue-slot buffer, which
-        // outlives the queue.
-        let res = match unsafe { q.ublk_submit_sqe(sqe) } {
+        let f = match op {
+            libublk::sys::UBLK_IO_OP_FLUSH => ops::sync_file_range(TgtFd::Fixed(1), off, bytes, 0),
+            libublk::sys::UBLK_IO_OP_READ => unsafe {
+                ops::read_at_raw(TgtFd::Fixed(1), buf_addr, bytes, off)
+            },
+            libublk::sys::UBLK_IO_OP_WRITE => unsafe {
+                ops::write_at_raw(TgtFd::Fixed(1), buf_addr, bytes, off)
+            },
+            _ => return -libc::EINVAL,
+        };
+        let res = match f {
             Ok(f) => f.await,
             Err(_) => -libc::EIO,
         };

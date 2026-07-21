@@ -352,14 +352,13 @@ mod integration {
 
     #[test]
     fn test_ublk_null_async() {
-        // submit one io_uring Nop as a target IO: the op future is keyed
-        // by the op slab, no user_data encoding needed
+        // submit one ring no-op as an instant "target IO" through the
+        // typed op catalog
         async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
-            // SAFETY: NOP references no memory.
-            let res = match unsafe { q.ublk_submit_sqe(opcode::Nop::new().build()) } {
+            let res = match libublk::ops::nop() {
                 Ok(f) => f.await,
                 Err(_) => 0,
             };
