@@ -187,7 +187,7 @@ use crate::op::{Op, Resources};
 use crate::ops::RawOp;
 use crate::UblkUringData;
 use async_lock::Semaphore;
-use io_uring::{cqueue, opcode, squeue, types, IoUring};
+use io_uring::{cqueue, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
@@ -1608,10 +1608,12 @@ impl UblkQueue {
             cmd_op
         };
 
-        let mut sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
-            .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
-            .build()
-            .user_data(user_data);
+        let mut sqe = crate::ops::uring_cmd16_sqe(
+            crate::ops::TgtFd::Fixed(0),
+            cmd_op,
+            unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) },
+        )
+        .user_data(user_data);
         if let Some(auto_buf_addr) = sqe_addr {
             assert!(self.support_auto_buf_zc());
             override_sqe!(&mut sqe, addr, auto_buf_addr);

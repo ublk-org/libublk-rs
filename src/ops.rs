@@ -303,6 +303,71 @@ pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> Result<RawOp, Ubl
     submit_raw(opcode::Send::new(types::Fd(fd), ptr, len).build())
 }
 
+/// Build an `IORING_OP_URING_CMD` SQE with a 16-byte inline payload
+/// (64-byte SQE, queue ring format).
+pub(crate) fn uring_cmd16_sqe(file: TgtFd, cmd_op: u32, cmd: [u8; 16]) -> squeue::Entry {
+    with_tgt_fd!(file, |fd| opcode::UringCmd16::new(fd, cmd_op)
+        .cmd(cmd)
+        .build())
+}
+
+/// Build an `IORING_OP_URING_CMD` SQE with an 80-byte inline payload
+/// (128-byte SQE, control ring format).
+pub(crate) fn uring_cmd80_sqe(fd: RawFd, cmd_op: u32, cmd: [u8; 80]) -> squeue::Entry128 {
+    opcode::UringCmd80::new(types::Fd(fd), cmd_op).cmd(cmd).build()
+}
+
+/// `IORING_OP_URING_CMD` with a 16-byte inline payload on the queue ring
+/// — the driver-command primitive for char devices (ublk io commands,
+/// nvme passthrough, ...).
+///
+/// # Safety
+///
+/// Any memory the command payload references (embedded pointers the
+/// driver dereferences) must remain valid until this op's CQE has been
+/// reaped — same contract as [`read_at_raw`].
+pub unsafe fn uring_cmd16(file: TgtFd, cmd_op: u32, cmd: [u8; 16]) -> Result<RawOp, UblkError> {
+    submit_raw(uring_cmd16_sqe(file, cmd_op, cmd))
+}
+
+/// `IORING_OP_URING_CMD` with an 80-byte inline payload on the
+/// thread-local control ring (128-byte SQEs) — the ublk control-command
+/// primitive.
+///
+/// # Safety
+///
+/// Same contract as [`uring_cmd16`].
+pub unsafe fn uring_cmd80(fd: RawFd, cmd_op: u32, cmd: [u8; 80]) -> Result<RawOp, UblkError> {
+    let op = Op::submit_ctrl(
+        |key| uring_cmd80_sqe(fd, cmd_op, cmd).user_data(key),
+        Resources::None,
+    )?;
+    Ok(RawOp::new(op))
+}
+
+/// As [`uring_cmd80`], with `buf` owned by the op while the command is
+/// in flight and handed back on completion — for commands whose payload
+/// references caller memory (e.g. the unprivileged-mode dev-path
+/// buffer), making them safe under future cancellation.
+///
+/// # Safety
+///
+/// Every pointer the command payload references must point into `buf`
+/// (whose liveness the op guarantees) or stay valid until the CQE is
+/// reaped, as for [`uring_cmd16`].
+pub unsafe fn uring_cmd80_buf(
+    fd: RawFd,
+    cmd_op: u32,
+    cmd: [u8; 80],
+    buf: Box<[u8]>,
+) -> Result<BufOp, UblkError> {
+    let op = Op::submit_ctrl(
+        |key| uring_cmd80_sqe(fd, cmd_op, cmd).user_data(key),
+        Resources::Buffer(buf),
+    )?;
+    Ok(BufOp { op })
+}
+
 /// Submit an arbitrary SQE on the queue ring — the escape hatch for
 /// opcodes without a dedicated constructor. The entry's `user_data` is
 /// overwritten with the op key.

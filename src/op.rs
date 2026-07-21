@@ -251,6 +251,22 @@ impl Op {
         })
     }
 
+    /// Non-blocking completion check for a synchronously driven op: the
+    /// CQE result once it has been reaped, consuming the op. Used by the
+    /// blocking control-command path, which drives the ring itself
+    /// instead of parking an executor.
+    pub(crate) fn try_take_result(&mut self) -> Option<i32> {
+        assert!(!self.done, "op polled after completion");
+        OP_SLAB.with(|slab| {
+            let mut slab = slab.borrow_mut();
+            let entry = slab.get_mut(self.key).expect("op entry vanished");
+            entry.result?;
+            let entry = slab.remove(self.key);
+            self.done = true;
+            entry.result
+        })
+    }
+
     /// Poll for the single completion, handing back the kept resources.
     pub(crate) fn poll_single(&mut self, cx: &mut Context<'_>) -> Poll<(i32, Resources)> {
         assert!(!self.done, "op polled after completion");

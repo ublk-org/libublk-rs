@@ -1,10 +1,9 @@
 use super::io::{UblkDev, UblkTgt};
 use super::{sys, UblkError, UblkFlags};
 use crate::op::{Op, Resources};
-use crate::ops::RawOp;
 use bitmaps::Bitmap;
 use derive_setters::*;
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{squeue, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -407,7 +406,7 @@ impl UblkCtrlCmdData {
         }
     }
 
-    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Vec<u8>>) {
+    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Box<[u8]>>) {
         // handle GET_DEV_INFO2 always with dev_path attached
         let cmd_op = self.cmd_op & 0xff;
 
@@ -425,7 +424,7 @@ impl UblkCtrlCmdData {
                     CTRL_UBLKC_PATH_MAX
                 }
             };
-            let mut v = vec![0_u8; size];
+            let mut v = vec![0_u8; size].into_boxed_slice();
 
             (v.as_mut_ptr(), v)
         };
@@ -840,7 +839,6 @@ pub(crate) struct UblkCtrlInner {
 
     //only used in Drop()
     force_sync: bool,
-    cmd_token: i32,
     queue_tids: Vec<i32>,
     queue_selected_cpus: Vec<usize>,
     pub(crate) nr_queues_configured: u16,
@@ -1144,7 +1142,6 @@ impl UblkCtrlInner {
             file,
             dev_info,
             json_manager: UblkJsonManager::new(dev_info.dev_id),
-            cmd_token: 0,
             queue_tids,
             queue_selected_cpus,
             nr_queues_configured: 0,
@@ -1186,7 +1183,6 @@ impl UblkCtrlInner {
             file,
             dev_info,
             json_manager: UblkJsonManager::new(dev_info.dev_id),
-            cmd_token: 0,
             queue_tids,
             queue_selected_cpus,
             nr_queues_configured: 0,
@@ -1297,13 +1293,9 @@ impl UblkCtrlInner {
         self.json_manager.get_json_path()
     }
 
-    fn ublk_ctrl_prep_cmd(
-        &mut self,
-        fd: i32,
-        dev_id: u32,
-        data: &UblkCtrlCmdData,
-        token: u64,
-    ) -> squeue::Entry128 {
+    /// Encode `data` as the 80-byte inline payload of a ublk control
+    /// uring_cmd.
+    fn ublk_ctrl_cmd_payload(dev_id: u32, data: &UblkCtrlCmdData) -> [u8; 80] {
         let cmd = sys::ublksrv_ctrl_cmd {
             addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
                 data.addr
@@ -1326,68 +1318,30 @@ impl UblkCtrlInner {
             ..Default::default()
         };
         let c_cmd = CtrlCmd { ctrl_cmd: cmd };
-
-        opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
-            .cmd(unsafe { c_cmd.buf })
-            .build()
-            .user_data(token)
+        // SAFETY: reading a plain C union as its byte representation.
+        unsafe { c_cmd.buf }
     }
 
-    fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> Result<RawOp, UblkError> {
+    /// Submit one control command and block until its CQE arrives,
+    /// driving the control ring through the op slab (the sync analog of
+    /// the awaited ops path — the same keyspace, no raw tokens).
+    fn ublk_submit_cmd_sync(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         let fd = self.file.as_raw_fd();
-        let dev_id = self.dev_info.dev_id;
-        let op = Op::submit_ctrl(
-            |token| self.ublk_ctrl_prep_cmd(fd, dev_id, data, token),
+        let payload = Self::ublk_ctrl_cmd_payload(self.dev_info.dev_id, data);
+        let mut op = Op::submit_ctrl(
+            |token| crate::ops::uring_cmd80_sqe(fd, data.cmd_op, payload).user_data(token),
             Resources::None,
         )?;
-        Ok(RawOp::new(op))
-    }
-
-    fn ublk_submit_cmd(
-        &mut self,
-        data: &UblkCtrlCmdData,
-        to_wait: usize,
-    ) -> Result<u64, UblkError> {
-        let fd = self.file.as_raw_fd();
-        let dev_id = self.dev_info.dev_id;
-
-        // token is generated uniquely because '&mut self' is
-        // passed in
-        let token = {
-            self.cmd_token += 1;
-            self.cmd_token
-        } as u64;
-        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
-
-        with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-            unsafe {
-                if let Err(e) = r.submission().push(&sqe) {
-                    eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
-                    return;
-                }
-            };
-            let _ = r.submit_and_wait(to_wait);
-        });
-        Ok(token)
-    }
-
-    /// check one control command and see if it is completed
-    ///
-    fn poll_cmd(&mut self, token: u64) -> i32 {
-        with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-            let res = match r.completion().next() {
-                Some(cqe) => {
-                    if cqe.user_data() != token {
-                        -libc::EAGAIN
-                    } else {
-                        cqe.result()
-                    }
-                }
-                None => -libc::EAGAIN,
-            };
-
-            res
-        })
+        loop {
+            if let Some(res) = op.try_take_result() {
+                return Ok(res);
+            }
+            with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+                r.submit_and_wait(1)?;
+                crate::op::ublk_reap_and_wake(r, |_, _| {});
+                Ok::<(), UblkError>(())
+            })?;
+        }
     }
 
     fn ublk_ctrl_need_retry(
@@ -1436,9 +1390,33 @@ impl UblkCtrlInner {
         let mut res: i32 = 0;
 
         for _ in 0..2 {
-            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
-            res = self.ublk_submit_cmd_async(&new_data)?.await;
-            new_data.unprep_un_privileged_dev_path(self, old_buf);
+            let (old_buf, path_buf) = new_data.prep_un_privileged_dev_path(self);
+            let fd = self.file.as_raw_fd();
+            let payload = Self::ublk_ctrl_cmd_payload(self.dev_info.dev_id, &new_data);
+            res = match path_buf {
+                // The op owns the path+data buffer while the command is
+                // in flight — dropping this future mid-await can no
+                // longer free memory the kernel still reads — and hands
+                // it back for the read-back copy in unprep below.
+                // SAFETY: the payload's addr points into `buf`, whose
+                // liveness the op guarantees.
+                Some(buf) => {
+                    let (res, buf) =
+                        unsafe { crate::ops::uring_cmd80_buf(fd, new_data.cmd_op, payload, buf) }?
+                            .await;
+                    new_data.unprep_un_privileged_dev_path(self, old_buf);
+                    drop(buf);
+                    res
+                }
+                // SAFETY: any buffer the payload references is caller
+                // memory that outlives this blocking retry loop.
+                None => {
+                    let res =
+                        unsafe { crate::ops::uring_cmd80(fd, new_data.cmd_op, payload) }?.await;
+                    new_data.unprep_un_privileged_dev_path(self, old_buf);
+                    res
+                }
+            };
 
             trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
             if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
@@ -1464,10 +1442,12 @@ impl UblkCtrlInner {
         let mut res: i32 = 0;
 
         for _ in 0..2 {
-            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
-            let token = self.ublk_submit_cmd(&new_data, 1)?;
-            res = self.poll_cmd(token);
+            // `path_buf` outlives the blocking submit below, and unprep's
+            // read-back happens before it drops at the loop bottom.
+            let (old_buf, path_buf) = new_data.prep_un_privileged_dev_path(self);
+            res = self.ublk_submit_cmd_sync(&new_data)?;
             new_data.unprep_un_privileged_dev_path(self, old_buf);
+            drop(path_buf);
 
             trace!("ublk_ctrl_cmd: cmd {:x} res {}", data.cmd_op, res);
             if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
