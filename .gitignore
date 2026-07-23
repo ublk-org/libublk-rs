@@ -11,3 +11,4 @@ libublk-rs-sys/Cargo.lock
 /*.orig
 /*.rej
 /*~
+*.swp
