@@ -305,6 +305,14 @@ mod integration {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
+            // The UBLK_AUTO_BUF_REG_FALLBACK contract: when auto
+            // registration fails, the kernel delivers the io with
+            // UBLK_IO_F_NEED_REG_BUF set and no buffer registered, and
+            // the server must not touch the fixed-buffer slot.
+            if (iod.op_flags & sys::UBLK_IO_F_NEED_REG_BUF) != 0 {
+                return bytes;
+            }
+
             let mut sqe = opcode::Nop::new()
                 .build()
                 .flags(io_uring::squeue::Flags::FIXED_FILE);
