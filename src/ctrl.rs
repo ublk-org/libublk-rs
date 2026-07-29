@@ -1020,7 +1020,8 @@ impl UblkCtrlInner {
         | sys::UBLK_F_CMD_IOCTL_ENCODE
         | sys::UBLK_F_USER_COPY
         | sys::UBLK_F_ZONED
-        | sys::UBLK_F_AUTO_BUF_REG) as u64;
+        | sys::UBLK_F_AUTO_BUF_REG
+        | sys::UBLK_F_QUIESCE) as u64;
 
     /// Create device info structure from parameters
     fn create_device_info(
@@ -1673,6 +1674,12 @@ impl UblkCtrlInner {
     fn quiesce(&mut self, timeout_ms: u64) -> Result<i32, UblkError> {
         let data = Self::prepare_quiesce_cmd(timeout_ms);
         self.ublk_ctrl_cmd(&data)
+    }
+
+    /// Quiesce this device by sending command to the ublk driver asynchronously
+    pub(crate) async fn quiesce_async(&mut self, timeout_ms: u64) -> Result<i32, UblkError> {
+        let data = Self::prepare_quiesce_cmd(timeout_ms);
+        self.ublk_ctrl_cmd_async(&data).await
     }
 
     /// Prepare GET_PARAMS command data
@@ -2490,17 +2497,34 @@ impl UblkCtrl {
         ctrl.stop()
     }
 
-    /// Quiesce a live ublk device without deleting it.
+    /// Quiesce a live ublk device without deleting it
     ///
-    /// Requires the device to have been created with both
-    /// `UBLK_F_USER_RECOVERY` and `UBLK_F_QUIESCE`.
+    /// The typical use case is upgrading the ublk server application while
+    /// keeping `/dev/ublkbN` persistent: quiesce the device, let the old
+    /// server exit, then bring up a new one via `START_USER_RECOVERY`.
     ///
-    /// On success, the kernel has stopped accepting new I/O and canceled
-    /// pending `uring_cmd`s for the current server. The serving process must
-    /// then unwind and close `/dev/ublkcN`, which allows the kernel to finish
-    /// transitioning the device into its recoverable no-server state.
+    /// # Arguments:
     ///
-    /// `timeout_ms = 0` means wait forever.
+    /// * `timeout_ms`: how long the driver waits for in-flight IO commands to
+    ///   become idle. Zero means wait forever. Note the driver truncates this
+    ///   to 32 bits, so values above `u32::MAX` do not mean what they look
+    ///   like.
+    ///
+    /// Requires the device to have been created with both `UBLK_F_QUIESCE`
+    /// and `UBLK_F_USER_RECOVERY`; otherwise the driver returns `EOPNOTSUPP`.
+    ///
+    /// The queue handlers must cooperate by treating `UBLK_IO_RES_ABORT` as
+    /// "stop fetching", because quiesce completes only once every queue has
+    /// unwound and the last reference to `/dev/ublkcN` is dropped. The device
+    /// then settles in `UBLK_S_DEV_QUIESCED` or `UBLK_S_DEV_FAIL_IO`.
+    ///
+    /// # Errors:
+    ///
+    /// Returns `EBUSY` if in-flight IO does not go idle within `timeout_ms`,
+    /// or `EINTR` if a signal arrives while waiting. **Neither is a no-op:**
+    /// the driver marks the device canceling before it starts waiting and does
+    /// not undo that on failure, so a device that fails to quiesce is left
+    /// refusing new IO. Retry the call, or stop the device.
     pub fn quiesce_dev(&self, timeout_ms: u64) -> Result<i32, UblkError> {
         self.get_inner_mut().quiesce(timeout_ms)
     }
@@ -2714,8 +2738,9 @@ impl UblkCtrl {
 
 #[cfg(test)]
 mod tests {
-    use super::{UblkCtrlCmdData, UblkCtrlInner, CTRL_CMD_HAS_DATA};
-    use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
+    use crate::ctrl::{
+        UblkCtrlBuilder, UblkCtrlCmdData, UblkCtrlInner, UblkQueueAffinity, CTRL_CMD_HAS_DATA,
+    };
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
@@ -2737,6 +2762,17 @@ mod tests {
             Some(f) => eprintln!("features is {:04x}", f),
             None => eprintln!("not support GET_FEATURES, require linux v6.5"),
         }
+    }
+
+    /// `quiesce_dev()` is unreachable unless the flag can be passed to
+    /// `UblkCtrlBuilder::ctrl_flags()`, since the driver rejects
+    /// `UBLK_U_CMD_QUIESCE_DEV` with EOPNOTSUPP when the device lacks it.
+    #[test]
+    fn test_quiesce_in_driver_flags() {
+        assert_ne!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_QUIESCE as u64,
+            0
+        );
     }
 
     #[test]
