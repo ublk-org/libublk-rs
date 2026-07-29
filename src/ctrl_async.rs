@@ -375,6 +375,17 @@ impl UblkCtrlAsync {
         self.get_inner_mut().quiesce_async(timeout_ms).await
     }
 
+    /// Give up ownership of the device, so dropping this control leaves it
+    /// in place
+    ///
+    /// See [`UblkCtrl::disown`] for what this means and when a server needs
+    /// it. Not async: it only touches local state.
+    ///
+    /// [`UblkCtrl::disown`]: crate::ctrl::UblkCtrl::disown
+    pub fn disown(&self) {
+        self.get_inner_mut().disown()
+    }
+
     /// Delete ublk device using async/await pattern
     ///
     /// This method provides true async/await support for device deletion,

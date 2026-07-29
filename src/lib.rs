@@ -72,6 +72,7 @@ bitflags! {
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
         const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;
         const UBLK_DEV_F_INTERNAL_3 = 1_u32 << 28;
+        const UBLK_DEV_F_INTERNAL_4 = 1_u32 << 27;
     }
 }
 
@@ -81,6 +82,7 @@ macro_rules! ublk_internal_flags_all {
             | UblkFlags::UBLK_DEV_F_INTERNAL_1
             | UblkFlags::UBLK_DEV_F_INTERNAL_2
             | UblkFlags::UBLK_DEV_F_INTERNAL_3
+            | UblkFlags::UBLK_DEV_F_INTERNAL_4
     };
 }
 

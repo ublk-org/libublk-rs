@@ -994,7 +994,7 @@ impl Drop for UblkCtrlInner {
     fn drop(&mut self) {
         let id = self.dev_info.dev_id;
         trace!("ctrl: device {} dropped", id);
-        if self.for_add_dev() {
+        if self.for_add_dev() && !self.is_disowned() {
             self.force_sync = true;
             if let Err(r) = self.del() {
                 //Maybe deleted from other utilities, so no warn or error:w
@@ -1011,6 +1011,7 @@ impl UblkCtrlInner {
     pub(crate) const BDEV_PATH: &'static str = "/dev/ublkb";
 
     const UBLK_CTRL_DEV_DELETED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_2;
+    const UBLK_CTRL_DEV_DISOWNED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_4;
     const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
         | sys::UBLK_F_URING_CMD_COMP_IN_TASK
         | sys::UBLK_F_NEED_GET_DATA
@@ -1102,6 +1103,14 @@ impl UblkCtrlInner {
 
     fn mark_deleted(&mut self) {
         self.dev_flags |= Self::UBLK_CTRL_DEV_DELETED;
+    }
+
+    fn is_disowned(&self) -> bool {
+        self.dev_flags.intersects(Self::UBLK_CTRL_DEV_DISOWNED)
+    }
+
+    pub(crate) fn disown(&mut self) {
+        self.dev_flags |= Self::UBLK_CTRL_DEV_DISOWNED;
     }
 
     /// Detect and store driver features
@@ -2527,6 +2536,24 @@ impl UblkCtrl {
     /// refusing new IO. Retry the call, or stop the device.
     pub fn quiesce_dev(&self, timeout_ms: u64) -> Result<i32, UblkError> {
         self.get_inner_mut().quiesce(timeout_ms)
+    }
+
+    /// Give up ownership of the device, so dropping this control leaves it
+    /// in place
+    ///
+    /// A control created with `UBLK_DEV_F_ADD_DEV` normally removes its device
+    /// when it drops. A ublk server that expects to be replaced rather than
+    /// shut down — the `UBLK_F_USER_RECOVERY` handoff that
+    /// [`quiesce_dev`](Self::quiesce_dev) exists for — must call this before
+    /// unwinding, otherwise it destroys the very device its successor is
+    /// meant to recover with `START_USER_RECOVERY`.
+    ///
+    /// This is one-way and purely local: it changes nothing in the driver,
+    /// only whether this control cleans up after itself. The device then has
+    /// to be removed explicitly with [`del_dev`](Self::del_dev), by whoever
+    /// ends up owning it.
+    pub fn disown(&self) {
+        self.get_inner_mut().disown()
     }
 
     /// Kill this device
