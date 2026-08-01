@@ -3,8 +3,8 @@ mod integration {
     use io_uring::opcode;
     use libublk::helpers::IoBuf;
     use libublk::io::{
-        BufDescList, UblkBatchCompletion, UblkBatchConfig, UblkBatchEvent, UblkBatchQueue, UblkDev,
-        UblkIOCtx, UblkQueue,
+        BufDescList, UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue,
+        UblkDev, UblkIOCtx, UblkQueue,
     };
     use libublk::override_sqe;
     use libublk::uring_async::ublk_submit_sqe_async;
@@ -137,6 +137,9 @@ mod integration {
     #[test]
     fn test_ublk_null_batch_io() {
         if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_BATCH_IO as u64 == 0 {
+            println!(
+                "skipping batch IO integration test: kernel does not advertise UBLK_F_BATCH_IO"
+            );
             return;
         }
 
@@ -156,36 +159,38 @@ mod integration {
         let q_fn = |qid: u16, dev: &UblkDev| {
             let queue = UblkQueue::new(qid, dev).unwrap();
             let buffers = dev.alloc_queue_io_bufs();
-            let config = UblkBatchConfig {
-                fetch_buffer_count: 1,
-                tags_per_fetch_buffer: 8,
-                ..UblkBatchConfig::default()
-            };
-            let mut batch = UblkBatchQueue::new(&queue, buffers, config).unwrap();
+            let config = UblkBatchConfig::new()
+                .with_fetch_buffer_count(2)
+                .with_fetch_command_count(2)
+                .with_max_inflight_commits(1)
+                .with_tags_per_fetch_buffer(8);
+            let mut batch =
+                UblkBatchQueue::new(&queue, UblkBatchBuffers::IoBufs(buffers), config).unwrap();
+            assert!(batch.try_submit_completions(&[]).unwrap());
             let mut pending = Vec::new();
 
             loop {
                 let mut batch_error = None;
                 queue
                     .flush_and_wake_io_tasks(
-                        |_user_data, cqe, _is_last| match batch.handle_cqe(cqe) {
-                            Ok(Some(UblkBatchEvent::Requests(tags))) => {
-                                for tag in tags {
-                                    let iod = queue.get_iod(tag);
-                                    let bytes = (iod.nr_sectors << 9) as i32;
-                                    let result = match iod.op_flags & 0xff {
-                                        sys::UBLK_IO_OP_READ => {
-                                            batch.get_io_buf_mut(tag).unwrap().zero_buf();
-                                            bytes
-                                        }
-                                        sys::UBLK_IO_OP_WRITE => bytes,
-                                        sys::UBLK_IO_OP_FLUSH => 0,
-                                        _ => -libc::EOPNOTSUPP,
-                                    };
-                                    pending.push(UblkBatchCompletion::new(tag, result));
-                                }
+                        |_user_data, cqe, _is_last| match batch.handle_cqe(cqe, |batch, tags| {
+                            for &tag in tags {
+                                let iod = queue.get_iod(tag);
+                                let bytes = (iod.nr_sectors << 9) as i32;
+                                let result = match iod.op_flags & 0xff {
+                                    sys::UBLK_IO_OP_READ => {
+                                        batch.io_buf_mut(tag).unwrap().zero_buf();
+                                        bytes
+                                    }
+                                    sys::UBLK_IO_OP_WRITE => bytes,
+                                    sys::UBLK_IO_OP_FLUSH => 0,
+                                    _ => -libc::EOPNOTSUPP,
+                                };
+                                pending.push(UblkBatchCompletion::new(tag, result));
                             }
-                            Ok(Some(_)) | Ok(None) => {}
+                            Ok(())
+                        }) {
+                            Ok(true) | Ok(false) => {}
                             Err(error) => batch_error = Some(error),
                         },
                         1,
@@ -194,29 +199,15 @@ mod integration {
                 if let Some(error) = batch_error {
                     panic!("batch queue failed: {error}");
                 }
-                if !batch.has_inflight_commit() && !pending.is_empty() {
-                    batch.submit_io_completions(pending.drain(..)).unwrap();
+                if !pending.is_empty() {
+                    match batch.try_submit_completions(&pending) {
+                        Ok(true) => pending.clear(),
+                        Ok(false) => {}
+                        Err(error) => panic!("batch commit failed: {error}"),
+                    }
                 }
-                if batch.is_fetch_stopped() && !batch.has_inflight_commit() && pending.is_empty() {
+                if batch.try_begin_shutdown().unwrap() && batch.is_shutdown_complete() {
                     break;
-                }
-            }
-
-            batch.begin_shutdown().unwrap();
-            while !batch.is_shutdown_complete() {
-                let mut batch_error = None;
-                queue
-                    .flush_and_wake_io_tasks(
-                        |_user_data, cqe, _is_last| {
-                            if let Err(error) = batch.handle_cqe(cqe) {
-                                batch_error = Some(error);
-                            }
-                        },
-                        1,
-                    )
-                    .unwrap();
-                if let Some(error) = batch_error {
-                    panic!("batch queue shutdown failed: {error}");
                 }
             }
         };

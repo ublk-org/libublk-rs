@@ -21,7 +21,8 @@ pub mod uring_async;
 #[allow(deprecated)]
 pub use io::{
     ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, with_task_io_ring,
-    with_task_io_ring_mut, BufDesc, BufDescList,
+    with_task_io_ring_mut, BufDesc, BufDescList, UblkBatchBuffers, UblkBatchCompletion,
+    UblkBatchConfig, UblkBatchQueue,
 };
 
 // Re-export control ring initialization and access

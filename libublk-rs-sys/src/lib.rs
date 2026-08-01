@@ -142,10 +142,8 @@ mod tests {
         assert_eq!(offset_of!(ublk_elem_header, result), 4);
         assert_eq!(size_of::<ublk_batch_io>(), 16);
         assert_eq!(offset_of!(ublk_batch_io, reserved2), 8);
-        assert_ne!(UBLK_U_IO_PREP_IO_CMDS, 0);
-        assert_ne!(UBLK_U_IO_COMMIT_IO_CMDS, 0);
-        assert_ne!(UBLK_U_IO_FETCH_IO_CMDS, 0);
-        assert_ne!(UBLK_U_IO_PREP_IO_CMDS, UBLK_U_IO_COMMIT_IO_CMDS);
-        assert_ne!(UBLK_U_IO_COMMIT_IO_CMDS, UBLK_U_IO_FETCH_IO_CMDS);
+        assert_eq!(UBLK_U_IO_PREP_IO_CMDS, 0xc010_7525);
+        assert_eq!(UBLK_U_IO_COMMIT_IO_CMDS, 0xc010_7526);
+        assert_eq!(UBLK_U_IO_FETCH_IO_CMDS, 0xc010_7527);
     }
 }
