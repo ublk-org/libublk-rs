@@ -11,36 +11,50 @@ libublk-rs is a Rust library for building Linux ublk (userspace block) target de
 - `cargo build` - Build the library
 - `cargo build --features=fat_complete` - Build with fat completion feature
 - `cargo test` - Run tests
+- `cargo test --test basic <name>` - Run a single integration test by name (e.g. `cargo test --test basic test_ublk_null`)
+- `cargo test -- --nocapture` - Show stdout/stderr from tests (useful when device creation fails silently)
 - `cargo run --example null help` - Run the null target example with help
 - `cargo run --example loop help` - Run the loop target example with help
 - `cargo run --example ramdisk` - Run the ramdisk example
+- `cargo run --example batch help` - Run the batch-completion example
+
+This is a Cargo **workspace**: the top-level `libublk` crate depends on the
+`libublk-rs-sys` subcrate (path dep) for the bindgen-generated kernel bindings.
+The `build.rs` lives in `libublk-rs-sys/`, not the root.
 
 ## Core Architecture
 
 ### Main Components
 
-1. **Control Layer (`src/ctrl.rs`)**: 
-   - `UblkCtrl` and `UblkCtrlBuilder` - Device creation and management
-   - Handles device lifecycle (add, start, stop, delete)
+1. **Control Layer (`src/ctrl.rs`, `src/ctrl_async.rs`)**:
+   - `UblkCtrl` / `UblkCtrlBuilder` - synchronous device creation and management
+   - `UblkCtrlAsync` (in `ctrl_async.rs`) - async/await variant; enforces `UBLK_CTRL_ASYNC_AWAIT`
+   - Handles device lifecycle (add, start, stop, delete) via `/dev/ublk-control`
    - CPU affinity management for queues
-   - Uses `/dev/ublk-control` for kernel communication
+   - Control-ring helpers: `ublk_init_ctrl_task_ring`, `with_ctrl_ring`, `with_ctrl_ring_mut`
 
 2. **I/O Layer (`src/io.rs`)**:
    - `UblkDev` - Device representation
    - `UblkQueue` - Per-queue I/O handling
    - `UblkIOCtx` - I/O context management
    - Raw SQE (Submission Queue Entry) manipulation via `RawSqe`
+   - **Unified buffer API**: `BufDesc` / `BufDescList` describe per-IO buffers
+     across the various ublk buffer modes (slice, user-copy, auto-buf-reg,
+     zero-copy). These are re-exported from the crate root — prefer them over
+     raw pointers in new code.
 
 3. **Async Support (`src/uring_async.rs`)**:
    - `UblkUringOpFuture` - io_uring integration
    - `wait_and_handle_io_events()` - Main event loop driver
+   - `run_uring_tasks`, `ublk_reap_events_with_handler`, `uring_poll_io_fn`
 
-4. **System Bindings (`src/sys.rs`, `src/bindings.rs`)**:
+4. **System Bindings (`src/sys.rs`, `src/bindings.rs`, `libublk-rs-sys/`)**:
    - Low-level kernel interface definitions
-   - Generated from C headers via build.rs
+   - The `-sys` crate generates Rust bindings from `ublk_cmd.h` via bindgen at
+     build time; the high-level crate stays free of build-script complexity.
 
 5. **Helpers (`src/helpers.rs`)**:
-   - `IoBuf` - I/O buffer management utilities
+   - `IoBuf<T>` - aligned I/O buffer management utility
 
 ### Key Patterns
 
@@ -51,10 +65,14 @@ libublk-rs is a Rust library for building Linux ublk (userspace block) target de
 
 ### Build System
 
-The project uses a custom `build.rs` that:
-- Generates Rust bindings from `ublk_cmd.h` using bindgen
-- Adds serde serialization support to generated structs
-- Handles kernel version compatibility issues (Fix753 workaround)
+`libublk-rs-sys/build.rs` (not a root-level build script):
+- Generates Rust bindings from `libublk-rs-sys/ublk_cmd.h` using bindgen
+- Post-processes the output to add `Serialize`/`Deserialize` derives via a regex
+  rewrite of every `pub struct`/`pub enum` (so device params can round-trip
+  through `serde_json`)
+- Handles kernel version compatibility for `UBLK_F_CMD_IOCTL_ENCODE` via the
+  `Fix753` callback, which strips a `Fix753_` prefix used to coerce bindgen
+  into emitting macro-defined constants
 
 ### Features
 
@@ -79,8 +97,9 @@ All examples follow the pattern:
 
 The examples demonstrate different target types:
 - `null.rs` - Null device (discards writes, returns zeros)
-- `loop.rs` - Loop device (file-backed)
-- `ramdisk.rs` - RAM-based storage
+- `loop.rs` - Loop device (file-backed); real async/await + io_uring usage
+- `ramdisk.rs` - RAM-based storage; single-thread async for *both* ctrl and IO
+- `batch.rs` - Demonstrates `fat_complete` batch-completion path
 
 ### Dependencies
 
@@ -94,9 +113,25 @@ Key external dependencies:
 
 ### Testing Requirements
 
-- Tests require Linux kernel 6.0+ with CONFIG_BLK_DEV_UBLK enabled
-- Some tests may require root privileges for device creation
+- Tests require Linux kernel 6.0+ with `CONFIG_BLK_DEV_UBLK` enabled
+- `tests/basic.rs` creates real `/dev/ublkbN` devices — needs either
+  `CAP_SYS_ADMIN` (run as root / `sudo cargo test`) **or** the unprivileged-mode
+  udev rules + `ublk_user_id` helper installed (see "Unprivileged Mode" below)
+- CI uses an mkosi-built VM image (`ci/mkosi.*`) so a real kernel is available;
+  plain GitHub Action runners can't create ublk devices without it
 - CI runs on both stable and nightly Rust toolchains
+
+### Mount namespace caveat (operational landmine)
+
+**The ublk daemon must not share a mount namespace with any process that
+mounts a filesystem on `/dev/ublkbN` or otherwise consumes the device.**
+The daemon serves I/O for its own device, so when it exits, any in-flight
+unmount/flush triggered in the same mount ns will wait for I/O that the
+exiting daemon can no longer serve → self-deadlock. Run the daemon under
+`unshare --mount` or call `unshare(CLONE_NEWNS)` at startup. This bites
+hardest in container/Kubernetes-pod deployments. Tracked in
+[libublk-rs#50](https://github.com/ublk-org/libublk-rs/issues/50); minimal
+repro in `vmtest/tests/ublk-mntns-min.sh`.
 
 ### Memory Locking (mlock) Support
 
