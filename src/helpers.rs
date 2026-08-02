@@ -25,11 +25,21 @@ impl<T> RefUnwindSafe for IoBuf<T> {}
 impl<T> UnwindSafe for IoBuf<T> {}
 
 impl<T> IoBuf<T> {
+    /// Allocate a 4096-aligned buffer of `size` bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is zero. The check has to come first: `alloc()` with a
+    /// zero-sized layout is undefined behaviour by its own safety contract, so
+    /// a guard placed after the allocation is too late to guard anything.
+    ///
+    /// Also panics if `size` rounded up to the 4096-byte alignment would
+    /// exceed `isize::MAX`, which is what `Layout::from_size_align()` rejects.
     pub fn new(size: usize) -> Self {
+        assert!(size != 0);
+
         let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
-
-        assert!(size != 0);
 
         IoBuf {
             ptr,
@@ -229,4 +239,35 @@ macro_rules! zero_io_buf {
             std::ptr::write_bytes($buffer.as_mut_ptr(), 0, $buffer.len());
         }
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IoBuf;
+
+    /// A zero size must be rejected before anything is allocated, so this
+    /// panics rather than reaching alloc() with a zero-sized layout.
+    #[test]
+    #[should_panic]
+    fn io_buf_rejects_zero_size() {
+        let _ = IoBuf::<u8>::new(0);
+    }
+
+    #[test]
+    fn io_buf_is_page_aligned_and_usable() {
+        let mut buf = IoBuf::<u8>::new(8192);
+        assert!(!buf.as_ptr().is_null());
+        assert_eq!(buf.as_ptr() as usize % 4096, 0);
+        assert_eq!(buf.len(), 8192);
+
+        // Alignment and length alone say nothing about whether the memory can
+        // actually be used, so touch both ends of it.
+        buf.zero_buf();
+        let slice = buf.as_mut_slice();
+        slice[0] = 0xa5;
+        slice[8191] = 0x5a;
+        assert_eq!(buf.as_slice()[0], 0xa5);
+        assert_eq!(buf.as_slice()[8191], 0x5a);
+        assert_eq!(buf.as_slice()[4096], 0);
+    }
 }
