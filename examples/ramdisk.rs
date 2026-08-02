@@ -272,7 +272,11 @@ fn create_ublk_ctrl_async(dev_id: i32, dev_flags: UblkFlags) -> Result<UblkCtrlA
             .nr_queues(1_u16)
             .depth(128_u16)
             .dev_flags(dev_flags)
-            .ctrl_flags(libublk::sys::UBLK_F_USER_RECOVERY as u64)
+            // QUIESCE rides on USER_RECOVERY and lets the device be quiesced
+            // gracefully; see test_ublk_ramdisk_quiesce.
+            .ctrl_flags(
+                (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_QUIESCE) as u64,
+            )
             .build_async()
             .await
     })
@@ -362,6 +366,19 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
             log::error!("poll_and_handle_rings failed: {}", e);
         }
     }));
+
+    // The queues are done, so this server is on its way out. The device is
+    // UBLK_F_USER_RECOVERY and may have been quiesced for a successor to take
+    // over, so hand it off instead of deleting it on the way down.
+    //
+    // This is unconditional because the server cannot tell the two cases
+    // apart here: the driver only reports UBLK_S_DEV_QUIESCED once the last
+    // reference to /dev/ublkcN is gone, which is after this process exits.
+    // So a device that was merely stopped is also left behind, and `ramdisk
+    // del <id>` is what removes it either way. A server that can distinguish
+    // its own shutdown from a handoff should call disown() only for the
+    // latter, and let the drop clean up otherwise.
+    ctrl.disown();
 }
 
 fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {

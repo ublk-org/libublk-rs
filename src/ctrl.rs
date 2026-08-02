@@ -994,7 +994,7 @@ impl Drop for UblkCtrlInner {
     fn drop(&mut self) {
         let id = self.dev_info.dev_id;
         trace!("ctrl: device {} dropped", id);
-        if self.for_add_dev() {
+        if self.for_add_dev() && !self.is_disowned() {
             self.force_sync = true;
             if let Err(r) = self.del() {
                 //Maybe deleted from other utilities, so no warn or error:w
@@ -1011,6 +1011,7 @@ impl UblkCtrlInner {
     pub(crate) const BDEV_PATH: &'static str = "/dev/ublkb";
 
     const UBLK_CTRL_DEV_DELETED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_2;
+    const UBLK_CTRL_DEV_DISOWNED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_4;
     const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
         | sys::UBLK_F_URING_CMD_COMP_IN_TASK
         | sys::UBLK_F_NEED_GET_DATA
@@ -1020,7 +1021,8 @@ impl UblkCtrlInner {
         | sys::UBLK_F_CMD_IOCTL_ENCODE
         | sys::UBLK_F_USER_COPY
         | sys::UBLK_F_ZONED
-        | sys::UBLK_F_AUTO_BUF_REG) as u64;
+        | sys::UBLK_F_AUTO_BUF_REG
+        | sys::UBLK_F_QUIESCE) as u64;
 
     /// Create device info structure from parameters
     fn create_device_info(
@@ -1101,6 +1103,14 @@ impl UblkCtrlInner {
 
     fn mark_deleted(&mut self) {
         self.dev_flags |= Self::UBLK_CTRL_DEV_DELETED;
+    }
+
+    fn is_disowned(&self) -> bool {
+        self.dev_flags.intersects(Self::UBLK_CTRL_DEV_DISOWNED)
+    }
+
+    pub(crate) fn disown(&mut self) {
+        self.dev_flags |= Self::UBLK_CTRL_DEV_DISOWNED;
     }
 
     /// Detect and store driver features
@@ -1650,6 +1660,11 @@ impl UblkCtrlInner {
         UblkCtrlCmdData::new_simple_cmd(sys::UBLK_U_CMD_STOP_DEV)
     }
 
+    /// Prepare QUIESCE_DEV command data.
+    fn prepare_quiesce_cmd(timeout_ms: u64) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_QUIESCE_DEV, timeout_ms)
+    }
+
     /// Stop this device by sending command to ublk driver
     ///
     fn stop(&mut self) -> Result<i32, UblkError> {
@@ -1661,6 +1676,18 @@ impl UblkCtrlInner {
     ///
     pub(crate) async fn stop_async(&mut self) -> Result<i32, UblkError> {
         let data = Self::prepare_stop_cmd();
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Quiesce this device by sending command to the ublk driver.
+    fn quiesce(&mut self, timeout_ms: u64) -> Result<i32, UblkError> {
+        let data = Self::prepare_quiesce_cmd(timeout_ms);
+        self.ublk_ctrl_cmd(&data)
+    }
+
+    /// Quiesce this device by sending command to the ublk driver asynchronously
+    pub(crate) async fn quiesce_async(&mut self, timeout_ms: u64) -> Result<i32, UblkError> {
+        let data = Self::prepare_quiesce_cmd(timeout_ms);
         self.ublk_ctrl_cmd_async(&data).await
     }
 
@@ -2479,6 +2506,56 @@ impl UblkCtrl {
         ctrl.stop()
     }
 
+    /// Quiesce a live ublk device without deleting it
+    ///
+    /// The typical use case is upgrading the ublk server application while
+    /// keeping `/dev/ublkbN` persistent: quiesce the device, let the old
+    /// server exit, then bring up a new one via `START_USER_RECOVERY`.
+    ///
+    /// # Arguments:
+    ///
+    /// * `timeout_ms`: how long the driver waits for in-flight IO commands to
+    ///   become idle. Zero means wait forever. Note the driver truncates this
+    ///   to 32 bits, so values above `u32::MAX` do not mean what they look
+    ///   like.
+    ///
+    /// Requires the device to have been created with both `UBLK_F_QUIESCE`
+    /// and `UBLK_F_USER_RECOVERY`; otherwise the driver returns `EOPNOTSUPP`.
+    ///
+    /// The queue handlers must cooperate by treating `UBLK_IO_RES_ABORT` as
+    /// "stop fetching", because quiesce completes only once every queue has
+    /// unwound and the last reference to `/dev/ublkcN` is dropped. The device
+    /// then settles in `UBLK_S_DEV_QUIESCED` or `UBLK_S_DEV_FAIL_IO`.
+    ///
+    /// # Errors:
+    ///
+    /// Returns `EBUSY` if in-flight IO does not go idle within `timeout_ms`,
+    /// or `EINTR` if a signal arrives while waiting. **Neither is a no-op:**
+    /// the driver marks the device canceling before it starts waiting and does
+    /// not undo that on failure, so a device that fails to quiesce is left
+    /// refusing new IO. Retry the call, or stop the device.
+    pub fn quiesce_dev(&self, timeout_ms: u64) -> Result<i32, UblkError> {
+        self.get_inner_mut().quiesce(timeout_ms)
+    }
+
+    /// Give up ownership of the device, so dropping this control leaves it
+    /// in place
+    ///
+    /// A control created with `UBLK_DEV_F_ADD_DEV` normally removes its device
+    /// when it drops. A ublk server that expects to be replaced rather than
+    /// shut down — the `UBLK_F_USER_RECOVERY` handoff that
+    /// [`quiesce_dev`](Self::quiesce_dev) exists for — must call this before
+    /// unwinding, otherwise it destroys the very device its successor is
+    /// meant to recover with `START_USER_RECOVERY`.
+    ///
+    /// This is one-way and purely local: it changes nothing in the driver,
+    /// only whether this control cleans up after itself. The device then has
+    /// to be removed explicitly with [`del_dev`](Self::del_dev), by whoever
+    /// ends up owning it.
+    pub fn disown(&self) {
+        self.get_inner_mut().disown()
+    }
+
     /// Kill this device
     ///
     /// Preferred method for target code to stop & delete device,
@@ -2688,7 +2765,9 @@ impl UblkCtrl {
 
 #[cfg(test)]
 mod tests {
-    use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
+    use crate::ctrl::{
+        UblkCtrlBuilder, UblkCtrlCmdData, UblkCtrlInner, UblkQueueAffinity, CTRL_CMD_HAS_DATA,
+    };
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
@@ -2710,6 +2789,28 @@ mod tests {
             Some(f) => eprintln!("features is {:04x}", f),
             None => eprintln!("not support GET_FEATURES, require linux v6.5"),
         }
+    }
+
+    /// `quiesce_dev()` is unreachable unless the flag can be passed to
+    /// `UblkCtrlBuilder::ctrl_flags()`, since the driver rejects
+    /// `UBLK_U_CMD_QUIESCE_DEV` with EOPNOTSUPP when the device lacks it.
+    #[test]
+    fn test_quiesce_in_driver_flags() {
+        assert_ne!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_QUIESCE as u64,
+            0
+        );
+    }
+
+    #[test]
+    fn test_prepare_quiesce_cmd() {
+        let data: UblkCtrlCmdData = UblkCtrlInner::prepare_quiesce_cmd(1_234);
+
+        assert_eq!(data.cmd_op, crate::sys::UBLK_U_CMD_QUIESCE_DEV);
+        assert_eq!(data.flags, CTRL_CMD_HAS_DATA);
+        assert_eq!(data.data, 1_234);
+        assert_eq!(data.addr, 0);
+        assert_eq!(data.len, 0);
     }
 
     fn __test_add_ctrl_dev(del_async: bool) {

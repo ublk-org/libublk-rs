@@ -659,47 +659,43 @@ mod integration {
         __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, null_queue_mut_io);
     }
 
-    /// run examples/ramdisk recovery test
-    #[test]
-    fn test_ublk_ramdisk_recovery() {
-        fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
-            if let Err(_current_exe) = env::current_exe() {
-                None
-            } else {
-                env::current_exe().ok().map(|mut path| {
+    fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
+        if let Err(_current_exe) = env::current_exe() {
+            None
+        } else {
+            env::current_exe().ok().map(|mut path| {
+                path.pop();
+                if path.ends_with("deps") {
                     path.pop();
-                    if path.ends_with("deps") {
-                        path.pop();
-                    }
-                    path
-                })
-            }
-        }
-
-        fn ublk_state_wait_until(ctrl: &UblkCtrl, state: u16, timeout: u32) {
-            let mut count = 0;
-            let unit = 100_u32;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(unit as u64));
-
-                ctrl.read_dev_info().unwrap();
-                if ctrl.dev_info().state == state {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    break;
                 }
-                count += unit;
-                assert!(count < timeout);
-            }
+                path
+            })
         }
+    }
 
-        let tgt_dir = get_curr_bin_dir().unwrap();
-        //println!("top dir: path {:?} {:?}", &tgt_dir, &file);
-        let rd_path = tgt_dir.display().to_string() + &"/examples/ramdisk".to_string();
-        let mut cmd = Command::new(&rd_path)
-            .args(["add", "-1", "32"])
+    fn ublk_state_wait_until(ctrl: &UblkCtrl, state: u16, timeout: u32) {
+        let mut count = 0;
+        let unit = 100_u32;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(unit as u64));
+
+            ctrl.read_dev_info().unwrap();
+            if ctrl.dev_info().state == state {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                break;
+            }
+            count += unit;
+            assert!(count < timeout);
+        }
+    }
+
+    /// Spawn `examples/ramdisk <cmd> ...` and return its (dev_id, queue tid).
+    fn ramdisk_spawn(rd_path: &str, args: &[&str]) -> (i32, libc::pid_t) {
+        let mut cmd = Command::new(rd_path)
+            .args(args)
             .stdout(Stdio::piped())
             .spawn()
-            .expect("fail to add ublk ramdisk");
+            .expect("fail to run ublk ramdisk");
         let stdout = cmd.stdout.take().expect("Failed to capture stdout");
         let _ = cmd.wait().expect("Failed to wait on child");
 
@@ -720,6 +716,111 @@ mod integration {
                 Err(e) => eprintln!("Error reading line: {}", e), // Handle error
             }
         }
+        (id, tid)
+    }
+
+    /// A disowned control must leave its device behind, and the device must
+    /// still be removable afterwards.
+    ///
+    /// This is what makes the quiesce handoff possible: without it the
+    /// outgoing server deletes the device its successor is meant to recover.
+    #[test]
+    fn test_ublk_ctrl_disown() {
+        fn wait_for_path(path: &str, want: bool) -> bool {
+            for _ in 0..20 {
+                if Path::new(path).exists() == want {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        }
+
+        // Take the id from dev_info rather than parsing it back out of the
+        // path: the name is system policy and udev may rename it.
+        let (id, cdev) = {
+            let ctrl = UblkCtrlBuilder::default()
+                .name("disown")
+                .nr_queues(1)
+                .depth(16)
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                .build()
+                .unwrap();
+            let id = ctrl.dev_info().dev_id as i32;
+            let cdev = ctrl.get_cdev_path();
+            assert!(
+                wait_for_path(&cdev, true),
+                "char device {} never appeared",
+                cdev
+            );
+
+            ctrl.disown();
+            (id, cdev)
+        };
+
+        // The control is gone; UBLK_DEV_F_ADD_DEV would normally have taken
+        // the device with it. This test switches that cleanup off, so from
+        // here on nothing removes the device for us -- delete it first and
+        // assert afterwards, so a later failure cannot strand it.
+        let survived = Path::new(&cdev).exists();
+        let removed = UblkCtrl::new_simple(id).and_then(|c| c.del_dev());
+
+        assert!(survived, "disowned device was deleted on drop");
+        // disown() must not disarm an explicit removal.
+        removed.expect("del_dev() failed on a disowned device");
+        assert!(
+            wait_for_path(&cdev, false),
+            "del_dev() did not remove disowned device {}",
+            cdev
+        );
+    }
+
+    /// Drive the graceful quiesce path end to end.
+    ///
+    /// [`test_ublk_ramdisk_recovery`] reaches `UBLK_S_DEV_QUIESCED` by killing
+    /// the queue thread, i.e. the crash path. This does it the intended way:
+    /// `UBLK_U_CMD_QUIESCE_DEV` cancels the server's pending `uring_cmd`s, the
+    /// server unwinds on `UBLK_IO_RES_ABORT` and exits, and the device settles
+    /// in `UBLK_S_DEV_QUIESCED` ready for `START_USER_RECOVERY`.
+    #[test]
+    fn test_ublk_ramdisk_quiesce() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_QUIESCE as u64 == 0 {
+            println!("skipping: kernel lacks UBLK_F_QUIESCE");
+            return;
+        }
+
+        let tgt_dir = get_curr_bin_dir().unwrap();
+        let rd_path = tgt_dir.display().to_string() + &"/examples/ramdisk".to_string();
+        let (id, tid) = ramdisk_spawn(&rd_path, &["add", "-1", "32"]);
+        assert!(tid != 0 && id >= 0);
+
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
+        assert!(Path::new(&ctrl.get_bdev_path()).exists() == true);
+
+        // Graceful quiesce, in place of the recovery test's SIGKILL.
+        // On EBUSY the driver leaves the device canceling, so say so here
+        // rather than letting the next wait fail with no explanation.
+        ctrl.quiesce_dev(3000)
+            .expect("quiesce failed; device is left canceling, not quiesced");
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_QUIESCED as u16, 6000);
+
+        // A quiesced device is still recoverable, and the bdev never went away.
+        assert!(Path::new(&ctrl.get_bdev_path()).exists() == true);
+        let (rid, rtid) = ramdisk_spawn(&rd_path, &["recover", &id.to_string()]);
+        assert!(rtid != 0 && rid == id);
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
+
+        ctrl.del_dev().unwrap();
+    }
+
+    /// run examples/ramdisk recovery test
+    #[test]
+    fn test_ublk_ramdisk_recovery() {
+        let tgt_dir = get_curr_bin_dir().unwrap();
+        //println!("top dir: path {:?} {:?}", &tgt_dir, &file);
+        let rd_path = tgt_dir.display().to_string() + &"/examples/ramdisk".to_string();
+        let (id, tid) = ramdisk_spawn(&rd_path, &["add", "-1", "32"]);
         assert!(tid != 0 && id >= 0);
 
         let ctrl = UblkCtrl::new_simple(id).unwrap();
