@@ -102,6 +102,15 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Res
     }
 }
 
+/// Sentinel meaning "the server failed to start", sent over the same eventfd
+/// the device id travels on.
+///
+/// Every other value on that channel is a success (`dev_id + 1`), so without a
+/// sentinel a failed startup says nothing at all and the parent -- which blocks
+/// in read_dev_id() with no timeout -- waits forever. `u64::MAX` itself cannot
+/// be used: eventfd rejects it with EINVAL.
+const DEV_ID_START_FAILED: u64 = u64::MAX - 1;
+
 fn write_dev_id(ctrl: &UblkCtrlAsync, efd: i32) -> Result<i32, Error> {
     // Can't write 0 to eventfd file, otherwise the read() side may
     // not be waken up
@@ -112,12 +121,25 @@ fn write_dev_id(ctrl: &UblkCtrlAsync, efd: i32) -> Result<i32, Error> {
     Ok(0)
 }
 
+/// Tell the waiting parent that this server is not coming up.
+fn write_dev_start_failed(efd: i32) {
+    if let Err(e) = nix::unistd::write(efd, &DEV_ID_START_FAILED.to_le_bytes()) {
+        log::error!("failed to report startup failure: {}", e);
+    }
+}
+
 fn read_dev_id(efd: i32) -> Result<i32, Error> {
     let mut buffer = [0; 8];
 
     let bytes_read = nix::unistd::read(efd, &mut buffer)?;
     if bytes_read == 0 {
         return Err(Error::new(ErrorKind::InvalidInput, "invalid device id"));
+    }
+    if u64::from_le_bytes(buffer) == DEV_ID_START_FAILED {
+        return Err(Error::new(
+            ErrorKind::Other,
+            "ublk server failed to start; see the daemon log",
+        ));
     }
     return Ok((i64::from_le_bytes(buffer) - 1) as i32);
 }
@@ -349,13 +371,30 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
     let ctrl_clone = ctrl.clone();
     let dev_clone = dev_rc.clone();
     f_vec.push(exec.spawn(async move {
-        let r = ctrl_clone
-            .configure_queue_async(&dev_clone, 0, unsafe { libc::gettid() })
-            .await
-            .unwrap();
-        if r >= 0 {
-            ctrl_clone.start_dev_async(&dev_clone).await.unwrap();
-            write_dev_id(&ctrl_clone, efd).expect("Failed to write dev_id");
+        // Report the outcome either way. The parent blocks on this eventfd,
+        // so any path that returns without writing hangs `ramdisk add`.
+        let started = async {
+            let r = ctrl_clone
+                .configure_queue_async(&dev_clone, 0, unsafe { libc::gettid() })
+                .await?;
+            if r < 0 {
+                return Err(UblkError::OtherError(r));
+            }
+            ctrl_clone.start_dev_async(&dev_clone).await?;
+            Ok::<(), UblkError>(())
+        }
+        .await;
+
+        match started {
+            Ok(()) => {
+                if let Err(e) = write_dev_id(&ctrl_clone, efd) {
+                    log::error!("failed to send dev id: {}", e);
+                }
+            }
+            Err(e) => {
+                log::error!("ramdisk failed to start: {}", e);
+                write_dev_start_failed(efd);
+            }
         }
     }));
     smol::block_on(exec_rc.run(async move {
@@ -404,31 +443,42 @@ fn test_add(recover: usize) {
         .stderr(daemonize::Stdio::devnull());
     match daemonize.execute() {
         daemonize::Outcome::Child(Ok(_)) => {
-            let mut size = (mb << 20) as u64;
+            // Everything the child does before it reports the device id has to
+            // be inside this guard, not just rd_add_dev(): the buffer
+            // allocation below asserts on a zero size, and any panic escaping
+            // here leaves the parent blocked in read_dev_id() forever. The
+            // process is daemonized onto /dev/null, so such a panic is
+            // invisible too -- `ramdisk add` would simply never return.
+            let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut size = (mb << 20) as u64;
 
-            if recover > 0 {
-                assert!(dev_id >= 0);
-                let ctrl = UblkCtrl::new_simple(dev_id).unwrap();
-                size = rd_get_device_size(&ctrl);
+                if recover > 0 {
+                    assert!(dev_id >= 0);
+                    let ctrl = UblkCtrl::new_simple(dev_id).unwrap();
+                    size = rd_get_device_size(&ctrl);
 
-                ctrl.start_user_recover().unwrap();
+                    ctrl.start_user_recover().unwrap();
+                }
+
+                // Create ramdisk storage using IoBuf for proper alignment and memory management
+                // IoBuf provides safe slice access while maintaining required memory alignment
+                let mut ramdisk_buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
+
+                // Zero-initialize the ramdisk storage for consistent behavior
+                // Using safe slice operations instead of unsafe memory manipulation
+                ramdisk_buf.zero_buf();
+
+                // Get mutable slice for safe operations within rd_add_dev
+                let storage_slice = ramdisk_buf.as_mut_slice();
+                rd_add_dev(dev_id, storage_slice, size, recover == 0, efd);
+            }));
+            if started.is_err() {
+                write_dev_start_failed(efd);
             }
-
-            // Create ramdisk storage using IoBuf for proper alignment and memory management
-            // IoBuf provides safe slice access while maintaining required memory alignment
-            let mut ramdisk_buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
-
-            // Zero-initialize the ramdisk storage for consistent behavior
-            // Using safe slice operations instead of unsafe memory manipulation
-            ramdisk_buf.zero_buf();
-
-            // Get mutable slice for safe operations within rd_add_dev
-            let storage_slice = ramdisk_buf.as_mut_slice();
-            rd_add_dev(dev_id, storage_slice, size, recover == 0, efd);
         }
         daemonize::Outcome::Parent(Ok(_)) => match read_dev_id(efd) {
             Ok(id) => UblkCtrl::new_simple(id).unwrap().dump(),
-            _ => eprintln!("Failed to add ublk device"),
+            Err(e) => eprintln!("Failed to add ublk device: {}", e),
         },
         _ => panic!(),
     }
