@@ -191,9 +191,16 @@ use async_lock::Semaphore;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
+use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Condvar, Mutex};
+
+// Keep the batch transport as a child of `io` so it can share the private
+// queue-ring and buffer-registration machinery without exposing those details.
+#[path = "io_batch.rs"]
+mod batch;
+pub use batch::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue};
 
 // Unified thread-local io_uring for all queue operations
 
@@ -201,6 +208,16 @@ use std::sync::{Arc, Condvar, Mutex};
 std::thread_local! {
     pub(crate) static QUEUE_RING: OnceCell<RefCell<IoUring<squeue::Entry>>> =
         OnceCell::new();
+    static DEFERRED_QUEUE_CQES: RefCell<VecDeque<cqueue::Entry>> =
+        const { RefCell::new(VecDeque::new()) };
+}
+
+pub(crate) fn defer_queue_cqe(cqe: cqueue::Entry) {
+    DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().push_back(cqe));
+}
+
+pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
+    DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().pop_front())
 }
 
 // Internal macro versions for backwards compatibility within the crate
@@ -785,6 +802,8 @@ pub(crate) struct BufferRegState {
     pub registered_queues: usize,
     /// Whether any queue has failed mlock
     pub mlock_failed: bool,
+    /// Whether any queue failed before buffer registration completed
+    pub queue_setup_failed: bool,
 }
 
 /// For supporting ublk device IO path, and one thin layer of device
@@ -878,6 +897,7 @@ impl UblkDev {
                 Mutex::new(BufferRegState {
                     registered_queues: 0,
                     mlock_failed: false,
+                    queue_setup_failed: false,
                 }),
                 Condvar::new(),
             )),
@@ -1008,6 +1028,9 @@ impl UblkDev {
         let mut state = lock.lock().unwrap();
 
         while state.registered_queues < nr_hw_queues {
+            if state.queue_setup_failed {
+                return Err(UblkError::OtherError(-libc::EIO));
+            }
             // Check for mlock failures
             if state.mlock_failed {
                 return Err(UblkError::OtherError(-libc::EPERM));
@@ -1015,6 +1038,9 @@ impl UblkDev {
             state = cvar.wait(state).unwrap();
         }
 
+        if state.queue_setup_failed {
+            return Err(UblkError::OtherError(-libc::EIO));
+        }
         // Final check for mlock failures
         if state.mlock_failed {
             return Err(UblkError::OtherError(-libc::EPERM));
@@ -1031,6 +1057,15 @@ impl UblkDev {
         if mlock_failed {
             state.mlock_failed = true;
         }
+        cvar.notify_all();
+    }
+
+    /// Notify that a queue failed before completing buffer registration.
+    pub(crate) fn notify_queue_setup_failed(&self) {
+        let (lock, cvar) = &*self.buf_reg_sync;
+        let mut state = lock.lock().unwrap();
+        state.registered_queues += 1;
+        state.queue_setup_failed = true;
         cvar.notify_all();
     }
 
@@ -1461,9 +1496,11 @@ impl UblkQueue<'_> {
 
             if all_registered {
                 self.buf_reg_semaphore.add_permits(self.q_depth as usize);
-                // Notify device that this queue completed buffer registration
-                self.dev
-                    .notify_buffer_registration_complete(self.is_mlock_failed());
+                if self.dev_flags & sys::UBLK_F_BATCH_IO as u64 == 0 {
+                    // Notify device that this queue completed buffer registration
+                    self.dev
+                        .notify_buffer_registration_complete(self.is_mlock_failed());
+                }
             }
         }
     }
@@ -2696,25 +2733,36 @@ impl UblkQueue<'_> {
     where
         F: FnMut(u64, &cqueue::Entry, bool),
     {
-        match self.wait_ios(to_wait) {
+        let deferred = DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow().len());
+        let ring_result = if deferred > 0 && deferred >= to_wait {
+            with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                ring.submit_and_wait(0).map_err(UblkError::IOError)?;
+                Ok(ring.completion().len() as i32)
+            })
+        } else {
+            self.wait_ios(to_wait.saturating_sub(deferred))
+        };
+        match ring_result {
             Err(r) => Err(r),
-            Ok(done) => {
+            Ok(ring_done) => {
+                let done = deferred + ring_done as usize;
                 let mut cmd_cnt = 0;
                 let mut aborted = false;
 
                 for i in 0..done {
-                    let cqe = {
-                        match with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                    let cqe = pop_deferred_queue_cqe().or_else(|| {
+                        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                             ring.completion().next()
-                        }) {
-                            None => {
-                                if cmd_cnt > 0 {
-                                    self.update_state_batch(cmd_cnt, aborted);
-                                }
-                                return Err(UblkError::OtherError(-libc::EINVAL));
+                        })
+                    });
+                    let cqe = match cqe {
+                        None => {
+                            if cmd_cnt > 0 {
+                                self.update_state_batch(cmd_cnt, aborted);
                             }
-                            Some(r) => r,
+                            return Err(UblkError::OtherError(-libc::EINVAL));
                         }
+                        Some(r) => r,
                     };
 
                     let user_data = cqe.user_data();
@@ -2729,7 +2777,7 @@ impl UblkQueue<'_> {
                 if cmd_cnt > 0 {
                     self.update_state_batch(cmd_cnt, aborted);
                 }
-                Ok(done)
+                Ok(done as i32)
             }
         }
     }
@@ -2777,6 +2825,63 @@ mod tests {
                 },
             )?;
 
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+    }
+
+    #[test]
+    fn test_flush_and_wake_io_tasks_delivers_deferred_cqes_first() {
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            let queue = UblkQueue::new(0, dev)?;
+            let target = crate::UblkUringData::Target as u64;
+            let deferred_user_data = target | 0x41;
+            let ring_user_data = target | 0x42;
+
+            with_task_io_ring_mut(|ring| -> Result<(), UblkError> {
+                let entry = io_uring::opcode::Nop::new()
+                    .build()
+                    .user_data(deferred_user_data);
+                unsafe {
+                    ring.submission()
+                        .push(&entry)
+                        .map_err(|_| UblkError::OtherError(-libc::EBUSY))?;
+                }
+                ring.submit_and_wait(1).map_err(UblkError::IOError)?;
+                let cqe = ring.completion().next().ok_or(UblkError::InvalidVal)?;
+                assert_eq!(cqe.user_data(), deferred_user_data);
+                super::defer_queue_cqe(cqe);
+
+                let entry = io_uring::opcode::Nop::new()
+                    .build()
+                    .user_data(ring_user_data);
+                unsafe {
+                    ring.submission()
+                        .push(&entry)
+                        .map_err(|_| UblkError::OtherError(-libc::EBUSY))?;
+                }
+                Ok(())
+            })?;
+
+            let mut handled = Vec::new();
+            let count = queue.flush_and_wake_io_tasks(
+                |user_data, _cqe, is_last| handled.push((user_data, is_last)),
+                2,
+            )?;
+
+            assert_eq!(count, 2);
+            assert_eq!(
+                handled,
+                vec![(deferred_user_data, false), (ring_user_data, true)]
+            );
+            assert!(super::DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow().is_empty()));
+            assert!(with_task_io_ring_mut(|ring| ring.completion().is_empty()));
             Ok(())
         };
 
@@ -3082,21 +3187,24 @@ mod tests {
             let (lock, _) = &*dev.buf_reg_sync;
             let state = lock.lock().unwrap();
             assert_eq!(state.registered_queues, 0);
-            assert_eq!(state.mlock_failed, false);
+            assert!(!state.mlock_failed);
+            assert!(!state.queue_setup_failed);
             drop(state);
 
             // Test notification of buffer registration without mlock failure
             dev.notify_buffer_registration_complete(false);
             let state = lock.lock().unwrap();
             assert_eq!(state.registered_queues, 1);
-            assert_eq!(state.mlock_failed, false);
+            assert!(!state.mlock_failed);
+            assert!(!state.queue_setup_failed);
             drop(state);
 
             // Test notification of buffer registration with mlock failure
             dev.notify_buffer_registration_complete(true);
             let state = lock.lock().unwrap();
             assert_eq!(state.registered_queues, 2);
-            assert_eq!(state.mlock_failed, true);
+            assert!(state.mlock_failed);
+            assert!(!state.queue_setup_failed);
             drop(state);
 
             // Test that wait_for_buffer_registration fails when mlock_failed is true
@@ -3109,6 +3217,36 @@ mod tests {
             }
 
             println!("Buffer registration synchronization test completed successfully");
+            Ok(())
+        };
+
+        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+    }
+
+    #[test]
+    fn test_queue_setup_failure_is_not_reported_as_mlock_failure() {
+        use crate::ctrl::UblkCtrlBuilder;
+        use crate::UblkFlags;
+
+        let ctrl = UblkCtrlBuilder::default()
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.notify_queue_setup_failed();
+
+            let (lock, _) = &*dev.buf_reg_sync;
+            let state = lock.lock().unwrap();
+            assert_eq!(state.registered_queues, 1);
+            assert!(!state.mlock_failed);
+            assert!(state.queue_setup_failed);
+            drop(state);
+
+            assert!(matches!(
+                dev.wait_for_buffer_registration(1),
+                Err(crate::UblkError::OtherError(code)) if code == -libc::EIO
+            ));
             Ok(())
         };
 

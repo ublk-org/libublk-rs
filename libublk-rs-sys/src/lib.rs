@@ -131,4 +131,19 @@ mod tests {
         assert_eq!((packed >> 24) & 0xFF, 0x34);
         assert_eq!((packed >> 32) & 0xFFFFFFFF, 0x56789ABC);
     }
+
+    #[test]
+    fn test_batch_io_uapi() {
+        use core::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(UBLK_F_BATCH_IO, 1 << 15);
+        assert_eq!(size_of::<ublk_elem_header>(), 8);
+        assert_eq!(align_of::<ublk_elem_header>(), 4);
+        assert_eq!(offset_of!(ublk_elem_header, result), 4);
+        assert_eq!(size_of::<ublk_batch_io>(), 16);
+        assert_eq!(offset_of!(ublk_batch_io, reserved2), 8);
+        assert_eq!(UBLK_U_IO_PREP_IO_CMDS, 0xc010_7525);
+        assert_eq!(UBLK_U_IO_COMMIT_IO_CMDS, 0xc010_7526);
+        assert_eq!(UBLK_U_IO_FETCH_IO_CMDS, 0xc010_7527);
+    }
 }

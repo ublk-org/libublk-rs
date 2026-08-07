@@ -2,7 +2,10 @@
 mod integration {
     use io_uring::opcode;
     use libublk::helpers::IoBuf;
-    use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
+    use libublk::io::{
+        BufDescList, UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue,
+        UblkDev, UblkIOCtx, UblkQueue,
+    };
     use libublk::override_sqe;
     use libublk::uring_async::ublk_submit_sqe_async;
     use libublk::{
@@ -128,6 +131,93 @@ mod integration {
         }
 
         __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, null_handle_queue);
+    }
+
+    /// Make one batch-IO ublk-null device and exercise the high-level batch transport.
+    #[test]
+    fn test_ublk_null_batch_io() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_BATCH_IO as u64 == 0 {
+            println!(
+                "skipping batch IO integration test: kernel does not advertise UBLK_F_BATCH_IO"
+            );
+            return;
+        }
+
+        let ctrl = UblkCtrlBuilder::default()
+            .name("batch_null")
+            .nr_queues(2)
+            .depth(64)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .ctrl_flags(sys::UBLK_F_BATCH_IO as u64)
+            .build()
+            .unwrap();
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+
+        let q_fn = |qid: u16, dev: &UblkDev| {
+            let queue = UblkQueue::new(qid, dev).unwrap();
+            let buffers = dev.alloc_queue_io_bufs();
+            let config = UblkBatchConfig::new()
+                .with_fetch_buffer_count(2)
+                .with_fetch_command_count(2)
+                .with_max_inflight_commits(1)
+                .with_tags_per_fetch_buffer(8);
+            let mut batch =
+                UblkBatchQueue::new(&queue, UblkBatchBuffers::IoBufs(buffers), config).unwrap();
+            assert!(batch.try_submit_completions(&[]).unwrap());
+            let mut pending = Vec::new();
+
+            loop {
+                let mut batch_error = None;
+                queue
+                    .flush_and_wake_io_tasks(
+                        |_user_data, cqe, _is_last| match batch.handle_cqe(cqe, |batch, tags| {
+                            for &tag in tags {
+                                let iod = queue.get_iod(tag);
+                                let bytes = (iod.nr_sectors << 9) as i32;
+                                let result = match iod.op_flags & 0xff {
+                                    sys::UBLK_IO_OP_READ => {
+                                        batch.io_buf_mut(tag).unwrap().zero_buf();
+                                        bytes
+                                    }
+                                    sys::UBLK_IO_OP_WRITE => bytes,
+                                    sys::UBLK_IO_OP_FLUSH => 0,
+                                    _ => -libc::EOPNOTSUPP,
+                                };
+                                pending.push(UblkBatchCompletion::new(tag, result));
+                            }
+                            Ok(())
+                        }) {
+                            Ok(true) | Ok(false) => {}
+                            Err(error) => batch_error = Some(error),
+                        },
+                        1,
+                    )
+                    .unwrap();
+                if let Some(error) = batch_error {
+                    panic!("batch queue failed: {error}");
+                }
+                if !pending.is_empty() {
+                    match batch.try_submit_completions(&pending) {
+                        Ok(true) => pending.clear(),
+                        Ok(false) => {}
+                        Err(error) => panic!("batch commit failed: {error}"),
+                    }
+                }
+                if batch.try_begin_shutdown().unwrap() && batch.is_shutdown_complete() {
+                    break;
+                }
+            }
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, UblkFlags::UBLK_DEV_F_ADD_DEV);
+            read_ublk_disk(ctrl, true);
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
     }
 
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
