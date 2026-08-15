@@ -4,6 +4,8 @@
 **/target
 libublk-rs-sys/Cargo.lock
 /.claude
+/.agents
+/skills-lock.json
 /*.patch
 /temp
 /*.orig
