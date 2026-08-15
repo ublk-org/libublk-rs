@@ -220,6 +220,137 @@ mod integration {
         .unwrap();
     }
 
+    /// Drive UBLK_F_BATCH_IO with a target that actually carries data.
+    ///
+    /// [`test_ublk_null_batch_io`] proves the transport starts, fetches and
+    /// completes commands, but its null target discards writes and returns
+    /// zeroes -- a batch that handed a tag the wrong buffer, or mixed up two
+    /// tags in one fetch, would still pass. Back the device with RAM and put a
+    /// filesystem on it instead: mkfs and mount only survive if every write
+    /// landed where it was addressed and every read came back from the same
+    /// place.
+    #[test]
+    fn test_ublk_ramdisk_batch_io() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_BATCH_IO as u64 == 0 {
+            println!("skipping batch ramdisk test: kernel does not advertise UBLK_F_BATCH_IO");
+            return;
+        }
+
+        let size = 32_u64 << 20;
+        // Kept alive until run_target() returns; the queue only sees its address.
+        let ramdisk_buf = IoBuf::<u8>::new(size as usize);
+        let ramdisk_addr = ramdisk_buf.as_mut_ptr() as usize;
+
+        // One queue, so the backing store has a single writer.
+        let ctrl = UblkCtrlBuilder::default()
+            .name("batch_rd")
+            .nr_queues(1)
+            .depth(64)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .ctrl_flags(sys::UBLK_F_BATCH_IO as u64)
+            .build()
+            .unwrap();
+
+        let tgt_init = move |dev: &mut UblkDev| {
+            dev.set_default_params(size);
+            Ok(())
+        };
+
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let queue = UblkQueue::new(qid, dev).unwrap();
+            let buffers = dev.alloc_queue_io_bufs();
+            let config = UblkBatchConfig::new()
+                .with_fetch_buffer_count(2)
+                .with_fetch_command_count(2)
+                .with_max_inflight_commits(1)
+                .with_tags_per_fetch_buffer(8);
+            let mut batch =
+                UblkBatchQueue::new(&queue, UblkBatchBuffers::IoBufs(buffers), config).unwrap();
+            assert!(batch.try_submit_completions(&[]).unwrap());
+            let mut pending = Vec::new();
+
+            loop {
+                let mut batch_error = None;
+                queue
+                    .flush_and_wake_io_tasks(
+                        |_user_data, cqe, _is_last| match batch.handle_cqe(cqe, |batch, tags| {
+                            for &tag in tags {
+                                let iod = queue.get_iod(tag);
+                                let off = (iod.start_sector << 9) as usize;
+                                let bytes = (iod.nr_sectors << 9) as usize;
+                                let oob = off + bytes > size as usize;
+
+                                let result = match iod.op_flags & 0xff {
+                                    sys::UBLK_IO_OP_READ => {
+                                        let buf = batch.io_buf_mut(tag).unwrap();
+                                        if oob || bytes > buf.len() {
+                                            -libc::EINVAL
+                                        } else {
+                                            // SAFETY: single queue, and the
+                                            // range is bounds-checked above.
+                                            unsafe {
+                                                let rd = std::slice::from_raw_parts(
+                                                    (ramdisk_addr + off) as *const u8,
+                                                    bytes,
+                                                );
+                                                buf.as_mut_slice()[..bytes].copy_from_slice(rd);
+                                            }
+                                            bytes as i32
+                                        }
+                                    }
+                                    sys::UBLK_IO_OP_WRITE => {
+                                        let buf = batch.io_buf(tag).unwrap();
+                                        if oob || bytes > buf.len() {
+                                            -libc::EINVAL
+                                        } else {
+                                            // SAFETY: as above.
+                                            unsafe {
+                                                let rd = std::slice::from_raw_parts_mut(
+                                                    (ramdisk_addr + off) as *mut u8,
+                                                    bytes,
+                                                );
+                                                rd.copy_from_slice(&buf.as_slice()[..bytes]);
+                                            }
+                                            bytes as i32
+                                        }
+                                    }
+                                    sys::UBLK_IO_OP_FLUSH => 0,
+                                    _ => -libc::EOPNOTSUPP,
+                                };
+                                pending.push(UblkBatchCompletion::new(tag, result));
+                            }
+                            Ok(())
+                        }) {
+                            Ok(true) | Ok(false) => {}
+                            Err(error) => batch_error = Some(error),
+                        },
+                        1,
+                    )
+                    .unwrap();
+                if let Some(error) = batch_error {
+                    panic!("batch queue failed: {error}");
+                }
+                if !pending.is_empty() {
+                    match batch.try_submit_completions(&pending) {
+                        Ok(true) => pending.clear(),
+                        Ok(false) => {}
+                        Err(error) => panic!("batch commit failed: {error}"),
+                    }
+                }
+                if batch.try_begin_shutdown().unwrap() && batch.is_shutdown_complete() {
+                    break;
+                }
+            }
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            ublk_ramdisk_tester(ctrl, UblkFlags::UBLK_DEV_F_ADD_DEV);
+        })
+        .unwrap();
+
+        drop(ramdisk_buf);
+    }
+
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[cfg(feature = "fat_complete")]
     #[test]
