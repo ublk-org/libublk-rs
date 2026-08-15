@@ -2968,6 +2968,21 @@ mod tests {
         assert!(ctrl.dev_info().ublksrv_flags == 0xbeef as u64);
     }
 
+    /// Poll until `path` reaches the expected existence state, up to 2s.
+    ///
+    /// Node teardown is asynchronous: DEL_DEV emits a `remove` uevent and
+    /// 86-ublk.rules forks a helper per node, which under a parallel run can
+    /// take a few hundred ms.  Sampling `exists()` once races it.
+    fn wait_for_path(path: &str, want: bool) -> bool {
+        for _ in 0..100 {
+            if Path::new(path).exists() == want {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
     fn __test_ublk_session<T>(mut w_fn: T) -> String
     where
         T: FnMut(&UblkCtrl) + Send + Sync + Clone + 'static,
@@ -3019,9 +3034,8 @@ mod tests {
         })
         .unwrap();
 
-        // could be too strict because of udev
         let bdev = ctrl.get_bdev_path();
-        assert!(Path::new(&bdev).exists() == false);
+        assert!(wait_for_path(&bdev, false));
 
         let cpath = ctrl.get_cdev_path();
 
@@ -3037,8 +3051,7 @@ mod tests {
             ctrl.kill_dev().unwrap();
         });
 
-        // could be too strict because of udev
-        assert!(Path::new(&cdev).exists() == false);
+        assert!(wait_for_path(&cdev, false));
     }
     /// test for_each_dev_id
     #[test]
@@ -3056,8 +3069,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 ctrl.kill_dev().unwrap();
             });
-            // could be too strict because of udev
-            assert!(Path::new(&cdev).exists() == false);
+            assert!(wait_for_path(&cdev, false));
         });
 
         std::thread::sleep(std::time::Duration::from_millis(400));
