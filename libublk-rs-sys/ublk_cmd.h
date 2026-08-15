@@ -51,6 +51,8 @@
 	_IOR('u', 0x13, struct ublksrv_ctrl_cmd)
 #define UBLK_U_CMD_DEL_DEV_ASYNC	\
 	_IOR('u', 0x14, struct ublksrv_ctrl_cmd)
+#define UBLK_U_CMD_UPDATE_SIZE		\
+	_IOWR('u', 0x15, struct ublksrv_ctrl_cmd)
 #define UBLK_U_CMD_QUIESCE_DEV		\
 	_IOWR('u', 0x16, struct ublksrv_ctrl_cmd)
 
@@ -233,6 +235,12 @@
  * deny the request by returning an error.
  */
 #define UBLK_F_ZONED (1ULL << 8)
+
+/*
+ * Resizing a block device is possible with UBLK_U_CMD_UPDATE_SIZE
+ * New size is passed in cmd->data[0] and is in units of sectors
+ */
+#define UBLK_F_UPDATE_SIZE		 (1ULL << 10)
 
 /*
  * request buffer is registered automatically to uring_cmd's io_uring

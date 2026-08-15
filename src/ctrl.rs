@@ -1021,6 +1021,7 @@ impl UblkCtrlInner {
         | sys::UBLK_F_CMD_IOCTL_ENCODE
         | sys::UBLK_F_USER_COPY
         | sys::UBLK_F_ZONED
+        | sys::UBLK_F_UPDATE_SIZE
         | sys::UBLK_F_AUTO_BUF_REG
         | sys::UBLK_F_QUIESCE
         | sys::UBLK_F_BATCH_IO) as u64;
@@ -1689,6 +1690,88 @@ impl UblkCtrlInner {
     /// Quiesce this device by sending command to the ublk driver asynchronously
     pub(crate) async fn quiesce_async(&mut self, timeout_ms: u64) -> Result<i32, UblkError> {
         let data = Self::prepare_quiesce_cmd(timeout_ms);
+        self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Prepare UPDATE_SIZE command data.
+    ///
+    /// The driver assigns `data[0]` straight into `params.basic.dev_sectors`,
+    /// so the wire value is sectors while our callers speak bytes.
+    ///
+    /// Reject a size that is not a whole number of *logical blocks* rather
+    /// than truncating it. The driver validates `dev_sectors` nowhere, and
+    /// this resizes a *live* disk, so silently rounding down is never what the
+    /// caller meant.
+    ///
+    /// Alignment is against the device's logical block size, not the 512-byte
+    /// sector the command is expressed in. Those differ whenever
+    /// `logical_bs_shift > 9`: on a 4096-byte device a capacity that is merely
+    /// sector aligned leaves a partial final block, which the block layer
+    /// cannot address.
+    fn prepare_update_size_cmd(
+        dev_size: u64,
+        logical_bs_shift: u8,
+    ) -> Result<UblkCtrlCmdData, UblkError> {
+        let bs = 1_u64 << logical_bs_shift;
+
+        if dev_size % bs != 0 {
+            return Err(UblkError::InvalidVal);
+        }
+        Ok(UblkCtrlCmdData::new_data_cmd(
+            sys::UBLK_U_CMD_UPDATE_SIZE,
+            dev_size >> 9,
+        ))
+    }
+
+    /// Refuse UPDATE_SIZE when the driver would dereference a NULL disk.
+    ///
+    /// The driver only started checking `ub_disk` in 25966fc09769 ("ublk: fix
+    /// NULL pointer dereference in ublk_ctrl_set_size()", v7.0-rc4, Cc:
+    /// stable), while the command dates from v6.16, so older kernels do not
+    /// return -ENODEV here.  `ub_disk` is written in exactly two places: it is
+    /// cleared in ublk_detach_disk(), which sets UBLK_S_DEV_DEAD two lines
+    /// earlier, and set in start_dev before the state goes LIVE.  So DEAD
+    /// covers every case where the disk is gone.
+    ///
+    /// Test DEAD rather than LIVE: a QUIESCED or FAIL_IO device keeps its
+    /// disk, and the driver resizes it happily.
+    fn reject_update_size_without_disk(&mut self) -> Result<(), UblkError> {
+        self.read_dev_info()?;
+        if self.dev_info.state as u32 == sys::UBLK_S_DEV_DEAD {
+            return Err(UblkError::OtherError(-libc::ENODEV));
+        }
+        Ok(())
+    }
+
+    /// Resize this device by sending command to the ublk driver.
+    ///
+    /// The disk check comes first: the logical block size is only meaningful
+    /// once the device is started, since that is when SET_PARAMS runs.
+    fn update_size(&mut self, dev_size: u64) -> Result<i32, UblkError> {
+        self.reject_update_size_without_disk()?;
+
+        let mut p = sys::ublk_params {
+            ..Default::default()
+        };
+        self.get_params(&mut p)?;
+
+        let data = Self::prepare_update_size_cmd(dev_size, p.basic.logical_bs_shift)?;
+        self.ublk_ctrl_cmd(&data)
+    }
+
+    /// Resize this device by sending command to the ublk driver asynchronously
+    pub(crate) async fn update_size_async(&mut self, dev_size: u64) -> Result<i32, UblkError> {
+        self.read_dev_info_async().await?;
+        if self.dev_info.state as u32 == sys::UBLK_S_DEV_DEAD {
+            return Err(UblkError::OtherError(-libc::ENODEV));
+        }
+
+        let mut p = sys::ublk_params {
+            ..Default::default()
+        };
+        self.get_params_async(&mut p).await?;
+
+        let data = Self::prepare_update_size_cmd(dev_size, p.basic.logical_bs_shift)?;
         self.ublk_ctrl_cmd_async(&data).await
     }
 
@@ -2539,6 +2622,56 @@ impl UblkCtrl {
         self.get_inner_mut().quiesce(timeout_ms)
     }
 
+    /// Resize a live ublk device
+    ///
+    /// The driver updates the disk capacity in place and notifies the block
+    /// layer, so `/dev/ublkbN` grows or shrinks without being recreated and
+    /// without interrupting the ublk server.
+    ///
+    /// # Arguments:
+    ///
+    /// * `dev_size`: the new size **in bytes**, same unit as
+    ///   [`UblkDev::set_default_params`]. It must be a whole number of the
+    ///   device's *logical blocks* — not merely of the 512-byte sectors the
+    ///   command travels in, which are the same thing only when
+    ///   `logical_bs_shift` is 9. `0` is accepted and sets the device to zero
+    ///   capacity; only *silent* truncation of a misaligned size is refused.
+    ///   The block size is read from the device, so this costs a `GET_PARAMS`.
+    ///
+    /// `UBLK_F_UPDATE_SIZE` is advisory: the driver never checks it before
+    /// handling `UBLK_U_CMD_UPDATE_SIZE`, so this works on any kernel that
+    /// knows the command. Test the bit in [`Self::get_features`] to find out
+    /// whether the loaded driver has it — that queries the driver, not any
+    /// device, so passing the flag to `UblkCtrlBuilder::ctrl_flags()` only
+    /// records the intent on the device and does not enable anything.
+    ///
+    /// # Errors:
+    ///
+    /// Returns [`UblkError::InvalidVal`] if `dev_size` is not aligned to the
+    /// logical block size, rather than truncating it to a smaller device.
+    ///
+    /// Returns `ENODEV` if the device has no disk, which is the case before
+    /// `START_DEV` and after the device has been stopped. This one is raised
+    /// here rather than by the driver: the driver's own check on `ub->ub_disk`
+    /// only arrived in 25966fc09769 ("ublk: fix NULL pointer dereference in
+    /// ublk_ctrl_set_size()", v7.0-rc4, Cc: stable), while the command dates
+    /// from v6.16, so the state is checked before sending. A device stopped
+    /// concurrently with this call can still race through that window.
+    ///
+    /// Shrinking is not refused, so it is the caller's job not to truncate a
+    /// device out from under a mounted filesystem.
+    ///
+    /// The driver writes the new value into its own `params.basic.dev_sectors`,
+    /// so a later [`Self::get_params`] reflects it. Copies made before the
+    /// resize do not follow: any `ublk_params` the caller holds, `UblkDev`'s
+    /// `tgt.dev_size`, and the JSON at `run_path()` that [`Self::dump`] prints
+    /// all keep the old size.
+    ///
+    /// [`UblkDev::set_default_params`]: crate::io::UblkDev::set_default_params
+    pub fn update_size(&self, dev_size: u64) -> Result<i32, UblkError> {
+        self.get_inner_mut().update_size(dev_size)
+    }
+
     /// Give up ownership of the device, so dropping this control leaves it
     /// in place
     ///
@@ -2809,6 +2942,53 @@ mod tests {
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_BATCH_IO as u64,
             0
         );
+    }
+
+    /// The flag is advisory -- the driver does not check it before handling
+    /// UPDATE_SIZE -- but it still has to survive `validate_new_params()`,
+    /// which rejects any flag outside `UBLK_DRV_F_ALL`. Without this a caller
+    /// passing `UBLK_F_UPDATE_SIZE` to `ctrl_flags()` cannot build a device.
+    #[test]
+    fn test_update_size_in_driver_flags() {
+        assert_ne!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_UPDATE_SIZE as u64,
+            0
+        );
+    }
+
+    /// The driver stores `data[0]` directly as `dev_sectors`, so the byte size
+    /// callers pass has to reach the wire divided by 512.  Getting this wrong
+    /// silently resizes the device by a factor of 512.
+    #[test]
+    fn test_prepare_update_size_cmd() {
+        let data: UblkCtrlCmdData = UblkCtrlInner::prepare_update_size_cmd(1_u64 << 30, 9).unwrap();
+
+        assert_eq!(data.cmd_op, crate::sys::UBLK_U_CMD_UPDATE_SIZE);
+        assert_eq!(data.flags, CTRL_CMD_HAS_DATA);
+        assert_eq!(data.data, (1_u64 << 30) / 512);
+        assert_eq!(data.addr, 0);
+        assert_eq!(data.len, 0);
+
+        // A misaligned size is refused instead of being truncated: rounding
+        // 400 down would hand the block layer a zero-capacity live disk.
+        assert!(matches!(
+            UblkCtrlInner::prepare_update_size_cmd(400, 9),
+            Err(UblkError::InvalidVal)
+        ));
+        assert!(UblkCtrlInner::prepare_update_size_cmd(0, 9).is_ok());
+
+        // Alignment follows the logical block size, not the 512-byte sector
+        // the command is expressed in. 2560 is 5 sectors: fine on a 512-byte
+        // device, a partial block on a 4096-byte one.
+        assert!(UblkCtrlInner::prepare_update_size_cmd(2560, 9).is_ok());
+        assert!(matches!(
+            UblkCtrlInner::prepare_update_size_cmd(2560, 12),
+            Err(UblkError::InvalidVal)
+        ));
+
+        // ...and a 4096-aligned size still goes out in sectors.
+        let data = UblkCtrlInner::prepare_update_size_cmd(8192, 12).unwrap();
+        assert_eq!(data.data, 16);
     }
 
     #[test]

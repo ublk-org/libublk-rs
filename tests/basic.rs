@@ -862,6 +862,114 @@ mod integration {
         );
     }
 
+    /// `UBLK_U_CMD_UPDATE_SIZE` must resize the live disk in place.
+    ///
+    /// The driver assigns `data[0]` straight into `params.basic.dev_sectors`
+    /// and calls `set_capacity_and_notify()`, so the new capacity has to be
+    /// visible in sysfs without the device being recreated.  This also pins
+    /// the byte/sector conversion: a unit slip here resizes by 512x.
+    #[test]
+    fn test_ublk_update_size() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_UPDATE_SIZE as u64 == 0 {
+            println!("skipping: kernel lacks UBLK_F_UPDATE_SIZE");
+            return;
+        }
+
+        const INIT_SIZE: u64 = 8_u64 << 30;
+        const GROWN_SIZE: u64 = 16_u64 << 30;
+        const SHRUNK_SIZE: u64 = 2_u64 << 30;
+
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(1)
+            .depth(16)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .ctrl_flags(sys::UBLK_F_UPDATE_SIZE as u64)
+            .build()
+            .unwrap();
+
+        // ENODEV before START_DEV. This is assertable only because the library
+        // checks the device state and refuses on its own: kernels before
+        // 25966fc09769 ("ublk: fix NULL pointer dereference in
+        // ublk_ctrl_set_size()", v7.0-rc4) do not check ub->ub_disk here, so
+        // the command must not be allowed to reach them.
+        match ctrl.update_size(GROWN_SIZE) {
+            Err(UblkError::OtherError(e)) => assert_eq!(e, -libc::ENODEV),
+            other => panic!("expected ENODEV before START_DEV, got {:?}", other),
+        }
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(INIT_SIZE);
+            Ok(())
+        };
+
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+            let bufs = bufs_rc.clone();
+
+            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+                let iod = q.get_iod(tag);
+                let bytes = (iod.nr_sectors << 9) as i32;
+                q.complete_io_cmd_unified(
+                    tag,
+                    BufDesc::Slice(bufs[tag as usize].as_slice()),
+                    Ok(UblkIORes::Result(bytes)),
+                )
+                .unwrap();
+            };
+
+            let queue = match UblkQueue::new(qid, dev)
+                .unwrap()
+                .submit_fetch_commands_unified(BufDescList::Slices(Some(&bufs_rc)))
+            {
+                Ok(q) => q,
+                Err(e) => {
+                    log::error!("submit_fetch_commands_unified failed: {}", e);
+                    return;
+                }
+            };
+
+            queue.wait_and_handle_io(io_handler);
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            let sysfs = format!("/sys/block/ublkb{}/size", ctrl.dev_info().dev_id);
+            let sectors = || -> u64 {
+                std::fs::read_to_string(&sysfs)
+                    .expect("read capacity")
+                    .trim()
+                    .parse()
+                    .expect("parse capacity")
+            };
+
+            assert_eq!(sectors(), INIT_SIZE >> 9, "unexpected initial capacity");
+
+            // Misaligned sizes are refused client-side, against the device's
+            // logical block size, so the capacity must be untouched after.
+            assert!(matches!(
+                ctrl.update_size(INIT_SIZE + 1),
+                Err(UblkError::InvalidVal)
+            ));
+            assert_eq!(sectors(), INIT_SIZE >> 9, "refused resize still applied");
+
+            ctrl.update_size(GROWN_SIZE).expect("grow failed");
+            assert_eq!(sectors(), GROWN_SIZE >> 9, "device did not grow");
+
+            ctrl.update_size(SHRUNK_SIZE).expect("shrink failed");
+            assert_eq!(sectors(), SHRUNK_SIZE >> 9, "device did not shrink");
+
+            // the driver keeps its own copy of the params in step
+            let mut p = sys::ublk_params {
+                ..Default::default()
+            };
+            ctrl.get_params(&mut p).expect("get_params failed");
+            assert_eq!(p.basic.dev_sectors, SHRUNK_SIZE >> 9);
+
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
     /// Drive the graceful quiesce path end to end.
     ///
     /// [`test_ublk_ramdisk_recovery`] reaches `UBLK_S_DEV_QUIESCED` by killing
