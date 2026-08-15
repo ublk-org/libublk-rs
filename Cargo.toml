@@ -80,7 +80,7 @@ rand = "0.8"
 
 # Put the conditional stuff at the bottom, order matters, see about comment
 [target.'cfg(not(target_arch = "s390x"))'.dependencies]
-io-uring = "^0.7"
+io-uring = "^0.7.12"
 
 [target.'cfg(target_arch = "s390x")'.dependencies]
-io-uring = { version = "^0.7", features = ["bindgen"] }
+io-uring = { version = "^0.7.12", features = ["bindgen"] }
