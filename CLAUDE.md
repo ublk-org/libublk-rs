@@ -100,7 +100,7 @@ The examples demonstrate different target types:
 - `null.rs` - Null device (discards writes, returns zeros)
 - `loop.rs` - Loop device (file-backed); real async/await + io_uring usage
 - `ramdisk.rs` - RAM-based storage; single-thread async for *both* ctrl and IO
-- `batch.rs` - Demonstrates `fat_complete` batch-completion path
+- `batch.rs` - Task-driven write batching on the typed ops catalog
 
 ### Dependencies
 

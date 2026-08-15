@@ -155,7 +155,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = |qid: u16, dev: &UblkDev| {
+        let q_fn = |qid: u16, dev: &Arc<UblkDev>| {
             let queue = UblkQueue::new(qid, dev).unwrap();
             let buffers = dev.alloc_queue_io_bufs();
             let config = UblkBatchConfig::new()
@@ -255,7 +255,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             let queue = UblkQueue::new(qid, dev).unwrap();
             let buffers = dev.alloc_queue_io_bufs();
             let config = UblkBatchConfig::new()
@@ -911,7 +911,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
 

@@ -2638,9 +2638,20 @@ impl UblkQueue {
                         Some(r) => r,
                     };
 
-                    let Some((data, is_io_cmd)) =
-                        crate::op::take_sync_entry(cqe.user_data(), cqe.result())
-                    else {
+                    let user_data = cqe.user_data();
+                    let resolved = if user_data & (UblkUringData::Target as u64) != 0
+                        && user_data < crate::op::RESERVED_USER_DATA_MIN
+                    {
+                        // SQEs pushed on the ring directly (e.g. by the
+                        // batch transport, whose multishot fetches cannot
+                        // ride a single-shot slab entry) keep their own
+                        // target-bit user_data; deliver it untouched. Slab
+                        // keys never carry the target bit.
+                        Some((user_data, false))
+                    } else {
+                        crate::op::take_sync_entry(user_data, cqe.result())
+                    };
+                    let Some((data, is_io_cmd)) = resolved else {
                         // Reserved sentinel or op-future CQE (delivered to
                         // its future by take_sync_entry): nothing for the
                         // sync handler.
@@ -2714,8 +2725,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut UblkDev| {
-            let queue = UblkQueue::new(0, dev)?;
+        let dev = std::sync::Arc::new(UblkDev::new(ctrl.get_name(), |_| Ok(()), &ctrl).unwrap());
+        let queue = UblkQueue::new(0, &dev).unwrap();
+        let run = || -> Result<(), UblkError> {
             let target = crate::UblkUringData::Target as u64;
             let deferred_user_data = target | 0x41;
             let ring_user_data = target | 0x42;
@@ -2761,7 +2773,7 @@ mod tests {
             Ok(())
         };
 
-        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+        run().unwrap();
     }
 
     #[test]
