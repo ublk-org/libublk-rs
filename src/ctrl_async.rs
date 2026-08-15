@@ -375,6 +375,28 @@ impl UblkCtrlAsync {
         self.get_inner_mut().quiesce_async(timeout_ms).await
     }
 
+    /// Resize a live ublk device, asynchronously
+    ///
+    /// Async counterpart of [`UblkCtrl::update_size`], which documents the
+    /// byte unit, the sector-alignment requirement, and what
+    /// `UBLK_F_UPDATE_SIZE` does and does not mean.
+    ///
+    /// `dev_size` is in bytes and must be a whole number of the device's
+    /// logical blocks, not just of 512-byte sectors; a misaligned value
+    /// returns [`UblkError::InvalidVal`] rather than being truncated.
+    ///
+    /// Returns `ENODEV` for a device with no disk, i.e. before `START_DEV` or
+    /// after it has been stopped. Like the sync path this is raised here, not
+    /// by the driver: the driver's own check on `ub->ub_disk` only arrived in
+    /// 25966fc09769 ("ublk: fix NULL pointer dereference in
+    /// ublk_ctrl_set_size()", v7.0-rc4, Cc: stable), five releases after the
+    /// command itself, so the device state is checked first.
+    ///
+    /// [`UblkCtrl::update_size`]: crate::ctrl::UblkCtrl::update_size
+    pub async fn update_size_async(&self, dev_size: u64) -> Result<i32, UblkError> {
+        self.get_inner_mut().update_size_async(dev_size).await
+    }
+
     /// Give up ownership of the device, so dropping this control leaves it
     /// in place
     ///
