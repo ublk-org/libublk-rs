@@ -92,16 +92,6 @@ macro_rules! ublk_internal_flags_all {
 
 pub(crate) use ublk_internal_flags_all;
 
-/// Ublk IO completion result
-///
-/// Ok() part of io command completion result `Result<UblkIORes, UblkError>`
-pub enum UblkIORes {
-    /// normal result
-    ///
-    /// Completion result of this io command
-    Result(i32),
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum UblkError {
     #[error("uring submission timeout")]
@@ -131,11 +121,11 @@ pub enum UblkError {
 
 #[cfg(test)]
 mod libublk {
-    use crate::{UblkError, UblkIORes};
+    use crate::UblkError;
 
     #[test]
     fn test_io_res_size() {
-        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
+        let sz = core::mem::size_of::<Result<i32, UblkError>>();
         assert!(sz == 16);
     }
 }

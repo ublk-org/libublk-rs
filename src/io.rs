@@ -180,7 +180,7 @@
 //! }
 //! ```
 
-use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
+use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags};
 use crate::bindings;
 use crate::helpers::IoBuf;
 use crate::op::{Op, Resources};
@@ -2049,21 +2049,13 @@ impl UblkQueue {
     /// # Arguments:
     ///
     /// * `tag`: io command tag
-    /// * `res`: io command result
+    /// * `res`: io command result: bytes transferred, or a negative errno
     ///
     /// When calling this API, target code has to make sure that thread-local QUEUE_RING
     /// won't be borrowed.
     #[inline]
-    fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
-        match res {
-            Ok(UblkIORes::Result(res))
-            | Err(UblkError::OtherError(res))
-            | Err(UblkError::UringIOError(res)) => {
-                self.commit_and_queue_io_cmd(tag, buf_addr as u64, res);
-            }
-            Err(UblkError::UringIoQueued) => {}
-            _ => {}
-        }
+    fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: i32) {
+        self.commit_and_queue_io_cmd(tag, buf_addr as u64, res);
     }
 
     #[inline(always)]
@@ -2093,7 +2085,7 @@ impl UblkQueue {
     ///
     /// * `tag`: io command tag
     /// * `buf_reg_data`: auto buffer registration data containing buffer index and flags
-    /// * `res`: io command result
+    /// * `res`: io command result: bytes transferred, or a negative errno
     ///
     /// This method supports zero-copy operations when UBLK_F_AUTO_BUF_REG is enabled.
     /// The buffer is automatically registered using the provided registration data.
@@ -2103,17 +2095,9 @@ impl UblkQueue {
         &self,
         tag: u16,
         buf_reg_data: &sys::ublk_auto_buf_reg,
-        res: Result<UblkIORes, UblkError>,
+        res: i32,
     ) {
-        match res {
-            Ok(UblkIORes::Result(res))
-            | Err(UblkError::OtherError(res))
-            | Err(UblkError::UringIOError(res)) => {
-                self.commit_and_queue_io_cmd_with_auto_buf_reg(tag, buf_reg_data, res);
-            }
-            Err(UblkError::UringIoQueued) => {}
-            _ => {}
-        }
+        self.commit_and_queue_io_cmd_with_auto_buf_reg(tag, buf_reg_data, res);
     }
 
     /// Complete one io command using unified buffer descriptor
@@ -2122,7 +2106,7 @@ impl UblkQueue {
     ///
     /// * `tag`: io command tag
     /// * `buf_desc`: unified buffer descriptor supporting both copy and zero-copy operations
-    /// * `res`: io command result
+    /// * `res`: io command result: bytes transferred, or a negative errno
     ///
     /// This unified method provides a single API for completing IO commands with both
     /// buffer slice and auto buffer registration modes. It dispatches to the appropriate
@@ -2150,7 +2134,7 @@ impl UblkQueue {
         &self,
         tag: u16,
         buf_desc: BufDesc,
-        res: Result<UblkIORes, UblkError>,
+        res: i32,
     ) -> Result<(), UblkError> {
         // Validate buffer descriptor compatibility with device capabilities
         buf_desc.validate_compatibility(self.dev_flags)?;
@@ -2390,9 +2374,10 @@ impl UblkQueue {
     /// closure.
     ///
     /// If IO is super fast to complete, such as ramdisk, this request can
-    /// be handled directly in the closure, and return `Ok(UblkIORes::Result)`
-    /// to complete the IO command originated from ublk driver. Another
-    /// example is null target(null.rs).
+    /// be handled directly in the closure, and the io command originated
+    /// from ublk driver is completed with the raw result (bytes
+    /// transferred, or a negative errno). Another example is null
+    /// target(null.rs).
     ///
     /// Most of times, IO is slow, so it needs to be handled asynchronously.
     /// The preferred way is to submit target IO by io_uring in IO handling
@@ -2400,15 +2385,15 @@ impl UblkQueue {
     /// target IO is completed, one io_uring CQE will be received, and the
     /// same IO closure is called for handling this target IO, which can be
     /// checked by `UblkIOCtx::is_tgt_io()` method. Finally if the coming
-    /// target IO completion means the original IO command is done,
-    /// `Ok(UblkIORes::Result)` is returned for moving on, otherwise UblkError::IoQueued
-    /// can be returned and the IO handling closure can continue to submit IO
-    /// or whatever for driving its IO logic.
+    /// target IO completion means the original IO command is done, the io
+    /// command is completed with the raw result, otherwise the IO handling
+    /// closure can continue to submit IO or whatever for driving its IO
+    /// logic.
     ///
     /// Not all target IO logics can be done by io_uring, such as some
     /// handling needs extra computation, which often require to offload IO
     /// in another context. However, when target IO is done in remote offload
-    /// context, `Ok(UblkIORes::Result)` has to be returned from the queue/
+    /// context, the io command has to be completed from the queue/
     /// io_uring context. One approach is to use eventfd to wakeup & notify
     /// ublk queue/io_uring. Here, eventfd can be thought as one special target
 

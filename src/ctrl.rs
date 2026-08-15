@@ -2871,7 +2871,7 @@ mod tests {
     };
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkError;
-    use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
+    use crate::{ctrl::UblkCtrl, UblkFlags};
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
@@ -3161,7 +3161,7 @@ mod tests {
                 q.complete_io_cmd_unified(
                     tag,
                     BufDesc::Slice(bufs[tag as usize].as_slice()),
-                    Ok(UblkIORes::Result(bytes)),
+                    bytes,
                 )
                 .unwrap();
             };

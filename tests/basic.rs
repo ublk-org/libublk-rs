@@ -8,7 +8,7 @@ mod integration {
     };
     use libublk::override_sqe;
     use libublk::{
-        ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags, UblkIORes,
+        ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags,
     };
     use std::env;
     use std::io::{BufRead, BufReader};
@@ -108,7 +108,7 @@ mod integration {
                 } else {
                     BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+                q.complete_io_cmd_unified(tag, buf_desc, bytes)
                     .unwrap();
             };
 
@@ -723,7 +723,7 @@ mod integration {
             let mut q_vec = Vec::<i32>::new();
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
-                let res = Ok(UblkIORes::Result((iod.nr_sectors << 9) as i32));
+                let res = (iod.nr_sectors << 9) as i32;
 
                 {
                     q_vec.push(tag as i32);
@@ -921,7 +921,7 @@ mod integration {
                 q.complete_io_cmd_unified(
                     tag,
                     BufDesc::Slice(bufs[tag as usize].as_slice()),
-                    Ok(UblkIORes::Result(bytes)),
+                    bytes,
                 )
                 .unwrap();
             };
@@ -1120,7 +1120,7 @@ mod integration {
                 } else {
                     BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+                q.complete_io_cmd_unified(tag, buf_desc, bytes)
                     .unwrap();
             };
 
@@ -1226,7 +1226,7 @@ mod integration {
                 q.complete_io_cmd_unified(
                     tag,
                     BufDesc::AutoReg(auto_buf_reg),
-                    Ok(UblkIORes::Result(bytes)),
+                    bytes,
                 )
                 .unwrap();
             };

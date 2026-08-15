@@ -6,7 +6,7 @@ use io_uring::{opcode, squeue, types};
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::ops::{self, TgtFd};
-use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags, UblkIORes};
+use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags};
 use serde::Serialize;
 use std::sync::Arc;
 use std::os::unix::fs::FileTypeExt;
@@ -212,7 +212,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue, tag: u16, i: &UblkIOCtx, io_slice: &[u8]
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), Ok(UblkIORes::Result(res)))
+            q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), res)
                 .unwrap();
             return;
         }
@@ -220,7 +220,7 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue, tag: u16, i: &UblkIOCtx, io_slice: &[u8]
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), Ok(UblkIORes::Result(res)))
+        q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), res)
             .unwrap();
     } else {
         let op = iod.op_flags & 0xff;
