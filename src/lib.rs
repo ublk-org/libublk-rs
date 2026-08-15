@@ -93,13 +93,8 @@ macro_rules! ublk_internal_flags_all {
 pub(crate) use ublk_internal_flags_all;
 
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum UblkError {
-    #[error("uring submission timeout")]
-    UringTimeout,
-
-    #[error("IO Queued")]
-    UringIoQueued,
-
     #[error("io_uring IO failure")]
     UringIOError(i32),
 
@@ -117,6 +112,29 @@ pub enum UblkError {
 
     #[error("other failure")]
     OtherError(i32),
+}
+
+impl UblkError {
+    /// Map this error to a negative errno, the form a ublk server uses
+    /// to complete a failed io command (and the form io_uring CQEs
+    /// report), so target code can propagate any [`UblkError`] into an
+    /// io completion.
+    pub fn errno(&self) -> i32 {
+        let e = match self {
+            UblkError::UringIOError(res) | UblkError::OtherError(res) => *res,
+            UblkError::IOError(err) => -err.raw_os_error().unwrap_or(libc::EIO),
+            UblkError::JsonError(_) => -libc::EINVAL,
+            UblkError::InvalidVal => -libc::EINVAL,
+            UblkError::QueueIsDown => -libc::ENODEV,
+        };
+        if e > 0 {
+            -e
+        } else if e == 0 {
+            -libc::EIO
+        } else {
+            e
+        }
+    }
 }
 
 #[cfg(test)]

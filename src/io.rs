@@ -2283,7 +2283,8 @@ impl UblkQueue {
     }
 
     #[inline]
-    fn __wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
+    /// Returns `Ok(None)` when the bounded wait timed out with no CQE.
+    fn __wait_ios(&self, to_wait: usize) -> Result<Option<i32>, UblkError> {
         let ts = types::Timespec::new().sec(Self::UBLK_QUEUE_IDLE_SECS as u64);
         let args = types::SubmitArgs::new().timespec(&ts);
 
@@ -2317,7 +2318,7 @@ impl UblkQueue {
             let ret = r.submitter().submit_with_args(to_wait, &args);
             match ret {
                 Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
-                    return Err(UblkError::UringTimeout);
+                    return Ok(None);
                 }
                 Err(err) => return Err(UblkError::IOError(err)),
                 Ok(_) => {}
@@ -2330,20 +2331,20 @@ impl UblkQueue {
                 state.is_stopping(),
                 state.is_idle(),
             );
-            Ok(nr_cqes)
+            Ok(Some(nr_cqes))
         })
     }
 
     #[inline]
     fn wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
-        match self.__wait_ios(to_wait) {
-            Ok(nr_cqes) => {
+        match self.__wait_ios(to_wait)? {
+            Some(nr_cqes) => {
                 if nr_cqes > 0 {
                     self.exit_queue_idle();
                 }
                 Ok(nr_cqes)
             }
-            Err(UblkError::UringTimeout) => {
+            None => {
                 with_queue_ring_mut_internal!(|r: &mut IoUring<io_uring::squeue::Entry>| {
                     if r.submission().is_empty() {
                         self.enter_queue_idle();
@@ -2351,7 +2352,6 @@ impl UblkQueue {
                 });
                 Ok(0)
             }
-            Err(err) => Err(err),
         }
     }
 
