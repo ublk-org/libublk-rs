@@ -3149,7 +3149,7 @@ mod tests {
             Ok(())
         };
         let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
-            use crate::BufDescList;
+            use crate::{BufDesc, BufDescList};
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
 
@@ -3157,10 +3157,13 @@ mod tests {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
                 let bufs = bufs_rc.clone();
-                let buf_addr = bufs[tag as usize].as_mut_ptr();
 
-                #[allow(deprecated)]
-                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd_unified(
+                    tag,
+                    BufDesc::Slice(bufs[tag as usize].as_slice()),
+                    Ok(UblkIORes::Result(bytes)),
+                )
+                .unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)

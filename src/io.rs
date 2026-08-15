@@ -270,60 +270,6 @@ macro_rules! with_queue_ring_mut_internal {
 
 /// Access the thread-local queue ring with immutable reference
 ///
-/// # Arguments
-/// * `_queue` - Reference to UblkQueue (used to ensure queue context)
-/// * `f` - Closure that receives immutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # use libublk::io::UblkQueue;
-/// # fn example(queue: &UblkQueue) -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_queue_ring(queue, |ring| {
-///     println!("SQ entries: {}", ring.params().sq_entries());
-/// });
-/// # Ok(())
-/// # }
-/// ```
-#[deprecated(
-    since = "0.5.0",
-    note = "use with_task_io_ring() instead - the UblkQueue parameter is unnecessary"
-)]
-pub fn with_queue_ring<F, R>(_queue: &UblkQueue, f: F) -> R
-where
-    F: FnOnce(&IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_internal!(f)
-}
-
-/// Access the thread-local queue ring with mutable reference
-///
-/// # Arguments
-/// * `_queue` - Reference to UblkQueue (used to ensure queue context)
-/// * `f` - Closure that receives mutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # use libublk::io::UblkQueue;
-/// # fn example(queue: &UblkQueue) -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_queue_ring_mut(queue, |ring| {
-///     ring.submit_and_wait(1)
-/// })?;
-/// # Ok(())
-/// # }
-/// ```
-#[deprecated(
-    since = "0.5.0",
-    note = "use with_task_io_ring_mut() instead - the UblkQueue parameter is unnecessary"
-)]
-pub fn with_queue_ring_mut<F, R>(_queue: &UblkQueue, f: F) -> R
-where
-    F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_mut_internal!(f)
-}
-
-/// Access the thread-local queue ring with immutable reference
-///
 /// This function provides direct access to the thread-local IO ring without
 /// requiring a UblkQueue parameter, making it more convenient for use cases
 /// where the queue reference is not readily available.
@@ -1373,30 +1319,6 @@ impl UblkQueue {
         self.state.borrow().is_stopping()
     }
 
-    /// Manipulate immutable queue uring
-    #[deprecated(
-        since = "0.5.0",
-        note = "removed in 0.6.0 - use with_queue_ring() instead"
-    )]
-    pub fn uring_op<R, H>(&self, op_handler: H) -> Result<R, UblkError>
-    where
-        H: Fn(&IoUring<squeue::Entry>) -> Result<R, UblkError>,
-    {
-        with_queue_ring_internal!(|uring: &IoUring<squeue::Entry>| op_handler(uring))
-    }
-
-    /// Manipulate mutable queue uring
-    #[deprecated(
-        since = "0.5.0",
-        note = "removed in 0.6.0 - use with_queue_ring_mut() instead"
-    )]
-    pub fn uring_op_mut<R, H>(&self, op_handler: H) -> Result<R, UblkError>
-    where
-        H: Fn(&mut IoUring<squeue::Entry>) -> Result<R, UblkError>,
-    {
-        with_queue_ring_mut_internal!(|uring: &mut IoUring<squeue::Entry>| op_handler(uring))
-    }
-
     /// Return queue depth
     ///
     /// Queue depth decides the max count of inflight io command
@@ -1481,10 +1403,6 @@ impl UblkQueue {
         self.state.borrow().is_mlock_failed()
     }
 
-    /// **DEPRECATED:** Register IO buffer, so that pages in this buffer can
-    /// be discarded in case queue becomes idle
-    ///
-    /// Internal implementation of register_io_buf without deprecation warnings
     fn register_io_buf_internal(&self, tag: u16, buf: &IoBuf<u8>) {
         if self.support_auto_buf_zc() {
             return;
@@ -1525,21 +1443,6 @@ impl UblkQueue {
         }
     }
 
-    /// **DEPRECATED:** Register IO buffer, so that pages in this buffer can
-    /// be discarded in case queue becomes idle
-    ///
-    /// This method is deprecated in favor of the unified buffer management
-    /// provided by [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_fetch_commands_unified`].
-    /// These methods handle buffer registration automatically and provide better
-    /// integration with the async I/O workflow.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_io_prep_cmd` and `submit_fetch_commands_unified` instead, removed in 0.6"
-    )]
-    pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
-        self.register_io_buf_internal(tag, buf);
-    }
-
     /// Wait for all buffer registrations to complete
     ///
     /// Each task acquires one permit, which is only available after all buffers are registered.
@@ -1578,8 +1481,8 @@ impl UblkQueue {
         *self.buf_reg_counter.borrow_mut() = 0;
     }
 
-    /// Register Io buffers
-    pub fn regiser_io_bufs(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
+    /// Register the per-tag IO buffers with the queue.
+    fn register_io_bufs(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
         if !self.support_auto_buf_zc() {
             if let Some(b) = bufs {
                 for tag in 0..self.q_depth {
@@ -2007,11 +1910,7 @@ impl UblkQueue {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_fetch_commands_unified` instead, removed in 0.6"
-    )]
-    pub fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
+    fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
         for i in 0..self.q_depth {
             let buf_addr = match bufs {
                 Some(b) => b[i as usize].as_mut_ptr(),
@@ -2039,11 +1938,7 @@ impl UblkQueue {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_fetch_commands_unified` instead, removed in 0.6"
-    )]
-    pub fn submit_fetch_commands_with_auto_buf_reg(
+    fn submit_fetch_commands_with_auto_buf_reg(
         self,
         buf_reg_data_list: &[sys::ublk_auto_buf_reg],
     ) -> Self {
@@ -2090,7 +1985,7 @@ impl UblkQueue {
     /// abstraction principles.
     ///
     /// When buffer slices are provided, this method automatically registers the IO buffers
-    /// before submitting fetch commands, eliminating the need for manual `regiser_io_bufs()` calls.
+    /// before submitting fetch commands, eliminating the need for manual buffer registration.
     ///
     /// # Buffer Descriptor List Compatibility:
     ///
@@ -2122,10 +2017,8 @@ impl UblkQueue {
                 }
 
                 // Automatically register IO buffers if provided and not in zero-copy mode
-                let queue_with_buffers = self.regiser_io_bufs(slice_opt);
+                let queue_with_buffers = self.register_io_bufs(slice_opt);
 
-                // Dispatch to existing submit_fetch_commands method
-                #[allow(deprecated)]
                 Ok(queue_with_buffers.submit_fetch_commands(slice_opt))
             }
             BufDescList::AutoRegs(auto_reg_slice) => {
@@ -2137,8 +2030,6 @@ impl UblkQueue {
                 // For auto buffer registration, add permits since buffers aren't registered through register_io_buf
                 self.buf_reg_semaphore.add_permits(self.q_depth as usize);
 
-                // Dispatch to existing submit_fetch_commands_with_auto_buf_reg method
-                #[allow(deprecated)]
                 Ok(self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice))
             }
         }
@@ -2162,12 +2053,8 @@ impl UblkQueue {
     ///
     /// When calling this API, target code has to make sure that thread-local QUEUE_RING
     /// won't be borrowed.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `complete_io_cmd_unified` instead, removed in 0.6"
-    )]
     #[inline]
-    pub fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
+    fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
         match res {
             Ok(UblkIORes::Result(res))
             | Err(UblkError::OtherError(res))
@@ -2211,12 +2098,8 @@ impl UblkQueue {
     /// This method supports zero-copy operations when UBLK_F_AUTO_BUF_REG is enabled.
     /// The buffer is automatically registered using the provided registration data.
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `complete_io_cmd_unified` instead, removed in 0.6"
-    )]
     #[inline]
-    pub fn complete_io_cmd_with_auto_buf_reg(
+    fn complete_io_cmd_with_auto_buf_reg(
         &self,
         tag: u16,
         buf_reg_data: &sys::ublk_auto_buf_reg,
@@ -2284,26 +2167,22 @@ impl UblkQueue {
                 } else {
                     slice.as_ptr() as *mut u8
                 };
-                #[allow(deprecated)]
                 self.complete_io_cmd(tag, buf_addr, res);
                 Ok(())
             }
             BufDesc::AutoReg(buf_reg_data) => {
                 // For auto buffer registration, use the specialized method
-                #[allow(deprecated)]
                 self.complete_io_cmd_with_auto_buf_reg(tag, &buf_reg_data, res);
                 Ok(())
             }
             BufDesc::ZonedAppendLba(lba) => {
                 // For zoned append LBA, pass the LBA value as the buffer address
-                #[allow(deprecated)]
                 self.complete_io_cmd(tag, lba as *mut u8, res);
                 Ok(())
             }
             BufDesc::RawAddress(addr) => {
                 // For raw address operations, use the address directly
                 // SAFETY: The caller is responsible for ensuring the address is valid
-                #[allow(deprecated)]
                 self.complete_io_cmd(tag, addr as *mut u8, res);
                 Ok(())
             }
@@ -2417,16 +2296,6 @@ impl UblkQueue {
             return true;
         }
         return false;
-    }
-
-    /// Return inflight IOs being handled by target code
-    #[deprecated(
-        since = "0.5.0",
-        note = "will be removed in 0.6.0 - it is easier for target code to count inflight IOs themselves"
-    )]
-    #[inline]
-    pub fn get_inflight_nr_io(&self) -> u32 {
-        self.q_depth - self.state.borrow().get_nr_cmd_inflight()
     }
 
     #[inline]
