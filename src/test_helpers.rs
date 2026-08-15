@@ -30,7 +30,7 @@ pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue) -> Result<(), UblkError
     use crate::helpers::IoBuf;
     use crate::BufDesc;
 
-    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+    let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
     let _buf = Some(buf);
     let iod = q.get_iod(tag);
     let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());

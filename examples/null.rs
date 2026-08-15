@@ -151,7 +151,7 @@ async fn null_io_task(
         let buf = if user_copy {
             None
         } else {
-            Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
+            Some(IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize))
         };
         __null_io_task(q, tag, buf.as_ref(), user_copy).await
     }

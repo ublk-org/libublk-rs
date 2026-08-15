@@ -266,7 +266,7 @@ fn q_fn(qid: u16, dev: &Arc<UblkDev>) {
 
 async fn lo_io_task(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
-    let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+    let mut buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
     // Submit initial prep command - any error will exit the function
     // The IoBuf is automatically registered

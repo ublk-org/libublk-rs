@@ -370,7 +370,7 @@ mod integration {
             tag: u16,
             dev_data: &Arc<Mutex<DevData>>,
         ) -> Result<(), UblkError> {
-            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
             // Submit initial prep command - any error will exit the function
             q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
@@ -647,7 +647,7 @@ mod integration {
             ramdisk_addr: usize,
             mlock_enabled: bool,
         ) -> Result<(), UblkError> {
-            let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let mut buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
             // Submit initial prep command - any error will exit the function
             // The IoBuf is automatically registered

@@ -13,6 +13,16 @@
 //! network targets like nbd or nvme-tcp (accept/recv/send), ring timers
 //! ([`sleep`]), fd readiness ([`poll_add`]), and an escape hatch for any
 //! other opcode ([`submit_sqe`]).
+//!
+//! # Completion-type convention
+//!
+//! Catalog ops resolve to the raw CQE result (`i32`, negative errno on
+//! failure): a ublk server usually completes the incoming io with that
+//! value verbatim, so [`RawOp`] and [`BufOp`] do not translate it.
+//! Dedicated future types translate to `Result` only where the raw value
+//! is not what the caller wants: [`Sleep`] folds the timer's `-ETIME`
+//! into success, and [`Accept`] wraps the returned descriptor in an
+//! [`OwnedFd`].
 
 use std::future::Future;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -29,6 +39,7 @@ use crate::UblkError;
 /// registered fixed-file table (index 0 is the ublk char device; targets
 /// typically register their backing file at index 1).
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub enum TgtFd {
     /// A plain (non-registered) file descriptor.
     Raw(RawFd),

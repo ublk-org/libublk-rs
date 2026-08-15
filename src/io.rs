@@ -1174,7 +1174,7 @@ pub struct UblkQueue {
     q_depth: u32,
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
-    pub dev: Arc<UblkDev>,
+    dev: Arc<UblkDev>,
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
@@ -1411,6 +1411,12 @@ impl UblkQueue {
     #[inline(always)]
     pub fn get_qid(&self) -> u16 {
         self.q_id
+    }
+
+    /// Return the device this queue serves.
+    #[inline(always)]
+    pub fn dev(&self) -> &Arc<UblkDev> {
+        &self.dev
     }
 
     /// Return IO command description info represented by `ublksrv_io_desc`

@@ -316,7 +316,7 @@ fn q_async_fn(qid: u16, dev: &Arc<UblkDev>, zero_copy: bool, io_delay_us: u32) {
             let buf = if zero_copy && q.support_auto_buf_zc() {
                 None
             } else {
-                Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
+                Some(IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize))
             };
             batch_io_task(&q, tag, buf.as_ref(), batch_state, zero_copy, io_delay_us).await
         }
