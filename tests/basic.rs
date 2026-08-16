@@ -485,6 +485,14 @@ mod integration {
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
             run_ublk_disk_sanity_test(ctrl, dev_flags);
             read_ublk_disk(ctrl, true);
+
+            // Idle past the reactor's park-safety period, then serve IO
+            // again: the safety-timeout bounce must leave the queue
+            // thread parked where the next FETCH completion can wake it,
+            // not on the executor's condvar.
+            std::thread::sleep(std::time::Duration::from_millis(1600));
+            read_ublk_disk(ctrl, true);
+
             ctrl.kill_dev().unwrap();
         })
         .unwrap();

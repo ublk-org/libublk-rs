@@ -14,7 +14,37 @@
 //! nothing more than that pattern applied to Tokio.
 
 use crate::UblkError;
+use std::cell::RefCell;
 use std::future::Future;
+use std::task::Waker;
+
+std::thread_local! {
+    /// Waker of this thread's `block_on` root future, woken by the park
+    /// hook when the reactor's safety timeout fires so the scheduler
+    /// re-runs (and re-enters the hook) instead of parking on its
+    /// condvar, which a CQE could never wake. It must be the root
+    /// (scheduler-native) waker: waking a `LocalSet` task from its own
+    /// thread only enqueues it without notifying the parker.
+    static PARK_KICK_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
+}
+
+fn park_hook() {
+    if matches!(
+        crate::reactor::wait_and_reap_events_inner(),
+        crate::reactor::ParkOutcome::SafetyTimeout
+    ) {
+        // No waker was woken, but ops are still in flight and the
+        // executor may hold deferred runnable work. Wake the block_on
+        // root so the scheduler loops (running any such work) and parks
+        // into this hook again, rather than on its condvar where the
+        // next CQE could never reach it.
+        PARK_KICK_WAKER.with(|w| {
+            if let Some(waker) = w.borrow().as_ref() {
+                waker.wake_by_ref();
+            }
+        });
+    }
+}
 
 /// One thread's runtime: a Tokio current-thread scheduler whose park
 /// primitive is the thread's io_uring(s).
@@ -31,7 +61,7 @@ impl UblkRuntime {
     /// Build the runtime on the current thread.
     pub fn new() -> Result<Self, UblkError> {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .on_thread_park(crate::reactor::wait_and_reap_events)
+            .on_thread_park(park_hook)
             .build()
             .map_err(UblkError::IOError)?;
         Ok(UblkRuntime { rt })
@@ -41,7 +71,23 @@ impl UblkRuntime {
     /// thread-local ublk uring(s) while the future is pending.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         let local = tokio::task::LocalSet::new();
-        self.rt.block_on(local.run_until(future))
+        self.rt.block_on(local.run_until(async move {
+            let mut future = std::pin::pin!(future);
+            std::future::poll_fn(move |cx| {
+                // (Re-)register the root waker for the park hook's kick.
+                PARK_KICK_WAKER.with(|w| {
+                    let mut slot = w.borrow_mut();
+                    if !slot
+                        .as_ref()
+                        .is_some_and(|existing| existing.will_wake(cx.waker()))
+                    {
+                        *slot = Some(cx.waker().clone());
+                    }
+                });
+                future.as_mut().poll(cx)
+            })
+            .await
+        }))
     }
 
     /// Create queue `qid` of `dev` on the current thread, spawn one

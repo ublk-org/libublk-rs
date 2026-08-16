@@ -1338,7 +1338,7 @@ impl UblkCtrlInner {
             }
             with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
                 r.submit_and_wait(1)?;
-                crate::op::ublk_reap_and_wake(r, |_, _| {});
+                let _ = crate::op::ublk_reap_and_wake(r, |_, _| {});
                 Ok::<(), UblkError>(())
             })?;
         }

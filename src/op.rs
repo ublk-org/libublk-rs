@@ -333,10 +333,13 @@ impl Drop for Op {
 /// Drain `ring`'s completion queue, waking the future behind each CQE.
 /// `per_cqe` runs for every CQE with a flag telling whether it completed
 /// a ublk io command (for the queue-state accounting). Returns the number
-/// of CQEs drained. The slab and the completion queue are borrowed once
-/// for the whole batch; CQEs posted mid-drain are picked up by the
-/// caller's next pass.
-pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> usize
+/// of CQEs drained and the number of wakers actually woken -- reserved
+/// sentinels, orphans and not-yet-polled futures drain without waking
+/// anything, and an executor park hook must not treat them as runnable
+/// work. The slab and the completion queue are borrowed once for the
+/// whole batch; CQEs posted mid-drain are picked up by the caller's next
+/// pass.
+pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, usize)
 where
     S: squeue::EntryMarker,
     F: FnMut(&cqueue::Entry, bool),
@@ -345,6 +348,7 @@ where
         let mut slab = slab.borrow_mut();
         let cq = ring.completion();
         let mut n = 0;
+        let mut woken = 0;
         for cqe in cq {
             n += 1;
             let data = cqe.user_data();
@@ -370,8 +374,9 @@ where
             entry.result = Some(cqe.result());
             if let Some(waker) = entry.waker.take() {
                 waker.wake();
+                woken += 1;
             }
         }
-        n
+        (n, woken)
     })
 }

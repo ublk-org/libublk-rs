@@ -72,7 +72,18 @@ pub fn has_pending_ops() -> bool {
 /// Drain both thread-local rings once, waking the future behind each
 /// CQE. Non-blocking. Returns the number of CQEs handled.
 pub fn reap_events() -> usize {
-    reap_queue_ring() + reap_ctrl_ring()
+    let (q, _) = reap_queue_ring();
+    let (c, _) = reap_ctrl_ring();
+    q + c
+}
+
+/// As [`reap_events`], also reporting how many wakers were woken:
+/// sentinel and orphan CQEs drain without making any task runnable, and
+/// the park path must not mistake them for progress.
+fn reap_events_counting_wakes() -> (usize, usize) {
+    let (qn, qw) = reap_queue_ring();
+    let (cn, cw) = reap_ctrl_ring();
+    (qn + cn, qw + cw)
 }
 
 /// Park the thread until at least one op future has been woken, or
@@ -88,34 +99,63 @@ pub fn reap_events() -> usize {
 /// call this unconditionally from its idle hook: cross-thread wakes
 /// (channels, join handles) still get through because the thread only
 /// sleeps while a CQE is guaranteed to arrive and wake it.
+///
+/// The safety-timeout path also returns, without any woken waker: the
+/// executor may have parked while still holding runnable (deferred)
+/// work, and only returning lets that work -- which may be what
+/// generates the next CQE -- run. An executor whose idle loop simply
+/// calls this function again is naturally live; an executor that would
+/// fall back to a park primitive CQEs cannot wake (as Tokio's condvar
+/// parker does) must re-enter its scheduler loop instead --
+/// [`crate::UblkRuntime`] does this by waking a no-op task.
 pub fn wait_and_reap_events() {
+    let _ = wait_and_reap_events_inner();
+}
+
+/// What a [`wait_and_reap_events`] pass ended with; tells the executor
+/// glue whether it must keep its scheduler loop alive.
+pub(crate) enum ParkOutcome {
+    /// At least one waker was woken; the executor has work.
+    Woken,
+    /// No op is in flight: a CQE cannot occur, so the executor may park
+    /// on its own primitive (cross-thread wakes still reach it there).
+    NoPendingOps,
+    /// The park-safety timeout expired with ops still in flight and no
+    /// waker woken. The executor MUST NOT park on a primitive that CQEs
+    /// cannot reach: it may hold deferred runnable work, and the next
+    /// pass of this function is the only CQE consumer.
+    SafetyTimeout,
+}
+
+pub(crate) fn wait_and_reap_events_inner() -> ParkOutcome {
     loop {
-        if reap_events() > 0 {
-            return;
+        let (_, woken) = reap_events_counting_wakes();
+        if woken > 0 {
+            return ParkOutcome::Woken;
         }
         if !has_pending_ops() {
             // Nothing a CQE could wake: let the executor park normally
             // so cross-thread wakes (e.g. join handles) still work.
-            return;
+            return ParkOutcome::NoPendingOps;
         }
         if !wait_for_cqe() {
-            return;
+            return ParkOutcome::SafetyTimeout;
         }
     }
 }
 
 /// Drain the queue ring's completion queue, waking the future behind each
 /// CQE and doing the io-command accounting the explicit event loops used
-/// to do. Returns the number of CQEs handled.
-fn reap_queue_ring() -> usize {
-    let (n, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
+/// to do. Returns the number of CQEs handled and of wakers woken.
+fn reap_queue_ring() -> (usize, usize) {
+    let (n, woken, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
         let Some(ring_cell) = cell.get() else {
-            return (0, 0, false);
+            return (0, 0, 0, false);
         };
         let mut ring = ring_cell.borrow_mut();
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
-        let n = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
+        let (n, woken) = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
             if cqe.user_data() == CTRL_POLL_DATA {
                 CTRL_POLL_ARMED.with(|armed| armed.set(false));
             } else if is_io_cmd {
@@ -125,21 +165,21 @@ fn reap_queue_ring() -> usize {
                 }
             }
         });
-        (n, cmd_cnt, aborted)
+        (n, woken, cmd_cnt, aborted)
     });
     if cmd_cnt > 0 {
         crate::io::update_queue_state(cmd_cnt, aborted);
     }
-    n
+    (n, woken)
 }
 
 /// Drain the control ring's completion queue, waking the future behind
-/// each CQE. Returns the number of CQEs handled.
-fn reap_ctrl_ring() -> usize {
+/// each CQE. Returns the number of CQEs handled and of wakers woken.
+fn reap_ctrl_ring() -> (usize, usize) {
     crate::ctrl::CTRL_URING.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(ring) = guard.as_mut() else {
-            return 0;
+            return (0, 0);
         };
         ublk_reap_and_wake(ring, |_, _| {})
     })
