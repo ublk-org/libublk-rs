@@ -75,10 +75,14 @@ pub fn reap_events() -> usize {
     reap_queue_ring() + reap_ctrl_ring()
 }
 
-/// Park the thread until at least one op future has been woken: reap
-/// both rings, and while nothing was woken and ops remain in flight,
-/// flush pending SQEs and sleep in `io_uring_enter` (bounded by a 1s
-/// safety timeout per pass).
+/// Park the thread until at least one op future has been woken, or
+/// until the park-safety timeout expires: reap both rings, and if
+/// nothing was woken while ops remain in flight, flush pending SQEs and
+/// sleep in `io_uring_enter` for at most one safety period (1s). The
+/// timeout path returns without a woken waker on purpose: the executor
+/// may park while it still holds runnable (deferred) work, and only
+/// returning lets that work -- which may be what generates the next
+/// CQE -- run.
 ///
 /// Returns immediately when no ops are in flight, so an executor may
 /// call this unconditionally from its idle hook: cross-thread wakes
@@ -194,14 +198,13 @@ fn wait_for_cqe() -> bool {
 
     match res {
         Ok(_) => true,
-        Err(ref err)
-            if matches!(
-                err.raw_os_error(),
-                Some(libc::ETIME | libc::EINTR | libc::EBUSY)
-            ) =>
-        {
-            true
-        }
+        // Safety timeout: hand control back to the executor instead of
+        // re-arming the wait. The executor may have parked while still
+        // holding runnable (deferred) work whose progress is the only
+        // way the awaited CQEs can ever be generated; bouncing out once
+        // per safety period keeps that case live instead of deadlocking.
+        Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => false,
+        Err(ref err) if matches!(err.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => true,
         Err(err) => {
             log::error!("ublk reactor: io_uring_enter failed: {}", err);
             false
