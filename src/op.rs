@@ -90,6 +90,7 @@ std::thread_local! {
 }
 
 /// Whether any op is still in flight on this thread (park-loop guard).
+#[inline]
 pub(crate) fn has_pending_ops() -> bool {
     OP_SLAB.with(|slab| !slab.borrow().is_empty())
 }
@@ -102,6 +103,7 @@ pub(crate) enum OpRing {
 }
 
 /// Push `sqe` to `r`, flushing once if the SQ ring is full.
+#[inline]
 fn push_sqe<S: squeue::EntryMarker>(r: &mut IoUring<S>, sqe: &S) -> Result<(), UblkError> {
     // SAFETY: every pointer carried by the SQE refers to memory owned
     // by the corresponding slab entry (or caller-guaranteed memory for
@@ -114,6 +116,7 @@ fn push_sqe<S: squeue::EntryMarker>(r: &mut IoUring<S>, sqe: &S) -> Result<(), U
     unsafe { r.submission().push(sqe) }.map_err(|_| UblkError::OtherError(-libc::EBUSY))
 }
 
+#[inline]
 fn push_queue_sqe(sqe: &squeue::Entry) -> Result<(), UblkError> {
     crate::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| push_sqe(r, sqe))
 }
@@ -122,6 +125,7 @@ fn push_ctrl_sqe(sqe: &squeue::Entry128) -> Result<(), UblkError> {
     crate::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| push_sqe(r, sqe))
 }
 
+#[inline]
 fn insert_entry(resources: Resources, is_io_cmd: bool, sync_data: Option<u64>) -> usize {
     OP_SLAB.with(|slab| {
         slab.borrow_mut().insert(OpEntry {
@@ -161,6 +165,7 @@ pub(crate) fn submit_sync(
 /// entries — the latter are completed and woken here exactly as
 /// [`ublk_reap_and_wake`] would, so a stray async op in a sync-driven
 /// queue is delivered to its future rather than corrupting state.
+#[inline]
 pub(crate) fn take_sync_entry(user_data: u64, result: i32) -> Option<(u64, bool)> {
     if user_data >= RESERVED_USER_DATA_MIN {
         return None;
@@ -201,6 +206,7 @@ pub(crate) struct Op {
 impl Op {
     /// Reserve a slab entry, then build-and-push the SQE with the entry's
     /// key as `user_data`; the entry is reclaimed if the push fails.
+    #[inline]
     fn submit_on(
         ring: OpRing,
         resources: Resources,
@@ -221,6 +227,7 @@ impl Op {
 
     /// Submit an SQE built by `build` (which receives the `user_data` key)
     /// on the queue ring, with `resources` kept alive in the slab entry.
+    #[inline]
     pub(crate) fn submit(
         build: impl FnOnce(u64) -> squeue::Entry,
         resources: Resources,
@@ -232,6 +239,7 @@ impl Op {
 
     /// As [`Op::submit`], marking the op as a ublk io command whose
     /// completion the queue-state accounting must observe.
+    #[inline]
     pub(crate) fn submit_io_cmd(
         build: impl FnOnce(u64) -> squeue::Entry,
         resources: Resources,
@@ -242,6 +250,7 @@ impl Op {
     }
 
     /// As [`Op::submit`], on the control ring (128-byte SQEs).
+    #[inline]
     pub(crate) fn submit_ctrl(
         build: impl FnOnce(u64) -> squeue::Entry128,
         resources: Resources,
@@ -268,6 +277,7 @@ impl Op {
     }
 
     /// Poll for the single completion, handing back the kept resources.
+    #[inline]
     pub(crate) fn poll_single(&mut self, cx: &mut Context<'_>) -> Poll<(i32, Resources)> {
         assert!(!self.done, "op polled after completion");
         OP_SLAB.with(|slab| {

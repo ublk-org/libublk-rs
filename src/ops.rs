@@ -76,6 +76,7 @@ pub struct BufOp {
 impl Future for BufOp {
     type Output = (i32, Box<[u8]>);
 
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (result, resources) = ready!(self.op.poll_single(cx));
         Poll::Ready((result, resources.into_buffer()))
@@ -97,6 +98,7 @@ impl RawOp {
 impl Future for RawOp {
     type Output = i32;
 
+    #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let (result, _) = ready!(self.op.poll_single(cx));
         Poll::Ready(result)
@@ -105,6 +107,7 @@ impl Future for RawOp {
 
 /// Submit a resource-free SQE; its `user_data` is overwritten with the
 /// op key.
+#[inline]
 fn submit_raw(sqe: squeue::Entry) -> Result<RawOp, UblkError> {
     let op = Op::submit(|key| sqe.user_data(key), Resources::None)?;
     Ok(RawOp::new(op))
@@ -113,6 +116,7 @@ fn submit_raw(sqe: squeue::Entry) -> Result<RawOp, UblkError> {
 /// Submit an SQE referencing `buf`, keeping the buffer alive in the op
 /// until the CQE hands it back; `user_data` is overwritten with the op
 /// key.
+#[inline]
 fn submit_buf(sqe: squeue::Entry, buf: Box<[u8]>) -> Result<BufOp, UblkError> {
     let op = Op::submit(|key| sqe.user_data(key), Resources::Buffer(buf))?;
     Ok(BufOp { op })
@@ -146,6 +150,7 @@ pub fn write_at(file: TgtFd, buf: Box<[u8]>, offset: u64) -> Result<BufOp, UblkE
 /// op's CQE has been reaped — which, if the returned future is dropped
 /// before completion, is *later* than the drop: the caller must keep the
 /// memory alive until queue teardown confirms no ops are pending.
+#[inline]
 pub unsafe fn read_at_raw(
     file: TgtFd,
     ptr: *mut u8,
@@ -162,6 +167,7 @@ pub unsafe fn read_at_raw(
 /// # Safety
 ///
 /// Same contract as [`read_at_raw`] (reads the buffer only).
+#[inline]
 pub unsafe fn write_at_raw(
     file: TgtFd,
     ptr: *const u8,
@@ -182,6 +188,7 @@ pub unsafe fn write_at_raw(
 /// valid, until this op's CQE has been reaped. `ptr` addresses into the
 /// registered buffer; ublk `UBLK_F_AUTO_BUF_REG` slots take a null
 /// pointer.
+#[inline]
 pub unsafe fn read_at_fixed(
     file: TgtFd,
     buf_index: u16,
@@ -202,6 +209,7 @@ pub unsafe fn read_at_fixed(
 /// # Safety
 ///
 /// As for [`read_at_fixed`].
+#[inline]
 pub unsafe fn write_at_fixed(
     file: TgtFd,
     buf_index: u16,
@@ -217,6 +225,7 @@ pub unsafe fn write_at_fixed(
 }
 
 /// `fsync(2)` / `fdatasync(2)` via the ring.
+#[inline]
 pub fn fsync(file: TgtFd, datasync: bool) -> Result<RawOp, UblkError> {
     let flags = if datasync {
         types::FsyncFlags::DATASYNC
@@ -230,6 +239,7 @@ pub fn fsync(file: TgtFd, datasync: bool) -> Result<RawOp, UblkError> {
 
 /// `sync_file_range(2)` via the ring (`flags` is the `SYNC_FILE_RANGE_*`
 /// bitset, passed through verbatim).
+#[inline]
 pub fn sync_file_range(file: TgtFd, offset: u64, len: u32, flags: u32) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(file, |fd| opcode::SyncFileRange::new(fd, len)
         .offset(offset)
@@ -239,6 +249,7 @@ pub fn sync_file_range(file: TgtFd, offset: u64, len: u32, flags: u32) -> Result
 
 /// `fallocate(2)` via the ring (`FALLOC_FL_*` modes: punch-hole,
 /// zero-range, ... — the file target's discard/write-zeroes primitive).
+#[inline]
 pub fn fallocate(file: TgtFd, mode: i32, offset: u64, len: u64) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(file, |fd| opcode::Fallocate::new(fd, len)
         .offset(offset)
@@ -283,6 +294,7 @@ pub fn sleep(duration: Duration) -> Result<Sleep, UblkError> {
 
 /// No-op via the ring (`IORING_OP_NOP`): completes immediately with 0 —
 /// an instant "target IO" for tests and benchmarks.
+#[inline]
 pub fn nop() -> Result<RawOp, UblkError> {
     submit_raw(opcode::Nop::new().build())
 }
@@ -354,6 +366,7 @@ pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> Result<RawOp, Ubl
 
 /// Build an `IORING_OP_URING_CMD` SQE with a 16-byte inline payload
 /// (64-byte SQE, queue ring format).
+#[inline]
 pub(crate) fn uring_cmd16_sqe(file: TgtFd, cmd_op: u32, cmd: [u8; 16]) -> squeue::Entry {
     with_tgt_fd!(file, |fd| opcode::UringCmd16::new(fd, cmd_op)
         .cmd(cmd)
