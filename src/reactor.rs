@@ -208,3 +208,44 @@ fn wait_for_cqe() -> bool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The executor's park hook must return within the park-safety bound
+    /// when no CQE arrives, instead of re-arming the wait forever.
+    ///
+    /// The executor may park while it still has runnable (deferred) work
+    /// -- Tokio's current-thread scheduler does exactly that at a
+    /// `LocalSet` tick boundary, parking after polling only part of the
+    /// spawned tasks. If the hook keeps waiting for a CQE that only those
+    /// unpolled tasks can cause, startup deadlocks (observed with one
+    /// spawned task per tag on a 128-deep queue: the FETCH completions
+    /// the hook waits for cannot arrive before every task has submitted
+    /// its FETCH and the device has started).
+    #[test]
+    fn test_wait_and_reap_events_bounded_without_cqe() {
+        crate::io::ublk_init_task_ring(|cell| {
+            if cell.get().is_none() {
+                let ring = io_uring::IoUring::builder()
+                    .build(64)
+                    .map_err(crate::UblkError::IOError)?;
+                cell.set(std::cell::RefCell::new(ring))
+                    .map_err(|_| crate::UblkError::OtherError(-libc::EEXIST))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        // One in-flight op whose CQE arrives long after the safety bound
+        let _op = crate::ops::sleep(std::time::Duration::from_secs(5)).unwrap();
+
+        let start = std::time::Instant::now();
+        wait_and_reap_events();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "park hook blocked past the safety timeout while the executor may hold runnable work"
+        );
+    }
+}

@@ -441,6 +441,55 @@ mod integration {
         .unwrap();
     }
 
+    /// A queue deeper than Tokio's per-tick task quota must still start.
+    ///
+    /// With one spawned task per tag, only a slice of the tasks get their
+    /// first poll before the scheduler hits a tick boundary and invokes
+    /// the park hook. If the reactor then blocks in io_uring_enter --
+    /// waiting on FETCH completions that cannot arrive until the
+    /// remaining tasks run and the device starts -- startup deadlocks.
+    /// Queue depth 128 with ctrl driven on another thread reproduces it.
+    #[test]
+    fn test_ublk_null_async_deep_queue() {
+        async fn io_task(q: Rc<UblkQueue>, tag: u16) -> Result<(), UblkError> {
+            let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
+
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+                .await?;
+            loop {
+                let iod = q.get_iod(tag);
+                let bytes = (iod.nr_sectors << 9) as i32;
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), bytes)
+                    .await?;
+            }
+        }
+
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null_deep")
+            .nr_queues(1)
+            .depth(128)
+            .id(-1)
+            .dev_flags(dev_flags)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            libublk::UblkRuntime::run_io_tasks(dev, qid, io_task).unwrap();
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl, true);
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
     fn __test_ublk_null_zc(bad_buf_idx: bool, fallback: bool) {
         const IORING_NOP_INJECT_RESULT: u32 = 1u32 << 0;
         const IORING_NOP_FIXED_BUFFER: u32 = 1u32 << 3;
