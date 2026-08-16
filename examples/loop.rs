@@ -8,10 +8,10 @@ use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::ops::{self, TgtFd};
 use libublk::{ctrl::UblkCtrl, BufDesc, UblkError, UblkFlags};
 use serde::Serialize;
-use std::sync::Arc;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 struct LoJson {
@@ -287,10 +287,8 @@ async fn lo_io_task(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
 }
 
 fn q_a_fn(qid: u16, dev: &Arc<UblkDev>) {
-    libublk::UblkRuntime::run_io_tasks(dev, qid, |q, tag| async move {
-        lo_io_task(&q, tag).await
-    })
-    .unwrap();
+    libublk::UblkRuntime::run_io_tasks(dev, qid, |q, tag| async move { lo_io_task(&q, tag).await })
+        .unwrap();
 }
 
 fn __loop_add(

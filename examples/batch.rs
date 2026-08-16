@@ -365,8 +365,7 @@ fn __batch_add(
     };
 
     // Always run in async mode for batch coordination
-    let q_async_handler =
-        move |qid, dev: &_| q_async_fn(qid, dev, zero_copy, io_delay_us);
+    let q_async_handler = move |qid, dev: &_| q_async_fn(qid, dev, zero_copy, io_delay_us);
     ctrl.run_target(tgt_init, q_async_handler, wh).unwrap();
 }
 

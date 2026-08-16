@@ -1341,15 +1341,13 @@ fn claim_tags(owned_tags: &mut [bool], tags: &[u16], seen: &mut [bool]) -> Resul
 /// cannot ride a single-shot slab entry, so the sync reaper instead passes
 /// their target-bit `user_data` through to the handler verbatim.
 fn push_batch_sqe(entry: &squeue::Entry) -> Result<(), UblkError> {
-    with_task_io_ring_mut(|ring| {
-        loop {
-            let res = unsafe { ring.submission().push(entry) };
-            if res.is_ok() {
-                return Ok(());
-            }
-            log::debug!("push_batch_sqe: flush and retry");
-            ring.submit_and_wait(0).map_err(UblkError::IOError)?;
+    with_task_io_ring_mut(|ring| loop {
+        let res = unsafe { ring.submission().push(entry) };
+        if res.is_ok() {
+            return Ok(());
         }
+        log::debug!("push_batch_sqe: flush and retry");
+        ring.submit_and_wait(0).map_err(UblkError::IOError)?;
     })
 }
 

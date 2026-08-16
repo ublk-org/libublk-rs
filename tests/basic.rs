@@ -7,9 +7,7 @@ mod integration {
         UblkDev, UblkIOCtx, UblkQueue,
     };
     use libublk::override_sqe;
-    use libublk::{
-        ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags,
-    };
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags};
     use std::env;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -108,8 +106,7 @@ mod integration {
                 } else {
                     BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd_unified(tag, buf_desc, bytes)
-                    .unwrap();
+                q.complete_io_cmd_unified(tag, buf_desc, bytes).unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)
@@ -638,7 +635,10 @@ mod integration {
                 let status = std::process::Command::new(cmd).args(args).status().unwrap();
                 assert!(status.success(), "{} {:?} failed", cmd, args);
             };
-            run("mkfs.ext4", &["-q", "-F", "-I", "512", "-E", "stride=2", &dev_path]);
+            run(
+                "mkfs.ext4",
+                &["-q", "-F", "-I", "512", "-E", "stride=2", &dev_path],
+            );
 
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let mnt = tmp_dir.path().to_str().unwrap();
@@ -1177,8 +1177,7 @@ mod integration {
                 } else {
                     BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd_unified(tag, buf_desc, bytes)
-                    .unwrap();
+                q.complete_io_cmd_unified(tag, buf_desc, bytes).unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)
@@ -1280,12 +1279,8 @@ mod integration {
                 };
 
                 // Use the unified complete_io_cmd_unified API with auto buffer registration
-                q.complete_io_cmd_unified(
-                    tag,
-                    BufDesc::AutoReg(auto_buf_reg),
-                    bytes,
-                )
-                .unwrap();
+                q.complete_io_cmd_unified(tag, BufDesc::AutoReg(auto_buf_reg), bytes)
+                    .unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)

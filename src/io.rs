@@ -1517,11 +1517,9 @@ impl UblkQueue {
             cmd_op
         };
 
-        let mut sqe = crate::ops::uring_cmd16_sqe(
-            crate::ops::TgtFd::Fixed(0),
-            cmd_op,
-            unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) },
-        )
+        let mut sqe = crate::ops::uring_cmd16_sqe(crate::ops::TgtFd::Fixed(0), cmd_op, unsafe {
+            core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd)
+        })
         .user_data(user_data);
         if let Some(auto_buf_addr) = sqe_addr {
             assert!(self.support_auto_buf_zc());
@@ -1676,9 +1674,10 @@ impl UblkQueue {
                 };
                 (buf_addr, None)
             }
-            BufDesc::AutoReg(buf_reg_data) => {
-                (0, Some(bindings::ublk_auto_buf_reg_to_sqe_addr(&buf_reg_data)))
-            }
+            BufDesc::AutoReg(buf_reg_data) => (
+                0,
+                Some(bindings::ublk_auto_buf_reg_to_sqe_addr(&buf_reg_data)),
+            ),
             // For zoned append, the LBA rides the buffer address field
             BufDesc::ZonedAppendLba(lba) => (lba, None),
             // SAFETY: the caller is responsible for the raw address' validity
@@ -1846,10 +1845,7 @@ impl UblkQueue {
     /// reaped — queue-slot buffers satisfy this by construction; see
     /// [`crate::ops::submit_sqe`] (which this delegates to) for the full
     /// contract.
-    pub unsafe fn ublk_submit_sqe(
-        &self,
-        sqe: io_uring::squeue::Entry,
-    ) -> Result<RawOp, UblkError> {
+    pub unsafe fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> Result<RawOp, UblkError> {
         unsafe { crate::ops::submit_sqe(sqe) }
     }
 

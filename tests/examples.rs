@@ -59,7 +59,13 @@ mod examples {
     }
 
     fn assert_ok(name: &str, args: &[&str], status: std::process::ExitStatus) {
-        assert!(status.success(), "example {} {:?} failed: {}", name, args, status);
+        assert!(
+            status.success(),
+            "example {} {:?} failed: {}",
+            name,
+            args,
+            status
+        );
     }
 
     fn bdev_path(dev_id: i32) -> PathBuf {

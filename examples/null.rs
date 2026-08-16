@@ -36,8 +36,7 @@ fn handle_io_cmd(q: &UblkQueue, tag: u16, io_slice: Option<&[u8]>) {
         BufDesc::Slice(&[])
     };
 
-    q.complete_io_cmd_unified(tag, buf_desc, bytes)
-        .unwrap();
+    q.complete_io_cmd_unified(tag, buf_desc, bytes).unwrap();
 }
 
 fn q_sync_zc_fn(qid: u16, dev: &Arc<UblkDev>) {
@@ -55,8 +54,7 @@ fn q_sync_zc_fn(qid: u16, dev: &Arc<UblkDev>) {
     let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
         let bytes = get_io_cmd_result(q, tag);
         let buf_desc = BufDesc::AutoReg(auto_buf_reg_list[tag as usize]);
-        q.complete_io_cmd_unified(tag, buf_desc, bytes)
-            .unwrap();
+        q.complete_io_cmd_unified(tag, buf_desc, bytes).unwrap();
     };
 
     let queue = match UblkQueue::new(qid, dev)

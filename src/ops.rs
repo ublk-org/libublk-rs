@@ -187,12 +187,7 @@ pub fn fsync(file: TgtFd, datasync: bool) -> Result<RawOp, UblkError> {
 
 /// `sync_file_range(2)` via the ring (`flags` is the `SYNC_FILE_RANGE_*`
 /// bitset, passed through verbatim).
-pub fn sync_file_range(
-    file: TgtFd,
-    offset: u64,
-    len: u32,
-    flags: u32,
-) -> Result<RawOp, UblkError> {
+pub fn sync_file_range(file: TgtFd, offset: u64, len: u32, flags: u32) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(file, |fd| opcode::SyncFileRange::new(fd, len)
         .offset(offset)
         .flags(flags)
@@ -325,7 +320,9 @@ pub(crate) fn uring_cmd16_sqe(file: TgtFd, cmd_op: u32, cmd: [u8; 16]) -> squeue
 /// Build an `IORING_OP_URING_CMD` SQE with an 80-byte inline payload
 /// (128-byte SQE, control ring format).
 pub(crate) fn uring_cmd80_sqe(fd: RawFd, cmd_op: u32, cmd: [u8; 80]) -> squeue::Entry128 {
-    opcode::UringCmd80::new(types::Fd(fd), cmd_op).cmd(cmd).build()
+    opcode::UringCmd80::new(types::Fd(fd), cmd_op)
+        .cmd(cmd)
+        .build()
 }
 
 /// `IORING_OP_URING_CMD` with a 16-byte inline payload on the queue ring
