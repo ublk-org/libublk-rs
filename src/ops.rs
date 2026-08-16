@@ -173,6 +173,49 @@ pub unsafe fn write_at_raw(
         .build()))
 }
 
+/// Read from `file` at `offset` into the ring-registered fixed buffer
+/// `buf_index` (`IORING_OP_READ_FIXED`).
+///
+/// # Safety
+///
+/// The fixed-buffer slot must stay registered, and any memory it maps
+/// valid, until this op's CQE has been reaped. `ptr` addresses into the
+/// registered buffer; ublk `UBLK_F_AUTO_BUF_REG` slots take a null
+/// pointer.
+pub unsafe fn read_at_fixed(
+    file: TgtFd,
+    buf_index: u16,
+    ptr: *mut u8,
+    len: u32,
+    offset: u64,
+) -> Result<RawOp, UblkError> {
+    submit_raw(with_tgt_fd!(file, |fd| opcode::ReadFixed::new(
+        fd, ptr, len, buf_index
+    )
+    .offset(offset)
+    .build()))
+}
+
+/// Write to `file` at `offset` from the ring-registered fixed buffer
+/// `buf_index` (`IORING_OP_WRITE_FIXED`).
+///
+/// # Safety
+///
+/// As for [`read_at_fixed`].
+pub unsafe fn write_at_fixed(
+    file: TgtFd,
+    buf_index: u16,
+    ptr: *const u8,
+    len: u32,
+    offset: u64,
+) -> Result<RawOp, UblkError> {
+    submit_raw(with_tgt_fd!(file, |fd| opcode::WriteFixed::new(
+        fd, ptr, len, buf_index
+    )
+    .offset(offset)
+    .build()))
+}
+
 /// `fsync(2)` / `fdatasync(2)` via the ring.
 pub fn fsync(file: TgtFd, datasync: bool) -> Result<RawOp, UblkError> {
     let flags = if datasync {
