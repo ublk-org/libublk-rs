@@ -22,11 +22,12 @@ introduction](https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf)
 
 Follows one 2-queue ublk-null target which is built over libublk, ublk block
 device(/dev/ublkbN) is created after the code is run. And the device will be
-deleted after terminating this process by ctrl+C.
+deleted after terminating this process by ctrl+C. Besides libublk, the
+sample needs the `ctrlc` crate for the signal handler.
 
 ``` rust
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::{ctrl::UblkCtrlBuilder, tokio, BufDesc, UblkRuntime};
+use libublk::{ctrl::UblkCtrlBuilder, BufDesc, UblkRuntime};
 
 // async/.await IO handling
 async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
@@ -35,7 +36,7 @@ async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
 
 async fn io_task(q: &UblkQueue, tag: u16) -> Result<(), libublk::UblkError> {
     // IO buffer for exchange data with /dev/ublkbN
-    let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
+    let buf_bytes = q.dev().dev_info.max_io_buf_bytes as usize;
     let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
 
     // Submit initial prep command for setup IO forward
@@ -94,14 +95,16 @@ fn main() {
 ```
 
  * [`examples/loop.rs`](examples/loop.rs): real example using
-   async/await & io_uring.
+   async/await & io_uring, with target IO going through the typed
+   operation catalog in [`libublk::ops`](src/ops.rs) (`read_at_raw`,
+   `write_at_raw`, `sync_file_range`, ...).
 
  * [`examples/ramdisk.rs`](examples/ramdisk.rs): single thread &
    async/.await for both ctrl and IO, this technique will be extended to
    create multiple devices from single thread in future
 
-`rublk`[^4] is based on libublk, and supports null, loop, zoned & qcow2 targets so
-far.
+`rublk`[^4] is based on libublk, and supports null, loop, zoned, qcow2,
+compress & vram targets so far.
 
 ## unprivileged ublk support
 
