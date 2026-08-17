@@ -411,6 +411,38 @@ pub unsafe fn send_raw(
         .build()))
 }
 
+/// Send from the ring-registered fixed buffer `buf_index` with a plain
+/// single-completion send -- the zero-copy-registration write path for
+/// sockets where `SEND_ZC` is unavailable (AF_UNIX). `addr` follows the
+/// registration type's convention, as for [`recv_fixed`]; `flags` as
+/// for [`recv`]; `linked` chains the send before the next pushed SQE
+/// (`IOSQE_IO_LINK`).
+///
+/// # Safety
+///
+/// As for [`read_at_fixed`]: the fixed-buffer slot must stay registered
+/// until this op's CQE has been reaped.
+pub unsafe fn send_fixed(
+    fd: TgtFd,
+    buf_index: u16,
+    addr: u64,
+    len: u32,
+    flags: i32,
+    linked: bool,
+) -> Result<RawOp, UblkError> {
+    let sqe = with_tgt_fd!(fd, |f| opcode::Send::new(f, addr as *const u8, len)
+        .flags(flags)
+        .build());
+    let mut sqe = if linked {
+        sqe.flags(squeue::Flags::IO_LINK)
+    } else {
+        sqe
+    };
+    crate::override_sqe!(&mut sqe, ioprio, |=, IORING_RECVSEND_FIXED_BUF);
+    crate::override_sqe!(&mut sqe, buf_index, buf_index);
+    submit_raw(sqe)
+}
+
 /// `IORING_RECVSEND_FIXED_BUF` (SQE ioprio bit): `addr`/`len` describe a
 /// range inside the registered buffer `buf_index`. Not in the io-uring
 /// crate's public API for plain send/recv.
@@ -478,7 +510,9 @@ impl Future for ZcNotif {
 /// is sent from the ring-registered fixed buffer of that index (`ptr` is
 /// then the offset within it, as for [`recv_fixed`]) and the kernel
 /// reuses that registration instead of pinning pages per send. `flags`
-/// as for [`recv`].
+/// as for [`recv`]. With `linked`, `IOSQE_IO_LINK` chains the send
+/// before the next SQE pushed on the ring -- for protocols that must
+/// keep concurrent sends in stream order.
 ///
 /// # Safety
 ///
@@ -491,12 +525,58 @@ pub unsafe fn send_zc(
     len: u32,
     flags: i32,
     buf_index: Option<u16>,
+    linked: bool,
 ) -> Result<SendZcOp, UblkError> {
     let op = MultiOp::submit(|key| {
-        with_tgt_fd!(fd, |f| opcode::SendZc::new(f, ptr, len)
+        let sqe = with_tgt_fd!(fd, |f| opcode::SendZc::new(f, ptr, len)
             .buf_index(buf_index)
             .flags(flags)
             .zc_flags(SEND_ZC_REPORT_USAGE)
+            .build());
+        let sqe = if linked {
+            sqe.flags(squeue::Flags::IO_LINK)
+        } else {
+            sqe
+        };
+        sqe.user_data(key)
+    })?;
+    Ok(SendZcOp { op })
+}
+
+/// Vectored send described by a caller-managed `msghdr`
+/// (`IORING_OP_SENDMSG`) -- the gather primitive for stream protocols:
+/// one op ships many frames' headers and payloads in order. `flags` as
+/// for [`recv`] (`MSG_WAITALL` makes the kernel resume short sends).
+///
+/// # Safety
+///
+/// `msg`, its iovec array and every buffer they reference must remain
+/// valid (reads only) until this op's CQE has been reaped.
+pub unsafe fn sendmsg_raw(
+    fd: TgtFd,
+    msg: *const libc::msghdr,
+    flags: i32,
+) -> Result<RawOp, UblkError> {
+    submit_raw(with_tgt_fd!(fd, |f| opcode::SendMsg::new(f, msg)
+        .flags(flags as u32)
+        .build()))
+}
+
+/// Zero-copy vectored send (`IORING_OP_SENDMSG_ZC`); two CQEs, as
+/// [`send_zc`].
+///
+/// # Safety
+///
+/// As [`sendmsg_raw`], but everything must stay valid until the
+/// **terminal** (notification) CQE has been reaped.
+pub unsafe fn sendmsg_zc(
+    fd: TgtFd,
+    msg: *const libc::msghdr,
+    flags: i32,
+) -> Result<SendZcOp, UblkError> {
+    let op = MultiOp::submit(|key| {
+        with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
+            .flags(flags as u32)
             .build())
         .user_data(key)
     })?;
@@ -624,6 +704,7 @@ mod tests {
                     payload.len() as u32,
                     0,
                     None,
+                    false,
                 )
             }?;
             let sent = op.sent().await;
