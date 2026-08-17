@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use io_uring::{opcode, squeue, types};
 
-use crate::op::{Op, Resources};
+use crate::op::{MultiOp, Op, Resources};
 use crate::UblkError;
 
 /// A target IO's file: a raw fd, or an index into the queue ring's
@@ -332,36 +332,175 @@ pub fn accept(fd: RawFd) -> Result<Accept, UblkError> {
     Ok(Accept { op })
 }
 
-/// Receive from a socket into an owned buffer.
-pub fn recv(fd: RawFd, mut buf: Box<[u8]>) -> Result<BufOp, UblkError> {
+/// Receive from a socket into an owned buffer. `flags` is the
+/// `recv(2)` `MSG_*` bitset (e.g. `libc::MSG_WAITALL` for a
+/// full-length receive), passed through verbatim.
+pub fn recv(fd: TgtFd, mut buf: Box<[u8]>, flags: i32) -> Result<BufOp, UblkError> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_mut_ptr();
-    submit_buf(opcode::Recv::new(types::Fd(fd), ptr, len).build(), buf)
+    submit_buf(
+        with_tgt_fd!(fd, |f| opcode::Recv::new(f, ptr, len).flags(flags).build()),
+        buf,
+    )
 }
 
-/// Send an owned buffer on a socket.
-pub fn send(fd: RawFd, buf: Box<[u8]>) -> Result<BufOp, UblkError> {
+/// Send an owned buffer on a socket; `flags` as for [`recv`].
+pub fn send(fd: TgtFd, buf: Box<[u8]>, flags: i32) -> Result<BufOp, UblkError> {
     let len = buf_len(&buf)?;
     let ptr = buf.as_ptr();
-    submit_buf(opcode::Send::new(types::Fd(fd), ptr, len).build(), buf)
+    submit_buf(
+        with_tgt_fd!(fd, |f| opcode::Send::new(f, ptr, len).flags(flags).build()),
+        buf,
+    )
 }
 
-/// Receive into caller-managed memory (queue-slot buffers).
+/// Receive into caller-managed memory (queue-slot buffers); `flags` as
+/// for [`recv`].
 ///
 /// # Safety
 ///
 /// Same contract as [`read_at_raw`].
-pub unsafe fn recv_raw(fd: RawFd, ptr: *mut u8, len: u32) -> Result<RawOp, UblkError> {
-    submit_raw(opcode::Recv::new(types::Fd(fd), ptr, len).build())
+#[inline]
+pub unsafe fn recv_raw(fd: TgtFd, ptr: *mut u8, len: u32, flags: i32) -> Result<RawOp, UblkError> {
+    submit_raw(with_tgt_fd!(fd, |f| opcode::Recv::new(f, ptr, len)
+        .flags(flags)
+        .build()))
 }
 
-/// Send from caller-managed memory.
+/// Receive into the ring-registered fixed buffer `buf_index`. `addr`
+/// follows the fixed-buffer convention of the registration type: an
+/// address inside a user-registered buffer, or the plain byte offset
+/// for kernel-registered buffers (ublk `UBLK_F_AUTO_BUF_REG` request
+/// buffers, which have no userspace mapping) -- resuming a partial
+/// receive continues at the consumed byte count. `flags` as for
+/// [`recv`].
+///
+/// # Safety
+///
+/// As for [`read_at_fixed`]: the fixed-buffer slot must stay registered
+/// until this op's CQE has been reaped.
+pub unsafe fn recv_fixed(
+    fd: TgtFd,
+    buf_index: u16,
+    addr: u64,
+    len: u32,
+    flags: i32,
+) -> Result<RawOp, UblkError> {
+    let mut sqe = with_tgt_fd!(fd, |f| opcode::Recv::new(f, addr as *mut u8, len)
+        .flags(flags)
+        .build());
+    crate::override_sqe!(&mut sqe, ioprio, |=, IORING_RECVSEND_FIXED_BUF);
+    crate::override_sqe!(&mut sqe, buf_index, buf_index);
+    submit_raw(sqe)
+}
+
+/// Send from caller-managed memory; `flags` as for [`recv`].
 ///
 /// # Safety
 ///
 /// Same contract as [`read_at_raw`] (reads the buffer only).
-pub unsafe fn send_raw(fd: RawFd, ptr: *const u8, len: u32) -> Result<RawOp, UblkError> {
-    submit_raw(opcode::Send::new(types::Fd(fd), ptr, len).build())
+#[inline]
+pub unsafe fn send_raw(
+    fd: TgtFd,
+    ptr: *const u8,
+    len: u32,
+    flags: i32,
+) -> Result<RawOp, UblkError> {
+    submit_raw(with_tgt_fd!(fd, |f| opcode::Send::new(f, ptr, len)
+        .flags(flags)
+        .build()))
+}
+
+/// `IORING_RECVSEND_FIXED_BUF` (SQE ioprio bit): `addr`/`len` describe a
+/// range inside the registered buffer `buf_index`. Not in the io-uring
+/// crate's public API for plain send/recv.
+const IORING_RECVSEND_FIXED_BUF: u16 = 1 << 2;
+/// `IORING_SEND_ZC_REPORT_USAGE`: the notification CQE reports whether
+/// the kernel copied (bit 31 of its result) instead of sending
+/// zero-copy.
+const SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
+/// Notification-CQE result bit set when a "zero-copy" send actually
+/// copied (loopback always copies). Not an errno.
+const NOTIF_ZC_COPIED: i32 = 1 << 31;
+
+/// Handle to an in-flight zero-copy send.
+///
+/// ZC sends complete in two CQEs: the send result first (awaited via
+/// [`SendZcOp::sent`]), then a notification once the kernel drops its
+/// last reference to the pages ([`SendZcOp::into_notif`]). The notif
+/// future must be awaited (or the handle deliberately dropped, orphaning
+/// the op) before any referenced memory is reused.
+pub struct SendZcOp {
+    op: MultiOp,
+}
+
+impl SendZcOp {
+    /// Await the send CQE: bytes accepted into the socket, or a negative
+    /// errno. Call once, before [`Self::into_notif`].
+    pub async fn sent(&mut self) -> i32 {
+        std::future::poll_fn(|cx| self.op.poll_next(cx))
+            .await
+            // The result CQE always precedes termination; a bare
+            // termination means the op was cancelled under teardown.
+            .unwrap_or(-libc::ECANCELED)
+    }
+
+    /// The notification future gating buffer reuse. Take it even when
+    /// the send failed: an errored ZC send may still have pinned pages
+    /// and post a notification; if it did not, the future resolves
+    /// immediately.
+    pub fn into_notif(self) -> ZcNotif {
+        ZcNotif { op: self.op }
+    }
+}
+
+/// Future of a ZC send's notification CQE; resolves to `true` when the
+/// kernel reports it copied the data rather than sending zero-copy
+/// (always the case on loopback).
+pub struct ZcNotif {
+    op: MultiOp,
+}
+
+impl Future for ZcNotif {
+    type Output = bool;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut copied = false;
+        while let Some(result) = ready!(self.op.poll_next(cx)) {
+            copied = result & NOTIF_ZC_COPIED != 0;
+        }
+        Poll::Ready(copied)
+    }
+}
+
+/// Zero-copy send from caller-managed memory (`IORING_OP_SEND_ZC`);
+/// completes in two CQEs -- see [`SendZcOp`]. With `buf_index` the data
+/// is sent from the ring-registered fixed buffer of that index (`ptr` is
+/// then the offset within it, as for [`recv_fixed`]) and the kernel
+/// reuses that registration instead of pinning pages per send. `flags`
+/// as for [`recv`].
+///
+/// # Safety
+///
+/// The memory (or the fixed-buffer slot) must stay valid until the
+/// **terminal** CQE -- the notification -- has been reaped, not merely
+/// until [`SendZcOp::sent`] resolves.
+pub unsafe fn send_zc(
+    fd: TgtFd,
+    ptr: *const u8,
+    len: u32,
+    flags: i32,
+    buf_index: Option<u16>,
+) -> Result<SendZcOp, UblkError> {
+    let op = MultiOp::submit(|key| {
+        with_tgt_fd!(fd, |f| opcode::SendZc::new(f, ptr, len)
+            .buf_index(buf_index)
+            .flags(flags)
+            .zc_flags(SEND_ZC_REPORT_USAGE)
+            .build())
+        .user_data(key)
+    })?;
+    Ok(SendZcOp { op })
 }
 
 /// Build an `IORING_OP_URING_CMD` SQE with a 16-byte inline payload
@@ -455,6 +594,105 @@ mod tests {
     fn test_runtime() -> Result<UblkRuntime, UblkError> {
         crate::io::init_task_ring_default(64, 64)?;
         UblkRuntime::new()
+    }
+
+    /// A connected TCP loopback pair (SEND_ZC does not support AF_UNIX).
+    fn socketpair() -> (std::net::TcpStream, std::net::TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let a = std::net::TcpStream::connect(addr).unwrap();
+        let (b, _) = listener.accept().unwrap();
+        (a, b)
+    }
+
+    /// Zero-copy send: both CQEs (send result + notification) must be
+    /// consumed through the two-phase SendZcOp, and the payload must
+    /// arrive intact.
+    #[test]
+    fn test_ops_send_zc() -> Result<(), UblkError> {
+        use std::os::fd::AsRawFd;
+
+        let rt = test_runtime()?;
+        let (a, b) = socketpair();
+        rt.block_on(async {
+            let payload = b"zero copy payload".to_vec().into_boxed_slice();
+            // SAFETY: `payload` outlives the notification await below.
+            let mut op = unsafe {
+                send_zc(
+                    TgtFd::Raw(a.as_raw_fd()),
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                    0,
+                    None,
+                )
+            }?;
+            let sent = op.sent().await;
+            assert_eq!(sent as usize, payload.len());
+            // AF_UNIX sends always copy; just consume the notification.
+            let _copied = op.into_notif().await;
+
+            let (res, rbuf) = recv(
+                TgtFd::Raw(b.as_raw_fd()),
+                vec![0u8; 64].into_boxed_slice(),
+                0,
+            )?
+            .await;
+            assert_eq!(res as usize, payload.len());
+            assert_eq!(&rbuf[..res as usize], &payload[..]);
+            Ok(())
+        })
+    }
+
+    /// recv_fixed must land the data in the ring-registered buffer at
+    /// the requested offset.
+    #[test]
+    fn test_ops_recv_fixed() -> Result<(), UblkError> {
+        use std::os::fd::AsRawFd;
+
+        let rt = test_runtime()?;
+        let (a, b) = socketpair();
+
+        // Register one 4k buffer with the task ring
+        let buf = crate::helpers::IoBuf::<u8>::new(4096);
+        let iovec = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 4096,
+        };
+        crate::io::with_task_io_ring_mut(|ring| {
+            // SAFETY: `buf` outlives the ring usage in this test.
+            unsafe { ring.submitter().register_buffers(&[iovec]) }.map_err(UblkError::IOError)
+        })?;
+
+        rt.block_on(async {
+            let msg = b"fixed landing";
+            let sent = send(
+                TgtFd::Raw(a.as_raw_fd()),
+                msg.to_vec().into_boxed_slice(),
+                0,
+            )?
+            .await;
+            assert_eq!(sent.0 as usize, msg.len());
+
+            // SAFETY: buffer 0 stays registered until after the await.
+            let res = unsafe {
+                recv_fixed(
+                    TgtFd::Raw(b.as_raw_fd()),
+                    0,
+                    buf.as_mut_ptr() as u64 + 128,
+                    msg.len() as u32,
+                    libc::MSG_WAITALL,
+                )
+            }?
+            .await;
+            if res == -libc::EINVAL {
+                // Registered-buffer recv needs a recent kernel
+                println!("skipping recv_fixed test: kernel does not support it");
+                return Ok(());
+            }
+            assert_eq!(res as usize, msg.len());
+            assert_eq!(&buf.as_slice()[128..128 + msg.len()], &msg[..]);
+            Ok(())
+        })
     }
 
     /// Test submit_sqe with NOP operation
