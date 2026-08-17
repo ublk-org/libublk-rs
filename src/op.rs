@@ -71,6 +71,13 @@ impl Resources {
 /// Per-op slab entry. Owns everything the kernel may still look at.
 pub(crate) struct OpEntry {
     result: Option<i32>,
+    /// Results beyond `result` for multi-CQE ops (`IORING_CQE_F_MORE`
+    /// chains); an empty `Vec` never allocates, so single-shot ops pay
+    /// nothing.
+    extra_results: Vec<i32>,
+    /// The terminal CQE (no `IORING_CQE_F_MORE`) has been reaped; no
+    /// more completions are coming for this entry.
+    terminated: bool,
     waker: Option<Waker>,
     /// The owning future was dropped; the reaper frees the entry on the
     /// terminal CQE.
@@ -83,6 +90,26 @@ pub(crate) struct OpEntry {
     /// sync event loop's handler in place of the on-ring slab key.
     sync_data: Option<u64>,
     resources: Resources,
+}
+
+impl OpEntry {
+    #[inline]
+    fn push_result(&mut self, result: i32) {
+        if self.result.is_none() && self.extra_results.is_empty() {
+            self.result = Some(result);
+        } else {
+            self.extra_results.push(result);
+        }
+    }
+
+    #[inline]
+    fn pop_result(&mut self) -> Option<i32> {
+        let result = self.result.take()?;
+        if !self.extra_results.is_empty() {
+            self.result = Some(self.extra_results.remove(0));
+        }
+        Some(result)
+    }
 }
 
 std::thread_local! {
@@ -130,6 +157,8 @@ fn insert_entry(resources: Resources, is_io_cmd: bool, sync_data: Option<u64>) -
     OP_SLAB.with(|slab| {
         slab.borrow_mut().insert(OpEntry {
             result: None,
+            extra_results: Vec::new(),
+            terminated: false,
             waker: None,
             orphaned: false,
             is_io_cmd,
@@ -166,7 +195,7 @@ pub(crate) fn submit_sync(
 /// [`ublk_reap_and_wake`] would, so a stray async op in a sync-driven
 /// queue is delivered to its future rather than corrupting state.
 #[inline]
-pub(crate) fn take_sync_entry(user_data: u64, result: i32) -> Option<(u64, bool)> {
+pub(crate) fn take_sync_entry(user_data: u64, result: i32, more: bool) -> Option<(u64, bool)> {
     if user_data >= RESERVED_USER_DATA_MIN {
         return None;
     }
@@ -179,10 +208,13 @@ pub(crate) fn take_sync_entry(user_data: u64, result: i32) -> Option<(u64, bool)
         };
         if entry.sync_data.is_none() {
             if entry.orphaned {
-                slab.remove(key);
+                if !more {
+                    slab.remove(key);
+                }
                 return None;
             }
-            entry.result = Some(result);
+            entry.terminated = !more;
+            entry.push_result(result);
             if let Some(waker) = entry.waker.take() {
                 waker.wake();
             }
@@ -298,6 +330,10 @@ impl Op {
                     Poll::Pending
                 }
                 Some(result) => {
+                    debug_assert!(
+                        entry.terminated,
+                        "multi-CQE sqe awaited through single-shot Op; use MultiOp"
+                    );
                     let entry = slab.remove(self.key);
                     self.done = true;
                     Poll::Ready((result, entry.resources))
@@ -309,34 +345,105 @@ impl Op {
 
 impl Drop for Op {
     fn drop(&mut self) {
-        if self.done {
-            return;
+        if !self.done {
+            orphan_entry(self.ring, self.key);
         }
-        let completed = OP_SLAB.with(|slab| {
-            let mut slab = slab.borrow_mut();
-            let Some(entry) = slab.get_mut(self.key) else {
-                return true;
-            };
-            if entry.result.is_some() {
-                slab.remove(self.key);
-                return true;
-            }
-            entry.orphaned = true;
-            entry.waker = None;
-            false
-        });
-        if completed {
-            return;
-        }
-        // Best effort: if the SQ is wedged, the eventual completion (or
-        // queue teardown) still reclaims the entry.
-        let cancel = opcode::AsyncCancel::new(self.key as u64)
-            .build()
-            .user_data(IGNORE_USER_DATA);
-        let _ = match self.ring {
-            OpRing::Queue => push_queue_sqe(&cancel),
-            OpRing::Ctrl => push_ctrl_sqe(&cancel.into()),
+    }
+}
+
+/// Orphan a dropped op's slab entry (reclaimed by the reaper on its
+/// terminal CQE) and issue a best-effort ASYNC_CANCEL; reclaims the
+/// entry directly when its terminal CQE has already been reaped.
+fn orphan_entry(ring: OpRing, key: usize) {
+    let completed = OP_SLAB.with(|slab| {
+        let mut slab = slab.borrow_mut();
+        let Some(entry) = slab.get_mut(key) else {
+            return true;
         };
+        if entry.terminated {
+            slab.remove(key);
+            return true;
+        }
+        entry.orphaned = true;
+        entry.waker = None;
+        false
+    });
+    if completed {
+        return;
+    }
+    // Best effort: if the SQ is wedged, the eventual completion (or
+    // queue teardown) still reclaims the entry.
+    let cancel = opcode::AsyncCancel::new(key as u64)
+        .build()
+        .user_data(IGNORE_USER_DATA);
+    let _ = match ring {
+        OpRing::Queue => push_queue_sqe(&cancel),
+        OpRing::Ctrl => push_ctrl_sqe(&cancel.into()),
+    };
+}
+
+/// Handle to a submitted operation that completes with one or more CQEs
+/// (`IORING_CQE_F_MORE` chains: zero-copy sends, multishot ops).
+///
+/// [`poll_next`](MultiOp::poll_next) yields each CQE result in arrival
+/// order and `None` once the terminal CQE has been consumed. Dropping
+/// the handle mid-chain orphans the entry like a single-shot [`Op`].
+pub(crate) struct MultiOp {
+    key: usize,
+    done: bool,
+}
+
+impl MultiOp {
+    /// Reserve a slab entry and push the SQE built by `build` (which
+    /// receives the `user_data` key) on the queue ring, as [`Op::submit`]
+    /// does for single-shot ops.
+    pub(crate) fn submit(build: impl FnOnce(u64) -> squeue::Entry) -> Result<MultiOp, UblkError> {
+        let key = insert_entry(Resources::None, false, None);
+        if let Err(e) = push_queue_sqe(&build(key as u64)) {
+            OP_SLAB.with(|slab| slab.borrow_mut().remove(key));
+            return Err(e);
+        }
+        Ok(MultiOp { key, done: false })
+    }
+
+    /// Poll for the next completion; `Ready(None)` after the terminal
+    /// CQE has been consumed.
+    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<i32>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        OP_SLAB.with(|slab| {
+            let mut slab = slab.borrow_mut();
+            let entry = slab.get_mut(self.key).expect("op entry vanished");
+            if let Some(result) = entry.pop_result() {
+                if entry.terminated && entry.result.is_none() {
+                    slab.remove(self.key);
+                    self.done = true;
+                }
+                return Poll::Ready(Some(result));
+            }
+            if entry.terminated {
+                slab.remove(self.key);
+                self.done = true;
+                return Poll::Ready(None);
+            }
+            if entry
+                .waker
+                .as_ref()
+                .map_or(true, |w| !w.will_wake(cx.waker()))
+            {
+                entry.waker = Some(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+    }
+}
+
+impl Drop for MultiOp {
+    fn drop(&mut self) {
+        if !self.done {
+            orphan_entry(OpRing::Queue, self.key);
+        }
     }
 }
 
@@ -373,15 +480,21 @@ where
                 continue;
             };
             per_cqe(&cqe, entry.is_io_cmd);
+            let more = cqueue::more(cqe.flags());
             if entry.orphaned || entry.sync_data.is_some() {
                 // Orphaned future, or a sync-mode entry drained by the
                 // runtime reaper (a queue should not mix the models; the
                 // sync handler is not available here, so the entry is
-                // only reclaimed and accounted).
-                slab.remove(key);
+                // only reclaimed and accounted) -- reclaimed on the
+                // terminal CQE only, so a multi-CQE chain cannot land on
+                // a recycled key.
+                if !more {
+                    slab.remove(key);
+                }
                 continue;
             }
-            entry.result = Some(cqe.result());
+            entry.terminated = !more;
+            entry.push_result(cqe.result());
             if let Some(waker) = entry.waker.take() {
                 waker.wake();
                 woken += 1;

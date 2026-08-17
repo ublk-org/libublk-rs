@@ -534,7 +534,7 @@ pub enum BufDescList<'a> {
 pub struct RawSqe {
     opcode: u8,
     flags: u8,
-    ioprio: u16,
+    pub(crate) ioprio: u16,
     fd: i32,
     off: u64,
     pub addr: u64,
@@ -2505,7 +2505,11 @@ impl UblkQueue {
                         // keys never carry the target bit.
                         Some((user_data, false))
                     } else {
-                        crate::op::take_sync_entry(user_data, cqe.result())
+                        crate::op::take_sync_entry(
+                            user_data,
+                            cqe.result(),
+                            cqueue::more(cqe.flags()),
+                        )
                     };
                     let Some((data, is_io_cmd)) = resolved else {
                         // Reserved sentinel or op-future CQE (delivered to
