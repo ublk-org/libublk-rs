@@ -9,26 +9,36 @@
 //!   wake the futures their CQEs complete.
 //! - [`wait_and_reap_events`] — blocking: park the thread inside
 //!   `io_uring_enter` until at least one future has been woken (or no
-//!   ops remain in flight).
+//!   ops remain in flight). Its [`ParkOutcome`] says which happened.
 //! - [`has_pending_ops`] — whether any op is still in flight.
 //!
 //! # Integrating an executor
 //!
 //! Run tasks until none is runnable, then call [`wait_and_reap_events`];
 //! the woken futures make their tasks runnable again. With an executor
-//! exposing an idle/park hook, pass `wait_and_reap_events` as the hook —
-//! that is exactly what the built-in `UblkRuntime` (the `tokio` feature)
-//! does with Tokio's `on_thread_park`. With a hand-rolled loop:
+//! exposing an idle/park hook, call it from the hook — that is exactly
+//! what the built-in `UblkRuntime` (the `tokio` feature) does with
+//! Tokio's `on_thread_park`. With a hand-rolled loop:
 //!
 //! ```no_run
+//! use libublk::reactor::{wait_and_reap_events, ParkOutcome};
 //! # fn executor_has_runnable_tasks() -> bool { false }
 //! # fn run_runnable_tasks() {}
 //! # fn all_tasks_finished() -> bool { true }
+//! # fn park_on_own_primitive() {}
 //! while !all_tasks_finished() {
 //!     while executor_has_runnable_tasks() {
 //!         run_runnable_tasks();
 //!     }
-//!     libublk::reactor::wait_and_reap_events();
+//!     match wait_and_reap_events() {
+//!         // Futures were woken, or the safety timeout expired while ops
+//!         // are still in flight: loop back into the scheduler, since
+//!         // this call is the only CQE consumer.
+//!         ParkOutcome::Woken | ParkOutcome::SafetyTimeout => {}
+//!         // No CQE can arrive; sleeping on another primitive is safe.
+//!         ParkOutcome::NoPendingOps => park_on_own_primitive(),
+//!         _ => {}
+//!     }
 //! }
 //! ```
 //!
@@ -86,35 +96,13 @@ fn reap_events_counting_wakes() -> (usize, usize) {
     (qn + cn, qw + cw)
 }
 
-/// Park the thread until at least one op future has been woken, or
-/// until the park-safety timeout expires: reap both rings, and if
-/// nothing was woken while ops remain in flight, flush pending SQEs and
-/// sleep in `io_uring_enter` for at most one safety period (1s). The
-/// timeout path returns without a woken waker on purpose: the executor
-/// may park while it still holds runnable (deferred) work, and only
-/// returning lets that work -- which may be what generates the next
-/// CQE -- run.
-///
-/// Returns immediately when no ops are in flight, so an executor may
-/// call this unconditionally from its idle hook: cross-thread wakes
-/// (channels, join handles) still get through because the thread only
-/// sleeps while a CQE is guaranteed to arrive and wake it.
-///
-/// The safety-timeout path also returns, without any woken waker: the
-/// executor may have parked while still holding runnable (deferred)
-/// work, and only returning lets that work -- which may be what
-/// generates the next CQE -- run. An executor whose idle loop simply
-/// calls this function again is naturally live; an executor that would
-/// fall back to a park primitive CQEs cannot wake (as Tokio's condvar
-/// parker does) must re-enter its scheduler loop instead --
-/// [`crate::UblkRuntime`] does this by waking a no-op task.
-pub fn wait_and_reap_events() {
-    let _ = wait_and_reap_events_inner();
-}
-
 /// What a [`wait_and_reap_events`] pass ended with; tells the executor
-/// glue whether it must keep its scheduler loop alive.
-pub(crate) enum ParkOutcome {
+/// whether it must keep its scheduler loop alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "the outcome decides whether the executor may park on its \
+              own primitive; ignoring SafetyTimeout can deadlock"]
+#[non_exhaustive]
+pub enum ParkOutcome {
     /// At least one waker was woken; the executor has work.
     Woken,
     /// No op is in flight: a CQE cannot occur, so the executor may park
@@ -127,7 +115,26 @@ pub(crate) enum ParkOutcome {
     SafetyTimeout,
 }
 
-pub(crate) fn wait_and_reap_events_inner() -> ParkOutcome {
+/// Park the thread until at least one op future has been woken, or
+/// until the park-safety timeout expires: reap both rings, and if
+/// nothing was woken while ops remain in flight, flush pending SQEs and
+/// sleep in `io_uring_enter` for at most one safety period (1s).
+///
+/// Returns immediately when no ops are in flight, so an executor may
+/// call this unconditionally from its idle hook: cross-thread wakes
+/// (channels, join handles) still get through because the thread only
+/// sleeps while a CQE is guaranteed to arrive and wake it.
+///
+/// The safety-timeout path also returns, without any woken waker: the
+/// executor may have parked while still holding runnable (deferred)
+/// work, and only returning lets that work -- which may be what
+/// generates the next CQE -- run. An executor whose idle loop simply
+/// calls this function again is naturally live. One that would instead
+/// fall back to a park primitive CQEs cannot wake (as Tokio's condvar
+/// parker does) must inspect the returned [`ParkOutcome`] and re-enter
+/// its scheduler loop on [`ParkOutcome::SafetyTimeout`] --
+/// [`crate::UblkRuntime`] does this by waking a no-op task.
+pub fn wait_and_reap_events() -> ParkOutcome {
     loop {
         let (_, woken) = reap_events_counting_wakes();
         if woken > 0 {
@@ -285,10 +292,13 @@ mod tests {
         let _op = crate::ops::sleep(std::time::Duration::from_secs(5)).unwrap();
 
         let start = std::time::Instant::now();
-        wait_and_reap_events();
+        let outcome = wait_and_reap_events();
         assert!(
             start.elapsed() < std::time::Duration::from_secs(3),
             "park hook blocked past the safety timeout while the executor may hold runnable work"
         );
+        // The op is still in flight and nothing was woken, so the
+        // executor must be told to re-enter its scheduler loop.
+        assert_eq!(outcome, ParkOutcome::SafetyTimeout);
     }
 }

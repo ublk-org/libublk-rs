@@ -30,7 +30,7 @@ std::thread_local! {
 
 fn park_hook() {
     if matches!(
-        crate::reactor::wait_and_reap_events_inner(),
+        crate::reactor::wait_and_reap_events(),
         crate::reactor::ParkOutcome::SafetyTimeout
     ) {
         // No waker was woken, but ops are still in flight and the
