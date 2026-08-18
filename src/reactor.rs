@@ -133,7 +133,8 @@ pub enum ParkOutcome {
 /// fall back to a park primitive CQEs cannot wake (as Tokio's condvar
 /// parker does) must inspect the returned [`ParkOutcome`] and re-enter
 /// its scheduler loop on [`ParkOutcome::SafetyTimeout`] --
-/// [`crate::UblkRuntime`] does this by waking a no-op task.
+/// `UblkRuntime` (the `tokio` feature) does this by waking a no-op
+/// task.
 pub fn wait_and_reap_events() -> ParkOutcome {
     loop {
         let (_, woken) = reap_events_counting_wakes();

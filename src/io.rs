@@ -1405,7 +1405,7 @@ impl UblkQueue {
     ///
     /// Only the legacy synchronous event loop sets this, after its
     /// 20-second wait expires with an empty submission queue. A queue
-    /// driven by [`UblkRuntime`](crate::UblkRuntime) or
+    /// driven by `UblkRuntime` (the `tokio` feature) or
     /// [`crate::reactor`] never marks itself idle, so this always
     /// returns `false` there.
     pub fn is_idle(&self) -> bool {
