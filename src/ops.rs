@@ -302,8 +302,8 @@ pub fn nop() -> Result<RawOp, UblkError> {
 /// Wait for `fd` to become ready for the given `poll(2)` event mask
 /// (e.g. `libc::POLLIN`) via one-shot `IORING_OP_POLL_ADD`; completes
 /// with the returned events mask. Re-issue to wait again.
-pub fn poll_add(fd: RawFd, events: u32) -> Result<RawOp, UblkError> {
-    submit_raw(opcode::PollAdd::new(types::Fd(fd), events).build())
+pub fn poll_add(fd: TgtFd, events: u32) -> Result<RawOp, UblkError> {
+    submit_raw(with_tgt_fd!(fd, |f| opcode::PollAdd::new(f, events).build()))
 }
 
 /// Future resolving to one accepted connection.
@@ -325,10 +325,13 @@ impl Future for Accept {
 }
 
 /// Accept one connection on a listening socket.
-pub fn accept(fd: RawFd) -> Result<Accept, UblkError> {
-    let op = submit_raw(
-        opcode::Accept::new(types::Fd(fd), std::ptr::null_mut(), std::ptr::null_mut()).build(),
-    )?;
+pub fn accept(fd: TgtFd) -> Result<Accept, UblkError> {
+    let op = submit_raw(with_tgt_fd!(fd, |f| opcode::Accept::new(
+        f,
+        std::ptr::null_mut(),
+        std::ptr::null_mut()
+    )
+    .build()))?;
     Ok(Accept { op })
 }
 
