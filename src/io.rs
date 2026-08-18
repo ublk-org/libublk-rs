@@ -354,7 +354,11 @@ pub(crate) fn init_task_ring_default(sq_depth: u32, cq_depth: u32) -> Result<(),
 }
 
 /// Unified buffer descriptor supporting both copy and zero-copy operations
+///
+/// Non-exhaustive: the kernel keeps growing new per-io buffer modes, and
+/// each one becomes a variant here. Match with a `_` arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum BufDesc<'a> {
     /// Buffer slice for copy-based operations
     ///
@@ -488,7 +492,13 @@ impl<'a> BufDesc<'a> {
     }
 }
 
+/// Per-queue buffer descriptor list, the [`BufDesc`] analog for the
+/// whole tag range.
+///
+/// Non-exhaustive for the same reason as [`BufDesc`]: new buffer modes
+/// arrive as new variants. Match with a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BufDescList<'a> {
     /// List of IoBuf for traditional buffer management
     ///
