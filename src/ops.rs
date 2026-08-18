@@ -23,6 +23,18 @@
 //! is not what the caller wants: [`Sleep`] folds the timer's `-ETIME`
 //! into success, and [`Accept`] wraps the returned descriptor in an
 //! [`OwnedFd`].
+//!
+//! # Panics
+//!
+//! The ring these ops submit on is thread-local, so every function here
+//! panics when called from a thread that has none. Create the queue's
+//! [`UblkQueue`](crate::io::UblkQueue) — or call
+//! [`ublk_init_task_ring`](crate::io::ublk_init_task_ring) — on the
+//! thread that will run the ops, and keep each queue's futures on that
+//! thread. (The control-ring ops panic likewise without
+//! [`ublk_init_ctrl_task_ring`](crate::ctrl::ublk_init_ctrl_task_ring)
+//! or a `UblkCtrl`.) An `Err` return means the SQE could not be
+//! queued, never that the ring was missing.
 
 use std::future::Future;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
