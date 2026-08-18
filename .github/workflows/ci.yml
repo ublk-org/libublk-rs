@@ -32,3 +32,14 @@ jobs:
       # which let its tests and examples rot undetected.
       - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --all-targets --verbose --target ${{ matrix.target }}
       - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --no-default-features --all-targets --verbose --target ${{ matrix.target }}
+      # `cargo build` never resolves doc links, and the reactor-only
+      # build hides every tokio-gated item, so a link to one of them
+      # (UblkRuntime) breaks in that configuration only -- including in
+      # the reactor docs a bring-your-own-executor user reads. Check
+      # both configurations, once; docs do not vary by target.
+      - name: Doc links (default features)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --verbose
+      - name: Doc links (reactor-only, no default features)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-default-features --no-deps --verbose
