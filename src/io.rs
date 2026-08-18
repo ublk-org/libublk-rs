@@ -581,11 +581,44 @@ pub struct RawSqe {
     __pad2: u64,
 }
 
-// The transmute in override_sqe! is only sound while both views agree.
+// The RawSqe view is only sound while both layouts agree.
 const _: () = {
     assert!(core::mem::size_of::<RawSqe>() == core::mem::size_of::<squeue::Entry>());
     assert!(core::mem::align_of::<RawSqe>() == core::mem::align_of::<squeue::Entry>());
+    // Entry128 carries a 64-byte SQE plus 64 bytes of trailing command
+    // payload, so RawSqe views its prefix.
+    assert!(core::mem::size_of::<RawSqe>() <= core::mem::size_of::<squeue::Entry128>());
+    assert!(core::mem::align_of::<RawSqe>() == core::mem::align_of::<squeue::Entry128>());
 };
+
+/// A submission queue entry that can be viewed field-wise as a
+/// [`RawSqe`], for [`override_sqe!`](crate::override_sqe).
+///
+/// Implemented for the io-uring submission entry types only; it exists
+/// so the macro is type-checked instead of reinterpreting whatever
+/// pointer it is handed.
+pub trait AsRawSqe {
+    /// View this entry's `io_uring_sqe` field-wise.
+    fn as_raw_sqe(&mut self) -> &mut RawSqe;
+}
+
+impl AsRawSqe for squeue::Entry {
+    #[inline]
+    fn as_raw_sqe(&mut self) -> &mut RawSqe {
+        // SAFETY: an Entry *is* one io_uring_sqe, and RawSqe mirrors
+        // that layout -- size and alignment asserted above.
+        unsafe { &mut *(self as *mut Self as *mut RawSqe) }
+    }
+}
+
+impl AsRawSqe for squeue::Entry128 {
+    #[inline]
+    fn as_raw_sqe(&mut self) -> &mut RawSqe {
+        // SAFETY: an Entry128 opens with the same io_uring_sqe; RawSqe
+        // views that prefix, whose size fits as asserted above.
+        unsafe { &mut *(self as *mut Self as *mut RawSqe) }
+    }
+}
 
 /// Set a submission queue entry field the io-uring opcode builders do
 /// not expose, by viewing the entry as a [`RawSqe`].
@@ -595,22 +628,16 @@ const _: () = {
 /// argument must be an `&mut io_uring::squeue::Entry` (or `Entry128`),
 /// and the field must be one [`RawSqe`] exposes.
 ///
-/// This writes through a transmute, so a bogus value for `$field` is a
-/// kernel-visible error rather than a compile error: pass only values
-/// the kernel defines for the opcode being built.
+/// The entry type is checked through [`AsRawSqe`], but the value is
+/// not: a field the kernel does not define for the opcode being built
+/// is a kernel-visible error, not a compile error.
 #[macro_export]
 macro_rules! override_sqe {
     ($entry:expr, $field:ident, $value:expr) => {
-        unsafe {
-            let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
-            sqe.$field = $value;
-        }
+        $crate::io::AsRawSqe::as_raw_sqe($entry).$field = $value
     };
     ($entry:expr, $field:ident, |=, $value:expr) => {
-        unsafe {
-            let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
-            sqe.$field |= $value;
-        }
+        $crate::io::AsRawSqe::as_raw_sqe($entry).$field |= $value
     };
 }
 
@@ -2627,15 +2654,8 @@ impl UblkQueue {
 /// the reactor-only configuration too.
 #[cfg(test)]
 mod raw_sqe_layout {
-    use super::RawSqe;
+    use super::{AsRawSqe, RawSqe};
     use io_uring::{opcode, squeue, types};
-
-    /// View an entry field-wise, as override_sqe! does.
-    fn view(sqe: &mut squeue::Entry) -> &mut RawSqe {
-        // SAFETY: an Entry is one io_uring_sqe, whose layout RawSqe
-        // mirrors -- size and alignment asserted above.
-        unsafe { &mut *(sqe as *mut squeue::Entry as *mut RawSqe) }
-    }
 
     /// The compile-time asserts fix RawSqe's size and alignment, but
     /// not where each field sits. Build entries whose values the
@@ -2651,7 +2671,7 @@ mod raw_sqe_layout {
         let mut sqe = opcode::Read::new(types::Fd(FD), ADDR as *mut u8, LEN)
             .offset(OFF)
             .build();
-        let raw: &mut RawSqe = view(&mut sqe);
+        let raw: &mut RawSqe = sqe.as_raw_sqe();
         assert_eq!(raw.fd, FD, "fd moved");
         assert_eq!(raw.off, OFF, "off moved");
         assert_eq!(raw.addr, ADDR, "addr moved");
@@ -2662,13 +2682,13 @@ mod raw_sqe_layout {
         // for, so pin them against builders that do set them.
         const IDX: u16 = 0x0abc;
         let mut fixed = opcode::ReadFixed::new(types::Fd(FD), ADDR as *mut u8, LEN, IDX).build();
-        assert_eq!(view(&mut fixed).buf_index, IDX, "buf_index moved");
+        assert_eq!(fixed.as_raw_sqe().buf_index, IDX, "buf_index moved");
 
         const ZC_FLAGS: u16 = 1 << 3;
         let mut zc = opcode::SendZc::new(types::Fd(FD), ADDR as *const u8, LEN)
             .zc_flags(ZC_FLAGS)
             .build();
-        assert_eq!(view(&mut zc).ioprio, ZC_FLAGS, "ioprio moved");
+        assert_eq!(zc.as_raw_sqe().ioprio, ZC_FLAGS, "ioprio moved");
     }
 
     /// user_data is written by the op layer through io-uring's own
@@ -2677,7 +2697,7 @@ mod raw_sqe_layout {
     fn user_data_agrees_with_the_io_uring_setter() {
         const KEY: u64 = 0x4242_4242_4242_4242;
         let mut sqe: squeue::Entry = opcode::Nop::new().build().user_data(KEY);
-        assert_eq!(view(&mut sqe).user_data, KEY, "user_data moved");
+        assert_eq!(sqe.as_raw_sqe().user_data, KEY, "user_data moved");
     }
 }
 
