@@ -85,10 +85,16 @@ bitflags! {
         /// It is required for ublk to be used as swap disk
         const UBLK_DEV_F_MLOCK_IO_BUFFER = 0b00100000;
 
+        /// Reserved for libublk's own use; targets must not set the
+        /// top 8 bits.
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_3 = 1_u32 << 28;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_4 = 1_u32 << 27;
     }
 }
@@ -105,24 +111,40 @@ macro_rules! ublk_internal_flags_all {
 
 pub(crate) use ublk_internal_flags_all;
 
+/// Every fallible libublk operation reports this error.
+///
+/// Use [`UblkError::errno`] to turn one into the negative errno a ublk
+/// server completes a failed io command with. The enum is
+/// `#[non_exhaustive]`: match with a `_` arm.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum UblkError {
+    /// An io_uring operation completed with a negative errno, carried
+    /// verbatim as the CQE reported it.
     #[error("io_uring IO failure")]
     UringIOError(i32),
 
+    /// Device parameters or the recovery JSON failed to (de)serialize.
     #[error("json failure")]
     JsonError(#[from] serde_json::Error),
 
+    /// The queue is being torn down and accepts no further io. Queue
+    /// handlers normally treat this as the signal to return cleanly.
     #[error("queue down failure")]
     QueueIsDown,
 
+    /// A syscall or `/dev/ublk-control` operation failed; wraps the
+    /// underlying [`std::io::Error`].
     #[error("other IO failure")]
     IOError(#[from] std::io::Error),
 
+    /// An argument was rejected before anything was submitted: a buffer
+    /// descriptor incompatible with the device flags, an out-of-range
+    /// length, a bad configuration.
     #[error("Invalid input")]
     InvalidVal,
 
+    /// A failure with no more specific variant, as a negative errno.
     #[error("other failure")]
     OtherError(i32),
 }

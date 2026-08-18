@@ -565,10 +565,15 @@ pub struct RawSqe {
     pub ioprio: u16,
     fd: i32,
     off: u64,
+    /// Buffer address, or an offset within a registered buffer.
     pub addr: u64,
+    /// Byte count for this operation.
     pub len: u32,
+    /// Opcode-specific flags (the SQE's `rw_flags` union member).
     pub rw_flags: u32,
     user_data: u64,
+    /// Registered buffer index, or buffer-group id for provided
+    /// buffers.
     pub buf_index: u16,
     personality: u16,
     splice_fd_in: i32,
@@ -754,6 +759,10 @@ impl<'a> UblkIOCtx<'a> {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Target-side device description: geometry, ring sizing, the fds the
+/// queue ring registers, and the ublk parameters. A target fills this
+/// in from its `tgt_init` closure; it is serialized into the device's
+/// JSON for recovery.
 pub struct UblkTgt {
     /// target type
     pub tgt_type: String,
@@ -775,7 +784,11 @@ pub struct UblkTgt {
     pub extra_ios: u16,
 
     //const struct ublk_tgt_ops *ops;
+    /// Backing files registered with the queue ring as fixed files.
+    /// Index 0 is the ublk char device, so a target's own files start
+    /// at 1 and are addressed as [`ops::TgtFd::Fixed`](crate::ops::TgtFd).
     pub fds: [i32; 32],
+    /// Number of valid entries in [`Self::fds`].
     pub nr_fds: i32,
 
     /// could become bigger, is it one issue?
@@ -801,6 +814,8 @@ pub(crate) struct BufferRegState {
 /// as defining target specific parameters, exporting its own json output,
 /// and so on.
 pub struct UblkDev {
+    /// Device info as the kernel reports it: id, queue count and depth,
+    /// feature flags.
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
     /// reserved for supporting new features
@@ -809,6 +824,7 @@ pub struct UblkDev {
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
 
+    /// Target-side description filled in by the target's init closure.
     pub tgt: UblkTgt,
     tgt_json: Option<serde_json::Value>,
 
@@ -969,6 +985,8 @@ impl UblkDev {
         bvec
     }
 
+    /// Set basic parameters for a `dev_size`-byte device with 512-byte
+    /// logical blocks, as a starting point for a target's own settings.
     pub fn set_default_params(&mut self, dev_size: u64) {
         let info = self.dev_info;
 
@@ -990,11 +1008,14 @@ impl UblkDev {
     }
 
     // Store target specific json data, json["target_data"]
+    /// Attach target-private JSON, stored with the device and returned
+    /// on recovery.
     pub fn set_target_json(&mut self, val: serde_json::Value) {
         self.tgt_json = Some(val);
     }
 
     // Retrieve target specific json data
+    /// The target-private JSON set by [`Self::set_target_json`].
     pub fn get_target_json(&self) -> Option<&serde_json::Value> {
         match self.tgt_json.as_ref() {
             None => None,
@@ -1242,6 +1263,7 @@ impl UblkQueue {
     }
 
     #[inline(always)]
+    /// Whether the device negotiated `UBLK_F_AUTO_BUF_REG` zero copy.
     pub fn support_auto_buf_zc(&self) -> bool {
         self.flags.intersects(Self::UBLK_QUEUE_AUTO_BUF_REG)
     }
@@ -1351,7 +1373,14 @@ impl UblkQueue {
         Ok(q)
     }
 
-    // Return if queue is idle
+    /// Whether the queue has been marked idle: every fetch command is
+    /// armed and waiting, and no target IO is outstanding.
+    ///
+    /// Only the legacy synchronous event loop sets this, after its
+    /// 20-second wait expires with an empty submission queue. A queue
+    /// driven by [`UblkRuntime`](crate::UblkRuntime) or
+    /// [`crate::reactor`] never marks itself idle, so this always
+    /// returns `false` there.
     pub fn is_idle(&self) -> bool {
         self.state.borrow().is_idle()
     }
@@ -1361,6 +1390,7 @@ impl UblkQueue {
         self.state.borrow_mut().mark_stopping()
     }
     // Return if queue is stopping
+    /// Whether the queue is being torn down and takes no new io.
     pub fn is_stopping(&self) -> bool {
         self.state.borrow().is_stopping()
     }

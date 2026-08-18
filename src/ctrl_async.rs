@@ -1,3 +1,10 @@
+//! Async device control: the `.await`-driven counterpart of
+//! [`crate::ctrl::UblkCtrl`].
+//!
+//! [`UblkCtrlAsync`] runs each control command as an op on the
+//! thread-local control ring, so a single thread can drive device
+//! setup and queue IO from the same executor.
+
 use super::ctrl::{UblkCtrlInner, UblkQueueAffinity};
 use super::io::UblkDev;
 use super::{sys, UblkError, UblkFlags};
@@ -30,6 +37,13 @@ impl UblkCtrlAsync {
         })
     }
 
+    /// The target-type name this handle was constructed with, or the
+    /// literal `"none"` when it was constructed without one.
+    ///
+    /// This is *not* read back from the device: a handle opened for an
+    /// existing device by id reports `"none"` however the running
+    /// device was named, so do not branch on it to identify a device
+    /// you did not create.
     pub fn get_name(&self) -> String {
         let inner = self.get_inner();
 

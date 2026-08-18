@@ -1,3 +1,15 @@
+//! Device lifecycle control: add, start, stop, delete and recover
+//! ublk devices through `/dev/ublk-control`.
+//!
+//! [`UblkCtrlBuilder`] configures a device, [`UblkCtrl`] owns it and
+//! runs the control commands; the async variant lives in
+//! [`crate::ctrl_async`].
+//!
+//! Only a handle that *created* the device (`UBLK_DEV_F_ADD_DEV`)
+//! deletes it on drop, and only while it still owns it -- see
+//! [`UblkCtrl::disown`]. A handle opened for an existing device, as a
+//! query or recovery tool does, never deletes anything when dropped.
+
 use super::io::{UblkDev, UblkTgt};
 use super::{sys, UblkError, UblkFlags};
 use crate::op::{Op, Resources};
@@ -234,16 +246,20 @@ pub struct UblkQueueAffinity {
 }
 
 impl UblkQueueAffinity {
+    /// An empty affinity mask; fill it via [`UblkCtrl::get_queue_affinity`].
     pub fn new() -> UblkQueueAffinity {
         UblkQueueAffinity {
             affinity: Bitmap::new(),
         }
     }
 
+    /// Size in bytes of the raw cpumask buffer.
     pub fn buf_len(&self) -> usize {
         1024 / 8
     }
 
+    /// Pointer to the raw cpumask buffer, for the control command that
+    /// fills it.
     pub fn addr(&self) -> *const u8 {
         self.affinity.as_bytes().as_ptr()
     }
@@ -252,6 +268,7 @@ impl UblkQueueAffinity {
         self.affinity.as_bytes().as_ptr() as *mut u8
     }
 
+    /// The mask as a vector of CPU numbers.
     pub fn to_bits_vec(&self) -> Vec<usize> {
         self.affinity.into_iter().collect()
     }
@@ -795,6 +812,8 @@ impl UblkCtrlBuilder<'_> {
             self.dev_flags,
         )
     }
+    /// Build the device as a [`UblkCtrlAsync`](super::ctrl_async::UblkCtrlAsync),
+    /// the `.await`-driven control handle.
     pub async fn build_async(self) -> Result<super::ctrl_async::UblkCtrlAsync, UblkError> {
         super::ctrl_async::UblkCtrlAsync::new_async(
             Some(self.name.to_string()),
@@ -2202,6 +2221,13 @@ impl UblkCtrl {
         })
     }
 
+    /// The target-type name this handle was constructed with, or the
+    /// literal `"none"` when it was constructed without one.
+    ///
+    /// This is *not* read back from the device: a handle opened for an
+    /// existing device by id reports `"none"` however the running
+    /// device was named, so do not branch on it to identify a device
+    /// you did not create.
     pub fn get_name(&self) -> String {
         let inner = self.get_inner();
 
@@ -2215,6 +2241,13 @@ impl UblkCtrl {
         self.get_inner().dev_flags
     }
 
+    /// Create a device control handle directly.
+    ///
+    /// [`UblkCtrlBuilder`] is the recommended way in: it names each
+    /// setting instead of relying on the position of eight arguments,
+    /// and fills in defaults. Use this when the values are already in
+    /// hand, e.g. when re-opening an existing device by `id`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: Option<String>,
         id: i32,
@@ -2343,6 +2376,7 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    /// Log this device's info and parameters, as `rublk list` prints them.
     pub fn dump(&self) {
         let mut ctrl = self.get_inner_mut();
         let mut p = sys::ublk_params {
@@ -2364,6 +2398,7 @@ impl UblkCtrl {
         println!("\tublksrv_flags: 0x{:x}", ctrl.dev_info.ublksrv_flags);
     }
 
+    /// Directory holding the per-device JSON files.
     pub fn run_dir() -> String {
         String::from("/run/ublksrvd")
     }

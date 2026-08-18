@@ -1,7 +1,11 @@
+//! Small utilities shared by targets: page-aligned IO buffers
+//! ([`IoBuf`]) and the [`zero_io_buf!`](crate::zero_io_buf) macro.
+
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
+/// The name of `T`, for logging a target's concrete type.
 pub fn type_of_this<T>(_: &T) -> String {
     std::any::type_name::<T>().to_string()
 }
@@ -233,6 +237,10 @@ impl<T> Drop for IoBuf<T> {
 }
 
 #[macro_export]
+/// Zero an [`IoBuf`](crate::helpers::IoBuf) in place.
+///
+/// `zero_io_buf!(buf)` clears the whole buffer -- the usual way a
+/// target serves a read it has no data for.
 macro_rules! zero_io_buf {
     ($buffer:expr) => {{
         unsafe {
