@@ -53,7 +53,11 @@ pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
 /// Ublk io_uring user_data constants, used by the legacy sync event
 /// loop's tag-encoded `user_data` (async ops are slab-keyed and carry no
 /// bit-encoded metadata)
+///
+/// Non-exhaustive: the reserved `user_data` bits are a wire format
+/// shared with the kernel, and further bits may be spoken for later.
 #[repr(u64)]
+#[non_exhaustive]
 pub enum UblkUringData {
     /// Target IO bit flag - indicates user_data is from target IO
     Target = 1_u64 << 63,
