@@ -23,6 +23,14 @@ pub mod sys;
 #[cfg(all(test, feature = "tokio"))]
 pub mod test_helpers;
 
+// Re-export io_uring: `squeue::Entry` and `cqueue::Entry` appear in this
+// crate's public API (`ops::submit_sqe`, `UblkQueue::ublk_submit_sqe`,
+// the `flush_and_wake_io_tasks` handler, the ring accessors), so a
+// target must build those values from the *same* io-uring version the
+// library was compiled against. Name it as `libublk::io_uring` instead
+// of declaring a separate dependency that has to be kept in lockstep.
+pub use io_uring;
+
 // Re-export tokio so targets use the same runtime version as the library
 // (tasks are spawned with `tokio::task::spawn_local` inside
 // `UblkRuntime::block_on`).
