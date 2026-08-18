@@ -182,11 +182,11 @@ fn push_sqe<S: squeue::EntryMarker>(r: &mut IoUring<S>, sqe: &S) -> Result<(), U
 
 #[inline]
 fn push_queue_sqe(sqe: &squeue::Entry) -> Result<(), UblkError> {
-    crate::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| push_sqe(r, sqe))
+    crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| push_sqe(r, sqe))
 }
 
 fn push_ctrl_sqe(sqe: &squeue::Entry128) -> Result<(), UblkError> {
-    crate::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| push_sqe(r, sqe))
+    crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| push_sqe(r, sqe))
 }
 
 #[inline]

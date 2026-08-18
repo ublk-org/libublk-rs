@@ -27,7 +27,6 @@ std::thread_local! {
 }
 
 // Internal macro versions for backwards compatibility within the crate
-#[macro_export]
 macro_rules! with_ctrl_ring_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
@@ -41,7 +40,6 @@ macro_rules! with_ctrl_ring_internal {
     };
 }
 
-#[macro_export]
 macro_rules! with_ctrl_ring_mut_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
@@ -55,7 +53,9 @@ macro_rules! with_ctrl_ring_mut_internal {
     };
 }
 
-// Make internal macros available within the crate
+// Crate-internal: never `#[macro_export]`, which would publish them at
+// the crate root as public API.
+pub(crate) use with_ctrl_ring_mut_internal;
 
 /// Execute a closure with access to the thread-local control ring
 ///
