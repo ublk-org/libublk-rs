@@ -26,6 +26,33 @@ tokio = ["dep:tokio"]
 name = "ublk_user_id"
 path = "utils/ublk_user_id_rs.rs"
 
+# Examples and integration tests drive devices through UblkRuntime, so
+# they are built only with the `tokio` feature. Without it `--all-targets`
+# still checks the library and its reactor-only unit tests.
+[[example]]
+name = "null"
+required-features = ["tokio"]
+
+[[example]]
+name = "loop"
+required-features = ["tokio"]
+
+[[example]]
+name = "ramdisk"
+required-features = ["tokio"]
+
+[[example]]
+name = "batch"
+required-features = ["tokio"]
+
+[[test]]
+name = "basic"
+required-features = ["tokio"]
+
+[[test]]
+name = "examples"
+required-features = ["tokio"]
+
 [package.metadata]
 scripts = ["utils/ublk_chown.sh"]
 

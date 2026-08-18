@@ -418,6 +418,14 @@ pub unsafe fn send_raw(
 /// for [`recv`]; `linked` chains the send before the next pushed SQE
 /// (`IOSQE_IO_LINK`).
 ///
+/// A link partner must be pushed from the same poll, with no `await` in
+/// between. The library also pushes SQEs on the queue ring -- the
+/// reactor's control-ring poll bridge when the executor parks, and an
+/// `ASYNC_CANCEL` when an op future is dropped -- and io_uring keeps a
+/// link open across `io_uring_enter`, so suspending mid-chain links one
+/// of those instead of the intended partner (and a failed send then
+/// cancels it).
+///
 /// # Safety
 ///
 /// As for [`read_at_fixed`]: the fixed-buffer slot must stay registered
@@ -459,9 +467,13 @@ const NOTIF_ZC_COPIED: i32 = 1 << 31;
 ///
 /// ZC sends complete in two CQEs: the send result first (awaited via
 /// [`SendZcOp::sent`]), then a notification once the kernel drops its
-/// last reference to the pages ([`SendZcOp::into_notif`]). The notif
-/// future must be awaited (or the handle deliberately dropped, orphaning
-/// the op) before any referenced memory is reused.
+/// last reference to the pages ([`SendZcOp::into_notif`]).
+///
+/// The notification future must be **awaited to completion** before any
+/// referenced memory is reused or freed. Dropping the handle is not an
+/// alternative: it only orphans the slab entry and issues a best-effort
+/// `ASYNC_CANCEL`, which cannot un-pin pages the kernel already holds,
+/// so the send may still be reading the buffer afterwards.
 pub struct SendZcOp {
     op: MultiOp,
 }
@@ -512,7 +524,8 @@ impl Future for ZcNotif {
 /// reuses that registration instead of pinning pages per send. `flags`
 /// as for [`recv`]. With `linked`, `IOSQE_IO_LINK` chains the send
 /// before the next SQE pushed on the ring -- for protocols that must
-/// keep concurrent sends in stream order.
+/// keep concurrent sends in stream order; the partner must be pushed
+/// from the same poll, as for [`send_fixed`].
 ///
 /// # Safety
 ///
@@ -575,10 +588,13 @@ pub unsafe fn sendmsg_zc(
     flags: i32,
 ) -> Result<SendZcOp, UblkError> {
     let op = MultiOp::submit(|key| {
-        with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
+        let mut sqe = with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
             .flags(flags as u32)
-            .build())
-        .user_data(key)
+            .build());
+        // SENDMSG_ZC takes its zc flags in ioprio like SEND_ZC does, but
+        // the io-uring crate exposes no zc_flags() builder for it.
+        crate::override_sqe!(&mut sqe, ioprio, |=, SEND_ZC_REPORT_USAGE);
+        sqe.user_data(key)
     })?;
     Ok(SendZcOp { op })
 }
@@ -663,7 +679,8 @@ pub unsafe fn submit_sqe(sqe: squeue::Entry) -> Result<RawOp, UblkError> {
     submit_raw(sqe)
 }
 
-#[cfg(test)]
+// These tests drive real devices through UblkRuntime.
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use crate::runtime::UblkRuntime;

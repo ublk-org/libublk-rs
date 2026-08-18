@@ -461,7 +461,8 @@ impl UblkCtrlAsync {
     }
 }
 
-#[cfg(test)]
+// These tests drive real devices through UblkRuntime.
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};

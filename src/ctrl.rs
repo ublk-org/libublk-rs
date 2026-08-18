@@ -1337,7 +1337,14 @@ impl UblkCtrlInner {
                 return Ok(res);
             }
             with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-                r.submit_and_wait(1)?;
+                // A signal delivered to the daemon must not fail the
+                // command: retry the wait, as reactor::wait_for_cqe does
+                // for the same ring.
+                match r.submit_and_wait(1) {
+                    Ok(_) => {}
+                    Err(ref e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
+                    Err(e) => return Err(UblkError::IOError(e)),
+                }
                 let _ = crate::op::ublk_reap_and_wake(r, |_, _| {});
                 Ok::<(), UblkError>(())
             })?;

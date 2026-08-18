@@ -46,6 +46,43 @@ pub(crate) const RESERVED_USER_DATA_MIN: u64 = u64::MAX - 15;
 /// (e.g. ASYNC_CANCEL issued on orphaning).
 pub(crate) const IGNORE_USER_DATA: u64 = u64::MAX - 1;
 
+/// Who owns the op behind one CQE's `user_data`.
+pub(crate) enum CqeOwner {
+    /// A slab key: the op layer owns this completion.
+    Op(usize),
+    /// An SQE pushed straight onto the ring with a target-bit
+    /// `user_data` — the batch transport's multishot fetches cannot ride
+    /// a single-shot slab entry. The target owns the completion and the
+    /// word is delivered to it untouched.
+    Target,
+    /// A reserved sentinel; carries no op state.
+    Sentinel,
+}
+
+/// Classify one CQE's `user_data`. A slab key is the only value that is
+/// below [`RESERVED_USER_DATA_MIN`], clear of the target bit, and
+/// representable as a `usize`; everything else belongs to the target or
+/// to nobody and must never index the slab.
+///
+/// Both reapers classify here so they cannot drift apart: the sync loop
+/// ([`crate::io::UblkQueue::flush_and_wake_io_tasks`]) and the reactor
+/// ([`ublk_reap_and_wake`]) share one keyspace.
+#[inline]
+pub(crate) fn classify_user_data(user_data: u64) -> CqeOwner {
+    if user_data >= RESERVED_USER_DATA_MIN {
+        return CqeOwner::Sentinel;
+    }
+    if user_data & (crate::UblkUringData::Target as u64) != 0 {
+        return CqeOwner::Target;
+    }
+    match usize::try_from(user_data) {
+        Ok(key) => CqeOwner::Op(key),
+        // Unreachable on 64-bit, and on 32-bit a word this large is not
+        // a key the slab ever handed out -- never truncate it into one.
+        Err(_) => CqeOwner::Sentinel,
+    }
+}
+
 /// Resources owned by the slab entry while the kernel may still reference
 /// them. They are released (or handed back to the caller) only once the
 /// terminal CQE has been reaped.
@@ -188,18 +225,15 @@ pub(crate) fn submit_sync(
 }
 
 /// Resolve one CQE for the sync event loop: remove and return the sync
-/// entry behind `user_data` as `(handler_word, is_io_cmd)`.
+/// entry behind `key` (from [`classify_user_data`]) as
+/// `(handler_word, is_io_cmd)`.
 ///
-/// Returns `None` for reserved sentinels, unknown keys, and op-future
-/// entries — the latter are completed and woken here exactly as
+/// Returns `None` for unknown keys and for op-future entries — the
+/// latter are completed and woken here exactly as
 /// [`ublk_reap_and_wake`] would, so a stray async op in a sync-driven
 /// queue is delivered to its future rather than corrupting state.
 #[inline]
-pub(crate) fn take_sync_entry(user_data: u64, result: i32, more: bool) -> Option<(u64, bool)> {
-    if user_data >= RESERVED_USER_DATA_MIN {
-        return None;
-    }
-    let key = user_data as usize;
+pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> Option<(u64, bool)> {
     OP_SLAB.with(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
@@ -468,12 +502,16 @@ where
         let mut woken = 0;
         for cqe in cq {
             n += 1;
-            let data = cqe.user_data();
-            if data >= RESERVED_USER_DATA_MIN {
-                per_cqe(&cqe, false);
-                continue;
-            }
-            let key = data as usize;
+            let key = match classify_user_data(cqe.user_data()) {
+                CqeOwner::Op(key) => key,
+                // Sentinels and target-owned CQEs (the batch transport
+                // pushes its own target-bit user_data) carry no op
+                // state: hand them to the caller untouched.
+                CqeOwner::Sentinel | CqeOwner::Target => {
+                    per_cqe(&cqe, false);
+                    continue;
+                }
+            };
             let Some(entry) = slab.get_mut(key) else {
                 debug_assert!(false, "CQE for unknown op {}", key);
                 per_cqe(&cqe, false);
@@ -502,4 +540,63 @@ where
         }
         (n, woken)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both reapers route CQEs through [`classify_user_data`], so a
+    /// target-owned word must never be mistaken for a slab key: the
+    /// batch transport pushes its own target-bit `user_data` on the same
+    /// ring the op slab uses.
+    #[test]
+    fn classify_user_data_separates_the_three_keyspaces() {
+        let target_bit = crate::UblkUringData::Target as u64;
+
+        assert!(matches!(classify_user_data(0), CqeOwner::Op(0)));
+        assert!(matches!(classify_user_data(66), CqeOwner::Op(66)));
+
+        // The batch transport's encoding: target bit plus its own fields.
+        assert!(matches!(
+            classify_user_data(target_bit | 0x42),
+            CqeOwner::Target
+        ));
+        assert!(matches!(classify_user_data(target_bit), CqeOwner::Target));
+
+        assert!(matches!(
+            classify_user_data(IGNORE_USER_DATA),
+            CqeOwner::Sentinel
+        ));
+        assert!(matches!(
+            classify_user_data(RESERVED_USER_DATA_MIN),
+            CqeOwner::Sentinel
+        ));
+        assert!(matches!(classify_user_data(u64::MAX), CqeOwner::Sentinel));
+    }
+
+    /// Classification must never lose bits: a word that does not fit in
+    /// a `usize` has to be rejected rather than truncated into a live
+    /// key (on 32-bit, `0x8000_0000_0000_0042 as usize` would be 66).
+    #[test]
+    fn classify_user_data_never_truncates_into_a_key() {
+        let cases = [
+            0,
+            66,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            0x1_0000_0042,
+            (crate::UblkUringData::Target as u64) | 0x42,
+            RESERVED_USER_DATA_MIN - 1,
+        ];
+        for data in cases {
+            if let CqeOwner::Op(key) = classify_user_data(data) {
+                assert_eq!(
+                    key as u64, data,
+                    "user_data {:#x} was truncated into key {:#x}",
+                    data, key
+                );
+            }
+        }
+    }
 }

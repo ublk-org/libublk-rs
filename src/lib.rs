@@ -18,7 +18,9 @@ pub mod reactor;
 #[cfg(feature = "tokio")]
 pub mod runtime;
 pub mod sys;
-#[cfg(test)]
+// The shared test helpers drive devices through UblkRuntime; the
+// reactor-only build tests the reactor directly instead.
+#[cfg(all(test, feature = "tokio"))]
 pub mod test_helpers;
 
 // Re-export tokio so targets use the same runtime version as the library

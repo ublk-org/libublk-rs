@@ -27,5 +27,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-multilib
       - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }} && rustup target add ${{ matrix.target }}
-      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --verbose --target ${{ matrix.target }}
-      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --no-default-features --verbose --target ${{ matrix.target }}
+      # --all-targets so examples and tests are built too: the
+      # reactor-only configuration used to compile the library alone,
+      # which let its tests and examples rot undetected.
+      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --all-targets --verbose --target ${{ matrix.target }}
+      - run: RUSTFLAGS="--cfg=io_uring_skip_arch_check" cargo build --no-default-features --all-targets --verbose --target ${{ matrix.target }}
