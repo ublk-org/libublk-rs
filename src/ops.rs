@@ -518,21 +518,51 @@ impl Future for ZcNotif {
 }
 
 /// Zero-copy send from caller-managed memory (`IORING_OP_SEND_ZC`);
-/// completes in two CQEs -- see [`SendZcOp`]. With `buf_index` the data
-/// is sent from the ring-registered fixed buffer of that index (`ptr` is
-/// then the offset within it, as for [`recv_fixed`]) and the kernel
-/// reuses that registration instead of pinning pages per send. `flags`
-/// as for [`recv`]. With `linked`, `IOSQE_IO_LINK` chains the send
-/// before the next SQE pushed on the ring -- for protocols that must
-/// keep concurrent sends in stream order; the partner must be pushed
-/// from the same poll, as for [`send_fixed`].
+/// completes in two CQEs -- see [`SendZcOp`]. `flags` as for [`recv`];
+/// `linked` as for [`send_fixed`], including the same-poll rule for the
+/// link partner. To send from a registered buffer instead, use
+/// [`send_zc_fixed`].
 ///
 /// # Safety
 ///
-/// The memory (or the fixed-buffer slot) must stay valid until the
-/// **terminal** CQE -- the notification -- has been reaped, not merely
-/// until [`SendZcOp::sent`] resolves.
+/// The memory must stay valid until the **terminal** CQE -- the
+/// notification -- has been reaped, not merely until [`SendZcOp::sent`]
+/// resolves.
 pub unsafe fn send_zc(
+    fd: TgtFd,
+    ptr: *const u8,
+    len: u32,
+    flags: i32,
+    linked: bool,
+) -> Result<SendZcOp, UblkError> {
+    send_zc_sqe(fd, ptr, len, flags, None, linked)
+}
+
+/// Zero-copy send from the ring-registered fixed buffer `buf_index`
+/// (`IORING_OP_SEND_ZC` with a registered buffer): the kernel reuses the
+/// registration instead of pinning pages per send. `addr` follows the
+/// registration type's convention, as for [`recv_fixed`]; `flags`,
+/// `linked` and the two-CQE completion are as for [`send_zc`].
+///
+/// # Safety
+///
+/// The fixed-buffer slot must stay registered until the **terminal**
+/// CQE -- the notification -- has been reaped, not merely until
+/// [`SendZcOp::sent`] resolves.
+pub unsafe fn send_zc_fixed(
+    fd: TgtFd,
+    buf_index: u16,
+    addr: u64,
+    len: u32,
+    flags: i32,
+    linked: bool,
+) -> Result<SendZcOp, UblkError> {
+    send_zc_sqe(fd, addr as *const u8, len, flags, Some(buf_index), linked)
+}
+
+/// Shared SEND_ZC submission: `buf_index` selects the registered-buffer
+/// form, in which `ptr` carries the in-buffer address or offset.
+unsafe fn send_zc_sqe(
     fd: TgtFd,
     ptr: *const u8,
     len: u32,
@@ -720,7 +750,6 @@ mod tests {
                     payload.as_ptr(),
                     payload.len() as u32,
                     0,
-                    None,
                     false,
                 )
             }?;
