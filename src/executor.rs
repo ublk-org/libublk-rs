@@ -265,6 +265,9 @@ mod tests {
         // Handle stays Ready once resolved.
         assert_eq!(poll_once(&mut h), Poll::Ready(()));
         assert!(!c.get());
+        drop(h);
+        assert!(d.get());
+        assert!(!c.get());
     }
 
     #[test]

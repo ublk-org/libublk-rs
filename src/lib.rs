@@ -33,7 +33,8 @@ pub mod test_helpers;
 pub use io_uring;
 
 // Re-export tokio so targets use the same runtime version as the library
-// (tasks are spawned with `tokio::task::spawn_local` inside
+// (tasks are spawned with `tokio::task::spawn_local` or the
+// executor-agnostic `crate::executor::spawn_local` inside
 // `UblkRuntime::block_on`).
 #[cfg(feature = "tokio")]
 pub use tokio;

@@ -11,7 +11,9 @@
 //!
 //! To use a different executor, disable the `tokio` feature and drive
 //! [`crate::reactor`] from that executor's idle hook — this module is
-//! nothing more than that pattern applied to Tokio.
+//! nothing more than that pattern applied to Tokio. Alternatively,
+//! implement [`crate::executor::UblkExecutor`] (see that module's docs
+//! for the liveness contract).
 
 use crate::UblkError;
 use std::cell::RefCell;
@@ -51,8 +53,10 @@ fn park_hook() {
 ///
 /// Create it on the thread that will run it, then call
 /// [`block_on`](UblkRuntime::block_on); tasks may use
-/// `tokio::task::spawn_local`. Tokio's IO and time drivers are absent:
-/// all IO on this thread goes through the ring.
+/// `tokio::task::spawn_local` or the executor-agnostic
+/// [`crate::executor::spawn_local`], which works under any
+/// [`crate::executor::UblkExecutor`]. Tokio's IO and time drivers are
+/// absent: all IO on this thread goes through the ring.
 pub struct UblkRuntime {
     rt: tokio::runtime::Runtime,
 }
