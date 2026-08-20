@@ -70,24 +70,26 @@ impl UblkRuntime {
     /// Run a future to completion inside a fresh `LocalSet`, driving the
     /// thread-local ublk uring(s) while the future is pending.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let local = tokio::task::LocalSet::new();
-        self.rt.block_on(local.run_until(async move {
-            let mut future = std::pin::pin!(future);
-            std::future::poll_fn(move |cx| {
-                // (Re-)register the root waker for the park hook's kick.
-                PARK_KICK_WAKER.with(|w| {
-                    let mut slot = w.borrow_mut();
-                    if !slot
-                        .as_ref()
-                        .is_some_and(|existing| existing.will_wake(cx.waker()))
-                    {
-                        *slot = Some(cx.waker().clone());
-                    }
-                });
-                future.as_mut().poll(cx)
-            })
-            .await
-        }))
+        crate::executor::with_ambient_spawner(self, || {
+            let local = tokio::task::LocalSet::new();
+            self.rt.block_on(local.run_until(async move {
+                let mut future = std::pin::pin!(future);
+                std::future::poll_fn(move |cx| {
+                    // (Re-)register the root waker for the park hook's kick.
+                    PARK_KICK_WAKER.with(|w| {
+                        let mut slot = w.borrow_mut();
+                        if !slot
+                            .as_ref()
+                            .is_some_and(|existing| existing.will_wake(cx.waker()))
+                        {
+                            *slot = Some(cx.waker().clone());
+                        }
+                    });
+                    future.as_mut().poll(cx)
+                })
+                .await
+            }))
+        })
     }
 
     /// Create queue `qid` of `dev` on the current thread, spawn one
@@ -127,5 +129,127 @@ impl UblkRuntime {
             }
             Ok(())
         })
+    }
+}
+
+/// Tokio's JoinHandle adapted to the executor contract. JoinHandle
+/// already detaches on drop; cancel maps to abort. A JoinError resolves
+/// the handle to `()` like completion does (panics are logged first),
+/// per the [`crate::executor::TaskHandle`] outcome-erasure contract.
+struct TokioTask(tokio::task::JoinHandle<()>);
+
+impl Future for TokioTask {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        match std::pin::Pin::new(&mut self.0).poll(cx) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(Err(e)) => {
+                if e.is_panic() {
+                    log::error!("spawned task panicked: {}", e);
+                }
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl crate::executor::UblkTask for TokioTask {
+    fn cancel(self: Box<Self>) {
+        self.0.abort();
+    }
+}
+
+/// Spawning goes through Tokio's free `spawn_local`, which targets the
+/// *innermost currently-running* `LocalSet` — normally the one
+/// [`UblkRuntime::block_on`] created, but not if target code nests its
+/// own `LocalSet::run_until` inside a task and spawns from there: the
+/// task then lands on that inner set and is destroyed when its
+/// `run_until` returns, which the handle reports as plain completion.
+/// Do not nest `LocalSet`s around [`crate::executor::spawn_local`]
+/// calls.
+impl crate::executor::UblkSpawner for UblkRuntime {
+    fn spawn_boxed(
+        &self,
+        fut: std::pin::Pin<Box<dyn Future<Output = ()>>>,
+    ) -> crate::executor::TaskHandle {
+        crate::executor::TaskHandle::new(Box::new(TokioTask(tokio::task::spawn_local(fut))))
+    }
+}
+
+impl crate::executor::UblkExecutor for UblkRuntime {
+    fn new() -> Result<Self, UblkError> {
+        UblkRuntime::new()
+    }
+    fn block_on<F: Future>(&self, future: F) -> F::Output {
+        UblkRuntime::block_on(self, future)
+    }
+    // Override the provided default with the existing unboxed fast path.
+    fn run_io_tasks<F, Fut>(
+        dev: &std::sync::Arc<crate::io::UblkDev>,
+        qid: u16,
+        io_task: F,
+    ) -> Result<(), UblkError>
+    where
+        F: Fn(std::rc::Rc<crate::io::UblkQueue>, u16) -> Fut + 'static,
+        Fut: Future<Output = Result<(), UblkError>> + 'static,
+    {
+        UblkRuntime::run_io_tasks(dev, qid, io_task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trait_impl_spawn_cancel_detach() {
+        use crate::executor::{spawn_local, UblkExecutor};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // Yield once so spawned tasks interleave with the root future.
+        struct YieldNow(bool);
+        impl std::future::Future for YieldNow {
+            type Output = ();
+            fn poll(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<()> {
+                if self.0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            }
+        }
+
+        let rt = <UblkRuntime as UblkExecutor>::new().unwrap();
+        let ran = Rc::new(Cell::new(0u32));
+        let (r1, r2) = (ran.clone(), ran.clone());
+        rt.block_on(async move {
+            // awaited task runs
+            let h = spawn_local(async move {
+                r1.set(r1.get() + 1);
+            });
+            h.await;
+            // detached task (handle dropped) still runs
+            drop(spawn_local(async move {
+                r2.set(r2.get() + 1);
+            }));
+            // cancelled pending task never runs its body end
+            let h = spawn_local(async {
+                std::future::pending::<()>().await;
+            });
+            h.cancel();
+            YieldNow(false).await;
+            YieldNow(false).await;
+        });
+        assert_eq!(ran.get(), 2);
     }
 }
