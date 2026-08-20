@@ -22,19 +22,21 @@ introduction](https://github.com/ming1/ubdsrv/blob/master/doc/ublk_intro.pdf)
 
 Follows one 2-queue ublk-null target which is built over libublk, ublk block
 device(/dev/ublkbN) is created after the code is run. And the device will be
-deleted after terminating this process by ctrl+C.
+deleted after terminating this process by ctrl+C. Besides libublk, the
+sample needs the `ctrlc` crate for the signal handler.
 
 ``` rust
-use libublk::{ctrl::UblkCtrlBuilder, io::UblkDev, io::UblkQueue};
+use libublk::io::{UblkDev, UblkQueue};
+use libublk::{ctrl::UblkCtrlBuilder, BufDesc, UblkRuntime};
 
 // async/.await IO handling
-async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
     (q.get_iod(tag).nr_sectors << 9) as i32
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), libublk::UblkError> {
+async fn io_task(q: &UblkQueue, tag: u16) -> Result<(), libublk::UblkError> {
     // IO buffer for exchange data with /dev/ublkbN
-    let buf_bytes = q.dev.dev_info.max_io_buf_bytes as usize;
+    let buf_bytes = q.dev().dev_info.max_io_buf_bytes as usize;
     let buf = libublk::helpers::IoBuf::<u8>::new(buf_bytes);
 
     // Submit initial prep command for setup IO forward
@@ -49,26 +51,10 @@ async fn io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), libublk::UblkError> 
     }
 }
 
-fn q_fn(qid: u16, dev: &UblkDev) {
-    let q_rc = std::rc::Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-    let exe_rc = std::rc::Rc::new(smol::LocalExecutor::new());
-    let exe = exe_rc.clone();
-    let mut f_vec = Vec::new();
-
-    for tag in 0..dev.dev_info.queue_depth {
-        let q = q_rc.clone();
-        f_vec.push(exe.spawn(async move { io_task(&q, tag).await }));
-    }
-
-    // Drive smol executor, won't exit until queue is dead
-    smol::block_on(exe_rc.run(async move {
-        let run_ops = || while exe.try_tick() {};
-        let done = || f_vec.iter().all(|task| task.is_finished());
-
-        if let Err(e) = libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-            log::error!("handle_uring_events failed: {}", e);
-        }
-    }));
+fn q_fn(qid: u16, dev: &std::sync::Arc<UblkDev>) {
+    // Tokio current-thread runtime parked inside io_uring_enter: CQEs
+    // wake the io tasks, and this returns once every task is done
+    UblkRuntime::run_io_tasks(dev, qid, |q, tag| async move { io_task(&q, tag).await }).unwrap();
 }
 
 fn main() {
@@ -109,14 +95,16 @@ fn main() {
 ```
 
  * [`examples/loop.rs`](examples/loop.rs): real example using
-   async/await & io_uring.
+   async/await & io_uring, with target IO going through the typed
+   operation catalog in [`libublk::ops`](src/ops.rs) (`read_at_raw`,
+   `write_at_raw`, `sync_file_range`, ...).
 
  * [`examples/ramdisk.rs`](examples/ramdisk.rs): single thread &
    async/.await for both ctrl and IO, this technique will be extended to
    create multiple devices from single thread in future
 
-`rublk`[^4] is based on libublk, and supports null, loop, zoned & qcow2 targets so
-far.
+`rublk`[^4] is based on libublk, and supports null, loop, zoned, qcow2,
+compress & vram targets so far.
 
 ## unprivileged ublk support
 

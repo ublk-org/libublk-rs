@@ -1,6 +1,6 @@
 [package]
 name = "libublk"
-version = "0.4.8"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Library for building linux block device in userspace"
@@ -17,11 +17,41 @@ publish = true
 maintenance = { status = "actively-developed" }
 
 [features]
-fat_complete = []
+default = ["tokio"]
+# Built-in Tokio current-thread executor integration (UblkRuntime).
+# Disable to bring your own executor driven via libublk::reactor.
+tokio = ["dep:tokio"]
 
 [[bin]]
 name = "ublk_user_id"
 path = "utils/ublk_user_id_rs.rs"
+
+# Examples and integration tests drive devices through UblkRuntime, so
+# they are built only with the `tokio` feature. Without it `--all-targets`
+# still checks the library and its reactor-only unit tests.
+[[example]]
+name = "null"
+required-features = ["tokio"]
+
+[[example]]
+name = "loop"
+required-features = ["tokio"]
+
+[[example]]
+name = "ramdisk"
+required-features = ["tokio"]
+
+[[example]]
+name = "batch"
+required-features = ["tokio"]
+
+[[test]]
+name = "basic"
+required-features = ["tokio"]
+
+[[test]]
+name = "examples"
+required-features = ["tokio"]
 
 [package.metadata]
 scripts = ["utils/ublk_chown.sh"]
@@ -56,7 +86,7 @@ serde_json = "1.0.79"
 bitmaps = "3.2.0"
 log = "0.4"
 thiserror = "1.0.43"
-smol = "2.0.2"
+tokio = { version = "1.52", features = ["rt"], optional = true }
 slab = "0.4.9"
 derive_setters = "0.1"
 bitflags = "2.4.1"

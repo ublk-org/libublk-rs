@@ -128,7 +128,7 @@
 //! use libublk::helpers::IoBuf;
 //! use libublk::sys;
 //!
-//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
 //!     let slice_desc = BufDesc::from_io_buf(&io_buf);
 //!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1, Some(&io_buf)).await?;
@@ -142,7 +142,7 @@
 //! use libublk::io::{BufDesc, UblkQueue};
 //! use libublk::sys;
 //!
-//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
 //!     let auto_reg = sys::ublk_auto_buf_reg {
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
@@ -180,20 +180,20 @@
 //! }
 //! ```
 
-use super::uring_async::UblkUringOpFuture;
-#[cfg(feature = "fat_complete")]
-use super::UblkFatRes;
-use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags, UblkIORes};
+use super::{ctrl::UblkCtrl, sys, UblkError, UblkFlags};
 use crate::bindings;
 use crate::helpers::IoBuf;
+use crate::op::{Op, Resources};
+use crate::ops::RawOp;
 use crate::UblkUringData;
 use async_lock::Semaphore;
-use io_uring::{cqueue, opcode, squeue, types, IoUring};
+use io_uring::{cqueue, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
 use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 
 // Keep the batch transport as a child of `io` so it can share the private
@@ -210,6 +210,12 @@ std::thread_local! {
         OnceCell::new();
     static DEFERRED_QUEUE_CQES: RefCell<VecDeque<cqueue::Entry>> =
         const { RefCell::new(VecDeque::new()) };
+
+    /// State of the queue owned by this thread, registered by
+    /// `UblkQueue::new()` so the runtime park hook can account completed
+    /// io commands without holding a `&UblkQueue`.
+    pub(crate) static QUEUE_STATE: RefCell<Option<Rc<RefCell<UblkQueueState>>>> =
+        const { RefCell::new(None) };
 }
 
 pub(crate) fn defer_queue_cqe(cqe: cqueue::Entry) {
@@ -220,8 +226,18 @@ pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
     DEFERRED_QUEUE_CQES.with(|cqes| cqes.borrow_mut().pop_front())
 }
 
+/// Account `cnt` completed io commands against the thread's registered
+/// queue state; `aborted` marks the queue as stopping. Called from the
+/// runtime park hook when reaping io-command CQEs.
+pub(crate) fn update_queue_state(cnt: u32, aborted: bool) {
+    QUEUE_STATE.with(|cell| {
+        if let Some(state) = cell.borrow().as_ref() {
+            state.borrow_mut().account_io_cmds(cnt, aborted);
+        }
+    })
+}
+
 // Internal macro versions for backwards compatibility within the crate
-#[macro_export]
 macro_rules! with_queue_ring_internal {
     ($closure:expr) => {
         $crate::io::QUEUE_RING.with(|cell| {
@@ -235,7 +251,6 @@ macro_rules! with_queue_ring_internal {
     };
 }
 
-#[macro_export]
 macro_rules! with_queue_ring_mut_internal {
     ($closure:expr) => {
         $crate::io::QUEUE_RING.with(|cell| {
@@ -249,65 +264,9 @@ macro_rules! with_queue_ring_mut_internal {
     };
 }
 
-// Make internal macros available within the crate.
-// Only the mut variant needs a `crate::io::` path re-export; the immutable one
-// is reached via textual scope inside this file and via the `#[macro_export]`
-// crate-root path elsewhere.
+// Crate-internal: never `#[macro_export]`, which would publish them at
+// the crate root as public API.
 pub(crate) use with_queue_ring_mut_internal;
-
-/// Access the thread-local queue ring with immutable reference
-///
-/// # Arguments
-/// * `_queue` - Reference to UblkQueue (used to ensure queue context)
-/// * `f` - Closure that receives immutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # use libublk::io::UblkQueue;
-/// # fn example(queue: &UblkQueue) -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_queue_ring(queue, |ring| {
-///     println!("SQ entries: {}", ring.params().sq_entries());
-/// });
-/// # Ok(())
-/// # }
-/// ```
-#[deprecated(
-    since = "0.5.0",
-    note = "use with_task_io_ring() instead - the UblkQueue parameter is unnecessary"
-)]
-pub fn with_queue_ring<F, R>(_queue: &UblkQueue, f: F) -> R
-where
-    F: FnOnce(&IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_internal!(f)
-}
-
-/// Access the thread-local queue ring with mutable reference
-///
-/// # Arguments
-/// * `_queue` - Reference to UblkQueue (used to ensure queue context)
-/// * `f` - Closure that receives mutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # use libublk::io::UblkQueue;
-/// # fn example(queue: &UblkQueue) -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_queue_ring_mut(queue, |ring| {
-///     ring.submit_and_wait(1)
-/// })?;
-/// # Ok(())
-/// # }
-/// ```
-#[deprecated(
-    since = "0.5.0",
-    note = "use with_task_io_ring_mut() instead - the UblkQueue parameter is unnecessary"
-)]
-pub fn with_queue_ring_mut<F, R>(_queue: &UblkQueue, f: F) -> R
-where
-    F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_mut_internal!(f)
-}
 
 /// Access the thread-local queue ring with immutable reference
 ///
@@ -395,7 +354,11 @@ pub(crate) fn init_task_ring_default(sq_depth: u32, cq_depth: u32) -> Result<(),
 }
 
 /// Unified buffer descriptor supporting both copy and zero-copy operations
+///
+/// Non-exhaustive: the kernel keeps growing new per-io buffer modes, and
+/// each one becomes a variant here. Match with a `_` arm.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum BufDesc<'a> {
     /// Buffer slice for copy-based operations
     ///
@@ -529,7 +492,13 @@ impl<'a> BufDesc<'a> {
     }
 }
 
+/// Per-queue buffer descriptor list, the [`BufDesc`] analog for the
+/// whole tag range.
+///
+/// Non-exhaustive for the same reason as [`BufDesc`]: new buffer modes
+/// arrive as new variants. Match with a `_` arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BufDescList<'a> {
     /// List of IoBuf for traditional buffer management
     ///
@@ -568,39 +537,107 @@ pub enum BufDescList<'a> {
     AutoRegs(&'a [sys::ublk_auto_buf_reg]),
 }
 
-/// A struct with the same memory layout as `io_uring_sys::io_uring_sqe`.
-/// The definition must match the one in `io-uring-sys` crate.
-/// This is a simplified version for demonstration.
+/// Field-wise view of a submission queue entry, laid out exactly like
+/// the kernel's `struct io_uring_sqe`.
+///
+/// [`override_sqe!`](crate::override_sqe) transmutes an
+/// `io_uring::squeue::Entry` to this type to reach SQE fields the
+/// io-uring crate's opcode builders do not expose (the `ioprio` flag
+/// bits, `buf_index`, and the `addr`/`len` overloads). Only the fields
+/// this crate needs are public; the rest are named so the offsets are
+/// right.
+///
+/// Size and alignment are asserted against `squeue::Entry` below at
+/// compile time; the field *offsets* are pinned by the `raw_sqe_layout`
+/// tests, which build entries with io-uring's own opcode builders and
+/// read the values back through this view. Between them, a change to
+/// either layout is caught at build or test time rather than by
+/// silently writing the wrong bytes.
 #[repr(C)]
 pub struct RawSqe {
     opcode: u8,
     flags: u8,
-    ioprio: u16,
+    /// Opcode-specific SQE flags, which the io-uring builders expose
+    /// for only some opcodes: `IORING_RECVSEND_FIXED_BUF` for a
+    /// fixed-buffer send/recv, `IORING_SEND_ZC_REPORT_USAGE` for
+    /// `SENDMSG_ZC`, and so on. Set bits with the `|=` form of
+    /// [`override_sqe!`](crate::override_sqe).
+    pub ioprio: u16,
     fd: i32,
     off: u64,
+    /// Buffer address, or an offset within a registered buffer.
     pub addr: u64,
+    /// Byte count for this operation.
     pub len: u32,
+    /// Opcode-specific flags (the SQE's `rw_flags` union member).
     pub rw_flags: u32,
     user_data: u64,
+    /// Registered buffer index, or buffer-group id for provided
+    /// buffers.
     pub buf_index: u16,
     personality: u16,
     splice_fd_in: i32,
-    __pad2: u32,
+    addr3: u64,
+    __pad2: u64,
 }
 
+// The RawSqe view is only sound while both layouts agree.
+const _: () = {
+    assert!(core::mem::size_of::<RawSqe>() == core::mem::size_of::<squeue::Entry>());
+    assert!(core::mem::align_of::<RawSqe>() == core::mem::align_of::<squeue::Entry>());
+    // Entry128 carries a 64-byte SQE plus 64 bytes of trailing command
+    // payload, so RawSqe views its prefix.
+    assert!(core::mem::size_of::<RawSqe>() <= core::mem::size_of::<squeue::Entry128>());
+    assert!(core::mem::align_of::<RawSqe>() == core::mem::align_of::<squeue::Entry128>());
+};
+
+/// A submission queue entry that can be viewed field-wise as a
+/// [`RawSqe`], for [`override_sqe!`](crate::override_sqe).
+///
+/// Implemented for the io-uring submission entry types only; it exists
+/// so the macro is type-checked instead of reinterpreting whatever
+/// pointer it is handed.
+pub trait AsRawSqe {
+    /// View this entry's `io_uring_sqe` field-wise.
+    fn as_raw_sqe(&mut self) -> &mut RawSqe;
+}
+
+impl AsRawSqe for squeue::Entry {
+    #[inline]
+    fn as_raw_sqe(&mut self) -> &mut RawSqe {
+        // SAFETY: an Entry *is* one io_uring_sqe, and RawSqe mirrors
+        // that layout -- size and alignment asserted above.
+        unsafe { &mut *(self as *mut Self as *mut RawSqe) }
+    }
+}
+
+impl AsRawSqe for squeue::Entry128 {
+    #[inline]
+    fn as_raw_sqe(&mut self) -> &mut RawSqe {
+        // SAFETY: an Entry128 opens with the same io_uring_sqe; RawSqe
+        // views that prefix, whose size fits as asserted above.
+        unsafe { &mut *(self as *mut Self as *mut RawSqe) }
+    }
+}
+
+/// Set a submission queue entry field the io-uring opcode builders do
+/// not expose, by viewing the entry as a [`RawSqe`].
+///
+/// `override_sqe!(&mut sqe, buf_index, idx)` assigns; the `|=` form
+/// (`override_sqe!(&mut sqe, ioprio, |=, bits)`) sets bits. The first
+/// argument must be an `&mut io_uring::squeue::Entry` (or `Entry128`),
+/// and the field must be one [`RawSqe`] exposes.
+///
+/// The entry type is checked through [`AsRawSqe`], but the value is
+/// not: a field the kernel does not define for the opcode being built
+/// is a kernel-visible error, not a compile error.
 #[macro_export]
 macro_rules! override_sqe {
     ($entry:expr, $field:ident, $value:expr) => {
-        unsafe {
-            let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
-            sqe.$field = $value;
-        }
+        $crate::io::AsRawSqe::as_raw_sqe($entry).$field = $value
     };
     ($entry:expr, $field:ident, |=, $value:expr) => {
-        unsafe {
-            let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
-            sqe.$field |= $value;
-        }
+        $crate::io::AsRawSqe::as_raw_sqe($entry).$field |= $value
     };
 }
 
@@ -613,14 +650,12 @@ macro_rules! override_sqe {
 ///
 /// If target won't use io_uring to handle IO, eventfd needs to be sent from
 /// the real handler context to wakeup ublk queue/io_uring context for
-/// driving the machinery. Eventfd gets minimized support with
-/// `dev_flags::UBLK_DEV_F_COMP_BATCH`, and native & generic IO offloading will
-/// be added soon.
+/// driving the machinery.
 ///
 /// UblkIOCtx & UblkQueue provide enough information for target code to
 /// handle this CQE and implement target IO handling logic.
 ///
-pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u32);
+pub struct UblkIOCtx<'a>(&'a cqueue::Entry, u64, u32);
 
 impl<'a> UblkIOCtx<'a> {
     const UBLK_IO_F_FIRST: u32 = 1u32 << 16;
@@ -645,33 +680,34 @@ impl<'a> UblkIOCtx<'a> {
     /// by passing `tag` via `Self::build_user_data()`
     #[inline(always)]
     pub fn get_tag(&self) -> u32 {
-        UblkIOCtx::user_data_to_tag(self.0.user_data())
+        UblkIOCtx::user_data_to_tag(self.1)
     }
 
-    /// Get this CQE's userdata
-    ///
+    /// Get this IO's userdata: the word built by [`Self::build_user_data`]
+    /// at submission (the on-ring `user_data` is a slab key resolved back
+    /// to this word before the IO closure runs)
     #[inline(always)]
     pub fn user_data(&self) -> u64 {
-        self.0.user_data()
+        self.1
     }
 
     /// Return false if it is one IO command from ublk driver, otherwise
     /// it is one target IO submitted from IO closure
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
-        Self::is_target_io(self.0.user_data())
+        Self::is_target_io(self.1)
     }
 
     /// if this IO represented by CQE is the last one in current batch
     #[inline(always)]
     pub fn is_last_cqe(&self) -> bool {
-        (self.1 & Self::UBLK_IO_F_LAST) != 0
+        (self.2 & Self::UBLK_IO_F_LAST) != 0
     }
 
     /// if this IO represented by CQE is the first one in current batch
     #[inline(always)]
     pub fn is_first_cqe(&self) -> bool {
-        (self.1 & Self::UBLK_IO_F_FIRST) != 0
+        (self.2 & Self::UBLK_IO_F_FIRST) != 0
     }
 
     /// Build offset for read from or write to per-io-cmd buffer
@@ -699,7 +735,7 @@ impl<'a> UblkIOCtx<'a> {
                 | offset as u64)
     }
 
-    /// Build userdata for submitting io via io_uring
+    /// Build userdata describing one sync-mode io to the IO closure
     ///
     /// # Arguments:
     ///
@@ -709,7 +745,10 @@ impl<'a> UblkIOCtx<'a> {
     /// * `is_target_io`: if this userdata is for handling target io, false if
     ///         if it is only for ublk io command
     ///
-    /// The built userdata is passed to io_uring for parsing io result
+    /// The built word is handed to `ublk_submit_sqe_sync()` and delivered
+    /// back through `UblkIOCtx::user_data()` when the CQE arrives; it is
+    /// no longer the on-ring `user_data` (that is a slab key owned by the
+    /// op layer).
     ///
     #[inline(always)]
     #[allow(arithmetic_overflow)]
@@ -725,21 +764,6 @@ impl<'a> UblkIOCtx<'a> {
             } else {
                 0
             }
-    }
-
-    /// Build userdata for async io_uring OP
-    ///
-    /// # Arguments:
-    /// * `tag`: io tag, length is 16bit
-    /// * `op`: io operation code, length is 8bit
-    /// * `op_id`: unique id in io task
-    ///
-    /// The built userdata has to be unique in this io task, so that
-    /// our executor can figure out the exact submitted OP with
-    /// completed cqe
-    #[inline(always)]
-    pub fn build_user_data_async(tag: u16, op: u32, op_id: u32) -> u64 {
-        Self::build_user_data(tag, op, op_id, true)
     }
 
     /// Extract tag from userdata
@@ -759,16 +783,13 @@ impl<'a> UblkIOCtx<'a> {
     fn is_target_io(user_data: u64) -> bool {
         (user_data & UblkUringData::Target as u64) != 0
     }
-
-    /// Check if this userdata is from IO command which is from
-    /// ublk driver
-    #[inline(always)]
-    pub(crate) fn is_io_command(user_data: u64) -> bool {
-        (user_data & UblkUringData::Target as u64) == 0
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Target-side device description: geometry, ring sizing, the fds the
+/// queue ring registers, and the ublk parameters. A target fills this
+/// in from its `tgt_init` closure; it is serialized into the device's
+/// JSON for recovery.
 pub struct UblkTgt {
     /// target type
     pub tgt_type: String,
@@ -790,7 +811,11 @@ pub struct UblkTgt {
     pub extra_ios: u16,
 
     //const struct ublk_tgt_ops *ops;
+    /// Backing files registered with the queue ring as fixed files.
+    /// Index 0 is the ublk char device, so a target's own files start
+    /// at 1 and are addressed as [`ops::TgtFd::Fixed`](crate::ops::TgtFd).
     pub fds: [i32; 32],
+    /// Number of valid entries in [`Self::fds`].
     pub nr_fds: i32,
 
     /// could become bigger, is it one issue?
@@ -816,6 +841,8 @@ pub(crate) struct BufferRegState {
 /// as defining target specific parameters, exporting its own json output,
 /// and so on.
 pub struct UblkDev {
+    /// Device info as the kernel reports it: id, queue count and depth,
+    /// feature flags.
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
     /// reserved for supporting new features
@@ -824,6 +851,7 @@ pub struct UblkDev {
     //fds[0] points to /dev/ublkcN
     cdev_file: fs::File,
 
+    /// Target-side description filled in by the target's init closure.
     pub tgt: UblkTgt,
     tgt_json: Option<serde_json::Value>,
 
@@ -984,6 +1012,8 @@ impl UblkDev {
         bvec
     }
 
+    /// Set basic parameters for a `dev_size`-byte device with 512-byte
+    /// logical blocks, as a starting point for a target's own settings.
     pub fn set_default_params(&mut self, dev_size: u64) {
         let info = self.dev_info;
 
@@ -1005,11 +1035,14 @@ impl UblkDev {
     }
 
     // Store target specific json data, json["target_data"]
+    /// Attach target-private JSON, stored with the device and returned
+    /// on recovery.
     pub fn set_target_json(&mut self, val: serde_json::Value) {
         self.tgt_json = Some(val);
     }
 
     // Retrieve target specific json data
+    /// The target-private JSON set by [`Self::set_target_json`].
     pub fn get_target_json(&self) -> Option<&serde_json::Value> {
         match self.tgt_json.as_ref() {
             None => None,
@@ -1140,6 +1173,16 @@ impl UblkQueueState {
         self.state |= Self::UBLK_QUEUE_STOPPING;
     }
 
+    /// Account `cnt` completed io commands; `aborted` marks the queue as
+    /// stopping. The single accounting sink shared by the sync event loop
+    /// and the runtime park hook.
+    pub(crate) fn account_io_cmds(&mut self, cnt: u32, aborted: bool) {
+        self.sub_cmd_inflight(cnt);
+        if aborted {
+            self.mark_stopping();
+        }
+    }
+
     fn set_idle(&mut self, val: bool) {
         if val {
             self.state |= Self::UBLK_QUEUE_IDLE;
@@ -1165,17 +1208,17 @@ impl UblkQueueState {
 ///
 /// So far, each queue is handled by one its own io_uring.
 ///
-pub struct UblkQueue<'a> {
+pub struct UblkQueue {
     flags: UblkFlags,
     q_id: u16,
     q_depth: u32,
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
-    pub dev: &'a UblkDev,
+    dev: Arc<UblkDev>,
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
-    pub(crate) state: RefCell<UblkQueueState>,
+    pub(crate) state: Rc<RefCell<UblkQueueState>>,
     /// Semaphore to coordinate buffer registrations
     /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
     buf_reg_semaphore: Semaphore,
@@ -1183,16 +1226,23 @@ pub struct UblkQueue<'a> {
     buf_reg_counter: RefCell<u32>,
 }
 
-impl AsRawFd for UblkQueue<'_> {
+impl AsRawFd for UblkQueue {
     fn as_raw_fd(&self) -> RawFd {
         with_queue_ring_internal!(|ring: &IoUring<squeue::Entry>| ring.as_raw_fd())
     }
 }
 
-impl Drop for UblkQueue<'_> {
+impl Drop for UblkQueue {
     fn drop(&mut self) {
-        let dev = self.dev;
+        let dev = &self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
+
+        QUEUE_STATE.with(|cell| {
+            let mut guard = cell.borrow_mut();
+            if guard.as_ref().is_some_and(|s| Rc::ptr_eq(s, &self.state)) {
+                guard.take();
+            }
+        });
 
         if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
             .submitter()
@@ -1226,7 +1276,7 @@ fn round_up(val: u32, rnd: u32) -> u32 {
     (val + rnd - 1) & !(rnd - 1)
 }
 
-impl UblkQueue<'_> {
+impl UblkQueue {
     const UBLK_QUEUE_IDLE_SECS: u32 = 20;
     const UBLK_QUEUE_IOCTL_ENCODE: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_0;
     const UBLK_QUEUE_AUTO_BUF_REG: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_1;
@@ -1240,6 +1290,7 @@ impl UblkQueue<'_> {
     }
 
     #[inline(always)]
+    /// Whether the device negotiated `UBLK_F_AUTO_BUF_REG` zero copy.
     pub fn support_auto_buf_zc(&self) -> bool {
         self.flags.intersects(Self::UBLK_QUEUE_AUTO_BUF_REG)
     }
@@ -1259,7 +1310,7 @@ impl UblkQueue<'_> {
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
     #[allow(clippy::uninit_vec)]
-    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
+    pub fn new(q_id: u16, dev: &Arc<UblkDev>) -> Result<UblkQueue, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
         let cq_depth = tgt.cq_depth;
@@ -1331,23 +1382,32 @@ impl UblkQueue<'_> {
             q_id,
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
-            dev,
+            dev: Arc::clone(dev),
             dev_flags: dev.dev_info.flags,
-            state: RefCell::new(UblkQueueState {
+            state: Rc::new(RefCell::new(UblkQueueState {
                 cmd_inflight: 0,
                 state: 0,
-            }),
+            })),
             bufs: RefCell::new(bufs),
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
         };
+
+        QUEUE_STATE.with(|cell| cell.borrow_mut().replace(Rc::clone(&q.state)));
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
 
         Ok(q)
     }
 
-    // Return if queue is idle
+    /// Whether the queue has been marked idle: every fetch command is
+    /// armed and waiting, and no target IO is outstanding.
+    ///
+    /// Only the legacy synchronous event loop sets this, after its
+    /// 20-second wait expires with an empty submission queue. A queue
+    /// driven by `UblkRuntime` (the `tokio` feature) or
+    /// [`crate::reactor`] never marks itself idle, so this always
+    /// returns `false` there.
     pub fn is_idle(&self) -> bool {
         self.state.borrow().is_idle()
     }
@@ -1357,32 +1417,9 @@ impl UblkQueue<'_> {
         self.state.borrow_mut().mark_stopping()
     }
     // Return if queue is stopping
+    /// Whether the queue is being torn down and takes no new io.
     pub fn is_stopping(&self) -> bool {
         self.state.borrow().is_stopping()
-    }
-
-    /// Manipulate immutable queue uring
-    #[deprecated(
-        since = "0.5.0",
-        note = "removed in 0.6.0 - use with_queue_ring() instead"
-    )]
-    pub fn uring_op<R, H>(&self, op_handler: H) -> Result<R, UblkError>
-    where
-        H: Fn(&IoUring<squeue::Entry>) -> Result<R, UblkError>,
-    {
-        with_queue_ring_internal!(|uring: &IoUring<squeue::Entry>| op_handler(uring))
-    }
-
-    /// Manipulate mutable queue uring
-    #[deprecated(
-        since = "0.5.0",
-        note = "removed in 0.6.0 - use with_queue_ring_mut() instead"
-    )]
-    pub fn uring_op_mut<R, H>(&self, op_handler: H) -> Result<R, UblkError>
-    where
-        H: Fn(&mut IoUring<squeue::Entry>) -> Result<R, UblkError>,
-    {
-        with_queue_ring_mut_internal!(|uring: &mut IoUring<squeue::Entry>| op_handler(uring))
     }
 
     /// Return queue depth
@@ -1399,6 +1436,12 @@ impl UblkQueue<'_> {
     #[inline(always)]
     pub fn get_qid(&self) -> u16 {
         self.q_id
+    }
+
+    /// Return the device this queue serves.
+    #[inline(always)]
+    pub fn dev(&self) -> &Arc<UblkDev> {
+        &self.dev
     }
 
     /// Return IO command description info represented by `ublksrv_io_desc`
@@ -1463,10 +1506,6 @@ impl UblkQueue<'_> {
         self.state.borrow().is_mlock_failed()
     }
 
-    /// **DEPRECATED:** Register IO buffer, so that pages in this buffer can
-    /// be discarded in case queue becomes idle
-    ///
-    /// Internal implementation of register_io_buf without deprecation warnings
     fn register_io_buf_internal(&self, tag: u16, buf: &IoBuf<u8>) {
         if self.support_auto_buf_zc() {
             return;
@@ -1507,21 +1546,6 @@ impl UblkQueue<'_> {
         }
     }
 
-    /// **DEPRECATED:** Register IO buffer, so that pages in this buffer can
-    /// be discarded in case queue becomes idle
-    ///
-    /// This method is deprecated in favor of the unified buffer management
-    /// provided by [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_fetch_commands_unified`].
-    /// These methods handle buffer registration automatically and provide better
-    /// integration with the async I/O workflow.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_io_prep_cmd` and `submit_fetch_commands_unified` instead, removed in 0.6"
-    )]
-    pub fn register_io_buf(&self, tag: u16, buf: &IoBuf<u8>) {
-        self.register_io_buf_internal(tag, buf);
-    }
-
     /// Wait for all buffer registrations to complete
     ///
     /// Each task acquires one permit, which is only available after all buffers are registered.
@@ -1560,8 +1584,8 @@ impl UblkQueue<'_> {
         *self.buf_reg_counter.borrow_mut() = 0;
     }
 
-    /// Register Io buffers
-    pub fn regiser_io_bufs(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
+    /// Register the per-tag IO buffers with the queue.
+    fn register_io_bufs(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
         if !self.support_auto_buf_zc() {
             if let Some(b) = bufs {
                 for tag in 0..self.q_depth {
@@ -1572,23 +1596,17 @@ impl UblkQueue<'_> {
         self
     }
 
+    /// Build the UringCmd16 SQE of one ublk io command.
     #[inline(always)]
-    #[cfg(feature = "fat_complete")]
-    fn support_comp_batch(&self) -> bool {
-        self.flags.intersects(UblkFlags::UBLK_DEV_F_COMP_BATCH)
-    }
-
-    #[inline(always)]
-    fn __queue_io_cmd_no_state(
+    fn build_io_cmd_sqe(
         &self,
-        r: &mut IoUring<squeue::Entry>,
         tag: u16,
         cmd_op: u32,
         buf_addr: u64,
         sqe_addr: Option<u64>,
-        user_data: u64,
         res: i32,
-    ) -> i32 {
+        user_data: u64,
+    ) -> squeue::Entry {
         let io_cmd = sys::ublksrv_io_cmd {
             tag,
             addr: buf_addr,
@@ -1602,43 +1620,33 @@ impl UblkQueue<'_> {
             cmd_op
         };
 
-        let mut sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
-            .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
-            .build()
-            .user_data(user_data);
+        let mut sqe = crate::ops::uring_cmd16_sqe(crate::ops::TgtFd::Fixed(0), cmd_op, unsafe {
+            core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd)
+        })
+        .user_data(user_data);
         if let Some(auto_buf_addr) = sqe_addr {
             assert!(self.support_auto_buf_zc());
             override_sqe!(&mut sqe, addr, auto_buf_addr);
         }
-
-        loop {
-            let res = unsafe { r.submission().push(&sqe) };
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("__queue_io_cmd: flush submission and retry");
-                    r.submit_and_wait(0).unwrap();
-                }
-            }
-        }
-        1
+        sqe
     }
+
+    /// Queue one sync-mode ublk io command: a slab entry carries `data`
+    /// (the handler word) and the SQE's `user_data` is the entry's key.
     #[inline(always)]
     fn __queue_io_cmd(
         &self,
-        r: &mut IoUring<squeue::Entry>,
         tag: u16,
         cmd_op: u32,
         buf_addr: u64,
         sqe_addr: Option<u64>,
         data: u64,
         res: i32,
-    ) -> i32 {
+    ) -> Result<i32, UblkError> {
         {
             let state = self.state.borrow();
             if state.is_stopping() {
-                return 0;
+                return Ok(0);
             }
 
             log::trace!(
@@ -1652,115 +1660,90 @@ impl UblkQueue<'_> {
                 buf_addr,
             );
         }
-        let res = self.__queue_io_cmd_no_state(r, tag, cmd_op, buf_addr, sqe_addr, data, res);
-        if res != 1 {
-            return res;
+        if let Err(e) = crate::op::submit_sync(
+            |key| self.build_io_cmd_sqe(tag, cmd_op, buf_addr, sqe_addr, res, key),
+            data,
+            true,
+        ) {
+            // The command is lost: this tag is never re-armed and
+            // cmd_inflight never counts it, so the queue would silently
+            // serve one io fewer for the rest of its life. Fail loudly.
+            log::error!(
+                "queue_io_cmd: qid {} tag {} cmd_op {} not queued: {}",
+                self.q_id,
+                tag,
+                cmd_op,
+                e,
+            );
+            return Err(e);
         }
 
         let mut state = self.state.borrow_mut();
         state.inc_cmd_inflight();
 
-        1
+        Ok(1)
     }
 
     #[inline(always)]
     fn queue_io_cmd(
         &self,
-        r: &mut IoUring<squeue::Entry>,
         tag: u16,
         cmd_op: u32,
         buf_addr: u64,
         res: i32,
-    ) -> i32 {
+    ) -> Result<i32, UblkError> {
         let data = UblkIOCtx::build_user_data(tag, cmd_op, 0, false);
-        self.__queue_io_cmd(r, tag, cmd_op, buf_addr, None, data, res)
+        self.__queue_io_cmd(tag, cmd_op, buf_addr, None, data, res)
     }
 
     #[inline(always)]
     fn commit_and_queue_io_cmd(
         &self,
-        r: &mut IoUring<squeue::Entry>,
         tag: u16,
         buf_addr: u64,
         io_cmd_result: i32,
-    ) {
+    ) -> Result<(), UblkError> {
         self.queue_io_cmd(
-            r,
             tag,
             sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
             buf_addr,
             io_cmd_result,
+        )?;
+        Ok(())
+    }
+
+    /// Submit one ublk io command asynchronously: the op-slab analog of
+    /// `__queue_io_cmd`. The returned future resolves to the command's
+    /// CQE result (the next incoming io for FETCH/COMMIT_AND_FETCH).
+    #[inline]
+    fn submit_io_cmd_async(
+        &self,
+        tag: u16,
+        cmd_op: u32,
+        buf_addr: u64,
+        sqe_addr: Option<u64>,
+        result: i32,
+    ) -> Result<RawOp, UblkError> {
+        let mut state = self.state.borrow_mut();
+        if state.is_stopping() {
+            return Err(UblkError::QueueIsDown);
+        }
+
+        log::trace!(
+            "submit_io_cmd_async: (qid {} flags {:x} tag {} cmd_op {}) buf_addr {:x}",
+            self.q_id,
+            self.flags,
+            tag,
+            cmd_op,
+            buf_addr,
         );
-    }
 
-    /// Submit one io command.
-    ///
-    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_io_commit_cmd`] instead.
-    ///
-    /// **IMPORTANT:** `UBLK_DEV_F_MLOCK_IO_BUFFER` is not supported with this deprecated API.
-    /// For mlock functionality, use the unified APIs: `submit_io_prep_cmd()`, `submit_io_commit_cmd()`,
-    /// `submit_fetch_commands_unified()` and `complete_io_cmd_unified()`.
-    ///
-    /// When it is called 1st time on this tag, the `cmd_op` has to be
-    /// UBLK_U_IO_FETCH_REQ, otherwise it is UBLK_U_IO_COMMIT_AND_FETCH_REQ.
-    ///
-    /// UblkUringOpFuture is one Future object, so this function is actually
-    /// one async function, and user can get result by submit_io_cmd().await
-    ///
-    /// Once result is returned, it means this command is completed and
-    /// one ublk IO command is coming from ublk driver.
-    ///
-    /// In case of zoned, `buf_addr` can be the returned LBA for zone append
-    /// command.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead, removed in 0.6"
-    )]
-    #[inline]
-    pub fn submit_io_cmd(
-        &self,
-        tag: u16,
-        cmd_op: u32,
-        buf_addr: *mut u8,
-        result: i32,
-    ) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            self.__queue_io_cmd(r, tag, cmd_op, buf_addr as u64, None, user_data, result)
-        });
-
-        f
-    }
-
-    /// Submit io command with auto buffer registration support
-    ///
-    /// **OBSOLETED:** This method is obsoleted. Use [`UblkQueue::submit_io_prep_cmd`] and [`UblkQueue::submit_io_commit_cmd`] instead.
-    ///
-    /// For UBLK_F_AUTO_BUF_REG, the buffer index and flags are passed via buf_reg_data.
-    /// When auto buffer registration is enabled, buf_addr should be set to the encoded
-    /// auto buffer registration data instead of the actual buffer address.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_io_prep_cmd` and `submit_io_commit_cmd` instead, removed in 0.6"
-    )]
-    #[inline]
-    pub fn submit_io_cmd_with_auto_buf_reg(
-        &self,
-        tag: u16,
-        cmd_op: u32,
-        buf_reg_data: &sys::ublk_auto_buf_reg,
-        result: i32,
-    ) -> UblkUringOpFuture {
-        let auto_buf_addr = Some(bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data));
-
-        let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            self.__queue_io_cmd(r, tag, cmd_op, 0, auto_buf_addr, user_data, result)
-        });
-
-        f
+        let op = Op::submit_io_cmd(
+            |key| self.build_io_cmd_sqe(tag, cmd_op, buf_addr, sqe_addr, result, key),
+            Resources::None,
+        )?;
+        state.inc_cmd_inflight();
+        Ok(RawOp::new(op))
     }
 
     /// Submit io command using unified buffer descriptor
@@ -1774,13 +1757,11 @@ impl UblkQueue<'_> {
     ///
     /// # Returns:
     ///
-    /// * `Ok(UblkUringOpFuture)` - Future that can be awaited for command completion
+    /// * `Ok(RawOp)` - Future that can be awaited for command completion
     /// * `Err(UblkError)` - Error if buffer descriptor is incompatible with device capabilities
     ///
     /// This unified method provides a single API for submitting IO commands with both
-    /// buffer slice and auto buffer registration modes. It dispatches to the appropriate
-    /// existing method based on the buffer descriptor type while maintaining zero-cost
-    /// abstraction principles.
+    /// buffer slice and auto buffer registration modes.
     ///
     /// # Buffer Descriptor Compatibility:
     ///
@@ -1799,41 +1780,34 @@ impl UblkQueue<'_> {
         cmd_op: u32,
         buf_desc: BufDesc,
         result: i32,
-    ) -> Result<UblkUringOpFuture, UblkError> {
+    ) -> Result<RawOp, UblkError> {
         // Validate buffer descriptor compatibility with device capabilities
         buf_desc.validate_compatibility(self.dev_flags)?;
 
-        // Dispatch to appropriate method based on buffer descriptor type
-        let future = match buf_desc {
+        // Map the buffer descriptor onto the io command's addr field (or
+        // the auto-buf-reg SQE addr override)
+        let (buf_addr, sqe_addr) = match buf_desc {
             BufDesc::Slice(slice) => {
-                // For slice operations, return null pointer if slice is empty (user_copy mode)
-                let buf_addr = if slice.len() == 0 {
-                    std::ptr::null_mut()
+                // For slice operations, pass a null address if the slice is
+                // empty (user_copy mode)
+                let buf_addr = if slice.is_empty() {
+                    0
                 } else {
-                    slice.as_ptr() as *mut u8
+                    slice.as_ptr() as u64
                 };
-                #[allow(deprecated)]
-                self.submit_io_cmd(tag, cmd_op, buf_addr, result)
+                (buf_addr, None)
             }
-            BufDesc::AutoReg(buf_reg_data) => {
-                // For auto buffer registration, use the specialized method
-                #[allow(deprecated)]
-                self.submit_io_cmd_with_auto_buf_reg(tag, cmd_op, &buf_reg_data, result)
-            }
-            BufDesc::ZonedAppendLba(lba) => {
-                // For zoned append LBA, pass the LBA value as the buffer address
-                #[allow(deprecated)]
-                self.submit_io_cmd(tag, cmd_op, lba as *mut u8, result)
-            }
-            BufDesc::RawAddress(addr) => {
-                // For raw address operations, use the address directly
-                // SAFETY: The caller is responsible for ensuring the address is valid
-                #[allow(deprecated)]
-                self.submit_io_cmd(tag, cmd_op, addr as *mut u8, result)
-            }
+            BufDesc::AutoReg(buf_reg_data) => (
+                0,
+                Some(bindings::ublk_auto_buf_reg_to_sqe_addr(&buf_reg_data)),
+            ),
+            // For zoned append, the LBA rides the buffer address field
+            BufDesc::ZonedAppendLba(lba) => (lba, None),
+            // SAFETY: the caller is responsible for the raw address' validity
+            BufDesc::RawAddress(addr) => (addr as u64, None),
         };
 
-        Ok(future)
+        self.submit_io_cmd_async(tag, cmd_op, buf_addr, sqe_addr, result)
     }
 
     /// Submit I/O preparation command (UBLK_U_IO_FETCH_REQ)
@@ -1984,74 +1958,55 @@ impl UblkQueue<'_> {
         }
     }
 
-    pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        crate::uring_async::__ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).unwrap()
+    /// Submit one target-IO SQE on the queue ring, returning a future of
+    /// its CQE result. The entry's `user_data` is overwritten with the op
+    /// key.
+    ///
+    /// # Safety
+    ///
+    /// Any memory the SQE references must stay valid until the CQE is
+    /// reaped — queue-slot buffers satisfy this by construction; see
+    /// [`crate::ops::submit_sqe`] (which this delegates to) for the full
+    /// contract.
+    pub unsafe fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> Result<RawOp, UblkError> {
+        unsafe { crate::ops::submit_sqe(sqe) }
     }
 
+    /// Submit one target-IO SQE for the sync event loop. `data` is the
+    /// handler word built by [`UblkIOCtx::build_user_data`] (with the
+    /// target bit set); it is delivered back to the IO closure via
+    /// `UblkIOCtx::user_data()` when the CQE arrives, while the on-ring
+    /// `user_data` is a slab key owned by the op layer.
     #[inline]
-    pub fn ublk_submit_sqe_sync(&self, sqe: io_uring::squeue::Entry) -> Result<(), UblkError> {
-        loop {
-            let res = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| unsafe {
-                ring.submission().push(&sqe)
-            });
-
-            match res {
-                Ok(_) => break,
-                Err(_) => {
-                    log::debug!("ublk_submit_sqe: flush and retry");
-                    with_queue_ring_internal!(
-                        |ring: &IoUring<squeue::Entry>| ring.submit_and_wait(0)
-                    )?;
-                }
-            }
-        }
-
-        Ok(())
+    pub fn ublk_submit_sqe_sync(
+        &self,
+        sqe: io_uring::squeue::Entry,
+        data: u64,
+    ) -> Result<(), UblkError> {
+        crate::op::submit_sync(|key| sqe.user_data(key), data, false)
     }
 
-    fn submit_reg_unreg_io_buf(&self, op: u32, tag: u16, buf_index: u16) -> UblkUringOpFuture {
-        let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
-
-        let io_cmd = sys::ublksrv_io_cmd {
-            tag,
-            addr: buf_index as u64,
-            q_id: self.q_id,
-            result: 0,
-        };
-
-        let cmd_op = if !self.is_ioctl_encode() {
-            op & 0xff
-        } else {
-            op
-        };
-
-        let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
-            .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
-            .build()
-            .user_data(user_data);
-
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            loop {
-                let res = unsafe { r.submission().push(&sqe) };
-                match res {
-                    Ok(_) => break,
-                    Err(_) => {
-                        log::debug!("submit_register_io_buf: flush and retry");
-                        r.submit_and_wait(0).unwrap();
-                    }
-                }
-            }
-        });
-
-        f
+    fn submit_reg_unreg_io_buf(
+        &self,
+        op: u32,
+        tag: u16,
+        buf_index: u16,
+    ) -> Result<RawOp, UblkError> {
+        // REGISTER/UNREGISTER_IO_BUF are not counted as io commands: they
+        // never carry an incoming io, so the queue-state accounting must
+        // not observe their completions.
+        let o = Op::submit(
+            |key| self.build_io_cmd_sqe(tag, op, buf_index as u64, None, 0, key),
+            Resources::None,
+        )?;
+        Ok(RawOp::new(o))
     }
     /// Submit manual buffer registration command
     ///
     /// Used when UBLK_F_AUTO_BUF_REG is enabled but auto registration fails
     /// and UBLK_AUTO_BUF_REG_FALLBACK was used.
     #[inline]
-    pub fn submit_register_io_buf(&self, tag: u16, buf_index: u16) -> UblkUringOpFuture {
+    pub fn submit_register_io_buf(&self, tag: u16, buf_index: u16) -> Result<RawOp, UblkError> {
         self.submit_reg_unreg_io_buf(sys::UBLK_U_IO_REGISTER_IO_BUF, tag, buf_index)
     }
 
@@ -2059,7 +2014,7 @@ impl UblkQueue<'_> {
     ///
     /// Used when UBLK_F_AUTO_BUF_REG is enabled to manually unregister buffers.
     #[inline]
-    pub fn submit_unregister_io_buf(&self, tag: u16, buf_index: u16) -> UblkUringOpFuture {
+    pub fn submit_unregister_io_buf(&self, tag: u16, buf_index: u16) -> Result<RawOp, UblkError> {
         self.submit_reg_unreg_io_buf(sys::UBLK_U_IO_UNREGISTER_IO_BUF, tag, buf_index)
     }
 
@@ -2074,11 +2029,7 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_fetch_commands_unified` instead, removed in 0.6"
-    )]
-    pub fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
+    fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Result<Self, UblkError> {
         for i in 0..self.q_depth {
             let buf_addr = match bufs {
                 Some(b) => b[i as usize].as_mut_ptr(),
@@ -2088,17 +2039,9 @@ impl UblkQueue<'_> {
             assert!(
                 ((self.dev_flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0) == bufs.is_none()
             );
-            with_queue_ring_mut_internal!(|ring| {
-                self.queue_io_cmd(
-                    ring,
-                    i as u16,
-                    sys::UBLK_U_IO_FETCH_REQ,
-                    buf_addr as u64,
-                    -1,
-                )
-            });
+            self.queue_io_cmd(i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr as u64, -1)?;
         }
-        self
+        Ok(self)
     }
 
     /// Submit all commands for fetching IO with auto buffer registration
@@ -2114,14 +2057,10 @@ impl UblkQueue<'_> {
     /// Only called during queue initialization. After queue is setup,
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `submit_fetch_commands_unified` instead, removed in 0.6"
-    )]
-    pub fn submit_fetch_commands_with_auto_buf_reg(
+    fn submit_fetch_commands_with_auto_buf_reg(
         self,
         buf_reg_data_list: &[sys::ublk_auto_buf_reg],
-    ) -> Self {
+    ) -> Result<Self, UblkError> {
         assert!(
             self.support_auto_buf_zc(),
             "Auto buffer registration not supported"
@@ -2136,19 +2075,16 @@ impl UblkQueue<'_> {
             let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
             let data = UblkIOCtx::build_user_data(i as u16, sys::UBLK_U_IO_FETCH_REQ, 0, false);
 
-            with_queue_ring_mut_internal!(|ring| {
-                self.__queue_io_cmd(
-                    ring,
-                    i as u16,
-                    sys::UBLK_U_IO_FETCH_REQ,
-                    0,
-                    Some(auto_buf_addr),
-                    data,
-                    -1,
-                )
-            });
+            self.__queue_io_cmd(
+                i as u16,
+                sys::UBLK_U_IO_FETCH_REQ,
+                0,
+                Some(auto_buf_addr),
+                data,
+                -1,
+            )?;
         }
-        self
+        Ok(self)
     }
 
     /// Submit all commands for fetching IO using unified buffer descriptor list
@@ -2168,7 +2104,7 @@ impl UblkQueue<'_> {
     /// abstraction principles.
     ///
     /// When buffer slices are provided, this method automatically registers the IO buffers
-    /// before submitting fetch commands, eliminating the need for manual `regiser_io_bufs()` calls.
+    /// before submitting fetch commands, eliminating the need for manual buffer registration.
     ///
     /// # Buffer Descriptor List Compatibility:
     ///
@@ -2200,11 +2136,9 @@ impl UblkQueue<'_> {
                 }
 
                 // Automatically register IO buffers if provided and not in zero-copy mode
-                let queue_with_buffers = self.regiser_io_bufs(slice_opt);
+                let queue_with_buffers = self.register_io_bufs(slice_opt);
 
-                // Dispatch to existing submit_fetch_commands method
-                #[allow(deprecated)]
-                Ok(queue_with_buffers.submit_fetch_commands(slice_opt))
+                queue_with_buffers.submit_fetch_commands(slice_opt)
             }
             BufDescList::AutoRegs(auto_reg_slice) => {
                 // AutoReg operations require UBLK_F_AUTO_BUF_REG
@@ -2215,20 +2149,17 @@ impl UblkQueue<'_> {
                 // For auto buffer registration, add permits since buffers aren't registered through register_io_buf
                 self.buf_reg_semaphore.add_permits(self.q_depth as usize);
 
-                // Dispatch to existing submit_fetch_commands_with_auto_buf_reg method
-                #[allow(deprecated)]
-                Ok(self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice))
+                self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice)
             }
         }
     }
 
-    fn __submit_fetch_commands(&self) {
+    fn __submit_fetch_commands(&self) -> Result<(), UblkError> {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as u16) as u64;
-            with_queue_ring_mut_internal!(|ring| {
-                self.queue_io_cmd(ring, i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr, -1)
-            });
+            self.queue_io_cmd(i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr, -1)?;
         }
+        Ok(())
     }
 
     /// Complete one io command
@@ -2238,61 +2169,33 @@ impl UblkQueue<'_> {
     /// # Arguments:
     ///
     /// * `tag`: io command tag
-    /// * `res`: io command result
+    /// * `res`: io command result: bytes transferred, or a negative errno
     ///
     /// When calling this API, target code has to make sure that thread-local QUEUE_RING
     /// won't be borrowed.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `complete_io_cmd_unified` instead, removed in 0.6"
-    )]
     #[inline]
-    pub fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            match res {
-                Ok(UblkIORes::Result(res))
-                | Err(UblkError::OtherError(res))
-                | Err(UblkError::UringIOError(res)) => {
-                    self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, res);
-                }
-                Err(UblkError::UringIoQueued) => {}
-                #[cfg(feature = "fat_complete")]
-                Ok(UblkIORes::FatRes(fat)) => match fat {
-                    UblkFatRes::BatchRes(ios) => {
-                        assert!(self.support_comp_batch());
-                        for item in ios {
-                            let tag = item.0;
-                            self.commit_and_queue_io_cmd(r, tag, buf_addr as u64, item.1);
-                        }
-                    }
-                    UblkFatRes::ZonedAppendRes((res, lba)) => {
-                        self.commit_and_queue_io_cmd(r, tag, lba, res);
-                    }
-                },
-                _ => {}
-            }
-        });
+    fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: i32) -> Result<(), UblkError> {
+        self.commit_and_queue_io_cmd(tag, buf_addr as u64, res)
     }
 
     #[inline(always)]
     fn commit_and_queue_io_cmd_with_auto_buf_reg(
         &self,
-        r: &mut IoUring<squeue::Entry>,
         tag: u16,
         buf_reg_data: &sys::ublk_auto_buf_reg,
         io_cmd_result: i32,
-    ) {
+    ) -> Result<(), UblkError> {
         let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
         let data = UblkIOCtx::build_user_data(tag, sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ, 0, false);
         self.__queue_io_cmd(
-            r,
             tag,
             sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ,
             0,
             Some(auto_buf_addr),
             data,
             io_cmd_result,
-        );
+        )?;
+        Ok(())
     }
 
     /// Complete one io command with auto buffer registration
@@ -2303,58 +2206,19 @@ impl UblkQueue<'_> {
     ///
     /// * `tag`: io command tag
     /// * `buf_reg_data`: auto buffer registration data containing buffer index and flags
-    /// * `res`: io command result
+    /// * `res`: io command result: bytes transferred, or a negative errno
     ///
     /// This method supports zero-copy operations when UBLK_F_AUTO_BUF_REG is enabled.
     /// The buffer is automatically registered using the provided registration data.
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
-    #[deprecated(
-        since = "0.5.0",
-        note = "Use `complete_io_cmd_unified` instead, removed in 0.6"
-    )]
     #[inline]
-    pub fn complete_io_cmd_with_auto_buf_reg(
+    fn complete_io_cmd_with_auto_buf_reg(
         &self,
         tag: u16,
         buf_reg_data: &sys::ublk_auto_buf_reg,
-        res: Result<UblkIORes, UblkError>,
-    ) {
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-            match res {
-                Ok(UblkIORes::Result(res))
-                | Err(UblkError::OtherError(res))
-                | Err(UblkError::UringIOError(res)) => {
-                    self.commit_and_queue_io_cmd_with_auto_buf_reg(r, tag, buf_reg_data, res);
-                }
-                Err(UblkError::UringIoQueued) => {}
-                #[cfg(feature = "fat_complete")]
-                Ok(UblkIORes::FatRes(fat)) => match fat {
-                    UblkFatRes::BatchRes(ios) => {
-                        assert!(self.support_comp_batch());
-                        for item in ios {
-                            let tag = item.0;
-                            self.commit_and_queue_io_cmd_with_auto_buf_reg(
-                                r,
-                                tag,
-                                buf_reg_data,
-                                item.1,
-                            );
-                        }
-                    }
-                    UblkFatRes::ZonedAppendRes((res, lba)) => {
-                        let mut buf_reg_data_for_zoned = *buf_reg_data;
-                        buf_reg_data_for_zoned.index = (lba & 0xffff) as u16;
-                        self.commit_and_queue_io_cmd_with_auto_buf_reg(
-                            r,
-                            tag,
-                            &buf_reg_data_for_zoned,
-                            res,
-                        );
-                    }
-                },
-                _ => {}
-            }
-        });
+        res: i32,
+    ) -> Result<(), UblkError> {
+        self.commit_and_queue_io_cmd_with_auto_buf_reg(tag, buf_reg_data, res)
     }
 
     /// Complete one io command using unified buffer descriptor
@@ -2363,7 +2227,7 @@ impl UblkQueue<'_> {
     ///
     /// * `tag`: io command tag
     /// * `buf_desc`: unified buffer descriptor supporting both copy and zero-copy operations
-    /// * `res`: io command result
+    /// * `res`: io command result: bytes transferred, or a negative errno
     ///
     /// This unified method provides a single API for completing IO commands with both
     /// buffer slice and auto buffer registration modes. It dispatches to the appropriate
@@ -2391,7 +2255,7 @@ impl UblkQueue<'_> {
         &self,
         tag: u16,
         buf_desc: BufDesc,
-        res: Result<UblkIORes, UblkError>,
+        res: i32,
     ) -> Result<(), UblkError> {
         // Validate buffer descriptor compatibility with device capabilities
         buf_desc.validate_compatibility(self.dev_flags)?;
@@ -2408,28 +2272,20 @@ impl UblkQueue<'_> {
                 } else {
                     slice.as_ptr() as *mut u8
                 };
-                #[allow(deprecated)]
-                self.complete_io_cmd(tag, buf_addr, res);
-                Ok(())
+                self.complete_io_cmd(tag, buf_addr, res)
             }
             BufDesc::AutoReg(buf_reg_data) => {
                 // For auto buffer registration, use the specialized method
-                #[allow(deprecated)]
-                self.complete_io_cmd_with_auto_buf_reg(tag, &buf_reg_data, res);
-                Ok(())
+                self.complete_io_cmd_with_auto_buf_reg(tag, &buf_reg_data, res)
             }
             BufDesc::ZonedAppendLba(lba) => {
                 // For zoned append LBA, pass the LBA value as the buffer address
-                #[allow(deprecated)]
-                self.complete_io_cmd(tag, lba as *mut u8, res);
-                Ok(())
+                self.complete_io_cmd(tag, lba as *mut u8, res)
             }
             BufDesc::RawAddress(addr) => {
                 // For raw address operations, use the address directly
                 // SAFETY: The caller is responsible for ensuring the address is valid
-                #[allow(deprecated)]
-                self.complete_io_cmd(tag, addr as *mut u8, res);
-                Ok(())
+                self.complete_io_cmd(tag, addr as *mut u8, res)
             }
         }
     }
@@ -2447,10 +2303,7 @@ impl UblkQueue<'_> {
             aborted,
             state,
         );
-        state.sub_cmd_inflight(cnt);
-        if aborted {
-            state.mark_stopping();
-        }
+        state.account_io_cmds(cnt, aborted);
     }
 
     #[inline(always)]
@@ -2546,18 +2399,9 @@ impl UblkQueue<'_> {
         return false;
     }
 
-    /// Return inflight IOs being handled by target code
-    #[deprecated(
-        since = "0.5.0",
-        note = "will be removed in 0.6.0 - it is easier for target code to count inflight IOs themselves"
-    )]
     #[inline]
-    pub fn get_inflight_nr_io(&self) -> u32 {
-        self.q_depth - self.state.borrow().get_nr_cmd_inflight()
-    }
-
-    #[inline]
-    fn __wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
+    /// Returns `Ok(None)` when the bounded wait timed out with no CQE.
+    fn __wait_ios(&self, to_wait: usize) -> Result<Option<i32>, UblkError> {
         let ts = types::Timespec::new().sec(Self::UBLK_QUEUE_IDLE_SECS as u64);
         let args = types::SubmitArgs::new().timespec(&ts);
 
@@ -2591,7 +2435,7 @@ impl UblkQueue<'_> {
             let ret = r.submitter().submit_with_args(to_wait, &args);
             match ret {
                 Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
-                    return Err(UblkError::UringTimeout);
+                    return Ok(None);
                 }
                 Err(err) => return Err(UblkError::IOError(err)),
                 Ok(_) => {}
@@ -2604,20 +2448,20 @@ impl UblkQueue<'_> {
                 state.is_stopping(),
                 state.is_idle(),
             );
-            Ok(nr_cqes)
+            Ok(Some(nr_cqes))
         })
     }
 
     #[inline]
     fn wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
-        match self.__wait_ios(to_wait) {
-            Ok(nr_cqes) => {
+        match self.__wait_ios(to_wait)? {
+            Some(nr_cqes) => {
                 if nr_cqes > 0 {
                     self.exit_queue_idle();
                 }
                 Ok(nr_cqes)
             }
-            Err(UblkError::UringTimeout) => {
+            None => {
                 with_queue_ring_mut_internal!(|r: &mut IoUring<io_uring::squeue::Entry>| {
                     if r.submission().is_empty() {
                         self.enter_queue_idle();
@@ -2625,7 +2469,6 @@ impl UblkQueue<'_> {
                 });
                 Ok(0)
             }
-            Err(err) => Err(err),
         }
     }
 
@@ -2648,9 +2491,10 @@ impl UblkQueue<'_> {
     /// closure.
     ///
     /// If IO is super fast to complete, such as ramdisk, this request can
-    /// be handled directly in the closure, and return `Ok(UblkIORes::Result)`
-    /// to complete the IO command originated from ublk driver. Another
-    /// example is null target(null.rs).
+    /// be handled directly in the closure, and the io command originated
+    /// from ublk driver is completed with the raw result (bytes
+    /// transferred, or a negative errno). Another example is null
+    /// target(null.rs).
     ///
     /// Most of times, IO is slow, so it needs to be handled asynchronously.
     /// The preferred way is to submit target IO by io_uring in IO handling
@@ -2658,15 +2502,15 @@ impl UblkQueue<'_> {
     /// target IO is completed, one io_uring CQE will be received, and the
     /// same IO closure is called for handling this target IO, which can be
     /// checked by `UblkIOCtx::is_tgt_io()` method. Finally if the coming
-    /// target IO completion means the original IO command is done,
-    /// `Ok(UblkIORes::Result)` is returned for moving on, otherwise UblkError::IoQueued
-    /// can be returned and the IO handling closure can continue to submit IO
-    /// or whatever for driving its IO logic.
+    /// target IO completion means the original IO command is done, the io
+    /// command is completed with the raw result, otherwise the IO handling
+    /// closure can continue to submit IO or whatever for driving its IO
+    /// logic.
     ///
     /// Not all target IO logics can be done by io_uring, such as some
     /// handling needs extra computation, which often require to offload IO
     /// in another context. However, when target IO is done in remote offload
-    /// context, `Ok(UblkIORes::Result)` has to be returned from the queue/
+    /// context, the io command has to be completed from the queue/
     /// io_uring context. One approach is to use eventfd to wakeup & notify
     /// ublk queue/io_uring. Here, eventfd can be thought as one special target
 
@@ -2686,9 +2530,10 @@ impl UblkQueue<'_> {
         loop {
             let mut is_first = true;
             let result = self.flush_and_wake_io_tasks(
-                |_user_data, cqe, is_last| {
+                |user_data, cqe, is_last| {
                     let ctx = UblkIOCtx(
                         cqe,
+                        user_data,
                         if is_first {
                             is_first = false;
                             UblkIOCtx::UBLK_IO_F_FIRST
@@ -2718,7 +2563,10 @@ impl UblkQueue<'_> {
     ///
     /// # Arguments:
     ///
-    /// * `wake_handler`: handler for wakeup io tasks pending on this uring
+    /// * `wake_handler`: handler called per drained CQE with the handler
+    /// word stored at submission (`UblkIOCtx::build_user_data` format),
+    /// resolved through the op slab — the on-ring `user_data` is a slab
+    /// key, see the keyspace contract in the `op` module.
     ///
     /// * `to_wait`: passed to io_uring_enter(), wait until `to_wait` events
     /// are available. It won't block in waiting for events if `to_wait` is
@@ -2768,13 +2616,30 @@ impl UblkQueue<'_> {
                     };
 
                     let user_data = cqe.user_data();
-                    if UblkIOCtx::is_io_command(user_data) {
+                    let resolved = match crate::op::classify_user_data(user_data) {
+                        // SQEs pushed on the ring directly (e.g. by the
+                        // batch transport, whose multishot fetches cannot
+                        // ride a single-shot slab entry) keep their own
+                        // target-bit user_data; deliver it untouched.
+                        crate::op::CqeOwner::Target => Some((user_data, false)),
+                        crate::op::CqeOwner::Sentinel => None,
+                        crate::op::CqeOwner::Op(key) => {
+                            crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
+                        }
+                    };
+                    let Some((data, is_io_cmd)) = resolved else {
+                        // Reserved sentinel or op-future CQE (delivered to
+                        // its future by take_sync_entry): nothing for the
+                        // sync handler.
+                        continue;
+                    };
+                    if is_io_cmd {
                         cmd_cnt += 1;
                         if cqe.result() == sys::UBLK_IO_RES_ABORT {
                             aborted = true;
                         }
                     }
-                    wake_handler(user_data, &cqe, i == done - 1);
+                    wake_handler(data, &cqe, i == done - 1);
                 }
                 if cmd_cnt > 0 {
                     self.update_state_batch(cmd_cnt, aborted);
@@ -2785,14 +2650,65 @@ impl UblkQueue<'_> {
     }
 }
 
+/// Layout checks for the [`RawSqe`] view. Pure layout, so they run in
+/// the reactor-only configuration too.
 #[cfg(test)]
+mod raw_sqe_layout {
+    use super::{AsRawSqe, RawSqe};
+    use io_uring::{opcode, squeue, types};
+
+    /// The compile-time asserts fix RawSqe's size and alignment, but
+    /// not where each field sits. Build entries whose values the
+    /// io-uring builders place for us, then read them back through the
+    /// view: if either side reorders a field, this fails.
+    #[test]
+    fn fields_land_where_the_builders_put_them() {
+        const FD: i32 = 0x1234_5678;
+        const ADDR: u64 = 0xdead_beef;
+        const LEN: u32 = 0x1122_3344;
+        const OFF: u64 = 0x5566_7788_99aa_bbcc;
+
+        let mut sqe = opcode::Read::new(types::Fd(FD), ADDR as *mut u8, LEN)
+            .offset(OFF)
+            .build();
+        let raw: &mut RawSqe = sqe.as_raw_sqe();
+        assert_eq!(raw.fd, FD, "fd moved");
+        assert_eq!(raw.off, OFF, "off moved");
+        assert_eq!(raw.addr, ADDR, "addr moved");
+        assert_eq!(raw.len, LEN, "len moved");
+        assert_eq!(raw.opcode, u8::from(opcode::Read::CODE), "opcode moved");
+
+        // buf_index and ioprio are the two fields override_sqe! exists
+        // for, so pin them against builders that do set them.
+        const IDX: u16 = 0x0abc;
+        let mut fixed = opcode::ReadFixed::new(types::Fd(FD), ADDR as *mut u8, LEN, IDX).build();
+        assert_eq!(fixed.as_raw_sqe().buf_index, IDX, "buf_index moved");
+
+        const ZC_FLAGS: u16 = 1 << 3;
+        let mut zc = opcode::SendZc::new(types::Fd(FD), ADDR as *const u8, LEN)
+            .zc_flags(ZC_FLAGS)
+            .build();
+        assert_eq!(zc.as_raw_sqe().ioprio, ZC_FLAGS, "ioprio moved");
+    }
+
+    /// user_data is written by the op layer through io-uring's own
+    /// setter, so the view must agree with it on placement.
+    #[test]
+    fn user_data_agrees_with_the_io_uring_setter() {
+        const KEY: u64 = 0x4242_4242_4242_4242;
+        let mut sqe: squeue::Entry = opcode::Nop::new().build().user_data(KEY);
+        assert_eq!(sqe.as_raw_sqe().user_data, KEY, "user_data moved");
+    }
+}
+
+// These tests drive real devices through UblkRuntime.
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use crate::ctrl::UblkCtrlBuilder;
     use crate::io::{with_task_io_ring, with_task_io_ring_mut, BufDesc, UblkDev, UblkQueue};
-    use crate::test_helpers::{device_handler_async, ublk_join_tasks};
+    use crate::test_helpers::device_handler_async;
     use crate::{sys, UblkError, UblkFlags};
     use io_uring::IoUring;
-    use std::rc::Rc;
 
     fn __submit_uring_nop(ring: &mut IoUring<io_uring::squeue::Entry>) -> Result<usize, UblkError> {
         let nop_e = io_uring::opcode::Nop::new().build().user_data(0x42).into();
@@ -2812,25 +2728,22 @@ mod tests {
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut UblkDev| {
-            let _q = UblkQueue::new(0, dev)?;
-            with_task_io_ring(|ring: &IoUring<io_uring::squeue::Entry>| {
-                // unregister_files() might fail if no files are registered - that's OK
-                let _ = ring.submitter().unregister_files();
-                ring.submitter()
-                    .register_files(&dev.tgt.fds)
-                    .map_err(UblkError::IOError)
-            })?;
-            with_task_io_ring_mut(
-                |ring: &mut IoUring<io_uring::squeue::Entry>| -> Result<usize, UblkError> {
-                    __submit_uring_nop(ring)
-                },
-            )?;
-
-            Ok(())
-        };
-
-        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+        let dev = std::sync::Arc::new(UblkDev::new(ctrl.get_name(), |_| Ok(()), &ctrl).unwrap());
+        let _q = UblkQueue::new(0, &dev).unwrap();
+        with_task_io_ring(|ring: &IoUring<io_uring::squeue::Entry>| {
+            // unregister_files() might fail if no files are registered - that's OK
+            let _ = ring.submitter().unregister_files();
+            ring.submitter()
+                .register_files(&dev.tgt.fds)
+                .map_err(UblkError::IOError)
+        })
+        .unwrap();
+        with_task_io_ring_mut(
+            |ring: &mut IoUring<io_uring::squeue::Entry>| -> Result<usize, UblkError> {
+                __submit_uring_nop(ring)
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2840,8 +2753,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut UblkDev| {
-            let queue = UblkQueue::new(0, dev)?;
+        let dev = std::sync::Arc::new(UblkDev::new(ctrl.get_name(), |_| Ok(()), &ctrl).unwrap());
+        let queue = UblkQueue::new(0, &dev).unwrap();
+        let run = || -> Result<(), UblkError> {
             let target = crate::UblkUringData::Target as u64;
             let deferred_user_data = target | 0x41;
             let ring_user_data = target | 0x42;
@@ -2887,7 +2801,7 @@ mod tests {
             Ok(())
         };
 
-        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+        run().unwrap();
     }
 
     #[test]
@@ -3096,8 +3010,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let tgt_init = |dev: &mut _| {
-            let q = UblkQueue::new(0, dev)?;
+        let dev = std::sync::Arc::new(UblkDev::new(ctrl.get_name(), |_| Ok(()), &ctrl).unwrap());
+        {
+            let q = UblkQueue::new(0, &dev).unwrap();
 
             // Test that semaphore starts with 0 permits
             assert!(
@@ -3166,10 +3081,7 @@ mod tests {
             assert!(permit2.is_some(), "Should have multiple permits available");
 
             println!("Optimized buffer registration synchronization test completed successfully");
-            Ok(())
-        };
-
-        UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+        }
     }
 
     #[test]
@@ -3257,19 +3169,12 @@ mod tests {
 
     #[test]
     fn test_mlock_failure() {
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-
-        let io_task = exe_rc.spawn(async {
+        crate::test_helpers::ublk_block_on_ctrl(async {
             device_handler_async(
                 UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER,
             )
             .await
             .unwrap();
         });
-
-        smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![io_task]);
-        }));
     }
 }

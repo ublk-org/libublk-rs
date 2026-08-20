@@ -202,18 +202,18 @@ impl InflightCommit {
     }
 }
 
-struct BufferRegistrationGuard<'queue, 'dev> {
-    queue: &'queue UblkQueue<'dev>,
+struct BufferRegistrationGuard<'queue> {
+    queue: &'queue UblkQueue,
     completed: bool,
 }
 
-impl BufferRegistrationGuard<'_, '_> {
+impl BufferRegistrationGuard<'_> {
     fn complete(&mut self) {
         self.completed = true;
     }
 }
 
-impl Drop for BufferRegistrationGuard<'_, '_> {
+impl Drop for BufferRegistrationGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
             self.queue.dev.notify_queue_setup_failed();
@@ -291,8 +291,9 @@ impl Drop for BufferGroupRegistration {
 ///     UblkQueue,
 /// };
 /// use libublk::UblkError;
+/// use std::sync::Arc;
 ///
-/// fn handle_queue(qid: u16, dev: &UblkDev) -> Result<(), UblkError> {
+/// fn handle_queue(qid: u16, dev: &Arc<UblkDev>) -> Result<(), UblkError> {
 ///     let queue = UblkQueue::new(qid, dev)?;
 ///     let buffers = dev.alloc_queue_io_bufs();
 ///     let mut batch = UblkBatchQueue::new(
@@ -343,8 +344,8 @@ impl Drop for BufferGroupRegistration {
 ///     Ok(())
 /// }
 /// ```
-pub struct UblkBatchQueue<'queue, 'dev> {
-    queue: &'queue UblkQueue<'dev>,
+pub struct UblkBatchQueue<'queue> {
+    queue: &'queue UblkQueue,
     buffers: Vec<IoBuf<u8>>,
     fetch_buffers: Vec<Box<[u16]>>,
     config: UblkBatchConfig,
@@ -363,7 +364,7 @@ pub struct UblkBatchQueue<'queue, 'dev> {
     shutdown_complete: bool,
 }
 
-impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
+impl<'queue> UblkBatchQueue<'queue> {
     /// Prepare all queue tags and start the configured multishot batch fetches.
     ///
     /// The batch queue owns `buffers` because their addresses are supplied to
@@ -390,7 +391,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     /// queue. Returns `EADDRINUSE` if another batch queue on that ring already
     /// owns the configured fetch buffer group.
     pub fn new(
-        queue: &'queue UblkQueue<'dev>,
+        queue: &'queue UblkQueue,
         buffers: UblkBatchBuffers,
         config: UblkBatchConfig,
     ) -> Result<Self, UblkError> {
@@ -495,7 +496,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
 
     /// Return the underlying ublk queue.
     #[inline(always)]
-    pub fn queue(&self) -> &UblkQueue<'dev> {
+    pub fn queue(&self) -> &UblkQueue {
         self.queue
     }
 
@@ -729,7 +730,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     }
 
     fn validate(
-        queue: &UblkQueue<'_>,
+        queue: &UblkQueue,
         buffers: &[IoBuf<u8>],
         config: UblkBatchConfig,
     ) -> Result<(), UblkError> {
@@ -742,7 +743,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
         )
     }
 
-    fn prepare_tags(queue: &UblkQueue<'_>, buffers: &[IoBuf<u8>]) -> Result<(), UblkError> {
+    fn prepare_tags(queue: &UblkQueue, buffers: &[IoBuf<u8>]) -> Result<(), UblkError> {
         let elements = buffers
             .iter()
             .enumerate()
@@ -787,7 +788,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
             remaining.as_ptr() as u64,
             batch_user_data(BATCH_COMMIT_OP, self.queue.get_qid(), commit_id),
         );
-        self.queue.ublk_submit_sqe_sync(entry)
+        push_batch_sqe(&entry)
     }
 
     fn handle_commit_cqe(&mut self, commit_id: u16, result: i32) -> Result<(), UblkError> {
@@ -919,7 +920,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
             self.config.fetch_buffer_group,
             batch_user_data(BATCH_REMOVE_OP, self.queue.get_qid(), 0),
         );
-        self.queue.ublk_submit_sqe_sync(entry)
+        push_batch_sqe(&entry)
     }
 
     fn handle_remove_cqe(&mut self, result: i32) -> Result<(), UblkError> {
@@ -937,14 +938,14 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     }
 
     fn submit_fetch(
-        queue: &UblkQueue<'_>,
+        queue: &UblkQueue,
         config: UblkBatchConfig,
         fetch_id: u16,
     ) -> Result<(), UblkError> {
-        queue.ublk_submit_sqe_sync(fetch_entry(queue, config, fetch_id))
+        push_batch_sqe(&fetch_entry(queue, config, fetch_id))
     }
 
-    fn enqueue_initial_fetches(queue: &UblkQueue<'_>, config: UblkBatchConfig) {
+    fn enqueue_initial_fetches(queue: &UblkQueue, config: UblkBatchConfig) {
         with_task_io_ring_mut(|ring| {
             let mut submission = ring.submission();
             let available = submission.capacity().saturating_sub(submission.len());
@@ -961,7 +962,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     }
 
     fn provide_fetch_buffer_sync(
-        queue: &UblkQueue<'_>,
+        queue: &UblkQueue,
         group: u16,
         buffer_id: u16,
         buffer: &mut [u16],
@@ -980,12 +981,12 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     }
 
     fn provide_fetch_buffer(
-        queue: &UblkQueue<'_>,
+        queue: &UblkQueue,
         group: u16,
         buffer_id: u16,
         buffer: &mut [u16],
     ) -> Result<(), UblkError> {
-        queue.ublk_submit_sqe_sync(provide_buffer_entry(
+        push_batch_sqe(&provide_buffer_entry(
             group,
             buffer_id,
             buffer,
@@ -994,7 +995,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     }
 
     fn remove_fetch_buffers_sync(
-        queue: &UblkQueue<'_>,
+        queue: &UblkQueue,
         group: u16,
         count: u16,
     ) -> Result<(), UblkError> {
@@ -1022,7 +1023,7 @@ impl<'queue, 'dev> UblkBatchQueue<'queue, 'dev> {
     }
 }
 
-impl Drop for UblkBatchQueue<'_, '_> {
+impl Drop for UblkBatchQueue<'_> {
     fn drop(&mut self) {
         if self.shutdown_complete {
             release_buffer_group(self.config.fetch_buffer_group);
@@ -1127,7 +1128,7 @@ fn remove_buffers_entry(count: u16, group: u16, user_data: u64) -> squeue::Entry
         .user_data(user_data)
 }
 
-fn fetch_entry(queue: &UblkQueue<'_>, config: UblkBatchConfig, fetch_id: u16) -> squeue::Entry {
+fn fetch_entry(queue: &UblkQueue, config: UblkBatchConfig, fetch_id: u16) -> squeue::Entry {
     let header = batch_fetch_header(queue.get_qid());
     let mut entry = batch_command(
         sys::UBLK_U_IO_FETCH_IO_CMDS,
@@ -1333,12 +1334,29 @@ fn claim_tags(owned_tags: &mut [bool], tags: &[u16], seen: &mut [bool]) -> Resul
     Ok(())
 }
 
+/// Push one batch SQE with its private `user_data` untouched, flushing the
+/// ring once if the submission queue is full.
+///
+/// Batch SQEs bypass the op slab: multishot fetches complete many times and
+/// cannot ride a single-shot slab entry, so the sync reaper instead passes
+/// their target-bit `user_data` through to the handler verbatim.
+fn push_batch_sqe(entry: &squeue::Entry) -> Result<(), UblkError> {
+    with_task_io_ring_mut(|ring| loop {
+        let res = unsafe { ring.submission().push(entry) };
+        if res.is_ok() {
+            return Ok(());
+        }
+        log::debug!("push_batch_sqe: flush and retry");
+        ring.submit_and_wait(0).map_err(UblkError::IOError)?;
+    })
+}
+
 fn submit_and_wait(
-    queue: &UblkQueue<'_>,
+    _queue: &UblkQueue,
     entry: squeue::Entry,
     expected_user_data: u64,
 ) -> Result<i32, UblkError> {
-    queue.ublk_submit_sqe_sync(entry)?;
+    push_batch_sqe(&entry)?;
     loop {
         let cqe = with_task_io_ring_mut(|ring| {
             ring.submit_and_wait(1).map_err(UblkError::IOError)?;

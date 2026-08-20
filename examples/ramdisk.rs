@@ -10,11 +10,9 @@ use libublk::ctrl_async::UblkCtrlAsync;
 ///
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::uring_async::{run_uring_tasks, ublk_reap_events_with_handler, ublk_wake_task};
+use libublk::tokio;
 use libublk::{BufDesc, UblkError, UblkFlags};
-use std::fs::File;
 use std::io::{Error, ErrorKind};
-use std::os::fd::{AsRawFd, FromRawFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -77,8 +75,8 @@ fn handle_io(q: &UblkQueue, tag: u16, io_buf: &mut [u8], ramdisk_storage: &mut [
     bytes as i32
 }
 
-async fn io_task(q: &UblkQueue<'_>, tag: u16, ramdisk_storage: &mut [u8]) -> Result<(), UblkError> {
-    let buf_size = q.dev.dev_info.max_io_buf_bytes as usize;
+async fn io_task(q: &UblkQueue, tag: u16, ramdisk_storage: &mut [u8]) -> Result<(), UblkError> {
+    let buf_size = q.dev().dev_info.max_io_buf_bytes as usize;
 
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
     // IoBuf provides slice-based access through Deref/DerefMut traits
@@ -144,168 +142,9 @@ fn read_dev_id(efd: i32) -> Result<i32, Error> {
     return Ok((i64::from_le_bytes(buffer) - 1) as i32);
 }
 
-/// Poll and handle both QUEUE_RING and CTRL_URING concurrently
-async fn poll_and_handle_rings<R, I>(
-    run_ops: R,
-    is_done: I,
-    check_done: bool,
-) -> Result<(), UblkError>
-where
-    R: Fn(),
-    I: Fn() -> bool,
-{
-    // Helper to create async wrapper for file descriptor
-    let create_async_wrapper = |fd: i32| -> Result<smol::Async<File>, UblkError> {
-        let file = unsafe { File::from_raw_fd(fd) };
-        smol::Async::new(file).map_err(|_| UblkError::OtherError(-libc::EINVAL))
-    };
-
-    // Get file descriptors and create async wrappers
-    let queue_fd = libublk::io::with_task_io_ring(|ring| ring.as_raw_fd());
-    let ctrl_fd = libublk::ctrl::with_ctrl_ring(|ring| ring.as_raw_fd());
-    let async_queue = create_async_wrapper(queue_fd)?;
-    let async_ctrl = create_async_wrapper(ctrl_fd)?;
-
-    // Polling function for both rings
-    let poll_both_rings = || async {
-        // Submit and wait on both rings
-        libublk::io::with_task_io_ring_mut(|ring| ring.submit_and_wait(0))?;
-        libublk::ctrl::with_ctrl_ring_mut(|ring| ring.submit_and_wait(0))?;
-
-        // Wait for either ring to become readable
-        smol::future::race(async_queue.readable(), async_ctrl.readable())
-            .await
-            .map(|_| false) // No timeout
-            .map_err(UblkError::IOError)
-    };
-
-    // Helper to handle events from a ring
-    let handle_ring_events = |cqe: &io_uring::cqueue::Entry| {
-        ublk_wake_task(cqe.user_data(), cqe);
-        cqe.result() == libublk::sys::UBLK_IO_RES_ABORT
-    };
-
-    // Event reaping function for both rings
-    let reap_events = |_poll_timeout| {
-        let mut aborted = check_done;
-
-        // Reap events from both rings
-        let queue_result = libublk::io::with_task_io_ring_mut(|ring| {
-            ublk_reap_events_with_handler(ring, |cqe| {
-                if handle_ring_events(cqe) {
-                    aborted = true;
-                }
-            })
-        });
-
-        let ctrl_result = libublk::ctrl::with_ctrl_ring_mut(|ring| {
-            ublk_reap_events_with_handler(ring, |cqe| {
-                if handle_ring_events(cqe) {
-                    aborted = true;
-                }
-            })
-        });
-
-        queue_result.and(ctrl_result).map(|_| aborted)
-    };
-
-    run_uring_tasks(poll_both_rings, reap_events, run_ops, is_done).await?;
-
-    // Prevent file descriptors from being closed when async wrappers are dropped
-    let _ = async_queue.into_inner().map(|f| {
-        use std::os::fd::IntoRawFd;
-        f.into_raw_fd()
-    });
-    let _ = async_ctrl.into_inner().map(|f| {
-        use std::os::fd::IntoRawFd;
-        f.into_raw_fd()
-    });
-
-    Ok(())
-}
-
-/// Generic function to run ublk async uring tasks with local executor
-///
-/// This function allocates a local executor and runs the provided async task
-/// along with the required event handling for ublk operations. It provides
-/// a reusable pattern for async ublk operations.
-///
-/// # Arguments
-/// * `task` - Async closure or block that returns a Result<T, UblkError>
-///
-/// # Returns
-/// Result containing the task result or an error
-///
-/// # Type Parameters
-/// * `T` - Return type of the async task
-/// * `F` - Future type returned by the async task
-/// * `Fut` - Function type that produces the future
-fn ublk_uring_run_async_task<T, F, Fut>(task: Fut) -> Result<T, UblkError>
-where
-    F: std::future::Future<Output = Result<T, UblkError>>,
-    Fut: FnOnce() -> F,
-{
-    let exe_rc = Rc::new(smol::LocalExecutor::new());
-    let task_done = Rc::new(std::cell::RefCell::new(false));
-    let task_done_clone = task_done.clone();
-    let exe = exe_rc.clone();
-
-    // Create the main task with the provided async block/closure
-    let main_task = exe.spawn(async move {
-        let result = task().await;
-        *task_done_clone.borrow_mut() = true;
-        result
-    });
-
-    // Create the event handling task
-    let exe2 = exe_rc.clone();
-    let event_task = exe_rc.spawn(async move {
-        let run_ops = || {
-            while exe2.try_tick() {}
-        };
-        let is_done = || *task_done.borrow();
-        poll_and_handle_rings(run_ops, is_done, true).await
-    });
-
-    // Run both tasks concurrently
-    smol::block_on(exe_rc.run(async {
-        let (task_result, _) = futures::join!(main_task, event_task);
-        task_result
-    }))
-}
-
-/// Create UblkCtrl using UblkCtrlBuilder::build_async() with smol executor
-///
-/// This function demonstrates how to create a UblkCtrl device using the async builder
-/// pattern. It now uses the generic ublk_uring_run_async_task() function for
-/// consistent async task execution patterns.
-///
-/// # Arguments
-/// * `dev_id` - Device ID to assign (-1 for auto-allocation)
-/// * `dev_flags` - Device flags to configure the device
-///
-/// # Returns
-/// Result containing the created UblkCtrlAsync instance or an error
-fn create_ublk_ctrl_async(dev_id: i32, dev_flags: UblkFlags) -> Result<UblkCtrlAsync, UblkError> {
-    ublk_uring_run_async_task(|| async move {
-        libublk::ctrl::UblkCtrlBuilder::default()
-            .name("async_ramdisk")
-            .id(dev_id)
-            .nr_queues(1_u16)
-            .depth(128_u16)
-            .dev_flags(dev_flags)
-            // QUIESCE rides on USER_RECOVERY and lets the device be quiesced
-            // gracefully; see test_ublk_ramdisk_quiesce.
-            .ctrl_flags(
-                (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_QUIESCE) as u64,
-            )
-            .build_async()
-            .await
-    })
-}
-
 ///run this ramdisk ublk daemon completely in single context with
-///async control command, no need Rust async any more
+///async control command: the UblkRuntime park hook drives both the
+///queue ring and the control ring on this one thread.
 fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool, efd: i32) {
     let dev_flags = if for_add {
         UblkFlags::UBLK_DEV_F_ADD_DEV
@@ -328,96 +167,105 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         Ok(())
     });
 
-    // Create the control using the generic async task runner
-    let ctrl = Rc::new(create_ublk_ctrl_async(dev_id, dev_flags).unwrap());
-
-    log::info!("device is created:: {:?}", &ctrl.dev_info());
-
-    let tgt_init = |dev: &mut UblkDev| {
-        dev.set_default_params(size);
-        Ok(())
-    };
-    let dev_rc = Arc::new(UblkDev::new_async(ctrl.get_name(), tgt_init, &ctrl).unwrap());
-    let dev_clone = dev_rc.clone();
-    let q_rc = Rc::new(UblkQueue::new(0, &dev_clone).unwrap());
-    let exec_rc = Rc::new(smol::LocalExecutor::new());
-    let exec = exec_rc.clone();
-
-    // spawn async io tasks
-    let mut f_vec = Vec::new();
-
     // Extract raw pointer and length for sharing across async tasks
     // This is the minimal unsafe code needed for async context sharing
     let storage_ptr = ramdisk_storage.as_mut_ptr();
     let storage_len = ramdisk_storage.len();
 
-    for tag in 0..ctrl.dev_info().queue_depth as u16 {
-        let q_clone = q_rc.clone();
+    let rt = libublk::UblkRuntime::new().unwrap();
+    rt.block_on(async move {
+        let ctrl = Rc::new(
+            libublk::ctrl::UblkCtrlBuilder::default()
+                .name("async_ramdisk")
+                .id(dev_id)
+                .nr_queues(1_u16)
+                .depth(128_u16)
+                .dev_flags(dev_flags)
+                // QUIESCE rides on USER_RECOVERY and lets the device be quiesced
+                // gracefully; see test_ublk_ramdisk_quiesce.
+                .ctrl_flags(
+                    (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_QUIESCE) as u64,
+                )
+                .build_async()
+                .await
+                .unwrap(),
+        );
 
-        f_vec.push(exec.spawn(async move {
-            // Reconstruct slice from raw pointer for each async task
-            // This is safe because:
-            // 1. The original ramdisk_storage buffer outlives all async tasks
-            // 2. Each task operates on different regions controlled by I/O offset bounds
-            // 3. The slice provides bounds checking for all operations within io_task
-            let storage_slice = unsafe { std::slice::from_raw_parts_mut(storage_ptr, storage_len) };
-            match io_task(&q_clone, tag, storage_slice).await {
-                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                Err(e) => log::error!("io_task failed for tag {}: {}", tag, e),
-            }
-        }));
-    }
+        log::info!("device is created:: {:?}", &ctrl.dev_info());
 
-    let ctrl_clone = ctrl.clone();
-    let dev_clone = dev_rc.clone();
-    f_vec.push(exec.spawn(async move {
-        // Report the outcome either way. The parent blocks on this eventfd,
-        // so any path that returns without writing hangs `ramdisk add`.
-        let started = async {
-            let r = ctrl_clone
-                .configure_queue_async(&dev_clone, 0, unsafe { libc::gettid() })
-                .await?;
-            if r < 0 {
-                return Err(UblkError::OtherError(r));
-            }
-            ctrl_clone.start_dev_async(&dev_clone).await?;
-            Ok::<(), UblkError>(())
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(size);
+            Ok(())
+        };
+        let dev_rc = Arc::new(UblkDev::new_async(ctrl.get_name(), tgt_init, &ctrl).unwrap());
+        let q_rc = Rc::new(UblkQueue::new(0, &dev_rc).unwrap());
+
+        let mut handles = Vec::new();
+        for tag in 0..ctrl.dev_info().queue_depth {
+            let q_clone = q_rc.clone();
+
+            handles.push(tokio::task::spawn_local(async move {
+                // Reconstruct slice from raw pointer for each async task
+                // This is safe because:
+                // 1. The original ramdisk_storage buffer outlives all async tasks
+                // 2. Each task operates on different regions controlled by I/O offset bounds
+                // 3. The slice provides bounds checking for all operations within io_task
+                let storage_slice =
+                    unsafe { std::slice::from_raw_parts_mut(storage_ptr, storage_len) };
+                match io_task(&q_clone, tag, storage_slice).await {
+                    Err(UblkError::QueueIsDown) | Ok(_) => {}
+                    Err(e) => log::error!("io_task failed for tag {}: {}", tag, e),
+                }
+            }));
         }
-        .await;
 
-        match started {
-            Ok(()) => {
-                if let Err(e) = write_dev_id(&ctrl_clone, efd) {
-                    log::error!("failed to send dev id: {}", e);
+        let ctrl_clone = ctrl.clone();
+        let dev_clone = dev_rc.clone();
+        handles.push(tokio::task::spawn_local(async move {
+            // Report the outcome either way. The parent blocks on this eventfd,
+            // so any path that returns without writing hangs `ramdisk add`.
+            let started = async {
+                let r = ctrl_clone
+                    .configure_queue_async(&dev_clone, 0, unsafe { libc::gettid() })
+                    .await?;
+                if r < 0 {
+                    return Err(UblkError::OtherError(r));
+                }
+                ctrl_clone.start_dev_async(&dev_clone).await?;
+                Ok::<(), UblkError>(())
+            }
+            .await;
+
+            match started {
+                Ok(()) => {
+                    if let Err(e) = write_dev_id(&ctrl_clone, efd) {
+                        log::error!("failed to send dev id: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("ramdisk failed to start: {}", e);
+                    write_dev_start_failed(efd);
                 }
             }
-            Err(e) => {
-                log::error!("ramdisk failed to start: {}", e);
-                write_dev_start_failed(efd);
-            }
-        }
-    }));
-    smol::block_on(exec_rc.run(async move {
-        let run_ops = || while exec.try_tick() {};
-        let done = || f_vec.iter().all(|task| task.is_finished());
+        }));
 
-        if let Err(e) = poll_and_handle_rings(run_ops, done, false).await {
-            log::error!("poll_and_handle_rings failed: {}", e);
+        for handle in handles {
+            let _ = handle.await;
         }
-    }));
 
-    // The queues are done, so this server is on its way out. The device is
-    // UBLK_F_USER_RECOVERY and may have been quiesced for a successor to take
-    // over, so hand it off instead of deleting it on the way down.
-    //
-    // This is unconditional because the server cannot tell the two cases
-    // apart here: the driver only reports UBLK_S_DEV_QUIESCED once the last
-    // reference to /dev/ublkcN is gone, which is after this process exits.
-    // So a device that was merely stopped is also left behind, and `ramdisk
-    // del <id>` is what removes it either way. A server that can distinguish
-    // its own shutdown from a handoff should call disown() only for the
-    // latter, and let the drop clean up otherwise.
-    ctrl.disown();
+        // The queues are done, so this server is on its way out. The device is
+        // UBLK_F_USER_RECOVERY and may have been quiesced for a successor to take
+        // over, so hand it off instead of deleting it on the way down.
+        //
+        // This is unconditional because the server cannot tell the two cases
+        // apart here: the driver only reports UBLK_S_DEV_QUIESCED once the last
+        // reference to /dev/ublkcN is gone, which is after this process exits.
+        // So a device that was merely stopped is also left behind, and `ramdisk
+        // del <id>` is what removes it either way. A server that can distinguish
+        // its own shutdown from a handoff should call disown() only for the
+        // latter, and let the drop clean up otherwise.
+        ctrl.disown();
+    });
 }
 
 fn rd_get_device_size(ctrl: &UblkCtrl) -> u64 {

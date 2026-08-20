@@ -1,9 +1,21 @@
+//! Device lifecycle control: add, start, stop, delete and recover
+//! ublk devices through `/dev/ublk-control`.
+//!
+//! [`UblkCtrlBuilder`] configures a device, [`UblkCtrl`] owns it and
+//! runs the control commands; the async variant lives in
+//! [`crate::ctrl_async`].
+//!
+//! Only a handle that *created* the device (`UBLK_DEV_F_ADD_DEV`)
+//! deletes it on drop, and only while it still owns it -- see
+//! [`UblkCtrl::disown`]. A handle opened for an existing device, as a
+//! query or recovery tool does, never deletes anything when dropped.
+
 use super::io::{UblkDev, UblkTgt};
-use super::uring_async::UblkUringOpFuture;
 use super::{sys, UblkError, UblkFlags};
+use crate::op::{Op, Resources};
 use bitmaps::Bitmap;
 use derive_setters::*;
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{squeue, IoUring};
 use log::{error, trace};
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -27,7 +39,6 @@ std::thread_local! {
 }
 
 // Internal macro versions for backwards compatibility within the crate
-#[macro_export]
 macro_rules! with_ctrl_ring_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
@@ -41,7 +52,6 @@ macro_rules! with_ctrl_ring_internal {
     };
 }
 
-#[macro_export]
 macro_rules! with_ctrl_ring_mut_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
@@ -55,8 +65,8 @@ macro_rules! with_ctrl_ring_mut_internal {
     };
 }
 
-// Make internal macros available within the crate
-pub(crate) use with_ctrl_ring_internal;
+// Crate-internal: never `#[macro_export]`, which would publish them at
+// the crate root as public API.
 pub(crate) use with_ctrl_ring_mut_internal;
 
 /// Execute a closure with access to the thread-local control ring
@@ -236,16 +246,20 @@ pub struct UblkQueueAffinity {
 }
 
 impl UblkQueueAffinity {
+    /// An empty affinity mask; fill it via [`UblkCtrl::get_queue_affinity`].
     pub fn new() -> UblkQueueAffinity {
         UblkQueueAffinity {
             affinity: Bitmap::new(),
         }
     }
 
+    /// Size in bytes of the raw cpumask buffer.
     pub fn buf_len(&self) -> usize {
         1024 / 8
     }
 
+    /// Pointer to the raw cpumask buffer, for the control command that
+    /// fills it.
     pub fn addr(&self) -> *const u8 {
         self.affinity.as_bytes().as_ptr()
     }
@@ -254,6 +268,7 @@ impl UblkQueueAffinity {
         self.affinity.as_bytes().as_ptr() as *mut u8
     }
 
+    /// The mask as a vector of CPU numbers.
     pub fn to_bits_vec(&self) -> Vec<usize> {
         self.affinity.into_iter().collect()
     }
@@ -408,7 +423,7 @@ impl UblkCtrlCmdData {
         }
     }
 
-    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Vec<u8>>) {
+    fn prep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner) -> (u64, Option<Box<[u8]>>) {
         // handle GET_DEV_INFO2 always with dev_path attached
         let cmd_op = self.cmd_op & 0xff;
 
@@ -426,7 +441,7 @@ impl UblkCtrlCmdData {
                     CTRL_UBLKC_PATH_MAX
                 }
             };
-            let mut v = vec![0_u8; size];
+            let mut v = vec![0_u8; size].into_boxed_slice();
 
             (v.as_mut_ptr(), v)
         };
@@ -797,6 +812,8 @@ impl UblkCtrlBuilder<'_> {
             self.dev_flags,
         )
     }
+    /// Build the device as a [`UblkCtrlAsync`](super::ctrl_async::UblkCtrlAsync),
+    /// the `.await`-driven control handle.
     pub async fn build_async(self) -> Result<super::ctrl_async::UblkCtrlAsync, UblkError> {
         super::ctrl_async::UblkCtrlAsync::new_async(
             Some(self.name.to_string()),
@@ -841,7 +858,6 @@ pub(crate) struct UblkCtrlInner {
 
     //only used in Drop()
     force_sync: bool,
-    cmd_token: i32,
     queue_tids: Vec<i32>,
     queue_selected_cpus: Vec<usize>,
     pub(crate) nr_queues_configured: u16,
@@ -1058,13 +1074,7 @@ impl UblkCtrlInner {
 
     /// Initialize queue data structures
     fn init_queue_data(nr_queues: u32) -> (Vec<i32>, Vec<usize>) {
-        let queue_tids = {
-            let mut tids = Vec::<i32>::with_capacity(nr_queues as usize);
-            unsafe {
-                tids.set_len(nr_queues as usize);
-            }
-            tids
-        };
+        let queue_tids = vec![0; nr_queues as usize];
         let queue_selected_cpus = vec![0; nr_queues as usize];
         (queue_tids, queue_selected_cpus)
     }
@@ -1151,7 +1161,6 @@ impl UblkCtrlInner {
             file,
             dev_info,
             json_manager: UblkJsonManager::new(dev_info.dev_id),
-            cmd_token: 0,
             queue_tids,
             queue_selected_cpus,
             nr_queues_configured: 0,
@@ -1193,7 +1202,6 @@ impl UblkCtrlInner {
             file,
             dev_info,
             json_manager: UblkJsonManager::new(dev_info.dev_id),
-            cmd_token: 0,
             queue_tids,
             queue_selected_cpus,
             nr_queues_configured: 0,
@@ -1304,13 +1312,9 @@ impl UblkCtrlInner {
         self.json_manager.get_json_path()
     }
 
-    fn ublk_ctrl_prep_cmd(
-        &mut self,
-        fd: i32,
-        dev_id: u32,
-        data: &UblkCtrlCmdData,
-        token: u64,
-    ) -> squeue::Entry128 {
+    /// Encode `data` as the 80-byte inline payload of a ublk control
+    /// uring_cmd.
+    fn ublk_ctrl_cmd_payload(dev_id: u32, data: &UblkCtrlCmdData) -> [u8; 80] {
         let cmd = sys::ublksrv_ctrl_cmd {
             addr: if (data.flags & CTRL_CMD_HAS_BUF) != 0 {
                 data.addr
@@ -1333,74 +1337,37 @@ impl UblkCtrlInner {
             ..Default::default()
         };
         let c_cmd = CtrlCmd { ctrl_cmd: cmd };
-
-        opcode::UringCmd80::new(types::Fd(fd), data.cmd_op)
-            .cmd(unsafe { c_cmd.buf })
-            .build()
-            .user_data(token)
+        // SAFETY: reading a plain C union as its byte representation.
+        unsafe { c_cmd.buf }
     }
 
-    fn ublk_submit_cmd_async(&mut self, data: &UblkCtrlCmdData) -> UblkUringOpFuture {
+    /// Submit one control command and block until its CQE arrives,
+    /// driving the control ring through the op slab (the sync analog of
+    /// the awaited ops path — the same keyspace, no raw tokens).
+    fn ublk_submit_cmd_sync(&mut self, data: &UblkCtrlCmdData) -> Result<i32, UblkError> {
         let fd = self.file.as_raw_fd();
-        let dev_id = self.dev_info.dev_id;
-        let f = UblkUringOpFuture::new(0);
-        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
-
-        unsafe {
-            with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
-                if let Err(e) = ring.submission().push(&sqe) {
-                    eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
+        let payload = Self::ublk_ctrl_cmd_payload(self.dev_info.dev_id, data);
+        let mut op = Op::submit_ctrl(
+            |token| crate::ops::uring_cmd80_sqe(fd, data.cmd_op, payload).user_data(token),
+            Resources::None,
+        )?;
+        loop {
+            if let Some(res) = op.try_take_result() {
+                return Ok(res);
+            }
+            with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+                // A signal delivered to the daemon must not fail the
+                // command: retry the wait, as reactor::wait_for_cqe does
+                // for the same ring.
+                match r.submit_and_wait(1) {
+                    Ok(_) => {}
+                    Err(ref e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
+                    Err(e) => return Err(UblkError::IOError(e)),
                 }
-            })
+                let _ = crate::op::ublk_reap_and_wake(r, |_, _| {});
+                Ok::<(), UblkError>(())
+            })?;
         }
-        f
-    }
-
-    fn ublk_submit_cmd(
-        &mut self,
-        data: &UblkCtrlCmdData,
-        to_wait: usize,
-    ) -> Result<u64, UblkError> {
-        let fd = self.file.as_raw_fd();
-        let dev_id = self.dev_info.dev_id;
-
-        // token is generated uniquely because '&mut self' is
-        // passed in
-        let token = {
-            self.cmd_token += 1;
-            self.cmd_token
-        } as u64;
-        let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, token);
-
-        with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-            unsafe {
-                if let Err(e) = r.submission().push(&sqe) {
-                    eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
-                    return;
-                }
-            };
-            let _ = r.submit_and_wait(to_wait);
-        });
-        Ok(token)
-    }
-
-    /// check one control command and see if it is completed
-    ///
-    fn poll_cmd(&mut self, token: u64) -> i32 {
-        with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-            let res = match r.completion().next() {
-                Some(cqe) => {
-                    if cqe.user_data() != token {
-                        -libc::EAGAIN
-                    } else {
-                        cqe.result()
-                    }
-                }
-                None => -libc::EAGAIN,
-            };
-
-            res
-        })
     }
 
     fn ublk_ctrl_need_retry(
@@ -1449,9 +1416,33 @@ impl UblkCtrlInner {
         let mut res: i32 = 0;
 
         for _ in 0..2 {
-            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
-            res = self.ublk_submit_cmd_async(&new_data).await;
-            new_data.unprep_un_privileged_dev_path(self, old_buf);
+            let (old_buf, path_buf) = new_data.prep_un_privileged_dev_path(self);
+            let fd = self.file.as_raw_fd();
+            let payload = Self::ublk_ctrl_cmd_payload(self.dev_info.dev_id, &new_data);
+            res = match path_buf {
+                // The op owns the path+data buffer while the command is
+                // in flight — dropping this future mid-await can no
+                // longer free memory the kernel still reads — and hands
+                // it back for the read-back copy in unprep below.
+                // SAFETY: the payload's addr points into `buf`, whose
+                // liveness the op guarantees.
+                Some(buf) => {
+                    let (res, buf) =
+                        unsafe { crate::ops::uring_cmd80_buf(fd, new_data.cmd_op, payload, buf) }?
+                            .await;
+                    new_data.unprep_un_privileged_dev_path(self, old_buf);
+                    drop(buf);
+                    res
+                }
+                // SAFETY: any buffer the payload references is caller
+                // memory that outlives this blocking retry loop.
+                None => {
+                    let res =
+                        unsafe { crate::ops::uring_cmd80(fd, new_data.cmd_op, payload) }?.await;
+                    new_data.unprep_un_privileged_dev_path(self, old_buf);
+                    res
+                }
+            };
 
             trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
             if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
@@ -1477,10 +1468,12 @@ impl UblkCtrlInner {
         let mut res: i32 = 0;
 
         for _ in 0..2 {
-            let (old_buf, _new) = new_data.prep_un_privileged_dev_path(self);
-            let token = self.ublk_submit_cmd(&new_data, 1)?;
-            res = self.poll_cmd(token);
+            // `path_buf` outlives the blocking submit below, and unprep's
+            // read-back happens before it drops at the loop bottom.
+            let (old_buf, path_buf) = new_data.prep_un_privileged_dev_path(self);
+            res = self.ublk_submit_cmd_sync(&new_data)?;
             new_data.unprep_un_privileged_dev_path(self, old_buf);
+            drop(path_buf);
 
             trace!("ublk_ctrl_cmd: cmd {:x} res {}", data.cmd_op, res);
             if !Self::ublk_ctrl_need_retry(&mut new_data, data, res) {
@@ -2228,6 +2221,13 @@ impl UblkCtrl {
         })
     }
 
+    /// The target-type name this handle was constructed with, or the
+    /// literal `"none"` when it was constructed without one.
+    ///
+    /// This is *not* read back from the device: a handle opened for an
+    /// existing device by id reports `"none"` however the running
+    /// device was named, so do not branch on it to identify a device
+    /// you did not create.
     pub fn get_name(&self) -> String {
         let inner = self.get_inner();
 
@@ -2241,6 +2241,13 @@ impl UblkCtrl {
         self.get_inner().dev_flags
     }
 
+    /// Create a device control handle directly.
+    ///
+    /// [`UblkCtrlBuilder`] is the recommended way in: it names each
+    /// setting instead of relying on the position of eight arguments,
+    /// and fills in defaults. Use this when the values are already in
+    /// hand, e.g. when re-opening an existing device by `id`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: Option<String>,
         id: i32,
@@ -2369,6 +2376,7 @@ impl UblkCtrl {
         Ok(0)
     }
 
+    /// Log this device's info and parameters, as `rublk list` prints them.
     pub fn dump(&self) {
         let mut ctrl = self.get_inner_mut();
         let mut p = sys::ublk_params {
@@ -2390,6 +2398,7 @@ impl UblkCtrl {
         println!("\tublksrv_flags: 0x{:x}", ctrl.dev_info.ublksrv_flags);
     }
 
+    /// Directory holding the per-device JSON files.
     pub fn run_dir() -> String {
         String::from("/run/ublksrvd")
     }
@@ -2788,7 +2797,7 @@ impl UblkCtrl {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, &Arc<UblkDev>) + Send + Sync + Clone + 'static,
     {
         use std::sync::mpsc;
 
@@ -2851,7 +2860,7 @@ impl UblkCtrl {
     pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<i32, UblkError>
     where
         T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, &Arc<UblkDev>) + Send + Sync + Clone + 'static,
         W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
     {
         let dev = &Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
@@ -2904,10 +2913,11 @@ mod tests {
     };
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkError;
-    use crate::{ctrl::UblkCtrl, UblkFlags, UblkIORes};
+    use crate::{ctrl::UblkCtrl, UblkFlags};
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     #[test]
     fn test_init_queue_thread_io_flusher() {
@@ -3180,8 +3190,8 @@ mod tests {
             dev.set_target_json(serde_json::json!({"null": "test_data" }));
             Ok(())
         };
-        let q_fn = move |qid: u16, dev: &UblkDev| {
-            use crate::BufDescList;
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            use crate::{BufDesc, BufDescList};
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
 
@@ -3189,10 +3199,13 @@ mod tests {
                 let iod = q.get_iod(tag);
                 let bytes = (iod.nr_sectors << 9) as i32;
                 let bufs = bufs_rc.clone();
-                let buf_addr = bufs[tag as usize].as_mut_ptr();
 
-                #[allow(deprecated)]
-                q.complete_io_cmd(tag, buf_addr, Ok(UblkIORes::Result(bytes)));
+                q.complete_io_cmd_unified(
+                    tag,
+                    BufDesc::Slice(bufs[tag as usize].as_slice()),
+                    bytes,
+                )
+                .unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)

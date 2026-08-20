@@ -10,47 +10,70 @@ use bitflags::bitflags;
 mod bindings;
 pub mod ctrl;
 pub mod ctrl_async;
+pub mod executor;
 pub mod helpers;
 pub mod io;
+mod op;
+pub mod ops;
+pub mod reactor;
+#[cfg(feature = "tokio")]
+pub mod runtime;
 pub mod sys;
-#[cfg(test)]
+// The shared test helpers drive devices through UblkRuntime; the
+// reactor-only build tests the reactor directly instead.
+#[cfg(all(test, feature = "tokio"))]
 pub mod test_helpers;
-pub mod uring_async;
+
+// Re-export io_uring: `squeue::Entry` and `cqueue::Entry` appear in this
+// crate's public API (`ops::submit_sqe`, `UblkQueue::ublk_submit_sqe`,
+// the `flush_and_wake_io_tasks` handler, the ring accessors), so a
+// target must build those values from the *same* io-uring version the
+// library was compiled against. Name it as `libublk::io_uring` instead
+// of declaring a separate dependency that has to be kept in lockstep.
+pub use io_uring;
+
+// Re-export tokio so targets use the same runtime version as the library
+// (tasks are spawned with `tokio::task::spawn_local` or the
+// executor-agnostic `crate::executor::spawn_local` inside
+// `UblkRuntime::block_on`).
+#[cfg(feature = "tokio")]
+pub use tokio;
+
+#[cfg(feature = "tokio")]
+pub use runtime::UblkRuntime;
 
 // Re-export important types for unified buffer management
 #[allow(deprecated)]
 pub use io::{
-    ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, with_task_io_ring,
-    with_task_io_ring_mut, BufDesc, BufDescList, UblkBatchBuffers, UblkBatchCompletion,
-    UblkBatchConfig, UblkBatchQueue,
+    ublk_init_task_ring, with_task_io_ring, with_task_io_ring_mut, BufDesc, BufDescList,
+    UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatchQueue,
 };
 
 // Re-export control ring initialization and access
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
 
-// Re-export async utilities
-pub use uring_async::{
-    run_uring_tasks, ublk_reap_events_with_handler, uring_poll_io_fn, wait_and_handle_io_events,
+// Re-export executor contract and utilities
+pub use executor::{
+    spawn_local, with_ambient_spawner, TaskHandle, UblkExecutor, UblkSpawner, UblkTask,
 };
 
-/// Ublk io_uring user_data constants
+/// Ublk io_uring user_data constants, used by the legacy sync event
+/// loop's tag-encoded `user_data` (async ops are slab-keyed and carry no
+/// bit-encoded metadata)
+///
+/// Non-exhaustive: the reserved `user_data` bits are a wire format
+/// shared with the kernel, and further bits may be spoken for later.
 #[repr(u64)]
+#[non_exhaustive]
 pub enum UblkUringData {
     /// Target IO bit flag - indicates user_data is from target IO
     Target = 1_u64 << 63,
-    /// Non-async IO bit flag - indicates it is from one non-async IO in
-    /// async/.await code path, should only be used in async/.await
-    NonAsync = 1_u64 << 62,
 }
 
 bitflags! {
     #[derive(Default, Debug, PartialEq, Eq, Copy, Clone)]
     /// UblkFlags: top 8bits are reserved for internal use
     pub struct UblkFlags: u32 {
-        /// feature: support IO batch completion from single IO tag, typical
-        /// usecase is to complete IOs from eventfd CQE handler
-        const UBLK_DEV_F_COMP_BATCH = 0b00000001;
-
         /// tell UblkCtrl that we are adding one new device
         const UBLK_DEV_F_ADD_DEV = 0b00000010;
 
@@ -69,10 +92,16 @@ bitflags! {
         /// It is required for ublk to be used as swap disk
         const UBLK_DEV_F_MLOCK_IO_BUFFER = 0b00100000;
 
+        /// Reserved for libublk's own use; targets must not set the
+        /// top 8 bits.
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_3 = 1_u32 << 28;
+        /// Reserved for libublk's own use.
         const UBLK_DEV_F_INTERNAL_4 = 1_u32 << 27;
     }
 }
@@ -89,76 +118,74 @@ macro_rules! ublk_internal_flags_all {
 
 pub(crate) use ublk_internal_flags_all;
 
-/// Ublk Fat completion result
-pub enum UblkFatRes {
-    /// Batch completion
-    ///
-    /// Vector is returned, and each element(`tag`, `result`) describes one
-    /// io command completion result.
-    BatchRes(Vec<(u16, i32)>),
-
-    /// Zoned Append completion result
-    ///
-    /// (`result`, `returned lba`) is included in this result.
-    ZonedAppendRes((i32, u64)),
-}
-
-/// Ublk IO completion result
+/// Every fallible libublk operation reports this error.
 ///
-/// Ok() part of io command completion result `Result<UblkIORes, UblkError>`
-pub enum UblkIORes {
-    /// normal result
-    ///
-    /// Completion result of this io command
-    Result(i32),
-
-    /// Fat completion result
-    #[cfg(feature = "fat_complete")]
-    FatRes(UblkFatRes),
-}
-
+/// Use [`UblkError::errno`] to turn one into the negative errno a ublk
+/// server completes a failed io command with. The enum is
+/// `#[non_exhaustive]`: match with a `_` arm.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum UblkError {
-    #[error("uring submission timeout")]
-    UringTimeout,
-
-    #[error("IO Queued")]
-    UringIoQueued,
-
+    /// An io_uring operation completed with a negative errno, carried
+    /// verbatim as the CQE reported it.
     #[error("io_uring IO failure")]
     UringIOError(i32),
 
+    /// Device parameters or the recovery JSON failed to (de)serialize.
     #[error("json failure")]
     JsonError(#[from] serde_json::Error),
 
+    /// The queue is being torn down and accepts no further io. Queue
+    /// handlers normally treat this as the signal to return cleanly.
     #[error("queue down failure")]
     QueueIsDown,
 
+    /// A syscall or `/dev/ublk-control` operation failed; wraps the
+    /// underlying [`std::io::Error`].
     #[error("other IO failure")]
     IOError(#[from] std::io::Error),
 
+    /// An argument was rejected before anything was submitted: a buffer
+    /// descriptor incompatible with the device flags, an out-of-range
+    /// length, a bad configuration.
     #[error("Invalid input")]
     InvalidVal,
 
+    /// A failure with no more specific variant, as a negative errno.
     #[error("other failure")]
     OtherError(i32),
 }
 
+impl UblkError {
+    /// Map this error to a negative errno, the form a ublk server uses
+    /// to complete a failed io command (and the form io_uring CQEs
+    /// report), so target code can propagate any [`UblkError`] into an
+    /// io completion.
+    pub fn errno(&self) -> i32 {
+        let e = match self {
+            UblkError::UringIOError(res) | UblkError::OtherError(res) => *res,
+            UblkError::IOError(err) => -err.raw_os_error().unwrap_or(libc::EIO),
+            UblkError::JsonError(_) => -libc::EINVAL,
+            UblkError::InvalidVal => -libc::EINVAL,
+            UblkError::QueueIsDown => -libc::ENODEV,
+        };
+        if e > 0 {
+            -e
+        } else if e == 0 {
+            -libc::EIO
+        } else {
+            e
+        }
+    }
+}
+
 #[cfg(test)]
 mod libublk {
-    use crate::{UblkError, UblkIORes};
+    use crate::UblkError;
 
-    #[cfg(not(feature = "fat_complete"))]
     #[test]
-    fn test_feature_fat_complete() {
-        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
+    fn test_io_res_size() {
+        let sz = core::mem::size_of::<Result<i32, UblkError>>();
         assert!(sz == 16);
-    }
-
-    #[cfg(feature = "fat_complete")]
-    #[test]
-    fn test_feature_fat_complete() {
-        let sz = core::mem::size_of::<Result<UblkIORes, UblkError>>();
-        assert!(sz == 32);
     }
 }

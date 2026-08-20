@@ -8,9 +8,9 @@
 
 use crate::ctrl::UblkCtrlBuilder;
 use crate::io::{UblkDev, UblkQueue};
-use crate::uring_async::{ublk_reap_events_with_handler, ublk_wake_task};
+use crate::runtime::UblkRuntime;
 use crate::{UblkError, UblkFlags};
-use io_uring::{squeue, IoUring};
+use std::future::Future;
 use std::rc::Rc;
 
 #[ctor::ctor]
@@ -26,11 +26,11 @@ fn init_logger() {
 ///
 /// This function simulates the I/O operations of a null device,
 /// accepting all writes and returning zeros for reads.
-pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) -> Result<(), UblkError> {
+pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue) -> Result<(), UblkError> {
     use crate::helpers::IoBuf;
     use crate::BufDesc;
 
-    let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+    let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
     let _buf = Some(buf);
     let iod = q.get_iod(tag);
     let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
@@ -47,31 +47,25 @@ pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue<'_>) -> Result<(), UblkE
     }
 }
 
-/// Queue async function for spawning I/O tasks
-///
-/// This function creates async tasks for each tag in the queue depth,
-/// simulating concurrent I/O operations.
-pub(crate) fn q_async_fn<'a>(
-    exe: &smol::LocalExecutor<'a>,
-    q_rc: &Rc<UblkQueue<'a>>,
-    depth: u16,
-    f_vec: &mut Vec<smol::Task<()>>,
-) {
-    for tag in 0..depth as u16 {
-        let q = q_rc.clone();
-        f_vec.push(exe.spawn(async move {
-            if let Err(e) = io_async_fn(tag, &q).await {
-                match e {
-                    UblkError::QueueIsDown => {
-                        // Queue down is expected during shutdown, don't log as error
-                    }
-                    _ => {
-                        log::debug!("io_async_fn failed for tag {}: {}", tag, e);
+/// Spawn one I/O task per tag on the current `LocalSet`.
+pub(crate) fn q_async_fn(q_rc: &Rc<UblkQueue>, depth: u16) -> Vec<tokio::task::JoinHandle<()>> {
+    (0..depth)
+        .map(|tag| {
+            let q = q_rc.clone();
+            tokio::task::spawn_local(async move {
+                if let Err(e) = io_async_fn(tag, &q).await {
+                    match e {
+                        UblkError::QueueIsDown => {
+                            // Queue down is expected during shutdown, don't log as error
+                        }
+                        _ => {
+                            log::debug!("io_async_fn failed for tag {}: {}", tag, e);
+                        }
                     }
                 }
-            }
-        }));
-    }
+            })
+        })
+        .collect()
 }
 
 /// Device handler for async testing
@@ -99,26 +93,18 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
 
     // Todo: support to handle multiple queues in one thread context
     let qh = std::thread::spawn(move || {
-        let q_rc = Rc::new(UblkQueue::new(0 as u16, &dev).unwrap());
-        let q = q_rc.clone();
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-        let mut f_vec: Vec<smol::Task<()>> = Vec::new();
+        let rt = UblkRuntime::new().unwrap();
+        rt.block_on(async move {
+            let q_rc = Rc::new(UblkQueue::new(0_u16, &dev).unwrap());
 
-        if dev_flags.contains(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
-            q.mark_mlock_failed();
-        }
-
-        q_async_fn(&exe, &q, dev.dev_info.queue_depth as u16, &mut f_vec);
-
-        smol::block_on(exe_rc.run(async move {
-            let run_ops = || while exe.try_tick() {};
-            let done = || f_vec.iter().all(|task| task.is_finished());
-
-            if let Err(e) = crate::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await {
-                log::error!("handle_uring_events failed: {}", e);
+            if dev_flags.contains(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
+                q_rc.mark_mlock_failed();
             }
-        }));
+
+            for handle in q_async_fn(&q_rc, dev.dev_info.queue_depth) {
+                let _ = handle.await;
+            }
+        });
     });
 
     // Avoid to leak device
@@ -133,72 +119,19 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
     // may hang in Drop() of UblkCtrlInner.
     ctrl.del_dev_async_await().await?;
 
-    if let Err(e) = smol::unblock(move || qh.join()).await {
+    if let Err(e) = tokio::task::spawn_blocking(move || qh.join())
+        .await
+        .unwrap()
+    {
         eprintln!("dev-{} join queue thread failed {:?}", dev_id, e);
     }
     Ok(())
 }
 
-/// Block on all tasks in the executor until they are finished
-///
-/// Utility function for managing task execution in tests.
-/// Implemented using run_uring_tasks(), ublk_reap_events_with_handler() and uring_poll_fn().
-pub(crate) fn ublk_join_tasks<T>(
-    exe: &smol::LocalExecutor,
-    tasks: Vec<smol::Task<T>>,
-) -> Result<(), UblkError> {
+/// Run a control-plane future to completion on a fresh `UblkRuntime`,
+/// with the thread-local control ring initialized first.
+pub(crate) fn ublk_block_on_ctrl<F: Future>(fut: F) -> F::Output {
     //support 64 devices
     crate::ctrl::init_ctrl_task_ring_default(64 * 2).unwrap();
-
-    smol::block_on(async {
-        let poll_uring = || async {
-            crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-                crate::uring_async::uring_poll_fn(r, None, 0)
-            })
-        };
-        let reap_event = |_poll_timeout| {
-            crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
-                ublk_reap_events_with_handler(r, |cqe| {
-                    ublk_wake_task(cqe.user_data(), cqe);
-                })
-            })?;
-            Ok(true)
-        };
-        let run_ops = || while exe.try_tick() {};
-        let is_done = || tasks.iter().all(|task| task.is_finished());
-
-        crate::uring_async::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
-    })
-}
-
-/// Block on all I/O tasks in the executor until they are finished
-///
-/// Similar to ublk_join_tasks() but uses QUEUE_RING for I/O operations
-/// instead of control ring operations.
-pub(crate) fn ublk_join_io_tasks<T>(
-    exe: &smol::LocalExecutor,
-    tasks: Vec<smol::Task<T>>,
-) -> Result<(), UblkError> {
-    // Initialize task ring for I/O operations
-    crate::io::init_task_ring_default(64, 64)?;
-
-    smol::block_on(async {
-        let poll_uring = || async {
-            crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-                crate::uring_async::uring_poll_fn(r, None, 0)
-            })
-        };
-        let reap_event = |_poll_timeout| {
-            crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
-                ublk_reap_events_with_handler(r, |cqe| {
-                    ublk_wake_task(cqe.user_data(), cqe);
-                })
-            })?;
-            Ok(true)
-        };
-        let run_ops = || while exe.try_tick() {};
-        let is_done = || tasks.iter().all(|task| task.is_finished());
-
-        crate::uring_async::run_uring_tasks(poll_uring, reap_event, run_ops, is_done).await
-    })
+    UblkRuntime::new().unwrap().block_on(fut)
 }

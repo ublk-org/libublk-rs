@@ -1,3 +1,10 @@
+//! Async device control: the `.await`-driven counterpart of
+//! [`crate::ctrl::UblkCtrl`].
+//!
+//! [`UblkCtrlAsync`] runs each control command as an op on the
+//! thread-local control ring, so a single thread can drive device
+//! setup and queue IO from the same executor.
+
 use super::ctrl::{UblkCtrlInner, UblkQueueAffinity};
 use super::io::UblkDev;
 use super::{sys, UblkError, UblkFlags};
@@ -30,6 +37,13 @@ impl UblkCtrlAsync {
         })
     }
 
+    /// The target-type name this handle was constructed with, or the
+    /// literal `"none"` when it was constructed without one.
+    ///
+    /// This is *not* read back from the device: a handle opened for an
+    /// existing device by id reports `"none"` however the running
+    /// device was named, so do not branch on it to identify a device
+    /// you did not create.
     pub fn get_name(&self) -> String {
         let inner = self.get_inner();
 
@@ -461,21 +475,18 @@ impl UblkCtrlAsync {
     }
 }
 
-#[cfg(test)]
+// These tests drive real devices through UblkRuntime.
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use crate::ctrl::{UblkCtrlBuilder, UblkQueueAffinity};
-    use crate::test_helpers::{device_handler_async, ublk_join_tasks};
+    use crate::test_helpers::{device_handler_async, ublk_block_on_ctrl};
     use crate::UblkError;
     use crate::{ctrl::UblkCtrl, UblkFlags};
-    use std::rc::Rc;
 
     #[test]
     fn test_get_queue_affinity_async() {
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-
-        let job = exe_rc.spawn(async {
+        ublk_block_on_ctrl(async {
             let ctrl = UblkCtrlBuilder::default()
                 .name("null_async_test")
                 .nr_queues(2_u16)
@@ -512,21 +523,14 @@ mod tests {
             let _ = ctrl.del_dev_async_await().await;
         });
 
-        smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
-        }));
-
         println!("✓ get_queue_affinity_async method implemented correctly");
     }
 
     /// Test async APIs
     #[test]
     fn test_async_apis() {
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-
         log::info!("start async test");
-        let job = exe_rc.spawn(async {
+        ublk_block_on_ctrl(async {
             log::info!("start main task");
             // Test new_async with basic parameters
             let result = UblkCtrlBuilder::default()
@@ -612,41 +616,32 @@ mod tests {
             }
         });
 
-        smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
-        }));
-
         println!("✓ Async constructor methods are properly defined");
     }
 
     /// Test async APIs for building ublk device
     #[test]
     fn test_create_ublk_async() {
-        let exe_rc = Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-        let mut fvec = Vec::new();
-
-        for _ in 0..64 {
-            fvec.push(exe_rc.spawn(async {
-                device_handler_async(UblkFlags::UBLK_DEV_F_ADD_DEV)
-                    .await
-                    .unwrap();
-            }));
-        }
-
-        smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, fvec);
-        }));
+        ublk_block_on_ctrl(async {
+            let handles: Vec<_> = (0..64)
+                .map(|_| {
+                    tokio::task::spawn_local(async {
+                        device_handler_async(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                            .await
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap();
+            }
+        });
     }
 
     #[test]
     fn test_ctrl_async_await_flag_enforcement() {
         // Test with async flag support using a sync runtime context
-
-        let exe_rc = std::rc::Rc::new(smol::LocalExecutor::new());
-        let exe = exe_rc.clone();
-
-        let job = exe_rc.spawn(async move {
+        ublk_block_on_ctrl(async move {
             let ctrl_async = UblkCtrlBuilder::default()
                 .name("test_async_flag")
                 .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
@@ -674,10 +669,6 @@ mod tests {
             }
             let _ = ctrl_async.del_dev_async_await().await;
         });
-
-        smol::block_on(exe_rc.run(async move {
-            let _ = ublk_join_tasks(&exe, vec![job]);
-        }));
 
         println!("✓ UBLK_CTRL_ASYNC_AWAIT flag enforcement tests passed");
         println!("  - Sync API rejection when flag is set: PASS");

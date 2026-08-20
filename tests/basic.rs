@@ -7,10 +7,7 @@ mod integration {
         UblkDev, UblkIOCtx, UblkQueue,
     };
     use libublk::override_sqe;
-    use libublk::uring_async::ublk_submit_sqe_async;
-    use libublk::{
-        ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags, UblkIORes,
-    };
+    use libublk::{ctrl::UblkCtrl, ctrl::UblkCtrlBuilder, sys, BufDesc, UblkError, UblkFlags};
     use std::env;
     use std::io::{BufRead, BufReader};
     use std::path::Path;
@@ -65,7 +62,7 @@ mod integration {
         assert!(out.status.success() == success);
     }
 
-    fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &UblkDev)) {
+    fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &Arc<UblkDev>)) {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .nr_queues(2)
@@ -78,7 +75,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, _dev: &UblkDev| {
+        let q_fn = move |qid: u16, _dev: &Arc<UblkDev>| {
             q_handler(qid, _dev);
         };
 
@@ -95,7 +92,7 @@ mod integration {
     #[test]
     fn test_ublk_null() {
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue(qid: u16, dev: &UblkDev) {
+        fn null_handle_queue(qid: u16, dev: &Arc<UblkDev>) {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
             let bufs = bufs_rc.clone();
@@ -109,8 +106,7 @@ mod integration {
                 } else {
                     BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
-                    .unwrap();
+                q.complete_io_cmd_unified(tag, buf_desc, bytes).unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)
@@ -156,7 +152,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = |qid: u16, dev: &UblkDev| {
+        let q_fn = |qid: u16, dev: &Arc<UblkDev>| {
             let queue = UblkQueue::new(qid, dev).unwrap();
             let buffers = dev.alloc_queue_io_bufs();
             let config = UblkBatchConfig::new()
@@ -256,7 +252,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             let queue = UblkQueue::new(qid, dev).unwrap();
             let buffers = dev.alloc_queue_io_bufs();
             let config = UblkBatchConfig::new()
@@ -351,78 +347,27 @@ mod integration {
         drop(ramdisk_buf);
     }
 
-    /// make one ublk-null and test if /dev/ublkbN can be created successfully
-    #[cfg(feature = "fat_complete")]
-    #[test]
-    fn test_ublk_null_comp_batch() {
-        use libublk::UblkFatRes;
-        /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue_batch(qid: u16, dev: &UblkDev) {
-            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
-            let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
-            let bufs = bufs_rc.clone();
-
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                let iod = q.get_iod(tag);
-                let bytes = (iod.nr_sectors << 9) as i32;
-
-                let buf_desc = if user_copy {
-                    BufDesc::Slice(&[]) // Empty slice for user_copy mode
-                } else {
-                    BufDesc::Slice(bufs[tag as usize].as_slice())
-                };
-
-                let res = Ok(UblkIORes::FatRes(UblkFatRes::BatchRes(vec![(tag, bytes)])));
-                q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
-            };
-
-            let queue = match UblkQueue::new(qid, dev)
-                .unwrap()
-                .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
-                    None
-                } else {
-                    Some(&bufs_rc)
-                })) {
-                Ok(q) => q,
-                Err(e) => {
-                    log::error!("submit_fetch_commands_unified failed: {}", e);
-                    return;
-                }
-            };
-
-            queue.wait_and_handle_io(io_handler);
-        }
-
-        __test_ublk_null(
-            UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_COMP_BATCH,
-            null_handle_queue_batch,
-        );
-    }
-
     #[test]
     fn test_ublk_null_async() {
-        // submit one io_uring Nop via io-uring crate and UringOpFuture, and
-        // user_data has to unique among io tasks, also has to encode tag
-        // info, so please build user_data by UblkIOCtx::build_user_data_async()
-        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+        // submit one ring no-op as an instant "target IO" through the
+        // typed op catalog
+        async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
-            let res = ublk_submit_sqe_async(
-                opcode::Nop::new().build(),
-                libublk::UblkUringData::Target as u64,
-            )
-            .await
-            .unwrap_or(0);
+            let res = match libublk::ops::nop() {
+                Ok(f) => f.await,
+                Err(_) => 0,
+            };
             bytes + res
         }
 
         async fn test_io_task(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             dev_data: &Arc<Mutex<DevData>>,
         ) -> Result<(), UblkError> {
-            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
             // Submit initial prep command - any error will exit the function
             q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
@@ -445,9 +390,6 @@ mod integration {
             done: u64,
         }
 
-        // submit one io_uring Nop via io-uring crate and UringOpFuture, and
-        // user_data has to unique among io tasks, also has to encode tag
-        // info, so please build user_data by UblkIOCtx::build_user_data_async()
         let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
         let depth = 64_u16;
         let ctrl = UblkCtrlBuilder::default()
@@ -469,38 +411,15 @@ mod integration {
 
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
-        let q_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
-            let exe = exe_rc.clone();
-            let mut f_vec = Vec::new();
-
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             // `q_fn` closure implements Clone() Trait, so the captured
             // `dev_data` is cloned to `q_fn` context.
-            let _dev_data = Rc::new(dev_data);
-
-            for tag in 0..depth {
-                let q = q_rc.clone();
-                let __dev_data = _dev_data.clone();
-
-                f_vec.push(exe.spawn(async move {
-                    match test_io_task(&q, tag, &__dev_data).await {
-                        Err(UblkError::QueueIsDown) | Ok(_) => {}
-                        Err(e) => log::error!("test_io_task failed for tag {}: {}", tag, e),
-                    }
-                }));
-            }
-
-            smol::block_on(exe_rc.run(async move {
-                let run_ops = || while exe.try_tick() {};
-                let done = || f_vec.iter().all(|task| task.is_finished());
-
-                if let Err(e) =
-                    libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await
-                {
-                    log::error!("handle_uring_events failed: {}", e);
-                }
-            }));
+            let dev_data = dev_data.clone();
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+                let dev_data = dev_data.clone();
+                async move { test_io_task(&q, tag, &dev_data).await }
+            })
+            .unwrap();
         };
 
         // kick off our targets
@@ -519,10 +438,67 @@ mod integration {
         .unwrap();
     }
 
+    /// A queue deeper than Tokio's per-tick task quota must still start.
+    ///
+    /// With one spawned task per tag, only a slice of the tasks get their
+    /// first poll before the scheduler hits a tick boundary and invokes
+    /// the park hook. If the reactor then blocks in io_uring_enter --
+    /// waiting on FETCH completions that cannot arrive until the
+    /// remaining tasks run and the device starts -- startup deadlocks.
+    /// Queue depth 128 with ctrl driven on another thread reproduces it.
+    #[test]
+    fn test_ublk_null_async_deep_queue() {
+        async fn io_task(q: Rc<UblkQueue>, tag: u16) -> Result<(), UblkError> {
+            let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
+
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+                .await?;
+            loop {
+                let iod = q.get_iod(tag);
+                let bytes = (iod.nr_sectors << 9) as i32;
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), bytes)
+                    .await?;
+            }
+        }
+
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null_deep")
+            .nr_queues(1)
+            .depth(128)
+            .id(-1)
+            .dev_flags(dev_flags)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            libublk::UblkRuntime::run_io_tasks(dev, qid, io_task).unwrap();
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl, true);
+
+            // Idle past the reactor's park-safety period, then serve IO
+            // again: the safety-timeout bounce must leave the queue
+            // thread parked where the next FETCH completion can wake it,
+            // not on the executor's condvar.
+            std::thread::sleep(std::time::Duration::from_millis(1600));
+            read_ublk_disk(ctrl, true);
+
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
     fn __test_ublk_null_zc(bad_buf_idx: bool, fallback: bool) {
         const IORING_NOP_INJECT_RESULT: u32 = 1u32 << 0;
         const IORING_NOP_FIXED_BUFFER: u32 = 1u32 << 3;
-        async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
+        async fn handle_io_cmd(q: &UblkQueue, tag: u16) -> i32 {
             let iod = q.get_iod(tag);
             let bytes = (iod.nr_sectors << 9) as i32;
 
@@ -546,14 +522,17 @@ mod integration {
             override_sqe!(&mut sqe, len, bytes as u32);
             override_sqe!(&mut sqe, buf_index, tag);
 
-            let res = ublk_submit_sqe_async(sqe, libublk::UblkUringData::Target as u64)
-                .await
-                .unwrap_or(0);
+            // SAFETY: the NOP references no caller memory (the fixed
+            // buffer is registered with the ring).
+            let res = match unsafe { q.ublk_submit_sqe(sqe) } {
+                Ok(f) => f.await,
+                Err(_) => 0,
+            };
             res
         }
 
         async fn test_auto_reg_io_task(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             depth: u16,
             bad_buf_idx: bool,
@@ -605,35 +584,11 @@ mod integration {
 
         // queue handler supports Clone(), so will be cloned in each
         // queue pthread context
-        let q_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
-            let exe = exe_rc.clone();
-            let mut f_vec = Vec::new();
-
-            for tag in 0..depth {
-                let q = q_rc.clone();
-
-                f_vec.push(exe.spawn(async move {
-                    match test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await {
-                        Err(UblkError::QueueIsDown) | Ok(_) => {}
-                        Err(e) => {
-                            log::error!("test_auto_reg_io_task failed for tag {}: {}", tag, e)
-                        }
-                    }
-                }));
-            }
-
-            smol::block_on(exe_rc.run(async move {
-                let run_ops = || while exe.try_tick() {};
-                let done = || f_vec.iter().all(|task| task.is_finished());
-
-                if let Err(e) =
-                    libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await
-                {
-                    log::error!("handle_uring_events failed: {}", e);
-                }
-            }));
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| async move {
+                test_auto_reg_io_task(&q, tag, depth, bad_buf_idx, fallback).await
+            })
+            .unwrap();
         };
 
         // kick off our targets
@@ -680,7 +635,10 @@ mod integration {
                 let status = std::process::Command::new(cmd).args(args).status().unwrap();
                 assert!(status.success(), "{} {:?} failed", cmd, args);
             };
-            run("mkfs.ext4", &["-q", "-F", "-I", "512", "-E", "stride=2", &dev_path]);
+            run(
+                "mkfs.ext4",
+                &["-q", "-F", "-I", "512", "-E", "stride=2", &dev_path],
+            );
 
             let tmp_dir = tempfile::TempDir::new().unwrap();
             let mnt = tmp_dir.path().to_str().unwrap();
@@ -693,7 +651,7 @@ mod integration {
     fn __test_ublk_ramdisk(dev_flags: UblkFlags) {
         // async function to handle individual I/O commands using slice operations for safe buffer access
         async fn handle_io_cmd(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             ramdisk_addr: usize,
             io_buf: &mut [u8],
@@ -741,12 +699,12 @@ mod integration {
         }
 
         async fn test_ramdisk_io_task(
-            q: &UblkQueue<'_>,
+            q: &UblkQueue,
             tag: u16,
             ramdisk_addr: usize,
             mlock_enabled: bool,
         ) -> Result<(), UblkError> {
-            let mut buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            let mut buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
             // Submit initial prep command - any error will exit the function
             // The IoBuf is automatically registered
@@ -786,37 +744,13 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
-            let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
-            let exe_rc = Rc::new(smol::LocalExecutor::new());
-            let exe = exe_rc.clone();
-            let mut f_vec = Vec::new();
-
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             let mlock_enabled = dev.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
 
-            for tag in 0..depth {
-                let q = q_rc.clone();
-
-                f_vec.push(exe.spawn(async move {
-                    match test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await {
-                        Err(UblkError::QueueIsDown) | Ok(_) => {
-                            log::error!("test_ramdisk_io_task done: {}", tag);
-                        }
-                        Err(e) => log::error!("test_ramdisk_io_task failed for tag {}: {}", tag, e),
-                    }
-                }));
-            }
-
-            smol::block_on(exe_rc.run(async move {
-                let run_ops = || while exe.try_tick() {};
-                let done = || f_vec.iter().all(|task| task.is_finished());
-
-                if let Err(e) =
-                    libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await
-                {
-                    log::error!("handle_uring_events failed: {}", e);
-                }
-            }));
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| async move {
+                test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await
+            })
+            .unwrap();
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
@@ -837,7 +771,7 @@ mod integration {
     #[test]
     fn test_fn_mut_io_closure() {
         /// called from queue_handler closure(), which supports Clone(),
-        fn null_queue_mut_io(qid: u16, dev: &UblkDev) {
+        fn null_queue_mut_io(qid: u16, dev: &Arc<UblkDev>) {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
             let bufs = bufs_rc.clone();
@@ -846,7 +780,7 @@ mod integration {
             let mut q_vec = Vec::<i32>::new();
             let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
                 let iod = q.get_iod(tag);
-                let res = Ok(UblkIORes::Result((iod.nr_sectors << 9) as i32));
+                let res = (iod.nr_sectors << 9) as i32;
 
                 {
                     q_vec.push(tag as i32);
@@ -1034,7 +968,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let bufs = bufs_rc.clone();
 
@@ -1044,7 +978,7 @@ mod integration {
                 q.complete_io_cmd_unified(
                     tag,
                     BufDesc::Slice(bufs[tag as usize].as_slice()),
-                    Ok(UblkIORes::Result(bytes)),
+                    bytes,
                 )
                 .unwrap();
             };
@@ -1229,7 +1163,7 @@ mod integration {
             );
         }
 
-        fn single_cpu_null_handle_queue(qid: u16, dev: &UblkDev) {
+        fn single_cpu_null_handle_queue(qid: u16, dev: &Arc<UblkDev>) {
             let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
             let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
             let bufs = bufs_rc.clone();
@@ -1243,8 +1177,7 @@ mod integration {
                 } else {
                     BufDesc::Slice(bufs[tag as usize].as_slice())
                 };
-                q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
-                    .unwrap();
+                q.complete_io_cmd_unified(tag, buf_desc, bytes).unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)
@@ -1279,7 +1212,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             single_cpu_null_handle_queue(qid, dev);
         };
 
@@ -1317,7 +1250,7 @@ mod integration {
             Ok(())
         };
 
-        let q_fn = move |qid: u16, dev: &UblkDev| {
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             // Create auto buffer registration data for each tag
             let mut buf_reg_data_list = Vec::with_capacity(depth as usize);
             let flags = if use_fallback {
@@ -1346,12 +1279,8 @@ mod integration {
                 };
 
                 // Use the unified complete_io_cmd_unified API with auto buffer registration
-                q.complete_io_cmd_unified(
-                    tag,
-                    BufDesc::AutoReg(auto_buf_reg),
-                    Ok(UblkIORes::Result(bytes)),
-                )
-                .unwrap();
+                q.complete_io_cmd_unified(tag, BufDesc::AutoReg(auto_buf_reg), bytes)
+                    .unwrap();
             };
 
             let queue = match UblkQueue::new(qid, dev)
