@@ -10,6 +10,7 @@ use bitflags::bitflags;
 mod bindings;
 pub mod ctrl;
 pub mod ctrl_async;
+pub mod executor;
 pub mod helpers;
 pub mod io;
 mod op;
@@ -49,6 +50,11 @@ pub use io::{
 
 // Re-export control ring initialization and access
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
+
+// Re-export executor contract and utilities
+pub use executor::{
+    spawn_local, with_ambient_spawner, TaskHandle, UblkExecutor, UblkSpawner, UblkTask,
+};
 
 /// Ublk io_uring user_data constants, used by the legacy sync event
 /// loop's tag-encoded `user_data` (async ops are slab-keyed and carry no
