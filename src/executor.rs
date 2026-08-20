@@ -168,9 +168,24 @@ pub trait UblkExecutor: UblkSpawner + Sized {
     /// the ambient spawner and parking on [`crate::reactor`] when idle.
     fn block_on<F: Future>(&self, future: F) -> F::Output;
 
+    /// Spawn a task on this executor. The default boxes the future and
+    /// forwards to [`UblkSpawner::spawn_boxed`]; an integration whose
+    /// native spawn is generic (Tokio's `spawn_local`) may override it
+    /// to skip the box. Unlike [`spawn_local`], this needs no ambient
+    /// spawner installed, only the executor itself.
+    fn spawn<F: Future<Output = ()> + 'static>(&self, fut: F) -> TaskHandle {
+        self.spawn_boxed(Box::pin(fut))
+    }
+
     /// Create queue `qid` of `dev` on the current thread, spawn one
-    /// `io_task(q, tag)` per tag, and run until every task completes.
-    /// Task errors other than [`UblkError::QueueIsDown`] are logged.
+    /// `io_task(q, tag)` per tag, and run until every task completes
+    /// (normally when the queue is torn down). Task errors other than
+    /// [`UblkError::QueueIsDown`] are logged, as are task panics (by
+    /// the integration's [`UblkTask`]).
+    ///
+    /// This is the standard body of a `run_target()` queue handler; use
+    /// [`Self::new`] + [`Self::block_on`] directly when the thread also
+    /// runs non-io tasks (e.g. control commands).
     fn run_io_tasks<F, Fut>(
         dev: &Arc<crate::io::UblkDev>,
         qid: u16,
@@ -182,12 +197,18 @@ pub trait UblkExecutor: UblkSpawner + Sized {
     {
         let rt = Self::new()?;
         let dev = dev.clone();
+        // block_on's future need not be 'static, so it may borrow `rt`.
+        let rt = &rt;
         rt.block_on(async move {
             let q = Rc::new(crate::io::UblkQueue::new(qid, &dev)?);
             let handles: Vec<TaskHandle> = (0..dev.dev_info.queue_depth)
                 .map(|tag| {
                     let task = io_task(q.clone(), tag);
-                    spawn_local(async move {
+                    // Spawn on `rt` directly rather than through the
+                    // ambient spawn_local: the library's own path must
+                    // not depend on block_on having installed the
+                    // ambient spawner, which the compiler cannot check.
+                    rt.spawn(async move {
                         match task.await {
                             Err(UblkError::QueueIsDown) | Ok(_) => {}
                             Err(e) => log::error!("io task failed for tag {}: {}", tag, e),
