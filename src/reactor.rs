@@ -156,14 +156,14 @@ pub fn wait_and_reap_events() -> ParkOutcome {
 /// CQE and doing the io-command accounting the explicit event loops used
 /// to do. Returns the number of CQEs handled and of wakers woken.
 fn reap_queue_ring() -> (usize, usize) {
-    let (n, woken, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
+    let (n, wakers, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
         let Some(ring_cell) = cell.get() else {
-            return (0, 0, 0, false);
+            return (0, Vec::new(), 0, false);
         };
         let mut ring = ring_cell.borrow_mut();
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
-        let (n, woken) = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
+        let (n, wakers) = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
             if cqe.user_data() == CTRL_POLL_DATA {
                 CTRL_POLL_ARMED.with(|armed| armed.set(false));
             } else if is_io_cmd {
@@ -173,10 +173,16 @@ fn reap_queue_ring() -> (usize, usize) {
                 }
             }
         });
-        (n, woken, cmd_cnt, aborted)
+        (n, wakers, cmd_cnt, aborted)
     });
     if cmd_cnt > 0 {
         crate::io::update_queue_state(cmd_cnt, aborted);
+    }
+    // Wake with every RefCell borrow released: an inline waker may drop
+    // an op future, which re-borrows the slab and the ring.
+    let woken = wakers.len();
+    for waker in wakers {
+        waker.wake();
     }
     (n, woken)
 }
@@ -184,13 +190,18 @@ fn reap_queue_ring() -> (usize, usize) {
 /// Drain the control ring's completion queue, waking the future behind
 /// each CQE. Returns the number of CQEs handled and of wakers woken.
 fn reap_ctrl_ring() -> (usize, usize) {
-    crate::ctrl::CTRL_URING.with(|cell| {
+    let (n, wakers) = crate::ctrl::CTRL_URING.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(ring) = guard.as_mut() else {
-            return (0, 0);
+            return (0, Vec::new());
         };
         ublk_reap_and_wake(ring, |_, _| {})
-    })
+    });
+    let woken = wakers.len();
+    for waker in wakers {
+        waker.wake();
+    }
+    (n, woken)
 }
 
 /// Flush pending SQEs and sleep in `io_uring_enter` until a CQE arrives

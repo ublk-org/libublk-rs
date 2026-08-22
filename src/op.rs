@@ -288,29 +288,32 @@ pub(crate) fn submit_sync(
 /// queue is delivered to its future rather than corrupting state.
 #[inline]
 pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> Option<(u64, bool)> {
-    OP_SLAB.with(|slab| {
+    let (ret, waker) = OP_SLAB.with(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
             debug_assert!(false, "CQE for unknown op {}", key);
-            return None;
+            return (None, None);
         };
         if entry.sync_data.is_none() {
             if entry.orphaned {
                 if !more {
                     slab.remove(key).discard_result(result);
                 }
-                return None;
+                return (None, None);
             }
             entry.terminated = !more;
             entry.push_result(result);
-            if let Some(waker) = entry.waker.take() {
-                waker.wake();
-            }
-            return None;
+            return (None, entry.waker.take());
         }
         let entry = slab.remove(key);
-        Some((entry.sync_data.unwrap(), entry.is_io_cmd))
-    })
+        (Some((entry.sync_data.unwrap(), entry.is_io_cmd)), None)
+    });
+    // Wake outside the slab borrow: an inline waker may drop a future
+    // whose Op re-enters the slab (orphan_entry).
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+    ret
 }
 
 /// Handle to one submitted single-shot operation.
@@ -560,16 +563,17 @@ impl Drop for MultiOp {
     }
 }
 
-/// Drain `ring`'s completion queue, waking the future behind each CQE.
-/// `per_cqe` runs for every CQE with a flag telling whether it completed
-/// a ublk io command (for the queue-state accounting). Returns the number
-/// of CQEs drained and the number of wakers actually woken -- reserved
-/// sentinels, orphans and not-yet-polled futures drain without waking
-/// anything, and an executor park hook must not treat them as runnable
-/// work. The slab and the completion queue are borrowed once for the
-/// whole batch; CQEs posted mid-drain are picked up by the caller's next
-/// pass.
-pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, usize)
+/// Drain `ring`'s completion queue, collecting the waker of the future
+/// behind each CQE. `per_cqe` runs for every CQE with a flag telling
+/// whether it completed a ublk io command (for the queue-state
+/// accounting). Returns the number of CQEs drained and the wakers to
+/// invoke — the caller MUST wake them, and only after releasing its
+/// ring borrow (see the comment on `wakers` below). Reserved sentinels,
+/// orphans and not-yet-polled futures drain without producing a waker,
+/// and an executor park hook must not treat them as runnable work. The
+/// slab and the completion queue are borrowed once for the whole batch;
+/// CQEs posted mid-drain are picked up by the caller's next pass.
+pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, Vec<Waker>)
 where
     S: squeue::EntryMarker,
     F: FnMut(&cqueue::Entry, bool),
@@ -578,7 +582,13 @@ where
         let mut slab = slab.borrow_mut();
         let cq = ring.completion();
         let mut n = 0;
-        let mut woken = 0;
+        // Collected, not woken here: a waker may run arbitrary code
+        // inline (a bring-your-own executor can drop a task's future,
+        // whose Op re-enters the slab and pushes a cancel SQE), so
+        // waking under the slab — or the caller's ring — RefCell borrow
+        // would panic with a double borrow. The caller wakes these
+        // after releasing its ring borrow.
+        let mut wakers: Vec<Waker> = Vec::new();
         for cqe in cq {
             n += 1;
             let key = match classify_user_data(cqe.user_data()) {
@@ -613,11 +623,10 @@ where
             entry.terminated = !more;
             entry.push_result(cqe.result());
             if let Some(waker) = entry.waker.take() {
-                waker.wake();
-                woken += 1;
+                wakers.push(waker);
             }
         }
-        (n, woken)
+        (n, wakers)
     })
 }
 

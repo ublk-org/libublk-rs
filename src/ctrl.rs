@@ -1358,7 +1358,7 @@ impl UblkCtrlInner {
             if let Some(res) = op.try_take_result() {
                 return Ok(res);
             }
-            with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+            let wakers = with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
                 // A signal delivered to the daemon must not fail the
                 // command: retry the wait, as reactor::wait_for_cqe does
                 // for the same ring.
@@ -1367,9 +1367,14 @@ impl UblkCtrlInner {
                     Err(ref e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
                     Err(e) => return Err(UblkError::IOError(e)),
                 }
-                let _ = crate::op::ublk_reap_and_wake(r, |_, _| {});
-                Ok::<(), UblkError>(())
+                let (_, wakers) = crate::op::ublk_reap_and_wake(r, |_, _| {});
+                Ok::<_, UblkError>(wakers)
             })?;
+            // Async op futures drained alongside this sync command wake
+            // outside the ring borrow (a waker may run inline).
+            for waker in wakers {
+                waker.wake();
+            }
         }
     }
 
