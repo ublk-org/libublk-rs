@@ -94,6 +94,10 @@ pub(crate) enum Resources {
     Buffer(Box<[u8]>),
     /// Timespec referenced by a TIMEOUT SQE.
     Timespec(#[allow(dead_code)] Box<io_uring::types::Timespec>),
+    /// Op references no caller memory, but a successful CQE result is a
+    /// fresh file descriptor the consumer owns (accept). If nobody
+    /// consumes the completion, the reaper must close it.
+    ResultFd,
 }
 
 impl Resources {
@@ -130,6 +134,18 @@ pub(crate) struct OpEntry {
 }
 
 impl OpEntry {
+    /// Release a completion nobody will consume. A discarded successful
+    /// accept result is a live connection fd: dropping the value would
+    /// leak it permanently (fd-table exhaustion under `select!`-style
+    /// accept cancellation), so close it here.
+    fn discard_result(&self, result: i32) {
+        if matches!(self.resources, Resources::ResultFd) && result >= 0 {
+            // SAFETY: the fd arrived in this op's own CQE and no
+            // consumer exists; this close is its only owner's.
+            unsafe { libc::close(result) };
+        }
+    }
+
     #[inline]
     fn push_result(&mut self, result: i32) {
         if self.result.is_none() && self.extra_results.is_empty() {
@@ -281,7 +297,7 @@ pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> Option<(u6
         if entry.sync_data.is_none() {
             if entry.orphaned {
                 if !more {
-                    slab.remove(key);
+                    slab.remove(key).discard_result(result);
                 }
                 return None;
             }
@@ -453,7 +469,12 @@ fn orphan_entry(ring: OpRing, key: usize) {
             return true;
         };
         if entry.terminated {
-            slab.remove(key);
+            // Result already reaped but never consumed (future dropped
+            // after completion, before its final poll).
+            let entry = slab.remove(key);
+            if let Some(result) = entry.result {
+                entry.discard_result(result);
+            }
             return true;
         }
         entry.orphaned = true;
@@ -585,7 +606,7 @@ where
                 // terminal CQE only, so a multi-CQE chain cannot land on
                 // a recycled key.
                 if !more {
-                    slab.remove(key);
+                    slab.remove(key).discard_result(cqe.result());
                 }
                 continue;
             }

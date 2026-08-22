@@ -337,14 +337,21 @@ impl Future for Accept {
 }
 
 /// Accept one connection on a listening socket.
+///
+/// Dropping the future before consuming its completion does not leak
+/// the connection: if an accept still lands (racing the cancel), the
+/// reaper closes the unclaimed fd.
 pub fn accept(fd: TgtFd) -> Result<Accept, UblkError> {
-    let op = submit_raw(with_tgt_fd!(fd, |f| opcode::Accept::new(
+    let sqe = with_tgt_fd!(fd, |f| opcode::Accept::new(
         f,
         std::ptr::null_mut(),
         std::ptr::null_mut()
     )
-    .build()))?;
-    Ok(Accept { op })
+    .build());
+    // ResultFd: a successful accept CQE carries a live fd; the reaper
+    // must close it if this future is dropped unconsumed.
+    let op = Op::submit(|key| sqe.user_data(key), Resources::ResultFd)?;
+    Ok(Accept { op: RawOp::new(op) })
 }
 
 /// Receive from a socket into an owned buffer. `flags` is the
