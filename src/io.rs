@@ -741,7 +741,7 @@ impl<'a> UblkIOCtx<'a> {
     ///
     /// * `tag`: io tag, length is 16bit
     /// * `op`: io operation code, length is 8bit
-    /// * `tgt_data`: target specific data, at most 39bit (64 - 16 - 8 - 1)
+    /// * `tgt_data`: target specific data, at most 16bit (asserted)
     /// * `is_target_io`: if this userdata is for handling target io, false if
     ///         if it is only for ublk io command
     ///
@@ -751,14 +751,15 @@ impl<'a> UblkIOCtx<'a> {
     /// op layer).
     ///
     #[inline(always)]
-    #[allow(arithmetic_overflow)]
     pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
         assert!((tgt_data >> 16) == 0);
 
         let op = op & 0xff;
+        // Widen BEFORE shifting: `tgt_data << 24` in u32 silently
+        // discards bits 8..16, which the assert above explicitly admits.
         tag as u64
-            | (op << 16) as u64
-            | (tgt_data << 24) as u64
+            | ((op as u64) << 16)
+            | ((tgt_data as u64) << 24)
             | if is_target_io {
                 UblkUringData::Target as u64
             } else {
@@ -2698,6 +2699,27 @@ mod raw_sqe_layout {
         const KEY: u64 = 0x4242_4242_4242_4242;
         let mut sqe: squeue::Entry = opcode::Nop::new().build().user_data(KEY);
         assert_eq!(sqe.as_raw_sqe().user_data, KEY, "user_data moved");
+    }
+}
+
+#[cfg(test)]
+mod user_data_tests {
+    use super::UblkIOCtx;
+    use crate::UblkUringData;
+
+    #[test]
+    fn build_user_data_keeps_all_16_tgt_data_bits() {
+        // Regression: `tgt_data << 24` computed in u32 dropped bits
+        // 8..16, so 0x0100 and 0x0200 built identical words.
+        let d = UblkIOCtx::build_user_data(0x12, 0xab, 0xbeef, true);
+        assert_eq!(d & 0xffff, 0x12);
+        assert_eq!((d >> 16) & 0xff, 0xab);
+        assert_eq!((d >> 24) & 0xffff, 0xbeef);
+        assert_ne!(d & (UblkUringData::Target as u64), 0);
+        assert_ne!(
+            UblkIOCtx::build_user_data(0, 0, 0x0100, false),
+            UblkIOCtx::build_user_data(0, 0, 0x0200, false),
+        );
     }
 }
 
