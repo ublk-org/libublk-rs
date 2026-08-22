@@ -188,6 +188,37 @@ impl crate::executor::UblkExecutor for UblkRuntime {
 mod tests {
     use super::*;
 
+    /// An io task failing before it registers its buffer must fail
+    /// run_target with an error instead of hanging both the main
+    /// thread (buffer-registration condvar) and the queue thread
+    /// (sibling tasks parked on the registration semaphore forever).
+    /// Requires a real ublk device.
+    #[test]
+    fn run_target_fails_fast_when_io_tasks_error() {
+        use crate::ctrl::{UblkCtrl, UblkCtrlBuilder};
+        use crate::io::UblkDev;
+        use crate::{UblkError, UblkFlags};
+        use std::sync::Arc;
+
+        let ctrl = UblkCtrlBuilder::default()
+            .name("fail_fast")
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(1_u64 << 30);
+            Ok(())
+        };
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            let res = UblkRuntime::run_io_tasks(dev, qid, |_q, _tag| async move {
+                Err::<(), UblkError>(UblkError::OtherError(-libc::EINVAL))
+            });
+            assert!(res.is_err());
+        };
+        let res = ctrl.run_target(tgt_init, q_fn, |_ctrl: &UblkCtrl| {});
+        assert!(res.is_err());
+    }
+
     /// The executor contract promises `spawn` needs only the executor
     /// itself, no running `block_on`: a task spawned before (or
     /// between) `block_on` calls starts once one runs. Under the old

@@ -217,6 +217,7 @@ pub trait UblkExecutor: UblkSpawner + Sized {
                 let handles: Vec<TaskHandle> = (0..dev.dev_info.queue_depth)
                     .map(|tag| {
                         let task = io_task(q.clone(), tag);
+                        let q = q.clone();
                         let dev = dev.clone();
                         let first_err = first_err.clone();
                         // Spawn on `rt` directly rather than through the
@@ -230,10 +231,13 @@ pub trait UblkExecutor: UblkSpawner + Sized {
                                     log::error!("io task failed for tag {}: {}", tag, e);
                                     // A task dying before registering its
                                     // buffer stalls the per-queue counter
-                                    // forever; fail the handshake NOW —
-                                    // sibling tasks parked on the
-                                    // registration semaphore may never let
-                                    // this block_on return.
+                                    // forever; unpark the sibling tasks
+                                    // waiting on the registration
+                                    // semaphore (they exit QueueIsDown)
+                                    // and fail the device handshake NOW —
+                                    // block_on cannot return while they
+                                    // are parked.
+                                    q.fail_buffer_registration();
                                     dev.notify_queue_setup_failed();
                                     first_err.borrow_mut().get_or_insert(e);
                                 }

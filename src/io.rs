@@ -1597,6 +1597,28 @@ impl UblkQueue {
         }
     }
 
+    /// Unblock the buffer-registration handshake after an io task died
+    /// before registering its buffer: the per-queue counter can then
+    /// never reach `q_depth`, so without this every sibling task parks
+    /// in [`Self::wait_for_all_buffer_registrations`] forever and the
+    /// queue thread never exits. Mark the queue stopping and hand out
+    /// the permits a completed registration would have; woken siblings
+    /// see the stopping state and bail with `QueueIsDown`.
+    ///
+    /// A no-op once registration completed (nobody is parked, and a
+    /// task failing at runtime must not force-stop a live queue here)
+    /// and in the modes that never wait.
+    pub(crate) fn fail_buffer_registration(&self) {
+        if self.support_auto_buf_zc() {
+            return;
+        }
+        if *self.buf_reg_counter.borrow() >= self.q_depth {
+            return;
+        }
+        self.mark_stopping();
+        self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+    }
+
     /// Register IO buffer, so that pages in this buffer can
     /// be discarded in case queue becomes idle
     pub fn unregister_io_buf(&self, tag: u16) {
@@ -1939,6 +1961,14 @@ impl UblkQueue {
         if self.is_mlock_failed() {
             self.mark_stopping();
             return Err(UblkError::OtherError(-libc::EPERM));
+        }
+
+        // A sibling task failed before registering its buffer
+        // (fail_buffer_registration released the wait above): the queue
+        // is going down before the device ever starts — do not arm the
+        // FETCH command.
+        if self.is_stopping() {
+            return Err(UblkError::QueueIsDown);
         }
 
         let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
