@@ -59,6 +59,11 @@ fn park_hook() {
 /// absent: all IO on this thread goes through the ring.
 pub struct UblkRuntime {
     rt: tokio::runtime::Runtime,
+    /// The runtime's own task set. Spawns via the executor contract
+    /// land here — never on whatever `LocalSet` happens to be running —
+    /// so tasks belong to *this* runtime and survive across its
+    /// `block_on` calls, dying only when the runtime is dropped.
+    local: tokio::task::LocalSet,
 }
 
 impl UblkRuntime {
@@ -68,15 +73,18 @@ impl UblkRuntime {
             .on_thread_park(park_hook)
             .build()
             .map_err(UblkError::IOError)?;
-        Ok(UblkRuntime { rt })
+        Ok(UblkRuntime {
+            rt,
+            local: tokio::task::LocalSet::new(),
+        })
     }
 
-    /// Run a future to completion inside a fresh `LocalSet`, driving the
-    /// thread-local ublk uring(s) while the future is pending.
+    /// Run a future to completion inside the runtime's `LocalSet`,
+    /// driving the thread-local ublk uring(s) while the future is
+    /// pending.
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         crate::executor::with_ambient_spawner(self, || {
-            let local = tokio::task::LocalSet::new();
-            self.rt.block_on(local.run_until(async move {
+            self.rt.block_on(self.local.run_until(async move {
                 let mut future = std::pin::pin!(future);
                 std::future::poll_fn(move |cx| {
                     // (Re-)register the root waker for the park hook's kick.
@@ -146,20 +154,20 @@ impl crate::executor::UblkTask for TokioTask {
     }
 }
 
-/// Spawning goes through Tokio's free `spawn_local`, which targets the
-/// *innermost currently-running* `LocalSet` — normally the one
-/// [`UblkRuntime::block_on`] created, but not if target code nests its
-/// own `LocalSet::run_until` inside a task and spawns from there: the
-/// task then lands on that inner set and is destroyed when its
-/// `run_until` returns, which the handle reports as plain completion.
-/// Do not nest `LocalSet`s around [`crate::executor::spawn_local`]
-/// calls.
+/// Spawning targets the runtime's own `LocalSet` (`self.local`), never
+/// the free `tokio::task::spawn_local` — the free form lands the task
+/// on the *innermost currently-running* `LocalSet`, so a nested
+/// `LocalSet::run_until` in target code would capture (and on return
+/// destroy) library-spawned tasks. Spawning on the handle also works
+/// before/between [`UblkRuntime::block_on`] calls: the task starts once
+/// `block_on` next runs. (Target code calling tokio's free
+/// `spawn_local` directly still gets the innermost-set semantics.)
 impl crate::executor::UblkSpawner for UblkRuntime {
     fn spawn_boxed(
         &self,
         fut: std::pin::Pin<Box<dyn Future<Output = ()>>>,
     ) -> crate::executor::TaskHandle {
-        crate::executor::TaskHandle::new(Box::new(TokioTask(tokio::task::spawn_local(fut))))
+        crate::executor::TaskHandle::new(Box::new(TokioTask(self.local.spawn_local(fut))))
     }
 }
 
@@ -170,15 +178,36 @@ impl crate::executor::UblkExecutor for UblkRuntime {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         UblkRuntime::block_on(self, future)
     }
-    // Tokio's spawn_local is itself generic: skip the spawn_boxed box.
+    // LocalSet::spawn_local is itself generic: skip the spawn_boxed box.
     fn spawn<F: Future<Output = ()> + 'static>(&self, fut: F) -> crate::executor::TaskHandle {
-        crate::executor::TaskHandle::new(Box::new(TokioTask(tokio::task::spawn_local(fut))))
+        crate::executor::TaskHandle::new(Box::new(TokioTask(self.local.spawn_local(fut))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The executor contract promises `spawn` needs only the executor
+    /// itself, no running `block_on`: a task spawned before (or
+    /// between) `block_on` calls starts once one runs. Under the old
+    /// free-`tokio::task::spawn_local` implementation this panicked.
+    #[test]
+    fn spawn_outside_block_on_runs_on_next_block_on() {
+        use crate::executor::UblkExecutor;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let rt = <UblkRuntime as UblkExecutor>::new().unwrap();
+        let ran = Rc::new(Cell::new(false));
+        let r = ran.clone();
+        let h = rt.spawn(async move {
+            r.set(true);
+        });
+        assert!(!ran.get());
+        rt.block_on(h);
+        assert!(ran.get());
+    }
 
     #[test]
     fn trait_impl_spawn_cancel_detach() {

@@ -44,8 +44,10 @@ pub trait UblkSpawner {
 /// [`UblkTask::cancel`] requests cancellation.
 ///
 /// Detached is not immortal: a detached task lives only as long as its
-/// executor. One still pending when the enclosing
-/// [`UblkExecutor::block_on`] returns is destroyed without completing.
+/// executor. An integration may destroy still-pending tasks as soon as
+/// the enclosing [`UblkExecutor::block_on`] returns; none survives the
+/// executor's drop. (The built-in tokio integration keeps them across
+/// `block_on` calls and destroys them when the runtime is dropped.)
 pub trait UblkTask: Future<Output = ()> + Unpin {
     /// Request cancellation (fire-and-forget), consuming the handle.
     fn cancel(self: Box<Self>);
@@ -59,10 +61,11 @@ pub trait UblkTask: Future<Output = ()> + Unpin {
 /// channel or shared state.
 ///
 /// Dropping the handle detaches the task: it stays scheduled, but only
-/// for as long as the executor runs — a detached task still pending
-/// when [`UblkExecutor::block_on`] returns is destroyed without
-/// completing. Await the handle (or such state) before the root future
-/// returns when the task must finish (e.g. a final flush).
+/// for as long as the executor lives — an integration may destroy a
+/// still-pending detached task as soon as [`UblkExecutor::block_on`]
+/// returns, and none survives the executor's drop. Await the handle
+/// (or such state) before the root future returns when the task must
+/// finish (e.g. a final flush).
 pub struct TaskHandle(Option<Box<dyn UblkTask>>);
 
 impl TaskHandle {
