@@ -2720,13 +2720,13 @@ impl UblkQueue {
             };
 
             let user_data = cqe.user_data();
-            let (data, is_io_cmd) = match crate::op::classify_user_data(user_data) {
+            let (data, is_io_cmd, orphaned) = match crate::op::classify_user_data(user_data) {
                 // SQEs pushed on the ring directly (e.g. by the
                 // batch transport, whose multishot fetches cannot
                 // ride a single-shot slab entry) keep their own
                 // target-bit user_data; deliver it untouched.
-                crate::op::CqeOwner::Target => (Some(user_data), false),
-                crate::op::CqeOwner::Sentinel => (None, false),
+                crate::op::CqeOwner::Target => (Some(user_data), false, false),
+                crate::op::CqeOwner::Sentinel => (None, false, false),
                 crate::op::CqeOwner::Op(key) => {
                     crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
                 }
@@ -2735,9 +2735,12 @@ impl UblkQueue {
             // was sync-mode: an async io command submitted on this
             // queue incremented cmd_inflight the same way, and its
             // completion draining through this loop must balance it.
+            // An orphaned command's ABORT is stale (possibly from a
+            // previously dropped queue on this thread) and must not
+            // flip this queue into stopping.
             if is_io_cmd {
                 cmd_cnt += 1;
-                if cqe.result() == sys::UBLK_IO_RES_ABORT {
+                if !orphaned && cqe.result() == sys::UBLK_IO_RES_ABORT {
                     aborted = true;
                 }
             }

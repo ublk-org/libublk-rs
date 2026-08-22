@@ -288,14 +288,17 @@ pub(crate) fn submit_sync(
 /// key resolves — sync, async and orphaned alike. The async submit path
 /// incremented `cmd_inflight` just like the sync one, so the sync
 /// loop's batch accounting must observe the completion either way, or
-/// the count leaks and the queue never reaches `is_idle()`.
+/// the count leaks and the queue never reaches `is_idle()`. The third
+/// flag marks orphaned entries, whose result (e.g. a stale ABORT from
+/// a previous queue on this thread) must be counted but must not drive
+/// current-queue state.
 #[inline]
-pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u64>, bool) {
+pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u64>, bool, bool) {
     let (ret, waker) = OP_SLAB.with(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
             debug_assert!(false, "CQE for unknown op {}", key);
-            return ((None, false), None);
+            return ((None, false, false), None);
         };
         let is_io_cmd = entry.is_io_cmd;
         if entry.sync_data.is_none() {
@@ -303,14 +306,14 @@ pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u6
                 if !more {
                     slab.remove(key).discard_result(result);
                 }
-                return ((None, is_io_cmd), None);
+                return ((None, is_io_cmd, true), None);
             }
             entry.terminated = !more;
             entry.push_result(result);
-            return ((None, is_io_cmd), entry.waker.take());
+            return ((None, is_io_cmd, false), entry.waker.take());
         }
         let entry = slab.remove(key);
-        ((Some(entry.sync_data.unwrap()), is_io_cmd), None)
+        ((Some(entry.sync_data.unwrap()), is_io_cmd, false), None)
     });
     // Wake outside the slab borrow: an inline waker may drop a future
     // whose Op re-enters the slab (orphan_entry).
@@ -568,9 +571,10 @@ impl Drop for MultiOp {
 }
 
 /// Drain `ring`'s completion queue, collecting the waker of the future
-/// behind each CQE. `per_cqe` runs for every CQE with a flag telling
+/// behind each CQE. `per_cqe` runs for every CQE with two flags:
 /// whether it completed a ublk io command (for the queue-state
-/// accounting). Returns the number of CQEs drained and the wakers to
+/// accounting) and whether the entry was orphaned (counted, but its
+/// result — e.g. a stale ABORT — must not drive current-queue state). Returns the number of CQEs drained and the wakers to
 /// invoke — the caller MUST wake them, and only after releasing its
 /// ring borrow (see the comment on `wakers` below). Reserved sentinels,
 /// orphans and not-yet-polled futures drain without producing a waker,
@@ -580,7 +584,7 @@ impl Drop for MultiOp {
 pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, Vec<Waker>)
 where
     S: squeue::EntryMarker,
-    F: FnMut(&cqueue::Entry, bool),
+    F: FnMut(&cqueue::Entry, bool, bool),
 {
     OP_SLAB.with(|slab| {
         let mut slab = slab.borrow_mut();
@@ -601,16 +605,22 @@ where
                 // pushes its own target-bit user_data) carry no op
                 // state: hand them to the caller untouched.
                 CqeOwner::Sentinel | CqeOwner::Target => {
-                    per_cqe(&cqe, false);
+                    per_cqe(&cqe, false, false);
                     continue;
                 }
             };
             let Some(entry) = slab.get_mut(key) else {
                 debug_assert!(false, "CQE for unknown op {}", key);
-                per_cqe(&cqe, false);
+                per_cqe(&cqe, false, false);
                 continue;
             };
-            per_cqe(&cqe, entry.is_io_cmd);
+            // The third flag marks orphaned entries: their completion
+            // must still be counted (the submit incremented the
+            // inflight count), but nobody is serving the command any
+            // more — in particular a stale ABORT from a command of a
+            // previously dropped queue on this thread must not flip a
+            // freshly registered queue into stopping.
+            per_cqe(&cqe, entry.is_io_cmd, entry.orphaned);
             let more = cqueue::more(cqe.flags());
             if entry.orphaned || entry.sync_data.is_some() {
                 // Orphaned future, or a sync-mode entry drained by the

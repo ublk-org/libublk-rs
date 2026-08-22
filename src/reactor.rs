@@ -172,12 +172,15 @@ fn reap_queue_ring() -> (usize, usize) {
         let mut ring = ring_cell.borrow_mut();
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
-        let (n, wakers) = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
+        let (n, wakers) = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd, orphaned| {
             if cqe.user_data() == CTRL_POLL_DATA {
                 CTRL_POLL_ARMED.with(|armed| armed.set(false));
             } else if is_io_cmd {
                 cmd_cnt += 1;
-                if cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
+                // An orphaned command's ABORT is stale — possibly from
+                // a queue already dropped on this thread — and must not
+                // flip the currently registered queue into stopping.
+                if !orphaned && cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
                     aborted = true;
                 }
             }
@@ -204,7 +207,7 @@ fn reap_ctrl_ring() -> (usize, usize) {
         let Some(ring) = guard.as_mut() else {
             return (0, Vec::new());
         };
-        ublk_reap_and_wake(ring, |_, _| {})
+        ublk_reap_and_wake(ring, |_, _, _| {})
     });
     let woken = wakers.len();
     for waker in wakers {

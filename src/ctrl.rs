@@ -1367,7 +1367,7 @@ impl UblkCtrlInner {
                     Err(ref e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
                     Err(e) => return Err(UblkError::IOError(e)),
                 }
-                let (_, wakers) = crate::op::ublk_reap_and_wake(r, |_, _| {});
+                let (_, wakers) = crate::op::ublk_reap_and_wake(r, |_, _, _| {});
                 Ok::<_, UblkError>(wakers)
             })?;
             // Async op futures drained alongside this sync command wake
