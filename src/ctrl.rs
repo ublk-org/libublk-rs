@@ -1028,9 +1028,12 @@ impl UblkCtrlInner {
 
     const UBLK_CTRL_DEV_DELETED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_2;
     const UBLK_CTRL_DEV_DISOWNED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_4;
+    // UBLK_F_NEED_GET_DATA is deliberately absent: nothing in the crate
+    // answers UBLK_IO_RES_NEED_GET_DATA with UBLK_U_IO_NEED_GET_DATA, so
+    // a device created with it would hang every write in the kernel.
+    // Rejecting the flag here surfaces that as InvalidVal at build time.
     const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
         | sys::UBLK_F_URING_CMD_COMP_IN_TASK
-        | sys::UBLK_F_NEED_GET_DATA
         | sys::UBLK_F_USER_RECOVERY
         | sys::UBLK_F_USER_RECOVERY_REISSUE
         | sys::UBLK_F_UNPRIVILEGED_DEV
@@ -2950,6 +2953,16 @@ mod tests {
     fn test_batch_io_in_driver_flags() {
         assert_ne!(
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_BATCH_IO as u64,
+            0
+        );
+    }
+
+    /// NEED_GET_DATA's response command is unimplemented; the flag must
+    /// stay rejected until it is, or writes hang in the kernel.
+    #[test]
+    fn test_need_get_data_rejected() {
+        assert_eq!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_NEED_GET_DATA as u64,
             0
         );
     }
