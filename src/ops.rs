@@ -443,10 +443,16 @@ pub unsafe fn send_raw(
 /// A link partner must be pushed from the same poll, with no `await` in
 /// between. The library also pushes SQEs on the queue ring -- the
 /// reactor's control-ring poll bridge when the executor parks, and an
-/// `ASYNC_CANCEL` when an op future is dropped -- and io_uring keeps a
-/// link open across `io_uring_enter`, so suspending mid-chain links one
-/// of those instead of the intended partner (and a failed send then
-/// cancels it).
+/// `ASYNC_CANCEL` when an op future is dropped -- so suspending
+/// mid-chain can link one of those instead of the intended partner (and
+/// a failed send then cancels it).
+///
+/// The kernel closes any open chain at the end of a submission pass,
+/// and the push path flushes the SQ when it fills up -- a flush landing
+/// between two linked SQEs therefore splits the chain silently (the
+/// earlier part runs unlinked from the rest). Respecting `IO_LINK` is
+/// the caller's job: keep `sq_depth` deep enough for everything one
+/// poll pushes, and keep chains short.
 ///
 /// # Safety
 ///
