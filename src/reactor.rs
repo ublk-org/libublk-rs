@@ -121,9 +121,18 @@ pub enum ParkOutcome {
 /// sleep in `io_uring_enter` for at most one safety period (1s).
 ///
 /// Returns immediately when no ops are in flight, so an executor may
-/// call this unconditionally from its idle hook: cross-thread wakes
-/// (channels, join handles) still get through because the thread only
-/// sleeps while a CQE is guaranteed to arrive and wake it.
+/// call this unconditionally from its idle hook.
+///
+/// Cross-thread wake latency: while ops ARE in flight — for a ublk
+/// queue thread that is always, its FETCH commands stay armed — the
+/// thread sleeps inside `io_uring_enter`, which a cross-thread wake
+/// (channel send, join-handle completion) cannot interrupt. Such a
+/// wake is observed at the next CQE or, at the latest, when the 1s
+/// safety timeout fires; nothing is lost, but anything signalling a
+/// busy-idle queue thread from outside pays up to one safety period
+/// of latency per round-trip. Latency-sensitive cross-thread
+/// signalling should go through the ring instead (e.g. poll an
+/// eventfd via [`crate::ops::poll_add`] and write it to wake).
 ///
 /// The safety-timeout path also returns, without any woken waker: the
 /// executor may have parked while still holding runnable (deferred)
