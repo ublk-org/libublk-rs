@@ -1167,7 +1167,24 @@ impl UblkQueueState {
 
     #[inline(always)]
     fn sub_cmd_inflight(&mut self, val: u32) {
-        self.cmd_inflight -= val;
+        // Saturate rather than underflow: a stale io command from a
+        // previously dropped queue on this thread (its orphaned entry
+        // outlives the queue in the op slab) can complete after a new
+        // queue registered its state, and its CQE is then accounted
+        // here. Wrapping would make queue_is_quiesced() permanently
+        // false — clean shutdown impossible — where saturating at the
+        // true floor is at worst transiently optimistic.
+        if val > self.cmd_inflight {
+            log::warn!(
+                "io-cmd completions ({}) exceed inflight count ({}): \
+                 stale command from a previous queue on this thread",
+                val,
+                self.cmd_inflight
+            );
+            self.cmd_inflight = 0;
+        } else {
+            self.cmd_inflight -= val;
+        }
     }
 
     fn mark_stopping(&mut self) {
