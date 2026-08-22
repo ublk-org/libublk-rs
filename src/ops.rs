@@ -337,14 +337,21 @@ impl Future for Accept {
 }
 
 /// Accept one connection on a listening socket.
+///
+/// Dropping the future before consuming its completion does not leak
+/// the connection: if an accept still lands (racing the cancel), the
+/// reaper closes the unclaimed fd.
 pub fn accept(fd: TgtFd) -> Result<Accept, UblkError> {
-    let op = submit_raw(with_tgt_fd!(fd, |f| opcode::Accept::new(
+    let sqe = with_tgt_fd!(fd, |f| opcode::Accept::new(
         f,
         std::ptr::null_mut(),
         std::ptr::null_mut()
     )
-    .build()))?;
-    Ok(Accept { op })
+    .build());
+    // ResultFd: a successful accept CQE carries a live fd; the reaper
+    // must close it if this future is dropped unconsumed.
+    let op = Op::submit(|key| sqe.user_data(key), Resources::ResultFd)?;
+    Ok(Accept { op: RawOp::new(op) })
 }
 
 /// Receive from a socket into an owned buffer. `flags` is the
@@ -436,10 +443,16 @@ pub unsafe fn send_raw(
 /// A link partner must be pushed from the same poll, with no `await` in
 /// between. The library also pushes SQEs on the queue ring -- the
 /// reactor's control-ring poll bridge when the executor parks, and an
-/// `ASYNC_CANCEL` when an op future is dropped -- and io_uring keeps a
-/// link open across `io_uring_enter`, so suspending mid-chain links one
-/// of those instead of the intended partner (and a failed send then
-/// cancels it).
+/// `ASYNC_CANCEL` when an op future is dropped -- so suspending
+/// mid-chain can link one of those instead of the intended partner (and
+/// a failed send then cancels it).
+///
+/// The kernel closes any open chain at the end of a submission pass,
+/// and the push path flushes the SQ when it fills up -- a flush landing
+/// between two linked SQEs therefore splits the chain silently (the
+/// earlier part runs unlinked from the rest). Respecting `IO_LINK` is
+/// the caller's job: keep `sq_depth` deep enough for everything one
+/// poll pushes, and keep chains short.
 ///
 /// # Safety
 ///
@@ -636,8 +649,10 @@ pub unsafe fn sendmsg_zc(
         let mut sqe = with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
             .flags(flags as u32)
             .build());
-        // SENDMSG_ZC takes its zc flags in ioprio like SEND_ZC does, but
-        // the io-uring crate exposes no zc_flags() builder for it.
+        // SENDMSG_ZC takes its zc flags in ioprio like SEND_ZC does; the
+        // io-uring crate's SendMsgZc builder calls the field `ioprio`
+        // rather than exposing a zc_flags() alias, so OR the bit in the
+        // same way either name would land it.
         crate::override_sqe!(&mut sqe, ioprio, |=, SEND_ZC_REPORT_USAGE);
         sqe.user_data(key)
     })?;
@@ -716,10 +731,17 @@ pub unsafe fn uring_cmd80_buf(
 /// opcodes without a dedicated constructor. The entry's `user_data` is
 /// overwritten with the op key.
 ///
+/// The returned handle is single-shot: the SQE must produce exactly
+/// one completion. Do not submit multishot opcodes (`.multi(true)`
+/// poll/accept/recv) or two-CQE opcodes (`SendZc`/`SendMsgZc` — use
+/// [`send_zc`]/[`sendmsg_zc`]) through it: the first CQE resolves the
+/// future and every later completion for the SQE is dropped (debug
+/// builds assert).
+///
 /// # Safety
 ///
-/// Every pointer the SQE carries must remain valid until this op's CQE
-/// has been reaped — same contract as [`read_at_raw`].
+/// Every pointer the SQE carries must remain valid until the SQE's
+/// *last* CQE has been reaped — same contract as [`read_at_raw`].
 pub unsafe fn submit_sqe(sqe: squeue::Entry) -> Result<RawOp, UblkError> {
     submit_raw(sqe)
 }
@@ -770,7 +792,8 @@ mod tests {
             }?;
             let sent = op.sent().await;
             assert_eq!(sent as usize, payload.len());
-            // AF_UNIX sends always copy; just consume the notification.
+            // Loopback TCP sends usually fall back to copying; either
+            // way, consume the notification CQE.
             let _copied = op.into_notif().await;
 
             let (res, rbuf) = recv(
