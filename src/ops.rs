@@ -716,10 +716,17 @@ pub unsafe fn uring_cmd80_buf(
 /// opcodes without a dedicated constructor. The entry's `user_data` is
 /// overwritten with the op key.
 ///
+/// The returned handle is single-shot: the SQE must produce exactly
+/// one completion. Do not submit multishot opcodes (`.multi(true)`
+/// poll/accept/recv) or two-CQE opcodes (`SendZc`/`SendMsgZc` — use
+/// [`send_zc`]/[`sendmsg_zc`]) through it: the first CQE resolves the
+/// future and every later completion for the SQE is dropped (debug
+/// builds assert).
+///
 /// # Safety
 ///
-/// Every pointer the SQE carries must remain valid until this op's CQE
-/// has been reaped — same contract as [`read_at_raw`].
+/// Every pointer the SQE carries must remain valid until the SQE's
+/// *last* CQE has been reaped — same contract as [`read_at_raw`].
 pub unsafe fn submit_sqe(sqe: squeue::Entry) -> Result<RawOp, UblkError> {
     submit_raw(sqe)
 }

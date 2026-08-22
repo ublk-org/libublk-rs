@@ -336,6 +336,9 @@ impl Op {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
             entry.result?;
+            // Control commands are all single-completion uring_cmds, so
+            // unlike poll_single this path needs no multi-CQE fallback.
+            debug_assert!(entry.terminated, "multi-CQE ctrl cmd");
             let entry = slab.remove(self.key);
             self.done = true;
             entry.result
@@ -364,13 +367,30 @@ impl Op {
                     Poll::Pending
                 }
                 Some(result) => {
-                    debug_assert!(
-                        entry.terminated,
-                        "multi-CQE sqe awaited through single-shot Op; use MultiOp"
-                    );
-                    let entry = slab.remove(self.key);
                     self.done = true;
-                    Poll::Ready((result, entry.resources))
+                    if entry.terminated {
+                        let entry = slab.remove(self.key);
+                        Poll::Ready((result, entry.resources))
+                    } else {
+                        // A multi-CQE SQE (send_zc, multishot) was
+                        // submitted through the single-shot path — a
+                        // contract violation of `ops::submit_sqe`. More
+                        // CQEs carrying this key are in flight: freeing
+                        // the key now would let the slab recycle it and
+                        // deliver those CQEs into an unrelated op. Park
+                        // the entry as orphaned instead — the reaper
+                        // reclaims it (and drops its resources) on the
+                        // terminal CQE.
+                        debug_assert!(false, "multi-CQE sqe awaited through single-shot Op");
+                        log::error!(
+                            "op {}: multi-CQE sqe awaited through single-shot Op; \
+                             later completions are dropped",
+                            self.key
+                        );
+                        entry.orphaned = true;
+                        entry.waker = None;
+                        Poll::Ready((result, Resources::None))
+                    }
                 }
             }
         })
