@@ -1332,12 +1332,32 @@ impl UblkQueue {
                 .map_err(UblkError::IOError)
         })?;
 
-        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+        // From here on, any error must unwind the ring registrations:
+        // the thread-local ring outlives this constructor, so leaving
+        // them behind turns a transient failure into permanent EBUSY
+        // from register_files on every retry (and pins the cdev fd
+        // until the thread exits).
+        let auto_buf_reg = (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+        let unwind_registrations = || {
             with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                if auto_buf_reg {
+                    let _ = ring.submitter().unregister_buffers();
+                }
+                let _ = ring.submitter().unregister_files();
+            })
+        };
+
+        if auto_buf_reg {
+            if let Err(e) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                 ring.submitter()
                     .register_buffers_sparse(depth)
                     .map_err(UblkError::IOError)
-            })?;
+            }) {
+                with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                    let _ = ring.submitter().unregister_files();
+                });
+                return Err(e);
+            }
         }
 
         let off =
@@ -1353,7 +1373,9 @@ impl UblkQueue {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::IOError(std::io::Error::last_os_error()));
+            let e = std::io::Error::last_os_error();
+            unwind_registrations();
+            return Err(UblkError::IOError(e));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
