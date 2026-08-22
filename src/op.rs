@@ -149,8 +149,46 @@ impl OpEntry {
     }
 }
 
+/// The op slab, wrapped so thread exit cannot free memory the kernel
+/// may still be using.
+struct OpSlab(Slab<OpEntry>);
+
+impl std::ops::Deref for OpSlab {
+    type Target = Slab<OpEntry>;
+    fn deref(&self) -> &Slab<OpEntry> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OpSlab {
+    fn deref_mut(&mut self) -> &mut Slab<OpEntry> {
+        &mut self.0
+    }
+}
+
+impl Drop for OpSlab {
+    fn drop(&mut self) {
+        // Thread exit with ops still in flight: TLS destructor order
+        // between this slab and the ring cells is unspecified, and even
+        // closing the ring fd first tears the ring down asynchronously
+        // (io_ring_exit_work) — the kernel can still complete a request
+        // into an op-owned buffer after this destructor runs. Freeing
+        // the entries here would be a use-after-free reachable from
+        // safe code (drop a pending recv's future, return from
+        // block_on, let the thread exit). Leak them instead: bounded by
+        // what was genuinely in flight, and sound.
+        if !self.0.is_empty() {
+            log::warn!(
+                "thread exiting with {} ops in flight: leaking their buffers",
+                self.0.len()
+            );
+            std::mem::forget(std::mem::take(&mut self.0));
+        }
+    }
+}
+
 std::thread_local! {
-    static OP_SLAB: RefCell<Slab<OpEntry>> = const { RefCell::new(Slab::new()) };
+    static OP_SLAB: RefCell<OpSlab> = const { RefCell::new(OpSlab(Slab::new())) };
 }
 
 /// Whether any op is still in flight on this thread (park-loop guard).
