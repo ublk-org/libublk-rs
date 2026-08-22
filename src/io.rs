@@ -1878,6 +1878,17 @@ impl UblkQueue {
     /// Returns a Result containing the command result when complete.
     /// Returns `Err(UblkError::OtherError(-EINVAL))` if buffer descriptor doesn't align with IoBuf.
     /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
+    ///
+    /// # Cancellation
+    ///
+    /// Once this future has armed the io command (its first poll after
+    /// the registration wait), the kernel holds the address of the
+    /// `BufDesc::Slice` buffer until the command completes or the queue
+    /// is torn down. Dropping the future mid-await does NOT recall the
+    /// command — only a best-effort cancel is issued — so on a running
+    /// device the buffer must stay alive until queue teardown, not
+    /// merely until the drop. The canonical per-tag io task never drops
+    /// these futures while the device is live.
     #[inline]
     pub async fn submit_io_prep_cmd(
         &self,
@@ -1913,12 +1924,14 @@ impl UblkQueue {
             }
         }
 
-        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
-        // Register the IoBuf if provided and acquire permit
+        // Register the IoBuf (which mlocks it when the device asks for
+        // that) and wait for the whole queue's registrations BEFORE
+        // arming the FETCH command: once the SQE is pushed the kernel
+        // holds the buffer address, and failing out of this function
+        // with the command armed would let the buffer be freed while
+        // the (never-started) device still references it.
         if let Some(buf) = io_buf {
             self.register_io_buf_internal(tag, buf);
-            // Wait for all buffer registrations to complete before submitting prep commands
-            // This ensures that the effect is similar to submit_fetch_commands_unified()
             self.wait_for_all_buffer_registrations().await;
         }
 
@@ -1928,6 +1941,7 @@ impl UblkQueue {
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
+        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
         match f {
             Ok(future) => {
                 let res = future.await;
