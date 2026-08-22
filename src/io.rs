@@ -2615,61 +2615,79 @@ impl UblkQueue {
         } else {
             self.wait_ios(to_wait.saturating_sub(deferred))
         };
-        match ring_result {
-            Err(r) => Err(r),
-            Ok(ring_done) => {
-                let done = deferred + ring_done as usize;
-                let mut cmd_cnt = 0;
-                let mut aborted = false;
-
-                for i in 0..done {
-                    let cqe = pop_deferred_queue_cqe().or_else(|| {
-                        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-                            ring.completion().next()
-                        })
-                    });
-                    let cqe = match cqe {
-                        None => {
-                            if cmd_cnt > 0 {
-                                self.update_state_batch(cmd_cnt, aborted);
-                            }
-                            return Err(UblkError::OtherError(-libc::EINVAL));
-                        }
-                        Some(r) => r,
-                    };
-
-                    let user_data = cqe.user_data();
-                    let resolved = match crate::op::classify_user_data(user_data) {
-                        // SQEs pushed on the ring directly (e.g. by the
-                        // batch transport, whose multishot fetches cannot
-                        // ride a single-shot slab entry) keep their own
-                        // target-bit user_data; deliver it untouched.
-                        crate::op::CqeOwner::Target => Some((user_data, false)),
-                        crate::op::CqeOwner::Sentinel => None,
-                        crate::op::CqeOwner::Op(key) => {
-                            crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
-                        }
-                    };
-                    let Some((data, is_io_cmd)) = resolved else {
-                        // Reserved sentinel or op-future CQE (delivered to
-                        // its future by take_sync_entry): nothing for the
-                        // sync handler.
-                        continue;
-                    };
-                    if is_io_cmd {
-                        cmd_cnt += 1;
-                        if cqe.result() == sys::UBLK_IO_RES_ABORT {
-                            aborted = true;
-                        }
-                    }
-                    wake_handler(data, &cqe, i == done - 1);
-                }
-                if cmd_cnt > 0 {
-                    self.update_state_batch(cmd_cnt, aborted);
-                }
-                Ok(done as i32)
+        // On a ring error, still deliver any deferred CQEs before
+        // surfacing it: they were parked precisely so they would not be
+        // lost, and dropping them can eat a batch PROVIDE/COMMIT
+        // completion and wedge is_shutdown_complete() forever.
+        let (ring_done, ring_err) = match ring_result {
+            Ok(n) => (n, None),
+            Err(e) => (0, Some(e)),
+        };
+        if let Some(e) = ring_err {
+            if deferred == 0 {
+                return Err(e);
             }
+            let _ = self.deliver_cqes(&mut wake_handler, deferred);
+            return Err(e);
         }
+        self.deliver_cqes(&mut wake_handler, deferred + ring_done as usize)
+    }
+
+    /// Drain and dispatch `done` CQEs (deferred ones first, then the
+    /// ring), batching the io-command state accounting.
+    fn deliver_cqes<F>(&self, wake_handler: &mut F, done: usize) -> Result<i32, UblkError>
+    where
+        F: FnMut(u64, &cqueue::Entry, bool),
+    {
+        let mut cmd_cnt = 0;
+        let mut aborted = false;
+
+        for i in 0..done {
+            let cqe = pop_deferred_queue_cqe().or_else(|| {
+                with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                    ring.completion().next()
+                })
+            });
+            let cqe = match cqe {
+                None => {
+                    if cmd_cnt > 0 {
+                        self.update_state_batch(cmd_cnt, aborted);
+                    }
+                    return Err(UblkError::OtherError(-libc::EINVAL));
+                }
+                Some(r) => r,
+            };
+
+            let user_data = cqe.user_data();
+            let resolved = match crate::op::classify_user_data(user_data) {
+                // SQEs pushed on the ring directly (e.g. by the
+                // batch transport, whose multishot fetches cannot
+                // ride a single-shot slab entry) keep their own
+                // target-bit user_data; deliver it untouched.
+                crate::op::CqeOwner::Target => Some((user_data, false)),
+                crate::op::CqeOwner::Sentinel => None,
+                crate::op::CqeOwner::Op(key) => {
+                    crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
+                }
+            };
+            let Some((data, is_io_cmd)) = resolved else {
+                // Reserved sentinel or op-future CQE (delivered to
+                // its future by take_sync_entry): nothing for the
+                // sync handler.
+                continue;
+            };
+            if is_io_cmd {
+                cmd_cnt += 1;
+                if cqe.result() == sys::UBLK_IO_RES_ABORT {
+                    aborted = true;
+                }
+            }
+            wake_handler(data, &cqe, i == done - 1);
+        }
+        if cmd_cnt > 0 {
+            self.update_state_batch(cmd_cnt, aborted);
+        }
+        Ok(done as i32)
     }
 }
 
