@@ -278,35 +278,39 @@ pub(crate) fn submit_sync(
     Ok(())
 }
 
-/// Resolve one CQE for the sync event loop: remove and return the sync
-/// entry behind `key` (from [`classify_user_data`]) as
-/// `(handler_word, is_io_cmd)`.
-///
-/// Returns `None` for unknown keys and for op-future entries — the
-/// latter are completed and woken here exactly as
+/// Resolve one CQE for the sync event loop: `(handler_word, is_io_cmd)`.
+/// The handler word is `Some` only for sync-mode entries, which are
+/// removed here; op-future entries are completed and woken exactly as
 /// [`ublk_reap_and_wake`] would, so a stray async op in a sync-driven
 /// queue is delivered to its future rather than corrupting state.
+///
+/// `is_io_cmd` reports the entry's accounting flag for EVERY entry the
+/// key resolves — sync, async and orphaned alike. The async submit path
+/// incremented `cmd_inflight` just like the sync one, so the sync
+/// loop's batch accounting must observe the completion either way, or
+/// the count leaks and the queue never reaches `is_idle()`.
 #[inline]
-pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> Option<(u64, bool)> {
+pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u64>, bool) {
     let (ret, waker) = OP_SLAB.with(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
             debug_assert!(false, "CQE for unknown op {}", key);
-            return (None, None);
+            return ((None, false), None);
         };
+        let is_io_cmd = entry.is_io_cmd;
         if entry.sync_data.is_none() {
             if entry.orphaned {
                 if !more {
                     slab.remove(key).discard_result(result);
                 }
-                return (None, None);
+                return ((None, is_io_cmd), None);
             }
             entry.terminated = !more;
             entry.push_result(result);
-            return (None, entry.waker.take());
+            return ((None, is_io_cmd), entry.waker.take());
         }
         let entry = slab.remove(key);
-        (Some((entry.sync_data.unwrap(), entry.is_io_cmd)), None)
+        ((Some(entry.sync_data.unwrap()), is_io_cmd), None)
     });
     // Wake outside the slab borrow: an inline waker may drop a future
     // whose Op re-enters the slab (orphan_entry).

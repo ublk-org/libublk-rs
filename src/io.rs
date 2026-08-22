@@ -2676,29 +2676,33 @@ impl UblkQueue {
             };
 
             let user_data = cqe.user_data();
-            let resolved = match crate::op::classify_user_data(user_data) {
+            let (data, is_io_cmd) = match crate::op::classify_user_data(user_data) {
                 // SQEs pushed on the ring directly (e.g. by the
                 // batch transport, whose multishot fetches cannot
                 // ride a single-shot slab entry) keep their own
                 // target-bit user_data; deliver it untouched.
-                crate::op::CqeOwner::Target => Some((user_data, false)),
-                crate::op::CqeOwner::Sentinel => None,
+                crate::op::CqeOwner::Target => (Some(user_data), false),
+                crate::op::CqeOwner::Sentinel => (None, false),
                 crate::op::CqeOwner::Op(key) => {
                     crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
                 }
             };
-            let Some((data, is_io_cmd)) = resolved else {
-                // Reserved sentinel or op-future CQE (delivered to
-                // its future by take_sync_entry): nothing for the
-                // sync handler.
-                continue;
-            };
+            // Account io-command completions whether or not the entry
+            // was sync-mode: an async io command submitted on this
+            // queue incremented cmd_inflight the same way, and its
+            // completion draining through this loop must balance it.
             if is_io_cmd {
                 cmd_cnt += 1;
                 if cqe.result() == sys::UBLK_IO_RES_ABORT {
                     aborted = true;
                 }
             }
+            let Some(data) = data else {
+                // Reserved sentinel or op-future CQE (delivered to
+                // its future by take_sync_entry): nothing for the
+                // sync handler.
+                continue;
+            };
             wake_handler(data, &cqe, i == done - 1);
         }
         if cmd_cnt > 0 {
