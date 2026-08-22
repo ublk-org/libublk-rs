@@ -643,8 +643,10 @@ pub unsafe fn sendmsg_zc(
         let mut sqe = with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
             .flags(flags as u32)
             .build());
-        // SENDMSG_ZC takes its zc flags in ioprio like SEND_ZC does, but
-        // the io-uring crate exposes no zc_flags() builder for it.
+        // SENDMSG_ZC takes its zc flags in ioprio like SEND_ZC does; the
+        // io-uring crate's SendMsgZc builder calls the field `ioprio`
+        // rather than exposing a zc_flags() alias, so OR the bit in the
+        // same way either name would land it.
         crate::override_sqe!(&mut sqe, ioprio, |=, SEND_ZC_REPORT_USAGE);
         sqe.user_data(key)
     })?;
@@ -784,7 +786,8 @@ mod tests {
             }?;
             let sent = op.sent().await;
             assert_eq!(sent as usize, payload.len());
-            // AF_UNIX sends always copy; just consume the notification.
+            // Loopback TCP sends usually fall back to copying; either
+            // way, consume the notification CQE.
             let _copied = op.into_notif().await;
 
             let (res, rbuf) = recv(
