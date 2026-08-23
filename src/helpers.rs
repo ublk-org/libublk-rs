@@ -18,9 +18,11 @@ pub struct IoBuf<T> {
     mlocked: Cell<bool>,
 }
 
-// Users of IoBuf has to deal with Send & Sync
-unsafe impl<T> Send for IoBuf<T> {}
-unsafe impl<T> Sync for IoBuf<T> {}
+// IoBuf owns its allocation like Box<[T]> does, so it is Send/Sync
+// exactly when T is: an unconditional impl would let e.g.
+// IoBuf<Cell<u8>> be shared across threads from safe code.
+unsafe impl<T: Send> Send for IoBuf<T> {}
+unsafe impl<T: Sync> Sync for IoBuf<T> {}
 
 // Explicitly implement RefUnwindSafe and UnwindSafe since Cell<bool> is not RefUnwindSafe
 // This is safe because the mlocked field is only used for tracking state and doesn't
@@ -43,7 +45,14 @@ impl<T> IoBuf<T> {
         assert!(size != 0);
 
         let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
+        // Deliberately NOT zeroed: zeroing every IO buffer taxes the
+        // hot allocation path, and a target that serves reads from a
+        // fresh buffer zeroes it itself (zero_io_buf!). The contents
+        // are uninitialized until the caller writes or zeroes them.
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
 
         IoBuf {
             ptr,

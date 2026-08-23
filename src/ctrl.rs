@@ -1028,9 +1028,12 @@ impl UblkCtrlInner {
 
     const UBLK_CTRL_DEV_DELETED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_2;
     const UBLK_CTRL_DEV_DISOWNED: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_4;
+    // UBLK_F_NEED_GET_DATA is deliberately absent: nothing in the crate
+    // answers UBLK_IO_RES_NEED_GET_DATA with UBLK_U_IO_NEED_GET_DATA, so
+    // a device created with it would hang every write in the kernel.
+    // Rejecting the flag here surfaces that as InvalidVal at build time.
     const UBLK_DRV_F_ALL: u64 = (sys::UBLK_F_SUPPORT_ZERO_COPY
         | sys::UBLK_F_URING_CMD_COMP_IN_TASK
-        | sys::UBLK_F_NEED_GET_DATA
         | sys::UBLK_F_USER_RECOVERY
         | sys::UBLK_F_USER_RECOVERY_REISSUE
         | sys::UBLK_F_UNPRIVILEGED_DEV
@@ -1355,7 +1358,7 @@ impl UblkCtrlInner {
             if let Some(res) = op.try_take_result() {
                 return Ok(res);
             }
-            with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
+            let wakers = with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
                 // A signal delivered to the daemon must not fail the
                 // command: retry the wait, as reactor::wait_for_cqe does
                 // for the same ring.
@@ -1364,9 +1367,14 @@ impl UblkCtrlInner {
                     Err(ref e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EBUSY)) => {}
                     Err(e) => return Err(UblkError::IOError(e)),
                 }
-                let _ = crate::op::ublk_reap_and_wake(r, |_, _| {});
-                Ok::<(), UblkError>(())
+                let (_, wakers) = crate::op::ublk_reap_and_wake(r, |_, _, _| {});
+                Ok::<_, UblkError>(wakers)
             })?;
+            // Async op futures drained alongside this sync command wake
+            // outside the ring borrow (a waker may run inline).
+            for waker in wakers {
+                waker.wake();
+            }
         }
     }
 
@@ -2950,6 +2958,16 @@ mod tests {
     fn test_batch_io_in_driver_flags() {
         assert_ne!(
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_BATCH_IO as u64,
+            0
+        );
+    }
+
+    /// NEED_GET_DATA's response command is unimplemented; the flag must
+    /// stay rejected until it is, or writes hang in the kernel.
+    #[test]
+    fn test_need_get_data_rejected() {
+        assert_eq!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_NEED_GET_DATA as u64,
             0
         );
     }

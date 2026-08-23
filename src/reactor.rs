@@ -121,9 +121,18 @@ pub enum ParkOutcome {
 /// sleep in `io_uring_enter` for at most one safety period (1s).
 ///
 /// Returns immediately when no ops are in flight, so an executor may
-/// call this unconditionally from its idle hook: cross-thread wakes
-/// (channels, join handles) still get through because the thread only
-/// sleeps while a CQE is guaranteed to arrive and wake it.
+/// call this unconditionally from its idle hook.
+///
+/// Cross-thread wake latency: while ops ARE in flight — for a ublk
+/// queue thread that is always, its FETCH commands stay armed — the
+/// thread sleeps inside `io_uring_enter`, which a cross-thread wake
+/// (channel send, join-handle completion) cannot interrupt. Such a
+/// wake is observed at the next CQE or, at the latest, when the 1s
+/// safety timeout fires; nothing is lost, but anything signalling a
+/// busy-idle queue thread from outside pays up to one safety period
+/// of latency per round-trip. Latency-sensitive cross-thread
+/// signalling should go through the ring instead (e.g. poll an
+/// eventfd via [`crate::ops::poll_add`] and write it to wake).
 ///
 /// The safety-timeout path also returns, without any woken waker: the
 /// executor may have parked while still holding runnable (deferred)
@@ -156,27 +165,36 @@ pub fn wait_and_reap_events() -> ParkOutcome {
 /// CQE and doing the io-command accounting the explicit event loops used
 /// to do. Returns the number of CQEs handled and of wakers woken.
 fn reap_queue_ring() -> (usize, usize) {
-    let (n, woken, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
+    let (n, wakers, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
         let Some(ring_cell) = cell.get() else {
-            return (0, 0, 0, false);
+            return (0, Vec::new(), 0, false);
         };
         let mut ring = ring_cell.borrow_mut();
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
-        let (n, woken) = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd| {
+        let (n, wakers) = ublk_reap_and_wake(&mut ring, |cqe, is_io_cmd, orphaned| {
             if cqe.user_data() == CTRL_POLL_DATA {
                 CTRL_POLL_ARMED.with(|armed| armed.set(false));
             } else if is_io_cmd {
                 cmd_cnt += 1;
-                if cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
+                // An orphaned command's ABORT is stale — possibly from
+                // a queue already dropped on this thread — and must not
+                // flip the currently registered queue into stopping.
+                if !orphaned && cqe.result() == crate::sys::UBLK_IO_RES_ABORT {
                     aborted = true;
                 }
             }
         });
-        (n, woken, cmd_cnt, aborted)
+        (n, wakers, cmd_cnt, aborted)
     });
     if cmd_cnt > 0 {
         crate::io::update_queue_state(cmd_cnt, aborted);
+    }
+    // Wake with every RefCell borrow released: an inline waker may drop
+    // an op future, which re-borrows the slab and the ring.
+    let woken = wakers.len();
+    for waker in wakers {
+        waker.wake();
     }
     (n, woken)
 }
@@ -184,13 +202,18 @@ fn reap_queue_ring() -> (usize, usize) {
 /// Drain the control ring's completion queue, waking the future behind
 /// each CQE. Returns the number of CQEs handled and of wakers woken.
 fn reap_ctrl_ring() -> (usize, usize) {
-    crate::ctrl::CTRL_URING.with(|cell| {
+    let (n, wakers) = crate::ctrl::CTRL_URING.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(ring) = guard.as_mut() else {
-            return (0, 0);
+            return (0, Vec::new());
         };
-        ublk_reap_and_wake(ring, |_, _| {})
-    })
+        ublk_reap_and_wake(ring, |_, _, _| {})
+    });
+    let woken = wakers.len();
+    for waker in wakers {
+        waker.wake();
+    }
+    (n, woken)
 }
 
 /// Flush pending SQEs and sleep in `io_uring_enter` until a CQE arrives

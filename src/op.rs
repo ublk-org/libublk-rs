@@ -94,6 +94,10 @@ pub(crate) enum Resources {
     Buffer(Box<[u8]>),
     /// Timespec referenced by a TIMEOUT SQE.
     Timespec(#[allow(dead_code)] Box<io_uring::types::Timespec>),
+    /// Op references no caller memory, but a successful CQE result is a
+    /// fresh file descriptor the consumer owns (accept). If nobody
+    /// consumes the completion, the reaper must close it.
+    ResultFd,
 }
 
 impl Resources {
@@ -130,6 +134,18 @@ pub(crate) struct OpEntry {
 }
 
 impl OpEntry {
+    /// Release a completion nobody will consume. A discarded successful
+    /// accept result is a live connection fd: dropping the value would
+    /// leak it permanently (fd-table exhaustion under `select!`-style
+    /// accept cancellation), so close it here.
+    fn discard_result(&self, result: i32) {
+        if matches!(self.resources, Resources::ResultFd) && result >= 0 {
+            // SAFETY: the fd arrived in this op's own CQE and no
+            // consumer exists; this close is its only owner's.
+            unsafe { libc::close(result) };
+        }
+    }
+
     #[inline]
     fn push_result(&mut self, result: i32) {
         if self.result.is_none() && self.extra_results.is_empty() {
@@ -149,8 +165,46 @@ impl OpEntry {
     }
 }
 
+/// The op slab, wrapped so thread exit cannot free memory the kernel
+/// may still be using.
+struct OpSlab(Slab<OpEntry>);
+
+impl std::ops::Deref for OpSlab {
+    type Target = Slab<OpEntry>;
+    fn deref(&self) -> &Slab<OpEntry> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OpSlab {
+    fn deref_mut(&mut self) -> &mut Slab<OpEntry> {
+        &mut self.0
+    }
+}
+
+impl Drop for OpSlab {
+    fn drop(&mut self) {
+        // Thread exit with ops still in flight: TLS destructor order
+        // between this slab and the ring cells is unspecified, and even
+        // closing the ring fd first tears the ring down asynchronously
+        // (io_ring_exit_work) — the kernel can still complete a request
+        // into an op-owned buffer after this destructor runs. Freeing
+        // the entries here would be a use-after-free reachable from
+        // safe code (drop a pending recv's future, return from
+        // block_on, let the thread exit). Leak them instead: bounded by
+        // what was genuinely in flight, and sound.
+        if !self.0.is_empty() {
+            log::warn!(
+                "thread exiting with {} ops in flight: leaking their buffers",
+                self.0.len()
+            );
+            std::mem::forget(std::mem::take(&mut self.0));
+        }
+    }
+}
+
 std::thread_local! {
-    static OP_SLAB: RefCell<Slab<OpEntry>> = const { RefCell::new(Slab::new()) };
+    static OP_SLAB: RefCell<OpSlab> = const { RefCell::new(OpSlab(Slab::new())) };
 }
 
 /// Whether any op is still in flight on this thread (park-loop guard).
@@ -224,39 +278,49 @@ pub(crate) fn submit_sync(
     Ok(())
 }
 
-/// Resolve one CQE for the sync event loop: remove and return the sync
-/// entry behind `key` (from [`classify_user_data`]) as
-/// `(handler_word, is_io_cmd)`.
-///
-/// Returns `None` for unknown keys and for op-future entries — the
-/// latter are completed and woken here exactly as
+/// Resolve one CQE for the sync event loop: `(handler_word, is_io_cmd)`.
+/// The handler word is `Some` only for sync-mode entries, which are
+/// removed here; op-future entries are completed and woken exactly as
 /// [`ublk_reap_and_wake`] would, so a stray async op in a sync-driven
 /// queue is delivered to its future rather than corrupting state.
+///
+/// `is_io_cmd` reports the entry's accounting flag for EVERY entry the
+/// key resolves — sync, async and orphaned alike. The async submit path
+/// incremented `cmd_inflight` just like the sync one, so the sync
+/// loop's batch accounting must observe the completion either way, or
+/// the count leaks and the queue never reaches `is_idle()`. The third
+/// flag marks orphaned entries, whose result (e.g. a stale ABORT from
+/// a previous queue on this thread) must be counted but must not drive
+/// current-queue state.
 #[inline]
-pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> Option<(u64, bool)> {
-    OP_SLAB.with(|slab| {
+pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u64>, bool, bool) {
+    let (ret, waker) = OP_SLAB.with(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
             debug_assert!(false, "CQE for unknown op {}", key);
-            return None;
+            return ((None, false, false), None);
         };
+        let is_io_cmd = entry.is_io_cmd;
         if entry.sync_data.is_none() {
             if entry.orphaned {
                 if !more {
-                    slab.remove(key);
+                    slab.remove(key).discard_result(result);
                 }
-                return None;
+                return ((None, is_io_cmd, true), None);
             }
             entry.terminated = !more;
             entry.push_result(result);
-            if let Some(waker) = entry.waker.take() {
-                waker.wake();
-            }
-            return None;
+            return ((None, is_io_cmd, false), entry.waker.take());
         }
         let entry = slab.remove(key);
-        Some((entry.sync_data.unwrap(), entry.is_io_cmd))
-    })
+        ((Some(entry.sync_data.unwrap()), is_io_cmd, false), None)
+    });
+    // Wake outside the slab borrow: an inline waker may drop a future
+    // whose Op re-enters the slab (orphan_entry).
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+    ret
 }
 
 /// Handle to one submitted single-shot operation.
@@ -336,6 +400,9 @@ impl Op {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
             entry.result?;
+            // Control commands are all single-completion uring_cmds, so
+            // unlike poll_single this path needs no multi-CQE fallback.
+            debug_assert!(entry.terminated, "multi-CQE ctrl cmd");
             let entry = slab.remove(self.key);
             self.done = true;
             entry.result
@@ -364,13 +431,30 @@ impl Op {
                     Poll::Pending
                 }
                 Some(result) => {
-                    debug_assert!(
-                        entry.terminated,
-                        "multi-CQE sqe awaited through single-shot Op; use MultiOp"
-                    );
-                    let entry = slab.remove(self.key);
                     self.done = true;
-                    Poll::Ready((result, entry.resources))
+                    if entry.terminated {
+                        let entry = slab.remove(self.key);
+                        Poll::Ready((result, entry.resources))
+                    } else {
+                        // A multi-CQE SQE (send_zc, multishot) was
+                        // submitted through the single-shot path — a
+                        // contract violation of `ops::submit_sqe`. More
+                        // CQEs carrying this key are in flight: freeing
+                        // the key now would let the slab recycle it and
+                        // deliver those CQEs into an unrelated op. Park
+                        // the entry as orphaned instead — the reaper
+                        // reclaims it (and drops its resources) on the
+                        // terminal CQE.
+                        debug_assert!(false, "multi-CQE sqe awaited through single-shot Op");
+                        log::error!(
+                            "op {}: multi-CQE sqe awaited through single-shot Op; \
+                             later completions are dropped",
+                            self.key
+                        );
+                        entry.orphaned = true;
+                        entry.waker = None;
+                        Poll::Ready((result, Resources::None))
+                    }
                 }
             }
         })
@@ -395,7 +479,12 @@ fn orphan_entry(ring: OpRing, key: usize) {
             return true;
         };
         if entry.terminated {
-            slab.remove(key);
+            // Result already reaped but never consumed (future dropped
+            // after completion, before its final poll).
+            let entry = slab.remove(key);
+            if let Some(result) = entry.result {
+                entry.discard_result(result);
+            }
             return true;
         }
         entry.orphaned = true;
@@ -481,25 +570,33 @@ impl Drop for MultiOp {
     }
 }
 
-/// Drain `ring`'s completion queue, waking the future behind each CQE.
-/// `per_cqe` runs for every CQE with a flag telling whether it completed
-/// a ublk io command (for the queue-state accounting). Returns the number
-/// of CQEs drained and the number of wakers actually woken -- reserved
-/// sentinels, orphans and not-yet-polled futures drain without waking
-/// anything, and an executor park hook must not treat them as runnable
-/// work. The slab and the completion queue are borrowed once for the
-/// whole batch; CQEs posted mid-drain are picked up by the caller's next
-/// pass.
-pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, usize)
+/// Drain `ring`'s completion queue, collecting the waker of the future
+/// behind each CQE. `per_cqe` runs for every CQE with two flags:
+/// whether it completed a ublk io command (for the queue-state
+/// accounting) and whether the entry was orphaned (counted, but its
+/// result — e.g. a stale ABORT — must not drive current-queue state). Returns the number of CQEs drained and the wakers to
+/// invoke — the caller MUST wake them, and only after releasing its
+/// ring borrow (see the comment on `wakers` below). Reserved sentinels,
+/// orphans and not-yet-polled futures drain without producing a waker,
+/// and an executor park hook must not treat them as runnable work. The
+/// slab and the completion queue are borrowed once for the whole batch;
+/// CQEs posted mid-drain are picked up by the caller's next pass.
+pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, Vec<Waker>)
 where
     S: squeue::EntryMarker,
-    F: FnMut(&cqueue::Entry, bool),
+    F: FnMut(&cqueue::Entry, bool, bool),
 {
     OP_SLAB.with(|slab| {
         let mut slab = slab.borrow_mut();
         let cq = ring.completion();
         let mut n = 0;
-        let mut woken = 0;
+        // Collected, not woken here: a waker may run arbitrary code
+        // inline (a bring-your-own executor can drop a task's future,
+        // whose Op re-enters the slab and pushes a cancel SQE), so
+        // waking under the slab — or the caller's ring — RefCell borrow
+        // would panic with a double borrow. The caller wakes these
+        // after releasing its ring borrow.
+        let mut wakers: Vec<Waker> = Vec::new();
         for cqe in cq {
             n += 1;
             let key = match classify_user_data(cqe.user_data()) {
@@ -508,16 +605,22 @@ where
                 // pushes its own target-bit user_data) carry no op
                 // state: hand them to the caller untouched.
                 CqeOwner::Sentinel | CqeOwner::Target => {
-                    per_cqe(&cqe, false);
+                    per_cqe(&cqe, false, false);
                     continue;
                 }
             };
             let Some(entry) = slab.get_mut(key) else {
                 debug_assert!(false, "CQE for unknown op {}", key);
-                per_cqe(&cqe, false);
+                per_cqe(&cqe, false, false);
                 continue;
             };
-            per_cqe(&cqe, entry.is_io_cmd);
+            // The third flag marks orphaned entries: their completion
+            // must still be counted (the submit incremented the
+            // inflight count), but nobody is serving the command any
+            // more — in particular a stale ABORT from a command of a
+            // previously dropped queue on this thread must not flip a
+            // freshly registered queue into stopping.
+            per_cqe(&cqe, entry.is_io_cmd, entry.orphaned);
             let more = cqueue::more(cqe.flags());
             if entry.orphaned || entry.sync_data.is_some() {
                 // Orphaned future, or a sync-mode entry drained by the
@@ -527,18 +630,17 @@ where
                 // terminal CQE only, so a multi-CQE chain cannot land on
                 // a recycled key.
                 if !more {
-                    slab.remove(key);
+                    slab.remove(key).discard_result(cqe.result());
                 }
                 continue;
             }
             entry.terminated = !more;
             entry.push_result(cqe.result());
             if let Some(waker) = entry.waker.take() {
-                waker.wake();
-                woken += 1;
+                wakers.push(waker);
             }
         }
-        (n, woken)
+        (n, wakers)
     })
 }
 

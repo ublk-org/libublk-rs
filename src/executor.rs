@@ -44,8 +44,10 @@ pub trait UblkSpawner {
 /// [`UblkTask::cancel`] requests cancellation.
 ///
 /// Detached is not immortal: a detached task lives only as long as its
-/// executor. One still pending when the enclosing
-/// [`UblkExecutor::block_on`] returns is destroyed without completing.
+/// executor. An integration may destroy still-pending tasks as soon as
+/// the enclosing [`UblkExecutor::block_on`] returns; none survives the
+/// executor's drop. (The built-in tokio integration keeps them across
+/// `block_on` calls and destroys them when the runtime is dropped.)
 pub trait UblkTask: Future<Output = ()> + Unpin {
     /// Request cancellation (fire-and-forget), consuming the handle.
     fn cancel(self: Box<Self>);
@@ -59,10 +61,11 @@ pub trait UblkTask: Future<Output = ()> + Unpin {
 /// channel or shared state.
 ///
 /// Dropping the handle detaches the task: it stays scheduled, but only
-/// for as long as the executor runs — a detached task still pending
-/// when [`UblkExecutor::block_on`] returns is destroyed without
-/// completing. Await the handle (or such state) before the root future
-/// returns when the task must finish (e.g. a final flush).
+/// for as long as the executor lives — an integration may destroy a
+/// still-pending detached task as soon as [`UblkExecutor::block_on`]
+/// returns, and none survives the executor's drop. Await the handle
+/// (or such state) before the root future returns when the task must
+/// finish (e.g. a final flush).
 pub struct TaskHandle(Option<Box<dyn UblkTask>>);
 
 impl TaskHandle {
@@ -180,8 +183,15 @@ pub trait UblkExecutor: UblkSpawner + Sized {
     /// Create queue `qid` of `dev` on the current thread, spawn one
     /// `io_task(q, tag)` per tag, and run until every task completes
     /// (normally when the queue is torn down). Task errors other than
-    /// [`UblkError::QueueIsDown`] are logged, as are task panics (by
-    /// the integration's [`UblkTask`]).
+    /// [`UblkError::QueueIsDown`] are logged and the first one is
+    /// returned once every task has ended; task panics are logged by
+    /// the integration's [`UblkTask`].
+    ///
+    /// Every failure — executor or queue construction, or an io task
+    /// erroring — also fails the device's buffer-registration
+    /// handshake, so a `run_target()` main thread waiting in
+    /// `start_dev` gets an error instead of waiting forever on a queue
+    /// that will never come up.
     ///
     /// This is the standard body of a `run_target()` queue handler; use
     /// [`Self::new`] + [`Self::block_on`] directly when the thread also
@@ -195,32 +205,61 @@ pub trait UblkExecutor: UblkSpawner + Sized {
         F: Fn(Rc<crate::io::UblkQueue>, u16) -> Fut + 'static,
         Fut: Future<Output = Result<(), UblkError>> + 'static,
     {
-        let rt = Self::new()?;
-        let dev = dev.clone();
-        // block_on's future need not be 'static, so it may borrow `rt`.
-        let rt = &rt;
-        rt.block_on(async move {
-            let q = Rc::new(crate::io::UblkQueue::new(qid, &dev)?);
-            let handles: Vec<TaskHandle> = (0..dev.dev_info.queue_depth)
-                .map(|tag| {
-                    let task = io_task(q.clone(), tag);
-                    // Spawn on `rt` directly rather than through the
-                    // ambient spawn_local: the library's own path must
-                    // not depend on block_on having installed the
-                    // ambient spawner, which the compiler cannot check.
-                    rt.spawn(async move {
-                        match task.await {
-                            Err(UblkError::QueueIsDown) | Ok(_) => {}
-                            Err(e) => log::error!("io task failed for tag {}: {}", tag, e),
-                        }
+        let res = (|| {
+            let rt = Self::new()?;
+            let dev = dev.clone();
+            // block_on's future need not be 'static, so it may borrow `rt`.
+            let rt = &rt;
+            rt.block_on(async move {
+                let q = Rc::new(crate::io::UblkQueue::new(qid, &dev)?);
+                // First io-task failure, reported once every task ended.
+                let first_err = Rc::new(std::cell::RefCell::new(None));
+                let handles: Vec<TaskHandle> = (0..dev.dev_info.queue_depth)
+                    .map(|tag| {
+                        let task = io_task(q.clone(), tag);
+                        let q = q.clone();
+                        let dev = dev.clone();
+                        let first_err = first_err.clone();
+                        // Spawn on `rt` directly rather than through the
+                        // ambient spawn_local: the library's own path must
+                        // not depend on block_on having installed the
+                        // ambient spawner, which the compiler cannot check.
+                        rt.spawn(async move {
+                            match task.await {
+                                Err(UblkError::QueueIsDown) | Ok(_) => {}
+                                Err(e) => {
+                                    log::error!("io task failed for tag {}: {}", tag, e);
+                                    // A task dying before registering its
+                                    // buffer stalls the per-queue counter
+                                    // forever; unpark the sibling tasks
+                                    // waiting on the registration
+                                    // semaphore (they exit QueueIsDown)
+                                    // and fail the device handshake NOW —
+                                    // block_on cannot return while they
+                                    // are parked.
+                                    q.fail_buffer_registration();
+                                    dev.notify_queue_setup_failed();
+                                    first_err.borrow_mut().get_or_insert(e);
+                                }
+                            }
+                        })
                     })
-                })
-                .collect();
-            for h in handles {
-                h.await;
-            }
-            Ok(())
-        })
+                    .collect();
+                for h in handles {
+                    h.await;
+                }
+                let err = first_err.borrow_mut().take();
+                err.map_or(Ok(()), Err)
+            })
+        })();
+        if res.is_err() {
+            // Covers executor/UblkQueue construction failures (a second
+            // notification after a task error is harmless): without it,
+            // run_target's no-timeout buffer-registration wait hangs the
+            // whole daemon on any per-queue setup error.
+            dev.notify_queue_setup_failed();
+        }
+        res
     }
 }
 

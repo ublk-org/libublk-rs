@@ -741,7 +741,7 @@ impl<'a> UblkIOCtx<'a> {
     ///
     /// * `tag`: io tag, length is 16bit
     /// * `op`: io operation code, length is 8bit
-    /// * `tgt_data`: target specific data, at most 39bit (64 - 16 - 8 - 1)
+    /// * `tgt_data`: target specific data, at most 16bit (asserted)
     /// * `is_target_io`: if this userdata is for handling target io, false if
     ///         if it is only for ublk io command
     ///
@@ -751,14 +751,15 @@ impl<'a> UblkIOCtx<'a> {
     /// op layer).
     ///
     #[inline(always)]
-    #[allow(arithmetic_overflow)]
     pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
         assert!((tgt_data >> 16) == 0);
 
         let op = op & 0xff;
+        // Widen BEFORE shifting: `tgt_data << 24` in u32 silently
+        // discards bits 8..16, which the assert above explicitly admits.
         tag as u64
-            | (op << 16) as u64
-            | (tgt_data << 24) as u64
+            | ((op as u64) << 16)
+            | ((tgt_data as u64) << 24)
             | if is_target_io {
                 UblkUringData::Target as u64
             } else {
@@ -1166,7 +1167,24 @@ impl UblkQueueState {
 
     #[inline(always)]
     fn sub_cmd_inflight(&mut self, val: u32) {
-        self.cmd_inflight -= val;
+        // Saturate rather than underflow: a stale io command from a
+        // previously dropped queue on this thread (its orphaned entry
+        // outlives the queue in the op slab) can complete after a new
+        // queue registered its state, and its CQE is then accounted
+        // here. Wrapping would make queue_is_quiesced() permanently
+        // false — clean shutdown impossible — where saturating at the
+        // true floor is at worst transiently optimistic.
+        if val > self.cmd_inflight {
+            log::warn!(
+                "io-cmd completions ({}) exceed inflight count ({}): \
+                 stale command from a previous queue on this thread",
+                val,
+                self.cmd_inflight
+            );
+            self.cmd_inflight = 0;
+        } else {
+            self.cmd_inflight -= val;
+        }
     }
 
     fn mark_stopping(&mut self) {
@@ -1331,12 +1349,32 @@ impl UblkQueue {
                 .map_err(UblkError::IOError)
         })?;
 
-        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+        // From here on, any error must unwind the ring registrations:
+        // the thread-local ring outlives this constructor, so leaving
+        // them behind turns a transient failure into permanent EBUSY
+        // from register_files on every retry (and pins the cdev fd
+        // until the thread exits).
+        let auto_buf_reg = (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+        let unwind_registrations = || {
             with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                if auto_buf_reg {
+                    let _ = ring.submitter().unregister_buffers();
+                }
+                let _ = ring.submitter().unregister_files();
+            })
+        };
+
+        if auto_buf_reg {
+            if let Err(e) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                 ring.submitter()
                     .register_buffers_sparse(depth)
                     .map_err(UblkError::IOError)
-            })?;
+            }) {
+                with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                    let _ = ring.submitter().unregister_files();
+                });
+                return Err(e);
+            }
         }
 
         let off =
@@ -1352,7 +1390,9 @@ impl UblkQueue {
             )
         };
         if io_cmd_buf == libc::MAP_FAILED {
-            return Err(UblkError::IOError(std::io::Error::last_os_error()));
+            let e = std::io::Error::last_os_error();
+            unwind_registrations();
+            return Err(UblkError::IOError(e));
         }
 
         let nr_ios = depth + tgt.extra_ios as u32;
@@ -1555,6 +1595,28 @@ impl UblkQueue {
             let _permit = self.buf_reg_semaphore.acquire().await;
             // Permit is automatically released when dropped
         }
+    }
+
+    /// Unblock the buffer-registration handshake after an io task died
+    /// before registering its buffer: the per-queue counter can then
+    /// never reach `q_depth`, so without this every sibling task parks
+    /// in [`Self::wait_for_all_buffer_registrations`] forever and the
+    /// queue thread never exits. Mark the queue stopping and hand out
+    /// the permits a completed registration would have; woken siblings
+    /// see the stopping state and bail with `QueueIsDown`.
+    ///
+    /// A no-op once registration completed (nobody is parked, and a
+    /// task failing at runtime must not force-stop a live queue here)
+    /// and in the modes that never wait.
+    pub(crate) fn fail_buffer_registration(&self) {
+        if self.support_auto_buf_zc() {
+            return;
+        }
+        if *self.buf_reg_counter.borrow() >= self.q_depth {
+            return;
+        }
+        self.mark_stopping();
+        self.buf_reg_semaphore.add_permits(self.q_depth as usize);
     }
 
     /// Register IO buffer, so that pages in this buffer can
@@ -1838,6 +1900,17 @@ impl UblkQueue {
     /// Returns a Result containing the command result when complete.
     /// Returns `Err(UblkError::OtherError(-EINVAL))` if buffer descriptor doesn't align with IoBuf.
     /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
+    ///
+    /// # Cancellation
+    ///
+    /// Once this future has armed the io command (its first poll after
+    /// the registration wait), the kernel holds the address of the
+    /// `BufDesc::Slice` buffer until the command completes or the queue
+    /// is torn down. Dropping the future mid-await does NOT recall the
+    /// command — only a best-effort cancel is issued — so on a running
+    /// device the buffer must stay alive until queue teardown, not
+    /// merely until the drop. The canonical per-tag io task never drops
+    /// these futures while the device is live.
     #[inline]
     pub async fn submit_io_prep_cmd(
         &self,
@@ -1873,12 +1946,14 @@ impl UblkQueue {
             }
         }
 
-        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
-        // Register the IoBuf if provided and acquire permit
+        // Register the IoBuf (which mlocks it when the device asks for
+        // that) and wait for the whole queue's registrations BEFORE
+        // arming the FETCH command: once the SQE is pushed the kernel
+        // holds the buffer address, and failing out of this function
+        // with the command armed would let the buffer be freed while
+        // the (never-started) device still references it.
         if let Some(buf) = io_buf {
             self.register_io_buf_internal(tag, buf);
-            // Wait for all buffer registrations to complete before submitting prep commands
-            // This ensures that the effect is similar to submit_fetch_commands_unified()
             self.wait_for_all_buffer_registrations().await;
         }
 
@@ -1888,6 +1963,15 @@ impl UblkQueue {
             return Err(UblkError::OtherError(-libc::EPERM));
         }
 
+        // A sibling task failed before registering its buffer
+        // (fail_buffer_registration released the wait above): the queue
+        // is going down before the device ever starts — do not arm the
+        // FETCH command.
+        if self.is_stopping() {
+            return Err(UblkError::QueueIsDown);
+        }
+
+        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
         match f {
             Ok(future) => {
                 let res = future.await;
@@ -2592,61 +2676,86 @@ impl UblkQueue {
         } else {
             self.wait_ios(to_wait.saturating_sub(deferred))
         };
-        match ring_result {
-            Err(r) => Err(r),
-            Ok(ring_done) => {
-                let done = deferred + ring_done as usize;
-                let mut cmd_cnt = 0;
-                let mut aborted = false;
-
-                for i in 0..done {
-                    let cqe = pop_deferred_queue_cqe().or_else(|| {
-                        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-                            ring.completion().next()
-                        })
-                    });
-                    let cqe = match cqe {
-                        None => {
-                            if cmd_cnt > 0 {
-                                self.update_state_batch(cmd_cnt, aborted);
-                            }
-                            return Err(UblkError::OtherError(-libc::EINVAL));
-                        }
-                        Some(r) => r,
-                    };
-
-                    let user_data = cqe.user_data();
-                    let resolved = match crate::op::classify_user_data(user_data) {
-                        // SQEs pushed on the ring directly (e.g. by the
-                        // batch transport, whose multishot fetches cannot
-                        // ride a single-shot slab entry) keep their own
-                        // target-bit user_data; deliver it untouched.
-                        crate::op::CqeOwner::Target => Some((user_data, false)),
-                        crate::op::CqeOwner::Sentinel => None,
-                        crate::op::CqeOwner::Op(key) => {
-                            crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
-                        }
-                    };
-                    let Some((data, is_io_cmd)) = resolved else {
-                        // Reserved sentinel or op-future CQE (delivered to
-                        // its future by take_sync_entry): nothing for the
-                        // sync handler.
-                        continue;
-                    };
-                    if is_io_cmd {
-                        cmd_cnt += 1;
-                        if cqe.result() == sys::UBLK_IO_RES_ABORT {
-                            aborted = true;
-                        }
-                    }
-                    wake_handler(data, &cqe, i == done - 1);
-                }
-                if cmd_cnt > 0 {
-                    self.update_state_batch(cmd_cnt, aborted);
-                }
-                Ok(done as i32)
+        // On a ring error, still deliver any deferred CQEs before
+        // surfacing it: they were parked precisely so they would not be
+        // lost, and dropping them can eat a batch PROVIDE/COMMIT
+        // completion and wedge is_shutdown_complete() forever.
+        let (ring_done, ring_err) = match ring_result {
+            Ok(n) => (n, None),
+            Err(e) => (0, Some(e)),
+        };
+        if let Some(e) = ring_err {
+            if deferred == 0 {
+                return Err(e);
             }
+            let _ = self.deliver_cqes(&mut wake_handler, deferred);
+            return Err(e);
         }
+        self.deliver_cqes(&mut wake_handler, deferred + ring_done as usize)
+    }
+
+    /// Drain and dispatch `done` CQEs (deferred ones first, then the
+    /// ring), batching the io-command state accounting.
+    fn deliver_cqes<F>(&self, wake_handler: &mut F, done: usize) -> Result<i32, UblkError>
+    where
+        F: FnMut(u64, &cqueue::Entry, bool),
+    {
+        let mut cmd_cnt = 0;
+        let mut aborted = false;
+
+        for i in 0..done {
+            let cqe = pop_deferred_queue_cqe().or_else(|| {
+                with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                    ring.completion().next()
+                })
+            });
+            let cqe = match cqe {
+                None => {
+                    if cmd_cnt > 0 {
+                        self.update_state_batch(cmd_cnt, aborted);
+                    }
+                    return Err(UblkError::OtherError(-libc::EINVAL));
+                }
+                Some(r) => r,
+            };
+
+            let user_data = cqe.user_data();
+            let (data, is_io_cmd, orphaned) = match crate::op::classify_user_data(user_data) {
+                // SQEs pushed on the ring directly (e.g. by the
+                // batch transport, whose multishot fetches cannot
+                // ride a single-shot slab entry) keep their own
+                // target-bit user_data; deliver it untouched.
+                crate::op::CqeOwner::Target => (Some(user_data), false, false),
+                crate::op::CqeOwner::Sentinel => (None, false, false),
+                crate::op::CqeOwner::Op(key) => {
+                    crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
+                }
+            };
+            // Account io-command completions whether or not the entry
+            // was sync-mode: an async io command submitted on this
+            // queue incremented cmd_inflight the same way, and its
+            // completion draining through this loop must balance it.
+            // An orphaned command's ABORT is stale (possibly from a
+            // previously dropped queue on this thread) and must not
+            // flip this queue into stopping.
+            if is_io_cmd {
+                cmd_cnt += 1;
+                if !orphaned && cqe.result() == sys::UBLK_IO_RES_ABORT {
+                    aborted = true;
+                }
+            }
+            let Some(data) = data else {
+                // Reserved sentinel or op-future CQE (delivered to
+                // its future by take_sync_entry): nothing for the
+                // sync handler.
+                continue;
+            };
+            wake_handler(data, &cqe, i == done - 1);
+        }
+        if cmd_cnt > 0 {
+            self.update_state_batch(cmd_cnt, aborted);
+        }
+        Ok(done as i32)
     }
 }
 
@@ -2698,6 +2807,27 @@ mod raw_sqe_layout {
         const KEY: u64 = 0x4242_4242_4242_4242;
         let mut sqe: squeue::Entry = opcode::Nop::new().build().user_data(KEY);
         assert_eq!(sqe.as_raw_sqe().user_data, KEY, "user_data moved");
+    }
+}
+
+#[cfg(test)]
+mod user_data_tests {
+    use super::UblkIOCtx;
+    use crate::UblkUringData;
+
+    #[test]
+    fn build_user_data_keeps_all_16_tgt_data_bits() {
+        // Regression: `tgt_data << 24` computed in u32 dropped bits
+        // 8..16, so 0x0100 and 0x0200 built identical words.
+        let d = UblkIOCtx::build_user_data(0x12, 0xab, 0xbeef, true);
+        assert_eq!(d & 0xffff, 0x12);
+        assert_eq!((d >> 16) & 0xff, 0xab);
+        assert_eq!((d >> 24) & 0xffff, 0xbeef);
+        assert_ne!(d & (UblkUringData::Target as u64), 0);
+        assert_ne!(
+            UblkIOCtx::build_user_data(0, 0, 0x0100, false),
+            UblkIOCtx::build_user_data(0, 0, 0x0200, false),
+        );
     }
 }
 
