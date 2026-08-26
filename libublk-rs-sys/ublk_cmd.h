@@ -55,6 +55,47 @@
 	_IOWR('u', 0x15, struct ublksrv_ctrl_cmd)
 #define UBLK_U_CMD_QUIESCE_DEV		\
 	_IOWR('u', 0x16, struct ublksrv_ctrl_cmd)
+#define UBLK_U_CMD_TRY_STOP_DEV		\
+	_IOWR('u', 0x17, struct ublksrv_ctrl_cmd)
+/*
+ * Register a shared memory buffer for zero-copy I/O.
+ * Input:  ctrl_cmd.addr points to struct ublk_shmem_buf_reg (buffer VA + size)
+ *         ctrl_cmd.len  = sizeof(struct ublk_shmem_buf_reg)
+ * Result: >= 0 is the assigned buffer index, < 0 is error
+ *
+ * The kernel pins pages from the calling process's address space
+ * and inserts PFN ranges into a per-device maple tree. When a block
+ * request's pages match registered pages, the driver sets
+ * UBLK_IO_F_SHMEM_ZC and encodes the buffer index + offset in addr,
+ * allowing the server to access the data via its own mapping of the
+ * same shared memory — true zero copy.
+ *
+ * The memory can be backed by memfd, hugetlbfs, or any GUP-compatible
+ * shared mapping. Queue freeze is handled internally.
+ *
+ * The buffer VA and size are passed via a user buffer (not inline in
+ * ctrl_cmd) so that unprivileged devices can prepend the device path
+ * to ctrl_cmd.addr without corrupting the VA.
+ */
+#define UBLK_U_CMD_REG_BUF		\
+	_IOWR('u', 0x18, struct ublksrv_ctrl_cmd)
+/*
+ * Unregister a shared memory buffer.
+ * Input:  ctrl_cmd.data[0] = buffer index
+ */
+#define UBLK_U_CMD_UNREG_BUF		\
+	_IOWR('u', 0x19, struct ublksrv_ctrl_cmd)
+
+/* Parameter buffer for UBLK_U_CMD_REG_BUF, pointed to by ctrl_cmd.addr */
+struct ublk_shmem_buf_reg {
+	__u64	addr;	/* userspace virtual address of shared memory */
+	__u64	len;	/* buffer size in bytes, page-aligned, default max 4GB */
+	__u32	flags;
+	__u32	reserved;
+};
+
+/* Pin pages without FOLL_WRITE; usable with write-sealed memfd */
+#define UBLK_SHMEM_BUF_READ_ONLY	(1U << 0)
 
 /*
  * 64bits are enough now, and it should be easy to extend in case of
@@ -237,6 +278,13 @@
 #define UBLK_F_ZONED (1ULL << 8)
 
 /*
+ * - Block devices are recoverable if ublk server exits and restarts
+ * - Outstanding I/O when ublk server exits is met with errors
+ * - I/O issued while there is no ublk server is met with errors
+ */
+#define UBLK_F_USER_RECOVERY_FAIL_IO (1ULL << 9)
+
+/*
  * Resizing a block device is possible with UBLK_U_CMD_UPDATE_SIZE
  * New size is passed in cmd->data[0] and is in units of sectors
  */
@@ -294,6 +342,25 @@
 #define UBLK_F_QUIESCE		(1ULL << 12)
 
 /*
+ * If this feature is set, ublk_drv supports each (qid,tag) pair having
+ * its own independent daemon task that is responsible for handling it.
+ * If it is not set, daemons are per-queue instead, so for two pairs
+ * (qid1,tag1) and (qid2,tag2), if qid1 == qid2, then the same task must
+ * be responsible for handling (qid1,tag1) and (qid2,tag2).
+ */
+#define UBLK_F_PER_IO_DAEMON (1ULL << 13)
+
+/*
+ * If this feature is set, UBLK_U_IO_REGISTER_IO_BUF/UBLK_U_IO_UNREGISTER_IO_BUF
+ * can be issued for an I/O on any task. q_id and tag are also ignored in
+ * UBLK_U_IO_UNREGISTER_IO_BUF's ublksrv_io_cmd.
+ * If it is unset, zero-copy buffers can only be registered and unregistered by
+ * the I/O's daemon task. The q_id and tag of the registered buffer are required
+ * in UBLK_U_IO_UNREGISTER_IO_BUF's ublksrv_io_cmd.
+ */
+#define UBLK_F_BUF_REG_OFF_DAEMON (1ULL << 14)
+
+/*
  * Support the following commands for delivering & committing io command
  * in batch.
  *
@@ -307,6 +374,29 @@
  * UBLK_U_IO_NEED_GET_DATA uring_cmd are not supported for this feature.
  */
 #define UBLK_F_BATCH_IO		(1ULL << 15)
+
+/*
+ * ublk device supports requests with integrity/metadata buffer.
+ * Requires UBLK_F_USER_COPY.
+ */
+#define UBLK_F_INTEGRITY (1ULL << 16)
+
+/*
+ * The device supports the UBLK_CMD_TRY_STOP_DEV command, which
+ * allows stopping the device only if there are no openers.
+ */
+#define UBLK_F_SAFE_STOP_DEV	(1ULL << 17)
+
+/* Disable automatic partition scanning when device is started */
+#define UBLK_F_NO_AUTO_PART_SCAN (1ULL << 18)
+
+/*
+ * Enable shared memory zero copy. When enabled, the server can register
+ * shared memory buffers via UBLK_U_CMD_REG_BUF. If a block request's
+ * pages match a registered buffer, UBLK_IO_F_SHMEM_ZC is set and addr
+ * encodes the buffer index + offset instead of a userspace buffer address.
+ */
+#define UBLK_F_SHMEM_ZC	(1ULL << 19)
 
 /* device state */
 #define UBLK_S_DEV_DEAD	0
@@ -405,6 +495,14 @@ struct ublksrv_ctrl_dev_info {
  * passed in.
  */
 #define		UBLK_IO_F_NEED_REG_BUF		(1U << 17)
+/* Request has an integrity data buffer */
+#define		UBLK_IO_F_INTEGRITY		(1UL << 18)
+/*
+ * I/O buffer is in a registered shared memory buffer. When set, the addr
+ * field in ublksrv_io_desc encodes buffer index and byte offset instead
+ * of a userspace virtual address.
+ */
+#define		UBLK_IO_F_SHMEM_ZC		(1U << 19)
 
 /*
  * io cmd is described by this structure, and stored in share memory, indexed
@@ -672,5 +770,32 @@ struct ublk_params {
 	struct ublk_param_devt		devt;
 	struct ublk_param_zoned	zoned;
 };
+
+/*
+ * Shared memory zero-copy addr encoding for UBLK_IO_F_SHMEM_ZC.
+ *
+ * When UBLK_IO_F_SHMEM_ZC is set, ublksrv_io_desc.addr is encoded as:
+ *   bits [0:31]  = byte offset within the buffer (up to 4GB)
+ *   bits [32:47] = buffer index (up to 65536)
+ *   bits [48:63] = reserved (must be zero)
+ */
+#define UBLK_SHMEM_ZC_OFF_MASK		0xffffffffULL
+#define UBLK_SHMEM_ZC_IDX_OFF		32
+#define UBLK_SHMEM_ZC_IDX_MASK		0xffffULL
+
+static inline __u64 ublk_shmem_zc_addr(__u16 index, __u32 offset)
+{
+	return ((__u64)index << UBLK_SHMEM_ZC_IDX_OFF) | offset;
+}
+
+static inline __u16 ublk_shmem_zc_index(__u64 addr)
+{
+	return (addr >> UBLK_SHMEM_ZC_IDX_OFF) & UBLK_SHMEM_ZC_IDX_MASK;
+}
+
+static inline __u32 ublk_shmem_zc_offset(__u64 addr)
+{
+	return (__u32)(addr & UBLK_SHMEM_ZC_OFF_MASK);
+}
 
 #endif
