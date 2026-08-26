@@ -18,10 +18,15 @@
 //!
 //! * [`ShmemZcAddr`] decodes the encoded `addr` of a matched request.
 //! * [`ShmemBuf`] owns one shared mapping the server can register.
+//! * [`ShmemBufs`] keeps the registered mappings by driver index and turns a
+//!   matched request into a pointer into the right one.
 
 use std::os::fd::BorrowedFd;
 use std::path::Path;
+use std::sync::{Mutex, RwLock};
 
+use crate::ctrl::UblkCtrl;
+use crate::ctrl_async::UblkCtrlAsync;
 use crate::{sys, UblkError};
 
 /// The decoded `ublksrv_io_desc.addr` of a request that carries
@@ -204,6 +209,202 @@ impl Drop for ShmemBuf {
     }
 }
 
+/// The shared buffers one device has registered, by driver index.
+///
+/// Queue handlers on every queue thread resolve matched requests against
+/// this table, while registration happens from whoever drives the control
+/// device -- before `START_DEV`, or later at runtime when an application
+/// hands over a new memfd. A `RwLock` keeps both correct; the per-request
+/// read lock is uncontended in practice.
+///
+/// Indexes are assigned by the driver (lowest free, so they stay small) and
+/// the table grows to fit. It never unregisters on drop: a mapping that is
+/// still registered when this goes away is a caller error, and the driver
+/// releases everything on device removal anyway.
+///
+/// Registering and unregistering are serialized against each other by a
+/// control-side lock, separate from the table lock: the driver recycles a
+/// freed index immediately, so an unregister racing a register could file
+/// the newcomer under the slot being emptied. The table lock itself is
+/// never held across a driver command, because the queue freeze inside
+/// that command waits for queue threads which need [`Self::resolve`].
+#[derive(Debug, Default)]
+pub struct ShmemBufs {
+    bufs: RwLock<Vec<Option<ShmemBuf>>>,
+    ctl: Mutex<()>,
+}
+
+/// Keeps a mapping alive if the future registering it is dropped mid-flight.
+///
+/// REG_BUF runs on io-wq after submission returns, so a cancelled
+/// registration may still be pinning the mapping's pages -- or, had the
+/// range been unmapped and reused, somebody else's. Leaking the mapping
+/// (bounded by its size, until the process exits) is the safe outcome.
+struct KeepOnCancel(Option<ShmemBuf>);
+
+impl KeepOnCancel {
+    fn take(mut self) -> ShmemBuf {
+        self.0.take().expect("mapping taken once")
+    }
+}
+
+impl Drop for KeepOnCancel {
+    fn drop(&mut self) {
+        if let Some(buf) = self.0.take() {
+            std::mem::forget(buf);
+        }
+    }
+}
+
+impl ShmemBufs {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `buf` with the device behind `ctrl` and take ownership of
+    /// the mapping under the index the driver assigned.
+    ///
+    /// See [`UblkCtrl::register_shmem_buf`] for the driver-side semantics,
+    /// errors, and the queue freeze this implies on a live device.
+    pub fn register(&self, ctrl: &UblkCtrl, buf: ShmemBuf) -> Result<u16, UblkError> {
+        let _ctl = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
+        let index = ctrl.register_shmem_buf(&buf)?;
+        self.insert(index, buf);
+        Ok(index)
+    }
+
+    /// Async counterpart of [`Self::register`].
+    ///
+    /// Dropping the returned future before it completes leaks `buf`'s
+    /// mapping rather than unmapping it: the driver may still be pinning
+    /// those pages (see [`UblkCtrlAsync::register_shmem_buf_async`]).
+    // The control lock is held across the await on purpose: it only
+    // serializes register/unregister against each other, and the awaited
+    // command is the very thing that needs serializing.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn register_async(
+        &self,
+        ctrl: &UblkCtrlAsync,
+        buf: ShmemBuf,
+    ) -> Result<u16, UblkError> {
+        let _ctl = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = KeepOnCancel(Some(buf));
+        let res = ctrl
+            .register_shmem_buf_async(keep.0.as_ref().unwrap())
+            .await;
+        // completed (either way): the mapping is ours to drop again
+        let buf = keep.take();
+        let index = res?;
+        self.insert(index, buf);
+        Ok(index)
+    }
+
+    /// Unregister `index` from the device and hand its mapping back.
+    ///
+    /// Only indexes this table registered are accepted; anything else is
+    /// `ENOENT` without touching the driver. Nothing in flight references
+    /// the returned mapping any more (see
+    /// [`UblkCtrl::unregister_shmem_buf`]), so it may simply be dropped.
+    pub fn unregister(&self, ctrl: &UblkCtrl, index: u16) -> Result<ShmemBuf, UblkError> {
+        let _ctl = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_registered(index)?;
+        ctrl.unregister_shmem_buf(index)?;
+        self.take(index).ok_or(UblkError::OtherError(-libc::ENOENT))
+    }
+
+    /// Async counterpart of [`Self::unregister`].
+    #[allow(clippy::await_holding_lock)] // see register_async
+    pub async fn unregister_async(
+        &self,
+        ctrl: &UblkCtrlAsync,
+        index: u16,
+    ) -> Result<ShmemBuf, UblkError> {
+        let _ctl = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_registered(index)?;
+        ctrl.unregister_shmem_buf_async(index).await?;
+        self.take(index).ok_or(UblkError::OtherError(-libc::ENOENT))
+    }
+
+    /// File `buf` under `index` without talking to the driver.
+    ///
+    /// Registrations belong to the device, not to the process that made
+    /// them, so they survive a ublk server restart: a server recovering a
+    /// device with `UBLK_F_USER_RECOVERY` maps the same shared object again
+    /// and adopts it under the index it recorded before, and requests keep
+    /// matching without any REG_BUF/UNREG_BUF round trip (which could not
+    /// be issued anyway: the driver freezes the queue for those, and a
+    /// quiesced queue full of requeued requests never drains).
+    ///
+    /// `buf` must map the very same pages the driver pinned under `index`;
+    /// adopting anything else serves wrong data. A mapping already held
+    /// under `index` is replaced and returned.
+    pub fn adopt(&self, index: u16, buf: ShmemBuf) -> Option<ShmemBuf> {
+        let mut bufs = self.bufs.write().unwrap();
+        let slot = index as usize;
+        if bufs.len() <= slot {
+            bufs.resize_with(slot + 1, || None);
+        }
+        bufs[slot].replace(buf)
+    }
+
+    /// Number of registered buffers.
+    pub fn len(&self) -> usize {
+        self.bufs
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|b| b.is_some())
+            .count()
+    }
+
+    /// Whether nothing is registered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The data pointer for a request the driver matched to one of these
+    /// buffers.
+    ///
+    /// Returns `None` for an ordinary request (no `UBLK_IO_F_SHMEM_ZC`), for
+    /// an index this table does not hold, and when
+    /// `offset + nr_sectors * 512` runs past the end of the mapping, so a
+    /// handler can treat every `None` on a flagged request as `EINVAL`.
+    ///
+    /// The pointer stays valid for as long as the mapping is registered
+    /// here; the memory behind it is shared with the application that
+    /// issued the request.
+    #[inline]
+    pub fn resolve(&self, iod: &sys::ublksrv_io_desc) -> Option<*mut u8> {
+        let zc = ShmemZcAddr::from_iod(iod)?;
+        let bytes = (iod.nr_sectors as usize) << 9;
+        let bufs = self.bufs.read().unwrap();
+        let buf = bufs.get(zc.index as usize)?.as_ref()?;
+        let end = (zc.offset as usize).checked_add(bytes)?;
+        if end > buf.len() {
+            return None;
+        }
+        // SAFETY: offset + bytes <= len, checked above.
+        Some(unsafe { buf.as_ptr().add(zc.offset as usize) })
+    }
+
+    fn insert(&self, index: u16, buf: ShmemBuf) {
+        let replaced = self.adopt(index, buf);
+        debug_assert!(replaced.is_none(), "driver handed out a live index");
+    }
+
+    fn take(&self, index: u16) -> Option<ShmemBuf> {
+        self.bufs.write().unwrap().get_mut(index as usize)?.take()
+    }
+
+    fn check_registered(&self, index: u16) -> Result<(), UblkError> {
+        match self.bufs.read().unwrap().get(index as usize) {
+            Some(Some(_)) => Ok(()),
+            _ => Err(UblkError::OtherError(-libc::ENOENT)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +510,101 @@ mod tests {
             ShmemBuf::from_fd(empty.as_fd(), 0, false),
             Err(UblkError::InvalidVal)
         ));
+    }
+
+    fn zc_iod(index: u16, offset: u32, bytes: u32) -> sys::ublksrv_io_desc {
+        sys::ublksrv_io_desc {
+            op_flags: sys::UBLK_IO_OP_WRITE | sys::UBLK_IO_F_SHMEM_ZC,
+            nr_sectors: bytes >> 9,
+            addr: ShmemZcAddr { index, offset }.encode(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shmem_bufs_resolve_points_into_the_right_mapping() {
+        let page = page_size();
+        let fd0 = memfd(2 * page);
+        let fd3 = memfd(page);
+        let table = ShmemBufs::new();
+        assert!(table.is_empty());
+
+        // Driver indexes need not be dense: the table grows to fit.
+        table.insert(0, ShmemBuf::from_fd(fd0.as_fd(), 0, false).unwrap());
+        table.insert(3, ShmemBuf::from_fd(fd3.as_fd(), 0, false).unwrap());
+        assert_eq!(table.len(), 2);
+
+        let base0 = table.bufs.read().unwrap()[0].as_ref().unwrap().as_ptr();
+        let base3 = table.bufs.read().unwrap()[3].as_ref().unwrap().as_ptr();
+
+        assert_eq!(
+            table.resolve(&zc_iod(0, page as u32, 4096)),
+            Some(unsafe { base0.add(page) })
+        );
+        assert_eq!(table.resolve(&zc_iod(3, 0, page as u32)), Some(base3));
+    }
+
+    #[test]
+    fn shmem_bufs_resolve_rejects_what_it_cannot_serve() {
+        let page = page_size();
+        let fd = memfd(page);
+        let table = ShmemBufs::new();
+        table.insert(1, ShmemBuf::from_fd(fd.as_fd(), 0, false).unwrap());
+
+        // ordinary request: not for this table, whatever addr holds
+        let mut plain = zc_iod(1, 0, 4096);
+        plain.op_flags &= !sys::UBLK_IO_F_SHMEM_ZC;
+        assert_eq!(table.resolve(&plain), None);
+
+        // unknown indexes, inside and beyond the table's length
+        assert_eq!(table.resolve(&zc_iod(0, 0, 4096)), None);
+        assert_eq!(table.resolve(&zc_iod(9, 0, 4096)), None);
+
+        // the last sector fits, one more does not, and offsets past the end
+        // or overflowing usize are refused
+        assert!(table
+            .resolve(&zc_iod(1, (page - 512) as u32, 512))
+            .is_some());
+        assert_eq!(table.resolve(&zc_iod(1, (page - 512) as u32, 1024)), None);
+        assert_eq!(table.resolve(&zc_iod(1, page as u32, 512)), None);
+        assert_eq!(table.resolve(&zc_iod(1, u32::MAX, 512)), None);
+
+        // adopt() publishes without the driver and hands back what it displaces
+        let other = ShmemBuf::from_fd(memfd(page).as_fd(), 0, false).unwrap();
+        let other_ptr = other.as_ptr();
+        let displaced = table.adopt(1, other).unwrap();
+        assert_ne!(displaced.as_ptr(), other_ptr);
+        assert_eq!(table.resolve(&zc_iod(1, 0, 512)), Some(other_ptr));
+        drop(displaced);
+
+        // gone after take(): a stale index resolves to nothing
+        assert!(table.take(1).is_some());
+        assert!(table.take(1).is_none());
+        assert_eq!(table.resolve(&zc_iod(1, 0, 512)), None);
+        assert!(matches!(
+            table.check_registered(1),
+            Err(UblkError::OtherError(e)) if e == -libc::ENOENT
+        ));
+    }
+
+    #[test]
+    fn keep_on_cancel_leaks_instead_of_unmapping() {
+        let page = page_size();
+        let fd = memfd(page);
+        let buf = ShmemBuf::from_fd(fd.as_fd(), 0, false).unwrap();
+        let ptr = buf.as_ptr();
+        unsafe { *ptr = 0x5a };
+
+        // dropped like a cancelled future: the mapping must survive
+        drop(KeepOnCancel(Some(buf)));
+        assert_eq!(unsafe { *ptr }, 0x5a);
+
+        // taken after completion: an ordinary, droppable mapping again
+        let buf = ShmemBuf::from_fd(fd.as_fd(), 0, false).unwrap();
+        let keep = KeepOnCancel(Some(buf));
+        let buf = keep.take();
+        assert_eq!(buf.len(), page);
+        drop(buf);
     }
 
     #[test]

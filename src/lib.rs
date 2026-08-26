@@ -54,7 +54,7 @@ pub use io::{
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
 
 // Re-export the shared-memory zero-copy types
-pub use shmem::{ShmemBuf, ShmemZcAddr};
+pub use shmem::{ShmemBuf, ShmemBufs, ShmemZcAddr};
 
 // Re-export executor contract and utilities
 pub use executor::{
