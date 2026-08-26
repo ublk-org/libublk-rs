@@ -56,6 +56,18 @@ The `build.rs` lives in `libublk-rs-sys/`, not the root.
 5. **Helpers (`src/helpers.rs`)**:
    - `IoBuf<T>` - aligned I/O buffer management utility
 
+6. **Shared-memory zero copy (`src/shmem.rs`)**:
+   - `UBLK_F_SHMEM_ZC` is opportunistic and per request, *not* a buffer
+     mode: `BufDesc` is unchanged, FETCH/COMMIT are unchanged
+   - `ShmemBuf` owns one `MAP_SHARED` mapping (hugetlbfs file, memfd);
+     `UblkCtrl::register_shmem_buf()` / `unregister_shmem_buf()` issue
+     `UBLK_U_CMD_REG_BUF` / `UNREG_BUF`; `ShmemBufs` keeps registered
+     mappings by driver index
+   - A request with `UBLK_IO_F_SHMEM_ZC` carries `(index << 32) | offset`
+     in `iod.addr` (`ShmemZcAddr`); the kernel copies nothing, the handler
+     uses `ShmemBufs::resolve(iod)` and must check this flag *before* its
+     auto-buf-reg / user-copy / slice logic
+
 ### Key Patterns
 
 - **Async/Await Model**: The library is built around async/await with io_uring for high-performance I/O
