@@ -474,6 +474,43 @@ impl UblkCtrlCmdData {
         (addr, Some(new_buf))
     }
 
+    /// Move a buffer command's payload into a box the op will own for as
+    /// long as the command is in flight.
+    ///
+    /// Every control command except the GET_* queries is executed on
+    /// io-wq (`ublk_ctrl_uring_cmd_may_sleep()`), so the driver reads
+    /// `ctrl_cmd.addr` *after* `io_uring_enter()` has returned. A payload
+    /// on an async caller's stack frame is gone as soon as that future is
+    /// dropped mid-await; a box handed to the op is not. Returns the
+    /// caller's address for [`Self::unown_payload`], or `None` when the
+    /// command carries no buffer.
+    fn own_payload(&mut self) -> Option<(u64, Box<[u8]>)> {
+        if self.flags & CTRL_CMD_HAS_BUF == 0 || self.len == 0 {
+            return None;
+        }
+        let len = self.len as usize;
+        let mut buf = vec![0_u8; len].into_boxed_slice();
+        // SAFETY: the command's addr/len describe the caller's live
+        // payload, exactly what the kernel would read.
+        unsafe { std::ptr::copy_nonoverlapping(self.addr as *const u8, buf.as_mut_ptr(), len) };
+        let caller_addr = self.addr;
+        self.addr = buf.as_ptr() as u64;
+        Some((caller_addr, buf))
+    }
+
+    /// Undo [`Self::own_payload`]: copy a read command's result back to
+    /// the caller and point the command at the caller's memory again.
+    fn unown_payload(&mut self, caller_addr: u64, buf: &[u8]) {
+        if self.flags & CTRL_CMD_BUF_READ != 0 {
+            // SAFETY: `caller_addr` is the writable buffer a read command
+            // was issued with.
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), caller_addr as *mut u8, buf.len())
+            };
+        }
+        self.addr = caller_addr;
+    }
+
     fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner, buf: u64) {
         let cmd_op = self.cmd_op & 0xff;
 
@@ -1425,31 +1462,36 @@ impl UblkCtrlInner {
 
         for _ in 0..2 {
             let (old_buf, path_buf) = new_data.prep_un_privileged_dev_path(self);
+            // The op owns the payload buffer while the command is in
+            // flight -- dropping this future mid-await can no longer free
+            // memory the kernel still reads from io-wq -- and hands it
+            // back for the read-back copy below. The unprivileged prep
+            // already produced such a box (path + payload); every other
+            // buffer command gets one here.
+            let owned = match path_buf {
+                Some(buf) => Some((None, buf)),
+                None => new_data
+                    .own_payload()
+                    .map(|(caller_addr, buf)| (Some(caller_addr), buf)),
+            };
             let fd = self.file.as_raw_fd();
             let payload = Self::ublk_ctrl_cmd_payload(self.dev_info.dev_id, &new_data);
-            res = match path_buf {
-                // The op owns the path+data buffer while the command is
-                // in flight — dropping this future mid-await can no
-                // longer free memory the kernel still reads — and hands
-                // it back for the read-back copy in unprep below.
+            res = match owned {
                 // SAFETY: the payload's addr points into `buf`, whose
                 // liveness the op guarantees.
-                Some(buf) => {
+                Some((caller_addr, buf)) => {
                     let (res, buf) =
                         unsafe { crate::ops::uring_cmd80_buf(fd, new_data.cmd_op, payload, buf) }?
                             .await;
-                    new_data.unprep_un_privileged_dev_path(self, old_buf);
+                    match caller_addr {
+                        Some(addr) => new_data.unown_payload(addr, &buf),
+                        None => new_data.unprep_un_privileged_dev_path(self, old_buf),
+                    }
                     drop(buf);
                     res
                 }
-                // SAFETY: any buffer the payload references is caller
-                // memory that outlives this blocking retry loop.
-                None => {
-                    let res =
-                        unsafe { crate::ops::uring_cmd80(fd, new_data.cmd_op, payload) }?.await;
-                    new_data.unprep_un_privileged_dev_path(self, old_buf);
-                    res
-                }
+                // SAFETY: the payload references no memory at all.
+                None => unsafe { crate::ops::uring_cmd80(fd, new_data.cmd_op, payload) }?.await,
             };
 
             trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
@@ -1493,8 +1535,10 @@ impl UblkCtrlInner {
     }
 
     /// Prepare ADD_DEV command data
+    /// ADD_DEV is a read-back command: the driver fills in the assigned
+    /// dev_id and its own view of the info before completing.
     fn prepare_add_cmd(&self) -> UblkCtrlCmdData {
-        UblkCtrlCmdData::new_write_buffer_cmd(
+        UblkCtrlCmdData::new_read_buffer_cmd(
             sys::UBLK_U_CMD_ADD_DEV,
             std::ptr::addr_of!(self.dev_info) as u64,
             core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
@@ -2981,6 +3025,48 @@ mod tests {
         assert_ne!(
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_UPDATE_SIZE as u64,
             0
+        );
+    }
+
+    /// The async path hands the op a copy of every buffer payload, so a
+    /// dropped future cannot free memory io-wq still reads; read commands
+    /// get the result copied back and the caller's address restored.
+    #[test]
+    fn test_own_payload_round_trip() {
+        let mut src = [1_u8, 2, 3, 4];
+        let mut data = UblkCtrlCmdData::new_write_buffer_cmd(
+            crate::sys::UBLK_U_CMD_SET_PARAMS,
+            src.as_ptr() as u64,
+            4,
+            false,
+        );
+        let (caller, mut buf) = data.own_payload().unwrap();
+        assert_eq!(caller, src.as_ptr() as u64);
+        assert_eq!(data.addr, buf.as_ptr() as u64);
+        assert_eq!(&buf[..], &[1, 2, 3, 4]);
+        // a write command's caller memory is left alone
+        buf[0] = 9;
+        data.unown_payload(caller, &buf);
+        assert_eq!(data.addr, caller);
+        assert_eq!(src, [1, 2, 3, 4]);
+
+        // a read command's result lands in the caller's buffer
+        let mut data = UblkCtrlCmdData::new_read_buffer_cmd(
+            crate::sys::UBLK_U_CMD_GET_PARAMS,
+            src.as_mut_ptr() as u64,
+            4,
+            false,
+        );
+        let (caller, mut buf) = data.own_payload().unwrap();
+        buf.copy_from_slice(&[5, 6, 7, 8]);
+        data.unown_payload(caller, &buf);
+        assert_eq!(src, [5, 6, 7, 8]);
+
+        // no buffer, nothing to own
+        assert!(
+            UblkCtrlCmdData::new_data_cmd(crate::sys::UBLK_U_CMD_UPDATE_SIZE, 1)
+                .own_payload()
+                .is_none()
         );
     }
 
