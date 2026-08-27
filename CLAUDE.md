@@ -74,6 +74,17 @@ The `build.rs` lives in `libublk-rs-sys/`, not the root.
   `Fix753` callback, which strips a `Fix753_` prefix used to coerce bindgen
   into emitting macro-defined constants
 
+**Rule: every change to `libublk-rs-sys/ublk_cmd.h` (or `build.rs`) that adds
+or changes generated items must bump `libublk-rs-sys`'s version, in its own
+commit, moving `version` in `libublk-rs-sys/Cargo.toml` and the
+`libublk-rs-sys = { path = ..., version = ... }` requirement in the root
+`Cargo.toml` together.** Local builds resolve the `-sys` crate through the
+path and never notice a stale registry copy; `cargo publish` verifies against
+the registry and fails with `E0425` on the new constants. Release order is
+`cargo publish --manifest-path libublk-rs-sys/Cargo.toml` first (there is no
+`[workspace]`, so `-p` does not work), then `cargo publish --dry-run` at the
+root, then the root crate.
+
 ### Features
 
 - `tokio` (default) - Built-in Tokio current-thread executor integration (`UblkRuntime`).
