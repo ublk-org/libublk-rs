@@ -43,6 +43,16 @@ impl UblkCtrlAsync {
         self.get_inner().dev_flags
     }
 
+    /// io threads serving each queue, see
+    /// [`UblkCtrlBuilder`](super::ctrl::UblkCtrlBuilder)`::io_threads_per_queue`.
+    pub fn io_threads_per_queue(&self) -> u16 {
+        self.get_inner().io_threads_per_queue
+    }
+
+    pub(crate) fn set_io_threads_per_queue(&self, n: u16) -> Result<(), UblkError> {
+        self.get_inner_mut().set_io_threads_per_queue(n)
+    }
+
     /// Async version of new() - creates a new ublk control device asynchronously
     ///
     /// # Arguments:
@@ -194,7 +204,8 @@ impl UblkCtrlAsync {
 
         ctrl.nr_queues_configured += 1;
 
-        if ctrl.nr_queues_configured == ctrl.dev_info.nr_hw_queues {
+        // Every io thread of every queue reports once.
+        if ctrl.nr_queues_configured == ctrl.nr_io_threads() {
             ctrl.build_json_async(dev).await?;
         }
 

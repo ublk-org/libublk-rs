@@ -65,10 +65,11 @@ mod integration {
         assert!(out.status.success() == success);
     }
 
-    fn __test_ublk_null(dev_flags: UblkFlags, q_handler: fn(u16, &UblkDev)) {
+    fn __test_ublk_null(dev_flags: UblkFlags, threads: u16, q_handler: fn(u16, &UblkDev)) {
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
             .nr_queues(2)
+            .io_threads_per_queue(threads)
             .dev_flags(dev_flags)
             .ctrl_flags(libublk::sys::UBLK_F_USER_COPY.into())
             .build()
@@ -91,46 +92,58 @@ mod integration {
         .unwrap();
     }
 
+    /// called from queue_handler closure(), which supports Clone(),
+    fn null_handle_queue(qid: u16, dev: &UblkDev) {
+        let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
+        let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
+        let bufs = bufs_rc.clone();
+
+        let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
+            let iod = q.get_iod(tag);
+            let bytes = (iod.nr_sectors << 9) as i32;
+
+            let buf_desc = if user_copy {
+                BufDesc::Slice(&[]) // Empty slice for user_copy mode
+            } else {
+                BufDesc::Slice(bufs[tag as usize].as_slice())
+            };
+            q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
+                .unwrap();
+        };
+
+        let queue = match UblkQueue::new(qid, dev)
+            .unwrap()
+            .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
+                None
+            } else {
+                Some(&bufs_rc)
+            })) {
+            Ok(q) => q,
+            Err(e) => {
+                log::error!("submit_fetch_commands_unified failed: {}", e);
+                return;
+            }
+        };
+
+        queue.wait_and_handle_io(io_handler);
+    }
+
     /// make one ublk-null and test if /dev/ublkbN can be created successfully
     #[test]
     fn test_ublk_null() {
-        /// called from queue_handler closure(), which supports Clone(),
-        fn null_handle_queue(qid: u16, dev: &UblkDev) {
-            let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
-            let user_copy = (dev.dev_info.flags & libublk::sys::UBLK_F_USER_COPY as u64) != 0;
-            let bufs = bufs_rc.clone();
+        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, 1, null_handle_queue);
+    }
 
-            let io_handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-                let iod = q.get_iod(tag);
-                let bytes = (iod.nr_sectors << 9) as i32;
-
-                let buf_desc = if user_copy {
-                    BufDesc::Slice(&[]) // Empty slice for user_copy mode
-                } else {
-                    BufDesc::Slice(bufs[tag as usize].as_slice())
-                };
-                q.complete_io_cmd_unified(tag, buf_desc, Ok(UblkIORes::Result(bytes)))
-                    .unwrap();
-            };
-
-            let queue = match UblkQueue::new(qid, dev)
-                .unwrap()
-                .submit_fetch_commands_unified(BufDescList::Slices(if user_copy {
-                    None
-                } else {
-                    Some(&bufs_rc)
-                })) {
-                Ok(q) => q,
-                Err(e) => {
-                    log::error!("submit_fetch_commands_unified failed: {}", e);
-                    return;
-                }
-            };
-
-            queue.wait_and_handle_io(io_handler);
+    /// The sync user-copy handler with three io threads per queue: FETCH,
+    /// the no-buffer permit path of `submit_fetch_commands_unified` and
+    /// `wait_and_handle_io` all run per partition.
+    #[test]
+    fn test_ublk_null_user_copy_io_threads() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_PER_IO_DAEMON as u64 == 0 {
+            println!("skipping: kernel does not advertise UBLK_F_PER_IO_DAEMON");
+            return;
         }
-
-        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, null_handle_queue);
+        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, 3, null_handle_queue);
     }
 
     /// Make one batch-IO ublk-null device and exercise the high-level batch transport.
@@ -395,6 +408,7 @@ mod integration {
 
         __test_ublk_null(
             UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_COMP_BATCH,
+            1,
             null_handle_queue_batch,
         );
     }
@@ -519,7 +533,7 @@ mod integration {
         .unwrap();
     }
 
-    fn __test_ublk_null_zc(bad_buf_idx: bool, fallback: bool) {
+    fn __test_ublk_null_zc(bad_buf_idx: bool, fallback: bool, threads: u16) {
         const IORING_NOP_INJECT_RESULT: u32 = 1u32 << 0;
         const IORING_NOP_FIXED_BUFFER: u32 = 1u32 << 3;
         async fn handle_io_cmd(q: &UblkQueue<'_>, tag: u16) -> i32 {
@@ -592,6 +606,7 @@ mod integration {
             .name("null")
             .nr_queues(2)
             .depth(depth)
+            .io_threads_per_queue(threads)
             .id(-1)
             .dev_flags(dev_flags)
             .ctrl_flags((sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_SUPPORT_ZERO_COPY) as u64)
@@ -611,7 +626,9 @@ mod integration {
             let exe = exe_rc.clone();
             let mut f_vec = Vec::new();
 
-            for tag in 0..depth {
+            // Only this thread's tag partition; with one io thread per
+            // queue that is the whole 0..depth.
+            for tag in q_rc.tags() {
                 let q = q_rc.clone();
 
                 f_vec.push(exe.spawn(async move {
@@ -651,22 +668,210 @@ mod integration {
 
     #[test]
     fn test_ublk_null_zc() {
-        __test_ublk_null_zc(false, false);
+        __test_ublk_null_zc(false, false, 1);
     }
 
     #[test]
     fn test_ublk_null_zc_bad_idx_fallback() {
-        __test_ublk_null_zc(true, true);
+        __test_ublk_null_zc(true, true, 1);
     }
 
     #[test]
     fn test_ublk_null_zc_fallback() {
-        __test_ublk_null_zc(false, true);
+        __test_ublk_null_zc(false, true, 1);
+    }
+
+    /// Auto buffer registration with four io threads per queue: each
+    /// thread's ring has its own sparse buffer table indexed by absolute
+    /// tag, and the AutoReg permit path counts per partition.
+    #[test]
+    fn test_ublk_null_zc_io_threads() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_PER_IO_DAEMON as u64 == 0 {
+            println!("skipping: kernel does not advertise UBLK_F_PER_IO_DAEMON");
+            return;
+        }
+        __test_ublk_null_zc(false, false, 4);
     }
 
     #[test]
     fn test_ublk_null_zc_bad_idx_no_fallback() {
-        __test_ublk_null_zc(true, false); //io failure in case that bad buf idx and no fallback
+        __test_ublk_null_zc(true, false, 1); //io failure in case that bad buf idx and no fallback
+    }
+
+    /// Several io threads per queue (`UBLK_F_PER_IO_DAEMON`): each
+    /// thread FETCHes and serves its own tag partition, every partition
+    /// must be counted for device start, and IO must flow through all
+    /// of them. Depth 65 with 4 threads gives unequal interleaved
+    /// partitions (17/16/16/16), exercising the balancing math end to end.
+    #[test]
+    fn test_ublk_null_io_threads_per_queue() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_PER_IO_DAEMON as u64 == 0 {
+            println!("skipping: kernel does not advertise UBLK_F_PER_IO_DAEMON");
+            return;
+        }
+
+        /// (qid, tid of the serving thread, tag) per armed io task
+        type TagLog = Arc<Mutex<Vec<(u16, libc::pid_t, u16)>>>;
+
+        async fn io_task(q: &UblkQueue<'_>, tag: u16, tags_seen: &TagLog) -> Result<(), UblkError> {
+            let tid = unsafe { libc::gettid() };
+            tags_seen.lock().unwrap().push((q.get_qid(), tid, tag));
+            let buf = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+                .await?;
+            loop {
+                let iod = q.get_iod(tag);
+                let res = (iod.nr_sectors << 9) as i32;
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
+                    .await?;
+            }
+        }
+
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let (depth, nr_queues, threads) = (65_u16, 2_u16, 4_u16);
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(nr_queues)
+            .depth(depth)
+            .io_threads_per_queue(threads)
+            .dev_flags(dev_flags)
+            .build()
+            .unwrap();
+        assert_eq!(ctrl.io_threads_per_queue(), threads);
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+        let tags_seen: TagLog = Arc::new(Mutex::new(Vec::new()));
+        let wh_tags = tags_seen.clone();
+        let q_fn = move |qid: u16, dev: &UblkDev| {
+            let q_rc = Rc::new(UblkQueue::new(qid, dev).unwrap());
+            let exe_rc = Rc::new(smol::LocalExecutor::new());
+            let exe = exe_rc.clone();
+            let mut f_vec = Vec::new();
+            let tags_seen = Rc::new(tags_seen.clone());
+
+            // One io task per tag of this thread's partition only
+            for tag in q_rc.tags() {
+                let q = q_rc.clone();
+                let tags_seen = tags_seen.clone();
+
+                f_vec.push(exe.spawn(async move {
+                    match io_task(&q, tag, &tags_seen).await {
+                        Err(UblkError::QueueIsDown) | Ok(_) => {}
+                        Err(e) => log::error!("io_task failed for tag {}: {}", tag, e),
+                    }
+                }));
+            }
+
+            smol::block_on(exe_rc.run(async move {
+                let run_ops = || while exe.try_tick() {};
+                let done = || f_vec.iter().all(|task| task.is_finished());
+
+                if let Err(e) =
+                    libublk::wait_and_handle_io_events(&q_rc, Some(20), run_ops, done).await
+                {
+                    log::error!("handle_uring_events failed: {}", e);
+                }
+            }));
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl, true);
+            let seen = wh_tags.lock().unwrap().clone();
+            for qid in 0..nr_queues {
+                // every tag of the queue armed exactly once ...
+                let mut tags: Vec<u16> = seen
+                    .iter()
+                    .filter(|(q, _, _)| *q == qid)
+                    .map(|(_, _, t)| *t)
+                    .collect();
+                tags.sort_unstable();
+                assert_eq!(tags, (0..depth).collect::<Vec<u16>>(), "queue {qid}");
+                // ... by `threads` distinct threads owning interleaved
+                // partitions of 17/16/16/16 tags: thread k has tags k, k+4, ...
+                let mut per_tid: std::collections::BTreeMap<libc::pid_t, Vec<u16>> =
+                    Default::default();
+                for (q, tid, t) in &seen {
+                    if *q == qid {
+                        per_tid.entry(*tid).or_default().push(*t);
+                    }
+                }
+                assert_eq!(per_tid.len(), threads as usize, "queue {qid}: {per_tid:?}");
+                let mut sizes: Vec<usize> = per_tid.values().map(|v| v.len()).collect();
+                sizes.sort_unstable();
+                assert_eq!(sizes, vec![16, 16, 16, 17], "queue {qid}");
+                for tags in per_tid.values() {
+                    let k = tags[0] % threads;
+                    assert!(
+                        tags.iter().all(|t| t % threads == k),
+                        "queue {qid}: not an interleaved partition: {tags:?}"
+                    );
+                }
+            }
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
+    /// Asking for more io threads than the driver supports must fail at
+    /// build time instead of hanging device start.
+    #[test]
+    fn test_io_threads_per_queue_rejects_bad_count() {
+        // more threads than tags
+        let r = UblkCtrlBuilder::default()
+            .name("null")
+            .depth(2)
+            .io_threads_per_queue(3)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build();
+        assert!(matches!(r, Err(UblkError::OtherError(e)) if e == -libc::EINVAL));
+        // zero threads
+        let r = UblkCtrlBuilder::default()
+            .name("null")
+            .io_threads_per_queue(0)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build();
+        assert!(matches!(r, Err(UblkError::OtherError(e)) if e == -libc::EINVAL));
+        // single-CPU affinity would put a queue's threads on one CPU
+        let r = UblkCtrlBuilder::default()
+            .name("null")
+            .io_threads_per_queue(2)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+            .build();
+        assert!(matches!(r, Err(UblkError::OtherError(e)) if e == -libc::EINVAL));
+    }
+
+    /// Two `UblkQueue`s for the same (queue, partition) must fail fast
+    /// with -EBUSY instead of leaving the device waiting for a partition
+    /// nobody serves; dropping the first one frees the slot again.
+    #[test]
+    fn test_io_thread_partition_claimed_once() {
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .depth(16)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()
+            .unwrap();
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+        let dev = UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
+        let q = UblkQueue::new_for_thread(0, &dev, 0).unwrap();
+        assert!(matches!(
+            UblkQueue::new_for_thread(0, &dev, 0),
+            Err(UblkError::OtherError(e)) if e == -libc::EBUSY
+        ));
+        // out-of-range partition index
+        assert!(matches!(
+            UblkQueue::new_for_thread(0, &dev, 1),
+            Err(UblkError::OtherError(e)) if e == -libc::EINVAL
+        ));
+        drop(q);
+        let _q = UblkQueue::new_for_thread(0, &dev, 0).unwrap();
     }
 
     fn ublk_ramdisk_tester(ctrl: &UblkCtrl, dev_flags: UblkFlags) {
@@ -874,7 +1079,7 @@ mod integration {
                 .wait_and_handle_io(io_handler);
         }
 
-        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, null_queue_mut_io);
+        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, 1, null_queue_mut_io);
     }
 
     fn get_curr_bin_dir() -> Option<std::path::PathBuf> {

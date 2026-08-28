@@ -60,6 +60,23 @@ The `build.rs` lives in `libublk-rs-sys/`, not the root.
 
 - **Async/Await Model**: The library is built around async/await with io_uring for high-performance I/O
 - **Queue-per-Core**: Each device has multiple queues (typically one per CPU core)
+- **io threads per queue** (`UblkCtrlBuilder::io_threads_per_queue(n)`,
+  driver flag `UBLK_F_PER_IO_DAEMON`): `run_target` spawns `n` threads per
+  queue, each `UblkQueue` owns the *interleaved* tag partition from
+  `UblkQueue::tags()` (tags `k, k+n, k+2n, …`; FETCH, buffer registration
+  and the target's one-task-per-tag loop all iterate it), and device start
+  waits for `nr_queues * n` registrations. Interleaved, not contiguous:
+  sbitmap hands out tags sequentially, so with submitter QD < depth the
+  live tags are a rotating contiguous window and contiguous partitions
+  idle most threads (d256 -T4 at QD128: 753K, no thread above 55%;
+  interleaved: 1.04M, all ~85%).
+  All `n` threads get the queue's CPU affinity — keep them there: the mask
+  contains the submitter's CPU and threads outside its L3 domain roughly
+  halve their IPC. Why it exists: blk-mq maps a request to the hctx of the
+  *issuing* CPU, so a single submitter whose QD fits in the ublk queue
+  drives one hctx → one thread → ~450K 4k IOPS cap (loop example). Naïve
+  per-io threading (e.g. kublk's interleaved tags, unpinned) gets slower;
+  2 threads inside the mask measured 795K vs 495K.
 - **Zero-Copy**: Uses memory mapping and buffer registration for efficient data transfer
 - **RAII**: Device cleanup happens automatically when `UblkCtrl` is dropped
 

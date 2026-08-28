@@ -977,7 +977,7 @@ impl UblkDev {
             ctrl.dev_info(),
             ctrl.get_cdev_path(),
             ctrl.get_dev_flags(),
-            1,
+            ctrl.io_threads_per_queue(),
             ops,
         )
     }
@@ -1007,7 +1007,7 @@ impl UblkDev {
             ctrl.dev_info(),
             ctrl.get_cdev_path(),
             ctrl.get_dev_flags(),
-            1,
+            ctrl.io_threads_per_queue(),
             ops,
         )
     }

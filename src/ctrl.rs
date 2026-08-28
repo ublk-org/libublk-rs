@@ -765,6 +765,47 @@ pub struct UblkCtrlBuilder<'a> {
 
     /// libublk feature flags: UBLK_DEV_F_*
     dev_flags: UblkFlags,
+
+    /// io threads per queue, default 1 (one thread serves a whole queue).
+    ///
+    /// With `n > 1` each queue's tags are split into `n` interleaved
+    /// partitions and [`UblkCtrl::run_target`] spawns `n` threads per
+    /// queue, all bound to the queue's CPU affinity, each FETCHing and
+    /// serving its own partition (the driver's `UBLK_F_PER_IO_DAEMON`).
+    /// Use it when one hw queue is the bottleneck: a submitter whose
+    /// queue depth fits in the ublk queue drives exactly one hw queue,
+    /// so its IOPS is capped by one thread's per-IO CPU cost. Keeping the
+    /// extra threads inside the queue's affinity mask matters: that mask
+    /// contains the submitter's CPU, and on CPUs with several L3 domains
+    /// a thread outside it pays cross-L3 traffic on every IO.
+    ///
+    /// Requires the driver to advertise `UBLK_F_PER_IO_DAEMON` (Linux
+    /// 6.16+, not with `UBLK_F_BATCH_IO`); `build()` fails with
+    /// `-ENOTSUP` otherwise. Must not exceed the queue depth, and cannot
+    /// be combined with `UBLK_DEV_F_SINGLE_CPU_AFFINITY` (`-EINVAL`).
+    ///
+    /// Only worth it for workloads that keep many requests in flight per
+    /// queue (batched submission, high queue depth); a QD-1 submitter
+    /// gains nothing and pays for extra wakeups. Note that a sync-style
+    /// target calling `UblkDev::alloc_queue_io_bufs()` allocates buffers
+    /// for the whole depth in each of the `n` threads (so `n` times the
+    /// memory, of which only each thread's own tags get mlocked under
+    /// `UBLK_DEV_F_MLOCK_IO_BUFFER`); per-tag allocation in io tasks
+    /// does not have that cost.
+    ///
+    /// [`UblkCtrl::run_target`] spawns and labels the threads. Code that
+    /// spawns io threads itself (e.g. around `UblkCtrlAsync`) must call
+    /// `libublk::io::set_io_thread_idx(k)` on thread `k` before creating
+    /// its `UblkQueue`; a second `UblkQueue` for the same partition fails
+    /// with `-EBUSY`. Such code must also call
+    /// [`UblkCtrl::configure_queue`] (or
+    /// [`UblkCtrlAsync::configure_queue_async`](super::ctrl_async::UblkCtrlAsync::configure_queue_async))
+    /// once per io thread rather than once per queue: the json export is
+    /// built when all `nr_queues * n` of them have reported, and a target
+    /// that reports once per queue gets a device that starts and serves IO
+    /// but never writes its json file, so `get_queue_tid`,
+    /// `get_target_data_from_json` and `dump()` come up empty.
+    io_threads_per_queue: u16,
 }
 
 impl Default for UblkCtrlBuilder<'_> {
@@ -778,6 +819,7 @@ impl Default for UblkCtrlBuilder<'_> {
             ctrl_flags: 0,
             ctrl_target_flags: 0,
             dev_flags: UblkFlags::empty(),
+            io_threads_per_queue: 1,
         }
     }
 }
@@ -786,7 +828,7 @@ impl UblkCtrlBuilder<'_> {
     /// create one pair of ublk devices, the 1st one is control device(`UblkCtrl`),
     /// and the 2nd one is data device(`UblkDev`)
     pub fn build(self) -> Result<UblkCtrl, UblkError> {
-        UblkCtrl::new(
+        let ctrl = UblkCtrl::new(
             Some(self.name.to_string()),
             self.id,
             self.nr_queues.into(),
@@ -795,10 +837,13 @@ impl UblkCtrlBuilder<'_> {
             self.ctrl_flags,
             self.ctrl_target_flags,
             self.dev_flags,
-        )
+        )?;
+        ctrl.get_inner_mut()
+            .set_io_threads_per_queue(self.io_threads_per_queue)?;
+        Ok(ctrl)
     }
     pub async fn build_async(self) -> Result<super::ctrl_async::UblkCtrlAsync, UblkError> {
-        super::ctrl_async::UblkCtrlAsync::new_async(
+        let ctrl = super::ctrl_async::UblkCtrlAsync::new_async(
             Some(self.name.to_string()),
             self.id,
             self.nr_queues.into(),
@@ -808,7 +853,9 @@ impl UblkCtrlBuilder<'_> {
             self.ctrl_target_flags,
             self.dev_flags,
         )
-        .await
+        .await?;
+        ctrl.set_io_threads_per_queue(self.io_threads_per_queue)?;
+        Ok(ctrl)
     }
 }
 
@@ -844,7 +891,50 @@ pub(crate) struct UblkCtrlInner {
     cmd_token: i32,
     queue_tids: Vec<i32>,
     queue_selected_cpus: Vec<usize>,
-    pub(crate) nr_queues_configured: u16,
+    pub(crate) nr_queues_configured: u32,
+    /// io threads serving each queue, see
+    /// [`UblkCtrlBuilder::io_threads_per_queue`].
+    pub(crate) io_threads_per_queue: u16,
+}
+
+impl UblkCtrlInner {
+    /// Validate and record the io-thread-per-queue count from the builder.
+    pub(crate) fn set_io_threads_per_queue(&mut self, n: u16) -> Result<(), UblkError> {
+        if n == 0 || n > self.dev_info.queue_depth {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+        if n > 1
+            && self
+                .dev_flags
+                .contains(UblkFlags::UBLK_DEV_F_SINGLE_CPU_AFFINITY)
+        {
+            // Each thread would pick its own random CPU from the mask; two
+            // threads of one queue on the same CPU defeats the purpose.
+            log::error!(
+                "dev {}: {} io threads per queue cannot be combined with \
+                 UBLK_DEV_F_SINGLE_CPU_AFFINITY",
+                self.dev_info.dev_id,
+                n
+            );
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+        if n > 1 && (self.dev_info.flags & sys::UBLK_F_PER_IO_DAEMON as u64) == 0 {
+            log::error!(
+                "dev {}: {} io threads per queue need UBLK_F_PER_IO_DAEMON \
+                 (Linux 6.16+, not with UBLK_F_BATCH_IO)",
+                self.dev_info.dev_id,
+                n
+            );
+            return Err(UblkError::OtherError(-libc::ENOTSUP));
+        }
+        self.io_threads_per_queue = n;
+        Ok(())
+    }
+
+    /// Total io threads of the device: every queue times its io threads.
+    pub(crate) fn nr_io_threads(&self) -> u32 {
+        self.dev_info.nr_hw_queues as u32 * self.io_threads_per_queue as u32
+    }
 }
 
 /// Affinity management helpers
@@ -1155,6 +1245,7 @@ impl UblkCtrlInner {
             queue_tids,
             queue_selected_cpus,
             nr_queues_configured: 0,
+            io_threads_per_queue: 1,
             dev_flags: config.dev_flags,
             force_async: false,
             force_sync: false,
@@ -1197,6 +1288,7 @@ impl UblkCtrlInner {
             queue_tids,
             queue_selected_cpus,
             nr_queues_configured: 0,
+            io_threads_per_queue: 1,
             dev_flags: config.dev_flags,
             force_async: false,
             force_sync: false,
@@ -2241,6 +2333,12 @@ impl UblkCtrl {
         self.get_inner().dev_flags
     }
 
+    /// io threads serving each queue, see
+    /// [`UblkCtrlBuilder::io_threads_per_queue`].
+    pub fn io_threads_per_queue(&self) -> u16 {
+        self.get_inner().io_threads_per_queue
+    }
+
     pub fn new(
         name: Option<String>,
         id: i32,
@@ -2362,7 +2460,8 @@ impl UblkCtrl {
 
         ctrl.nr_queues_configured += 1;
 
-        if ctrl.nr_queues_configured == ctrl.dev_info.nr_hw_queues {
+        // Every io thread of every queue reports once.
+        if ctrl.nr_queues_configured == ctrl.nr_io_threads() {
             ctrl.build_json(dev)?;
         }
 
@@ -2794,26 +2893,34 @@ impl UblkCtrl {
 
         let mut q_threads = Vec::new();
         let nr_queues = dev.dev_info.nr_hw_queues;
+        // `nr_threads` io threads per queue, each serving one tag
+        // partition (see `UblkCtrlBuilder::io_threads_per_queue`); all of
+        // a queue's threads get the queue's affinity below.
+        let nr_threads = dev.io_threads_per_queue();
 
         let (tx, rx) = mpsc::channel();
 
         for q in 0..nr_queues {
-            let _dev = Arc::clone(dev);
-            let _tx = tx.clone();
-            let mut _q_fn = q_fn.clone();
+            for t in 0..nr_threads {
+                let _dev = Arc::clone(dev);
+                let _tx = tx.clone();
+                let mut _q_fn = q_fn.clone();
 
-            q_threads.push(std::thread::spawn(move || {
-                let tid = Self::init_queue_thread();
-                if let Err(e) = _tx.send((q, tid)) {
-                    eprintln!("Warning: Failed to send queue thread info: {}", e);
-                    return;
-                }
-                _q_fn(q, &_dev);
-            }));
+                q_threads.push(std::thread::spawn(move || {
+                    let tid = Self::init_queue_thread();
+                    // Read by UblkQueue::new() to pick this thread's tags.
+                    crate::io::set_io_thread_idx(t);
+                    if let Err(e) = _tx.send((q, tid)) {
+                        eprintln!("Warning: Failed to send queue thread info: {}", e);
+                        return;
+                    }
+                    _q_fn(q, &_dev);
+                }));
+            }
         }
 
         // Set affinity from main thread context using thread IDs
-        for _q in 0..nr_queues {
+        for _i in 0..(nr_queues as u32 * nr_threads as u32) {
             let (qid, tid) = match rx.recv() {
                 Ok(data) => data,
                 Err(e) => {
