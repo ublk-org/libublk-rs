@@ -274,13 +274,15 @@ async fn lo_io_task(q: &UblkQueue<'_>, tag: u16) -> Result<(), UblkError> {
     }
 }
 
-fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
+fn q_a_fn(qid: u16, dev: &UblkDev) {
     let q_rc = Rc::new(UblkQueue::new(qid as u16, &dev).unwrap());
     let exe_rc = Rc::new(smol::LocalExecutor::new());
     let exe = exe_rc.clone();
     let mut f_vec = Vec::new();
 
-    for tag in 0..depth {
+    // One io task per tag served by this thread: the whole queue, or its
+    // interleaved partition with `-T n`.
+    for tag in q_rc.tags() {
         let q = q_rc.clone();
 
         f_vec.push(exe.spawn(async move {
@@ -301,10 +303,12 @@ fn q_a_fn(qid: u16, dev: &UblkDev, depth: u16) {
     }));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn __loop_add(
     id: i32,
     nr_queues: u32,
     depth: u16,
+    threads_per_queue: u16,
     buf_sz: u32,
     backing_file: &String,
     ctrl_flags: u64,
@@ -334,6 +338,7 @@ fn __loop_add(
         .ctrl_flags(ctrl_flags)
         .nr_queues(nr_queues.try_into().unwrap())
         .depth(depth)
+        .io_threads_per_queue(threads_per_queue)
         .io_buf_bytes(buf_sz)
         .dev_flags(dev_flags)
         .build()
@@ -347,7 +352,7 @@ fn __loop_add(
     };
 
     if aio {
-        ctrl.run_target(tgt_init, move |qid, dev: &_| q_a_fn(qid, dev, depth), wh)
+        ctrl.run_target(tgt_init, move |qid, dev: &_| q_a_fn(qid, dev), wh)
             .unwrap();
     } else {
         ctrl.run_target(tgt_init, move |qid, dev: &_| q_fn(qid, dev), wh)
@@ -355,10 +360,12 @@ fn __loop_add(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn loop_add(
     id: i32,
     nr_queues: u32,
     depth: u16,
+    threads_per_queue: u16,
     buf_sz: u32,
     backing_file: &String,
     ctrl_flags: u64,
@@ -369,6 +376,7 @@ fn loop_add(
             id,
             nr_queues,
             depth,
+            threads_per_queue,
             buf_sz,
             backing_file,
             ctrl_flags,
@@ -384,6 +392,7 @@ fn loop_add(
                 id,
                 nr_queues,
                 depth,
+                threads_per_queue,
                 buf_sz,
                 backing_file,
                 ctrl_flags,
@@ -428,6 +437,18 @@ fn main() {
                         .short('d')
                         .default_value("64")
                         .help("queue depth: max in-flight io commands")
+                        .action(ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("threads_per_queue")
+                        .long("threads-per-queue")
+                        .short('T')
+                        .default_value("1")
+                        .help(
+                            "io threads per queue (UBLK_F_PER_IO_DAEMON): split each \
+                             queue's tags across N threads bound to the queue's CPUs, \
+                             so one saturated hw queue is served by N CPUs",
+                        )
                         .action(ArgAction::Set),
                 )
                 .arg(
@@ -510,6 +531,11 @@ fn main() {
                 .unwrap()
                 .parse::<u32>()
                 .unwrap_or(64);
+            let threads_per_queue = add_matches
+                .get_one::<String>("threads_per_queue")
+                .unwrap()
+                .parse::<u16>()
+                .unwrap_or(1);
             let buf_size = add_matches
                 .get_one::<String>("buf_size")
                 .unwrap()
@@ -539,6 +565,7 @@ fn main() {
                 id,
                 nr_queues,
                 depth.try_into().unwrap(),
+                threads_per_queue,
                 buf_size,
                 backing_file,
                 ctrl_flags,
