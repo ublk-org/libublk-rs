@@ -196,6 +196,36 @@ To measure the device rather than one queue, use several submitters
 that load a deeper queue wins as expected (`-d 128` ≈ 3M vs `-d 64` ≈ 1.9M
 4k-IOPS on the same NVMe with 8 queues).
 
+When one hw queue really is the bottleneck — one submitter, or a workload
+that concentrates on a few queues — give the queue more threads instead of
+relying on that accident: `UblkCtrlBuilder::io_threads_per_queue(n)`
+(loop example: `-T n`) splits every queue's tags across `n` io threads
+(`UBLK_F_PER_IO_DAEMON`, Linux 6.16+), interleaved (`k, k+n, …`) so that
+whatever window of tags blk-mq has in flight lands on all `n` threads, all
+bound to the queue's CPU affinity. On the machine above `-d 128 -T 2` with
+one submitter reaches ~800K 4k-IOPS and `-T 4` about 1M, independent of
+`-d`, beating the `-d 64` number by a wide margin; keeping the
+threads inside the queue's affinity mask is what makes it work (the mask
+contains the submitter's CPU; a thread outside that L3 domain halves its
+IPC on this workload).
+
+> **⚠️ Only for batched workloads.** Enable `io_threads_per_queue` only
+> when the workload keeps many requests in flight per queue — **batched
+> submission** or high queue depth. **Otherwise leave it at the default
+> of 1.** The extra threads get parallel work only when several requests
+> reach the queue at once; each request still costs the same, and a
+> request now lands on whichever thread owns its tag, so a QD-1 or
+> one-IO-per-submit workload gains nothing and pays for the extra wakeups
+> and the split cache footprint. Measured on the same setup (`-d 128`,
+> one submitter, `-T 1` → `-T 4`):
+>
+> | submitter | `-T 1` | `-T 4` |
+> |---|---|---|
+> | QD 1, one IO per submit | 29.1K | 28.4K (≈1 µs more latency) |
+> | QD 8, one IO per submit | 210K | 214K |
+> | QD 32, one IO per submit | 360K | 510K |
+> | QD 128, batches of 32 | 420K | **990K** |
+
 ## Example
 
 ### loop

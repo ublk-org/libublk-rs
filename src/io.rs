@@ -218,9 +218,26 @@ std::thread_local! {
         const { RefCell::new(None) };
 
     /// Index of this thread among the io threads serving its queue
-    /// (`0..UblkDev::io_threads_per_queue()`), read by [`UblkQueue::new`]
-    /// to pick the tag partition this thread owns.
+    /// (`0..UblkDev::io_threads_per_queue()`), set by
+    /// `UblkCtrl::run_target` before the queue handler runs and read by
+    /// [`UblkQueue::new`] to pick the tag partition this thread owns.
     static IO_THREAD_IDX: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// Record which io thread of its queue the current thread is, so that
+/// [`UblkQueue::new`] (and therefore `run_io_tasks`) serves partition
+/// `idx` of the queue's tags.
+///
+/// `UblkCtrl::run_target` calls this for every thread it spawns. Only
+/// code that spawns the io threads itself — e.g. a target driving an
+/// `UblkCtrlAsync` — needs to call it, once per thread before creating
+/// the thread's `UblkQueue`, with a distinct `idx` in
+/// `0..UblkDev::io_threads_per_queue()` for each thread of a queue.
+/// Creating two `UblkQueue`s for the same partition fails with `-EBUSY`
+/// rather than leaving the device waiting for a partition nobody
+/// serves.
+pub fn set_io_thread_idx(idx: u16) {
+    IO_THREAD_IDX.with(|c| c.set(idx));
 }
 
 /// Index of the current thread among the io threads serving its queue,
@@ -990,7 +1007,7 @@ impl UblkDev {
             ctrl.dev_info(),
             ctrl.get_cdev_path(),
             ctrl.get_dev_flags(),
-            1,
+            ctrl.io_threads_per_queue(),
             ops,
         )
     }
@@ -1020,7 +1037,7 @@ impl UblkDev {
             ctrl.dev_info(),
             ctrl.get_cdev_path(),
             ctrl.get_dev_flags(),
-            1,
+            ctrl.io_threads_per_queue(),
             ops,
         )
     }
