@@ -7,6 +7,7 @@
 
 use super::ctrl::{UblkCtrlInner, UblkQueueAffinity};
 use super::io::UblkDev;
+use super::shmem::ShmemBuf;
 use super::{sys, UblkError, UblkFlags};
 use std::fs;
 use std::path::Path;
@@ -409,6 +410,30 @@ impl UblkCtrlAsync {
     /// [`UblkCtrl::update_size`]: crate::ctrl::UblkCtrl::update_size
     pub async fn update_size_async(&self, dev_size: u64) -> Result<i32, UblkError> {
         self.get_inner_mut().update_size_async(dev_size).await
+    }
+
+    /// Async counterpart of [`UblkCtrl::register_shmem_buf`], which documents
+    /// the semantics.
+    ///
+    /// Not cancellation-safe with respect to `buf`: REG_BUF executes on
+    /// io-wq after submission returns, so if this future is dropped before
+    /// it completes the driver may still be pinning the mapping -- or, once
+    /// the range is unmapped and reused, whatever lives there next. A
+    /// caller that drops the future must keep `buf` mapped (leak it) rather
+    /// than unmap it; [`ShmemBufs::register_async`](crate::ShmemBufs::register_async)
+    /// does exactly that.
+    ///
+    /// [`UblkCtrl::register_shmem_buf`]: crate::ctrl::UblkCtrl::register_shmem_buf
+    pub async fn register_shmem_buf_async(&self, buf: &ShmemBuf) -> Result<u16, UblkError> {
+        self.get_inner_mut().register_shmem_buf_async(buf).await
+    }
+
+    /// Async counterpart of [`UblkCtrl::unregister_shmem_buf`], which
+    /// documents the semantics.
+    ///
+    /// [`UblkCtrl::unregister_shmem_buf`]: crate::ctrl::UblkCtrl::unregister_shmem_buf
+    pub async fn unregister_shmem_buf_async(&self, index: u16) -> Result<(), UblkError> {
+        self.get_inner_mut().unregister_shmem_buf_async(index).await
     }
 
     /// Give up ownership of the device, so dropping this control leaves it

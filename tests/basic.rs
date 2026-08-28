@@ -648,54 +648,61 @@ mod integration {
         ctrl.kill_dev().unwrap();
     }
 
-    fn __test_ublk_ramdisk(dev_flags: UblkFlags) {
-        // async function to handle individual I/O commands using slice operations for safe buffer access
+    /// A ublk-ramdisk, optionally with a shared buffer registered for
+    /// `UBLK_F_SHMEM_ZC`: the handler then serves matched requests straight
+    /// from the mapping and the tester issues O_DIRECT io from it.
+    fn __test_ublk_ramdisk(dev_flags: UblkFlags, shmem: Option<ShmemKind>) {
+        use std::sync::atomic::Ordering;
+
+        // async function to handle individual I/O commands: the data lives in
+        // the shared mapping for a request the driver matched to a registered
+        // buffer (the kernel copied nothing), in the tag's own buffer otherwise
         async fn handle_io_cmd(
             q: &UblkQueue,
             tag: u16,
             ramdisk_addr: usize,
             io_buf: &mut [u8],
+            shmem: &libublk::ShmemBufs,
+            stats: &ShmemStats,
         ) -> i32 {
             let iod = q.get_iod(tag);
             let off = (iod.start_sector << 9) as usize;
             let bytes = (iod.nr_sectors << 9) as usize;
             let op = iod.op_flags & 0xff;
 
-            // Ensure we don't read/write beyond buffer boundaries
-            if bytes > io_buf.len() {
+            if op == sys::UBLK_IO_OP_FLUSH {
+                return 0;
+            }
+            if op != sys::UBLK_IO_OP_READ && op != sys::UBLK_IO_OP_WRITE {
                 return -libc::EINVAL;
             }
 
-            match op {
-                sys::UBLK_IO_OP_FLUSH => {
-                    // For flush, we just return success
-                    bytes as i32
+            let data: *mut u8 = match shmem.resolve(iod) {
+                Some(p) => {
+                    stats.zc.fetch_add(1, Ordering::Relaxed);
+                    p
                 }
-                sys::UBLK_IO_OP_READ => {
-                    // For read operations, copy data from ramdisk to I/O buffer using safe slice operations
-                    // Create a safe slice from the ramdisk memory for the read operation
-                    unsafe {
-                        let ramdisk_slice =
-                            std::slice::from_raw_parts((ramdisk_addr + off) as *const u8, bytes);
-                        io_buf[..bytes].copy_from_slice(ramdisk_slice);
+                // matched to a buffer this device never registered
+                None if iod.op_flags & sys::UBLK_IO_F_SHMEM_ZC != 0 => return -libc::EINVAL,
+                None => {
+                    // Ensure we don't read/write beyond buffer boundaries
+                    if bytes > io_buf.len() {
+                        return -libc::EINVAL;
                     }
-                    bytes as i32
+                    stats.copy.fetch_add(1, Ordering::Relaxed);
+                    io_buf.as_mut_ptr()
                 }
-                sys::UBLK_IO_OP_WRITE => {
-                    // For write operations, copy data from I/O buffer to ramdisk using safe slice operations
-                    // Create a safe slice from the ramdisk memory for the write operation
-                    unsafe {
-                        let ramdisk_slice =
-                            std::slice::from_raw_parts_mut((ramdisk_addr + off) as *mut u8, bytes);
-                        ramdisk_slice.copy_from_slice(&io_buf[..bytes]);
-                    }
-                    bytes as i32
-                }
-                _ => {
-                    // Invalid operation
-                    -libc::EINVAL
+            };
+
+            let disk = (ramdisk_addr + off) as *mut u8;
+            unsafe {
+                if op == sys::UBLK_IO_OP_READ {
+                    std::ptr::copy_nonoverlapping(disk, data, bytes);
+                } else {
+                    std::ptr::copy_nonoverlapping(data, disk, bytes);
                 }
             }
+            bytes as i32
         }
 
         async fn test_ramdisk_io_task(
@@ -703,6 +710,8 @@ mod integration {
             tag: u16,
             ramdisk_addr: usize,
             mlock_enabled: bool,
+            shmem: Arc<libublk::ShmemBufs>,
+            stats: Arc<ShmemStats>,
         ) -> Result<(), UblkError> {
             let mut buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
@@ -720,12 +729,25 @@ mod integration {
             }
 
             loop {
-                let res = handle_io_cmd(&q, tag, ramdisk_addr, buf.as_mut_slice()).await;
+                let res =
+                    handle_io_cmd(q, tag, ramdisk_addr, buf.as_mut_slice(), &shmem, &stats).await;
                 // Any error (including QueueIsDown) will break the loop by exiting the function
                 q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
                     .await?;
             }
         }
+
+        // hugetlb needs a reservation; skip the test when it cannot be had
+        let (_hugepages, shmem_size) = match shmem {
+            None => (None, 0),
+            Some(ShmemKind::Memfd) => (None, 2_usize << 20),
+            Some(ShmemKind::Hugetlb) => {
+                match HugePages::page_size().and_then(|_| HugePages::reserve(4)) {
+                    Some(hp) => (Some(hp), 2 * HugePages::page_size().unwrap()),
+                    None => return,
+                }
+            }
+        };
 
         let size = 32_u64 << 20;
         let ramdisk_buf = libublk::helpers::IoBuf::<u8>::new(size as usize);
@@ -737,6 +759,11 @@ mod integration {
             .nr_queues(1)
             .depth(depth)
             .dev_flags(dev_flags)
+            .ctrl_flags(if shmem.is_some() {
+                sys::UBLK_F_SHMEM_ZC.into()
+            } else {
+                0
+            })
             .build()
             .unwrap();
         let tgt_init = |dev: &mut UblkDev| {
@@ -744,16 +771,33 @@ mod integration {
             Ok(())
         };
 
+        let bufs = Arc::new(libublk::ShmemBufs::new());
+        let stats = Arc::new(ShmemStats::default());
+        // registered before START_DEV, so no queue to freeze
+        let registered = shmem.map(|kind| {
+            let buf = shmem_buf(shmem_size, kind == ShmemKind::Hugetlb);
+            let base = buf.as_ptr() as usize;
+            (bufs.register(&ctrl, buf).unwrap(), base)
+        });
+
+        let (q_bufs, q_stats) = (bufs.clone(), stats.clone());
         let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             let mlock_enabled = dev.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
+            let (bufs, stats) = (q_bufs.clone(), q_stats.clone());
 
-            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| async move {
-                test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled).await
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+                let (bufs, stats) = (bufs.clone(), stats.clone());
+                async move {
+                    test_ramdisk_io_task(&q, tag, ramdisk_addr, mlock_enabled, bufs, stats).await
+                }
             })
             .unwrap();
         };
 
         ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            if let Some((index, base)) = registered {
+                ramdisk_shmem_zc_check(ctrl, &bufs, index, base, shmem_size, &stats);
+            }
             ublk_ramdisk_tester(ctrl, dev_flags);
         })
         .unwrap();
@@ -764,7 +808,319 @@ mod integration {
     /// - if yes, then test format/mount/umount over this ublk-ramdisk
     #[test]
     fn test_ublk_ramdisk() {
-        __test_ublk_ramdisk(UblkFlags::UBLK_DEV_F_ADD_DEV);
+        __test_ublk_ramdisk(UblkFlags::UBLK_DEV_F_ADD_DEV, None);
+    }
+
+    // ---- UBLK_F_SHMEM_ZC -------------------------------------------------
+
+    fn shmem_zc_supported() -> bool {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_SHMEM_ZC as u64 == 0 {
+            println!("skipping: kernel lacks UBLK_F_SHMEM_ZC");
+            return false;
+        }
+        true
+    }
+
+    fn page_size() -> usize {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
+    /// Reserve `nr` hugepages via /proc/sys/vm/nr_hugepages and put the old
+    /// value back on drop.  `None` when that cannot be done (not root, no
+    /// hugetlb, fragmented memory).
+    struct HugePages {
+        prev: String,
+    }
+
+    impl HugePages {
+        const CTL: &'static str = "/proc/sys/vm/nr_hugepages";
+
+        fn reserve(nr: usize) -> Option<Self> {
+            let prev = std::fs::read_to_string(Self::CTL).ok()?;
+            let have: usize = prev.trim().parse().ok()?;
+            let want = have.max(nr);
+            std::fs::write(Self::CTL, format!("{}\n", want)).ok()?;
+            // pages the pool holds but someone else has taken, or already
+            // promised to (Rsvd), do not help
+            let free = Self::meminfo("HugePages_Free:")
+                .unwrap_or(0)
+                .saturating_sub(Self::meminfo("HugePages_Rsvd:").unwrap_or(0));
+            if free < nr {
+                std::fs::write(Self::CTL, &prev).ok();
+                println!("skipping: only {} of {} hugepages free", free, nr);
+                return None;
+            }
+            Some(Self { prev })
+        }
+
+        /// The numeric value of `key` in /proc/meminfo (a count, or kB).
+        fn meminfo(key: &str) -> Option<usize> {
+            let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let line = meminfo.lines().find(|l| l.starts_with(key))?;
+            line.split_whitespace().nth(1)?.parse().ok()
+        }
+
+        /// Hugepagesize from /proc/meminfo, in bytes.
+        fn page_size() -> Option<usize> {
+            Self::meminfo("Hugepagesize:").map(|kb| kb << 10)
+        }
+    }
+
+    impl Drop for HugePages {
+        fn drop(&mut self) {
+            let _ = std::fs::write(Self::CTL, &self.prev);
+        }
+    }
+
+    /// A memfd of `size` bytes, hugetlb-backed when asked (that needs a
+    /// hugepage reservation and a `size` in whole hugepages).
+    fn shmem_memfd(size: usize, hugetlb: bool) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+
+        let flags = libc::MFD_CLOEXEC | if hugetlb { libc::MFD_HUGETLB } else { 0 };
+        let fd = unsafe { libc::memfd_create(c"libublk-shmem-zc".as_ptr(), flags) };
+        assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            unsafe { libc::ftruncate(fd, size as libc::off_t) },
+            0,
+            "ftruncate: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    fn shmem_buf(size: usize, hugetlb: bool) -> libublk::ShmemBuf {
+        use std::os::fd::AsFd;
+        let fd = shmem_memfd(size, hugetlb);
+        libublk::ShmemBuf::from_fd(fd.as_fd(), 0, false).unwrap()
+    }
+
+    /// Registration bookkeeping against a live device: indexes come back
+    /// lowest-free, unregistering frees them, unknown indexes are ENOENT,
+    /// and a device created without the flag refuses REG_BUF.
+    #[test]
+    fn test_ublk_shmem_zc_reg_unreg() {
+        if !shmem_zc_supported() {
+            return;
+        }
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(1)
+            .id(-1)
+            .dev_flags(dev_flags)
+            .ctrl_flags(sys::UBLK_F_SHMEM_ZC.into())
+            .build()
+            .unwrap();
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
+            libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| async move {
+                let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
+                q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+                    .await?;
+                loop {
+                    let iod = q.get_iod(tag);
+                    let res = (iod.nr_sectors << 9) as i32;
+                    q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
+                        .await?;
+                }
+            })
+            .unwrap();
+        };
+
+        let page = page_size();
+        // registered before START_DEV: no disk yet, so no queue freeze
+        let bufs = libublk::ShmemBufs::new();
+        assert_eq!(bufs.register(&ctrl, shmem_buf(2 * page, false)).unwrap(), 0);
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+
+            // and after: the driver freezes the live queue around the update
+            assert_eq!(bufs.register(ctrl, shmem_buf(page, false)).unwrap(), 1);
+            assert_eq!(bufs.len(), 2);
+
+            let freed = bufs.unregister(ctrl, 0).unwrap();
+            assert_eq!(freed.len(), 2 * page);
+            assert_eq!(bufs.len(), 1);
+            drop(freed);
+
+            // the index is recycled
+            assert_eq!(bufs.register(ctrl, shmem_buf(page, false)).unwrap(), 0);
+
+            // never registered: refused by the table, and by the driver
+            assert!(matches!(
+                bufs.unregister(ctrl, 5),
+                Err(UblkError::OtherError(e)) if e == -libc::ENOENT
+            ));
+            assert!(matches!(
+                ctrl.unregister_shmem_buf(5),
+                Err(UblkError::UringIOError(e)) if e == -libc::ENOENT
+            ));
+
+            // read-only mappings register too
+            let ro = {
+                use std::os::fd::AsFd;
+                let fd = shmem_memfd(page, false);
+                libublk::ShmemBuf::from_fd(fd.as_fd(), 0, true).unwrap()
+            };
+            let ro_idx = bufs.register(ctrl, ro).unwrap();
+            bufs.unregister(ctrl, ro_idx).unwrap();
+
+            // a device without the feature flag refuses REG_BUF outright
+            let plain = UblkCtrlBuilder::default()
+                .name("null")
+                .nr_queues(1)
+                .id(-1)
+                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                .build()
+                .unwrap();
+            assert!(matches!(
+                plain.register_shmem_buf(&shmem_buf(page, false)),
+                Err(UblkError::UringIOError(e)) if e == -libc::EOPNOTSUPP
+            ));
+
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
+    /// What backs the shared buffer a ramdisk test registers.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ShmemKind {
+        Memfd,
+        Hugetlb,
+    }
+
+    /// How many requests the ramdisk handler served from a shared buffer
+    /// versus through its own buffer.
+    #[derive(Default)]
+    struct ShmemStats {
+        zc: std::sync::atomic::AtomicU64,
+        copy: std::sync::atomic::AtomicU64,
+    }
+
+    /// O_DIRECT io on the ramdisk issued **from the registered mapping**
+    /// (same process, so the PFNs match and the driver's zero-copy path
+    /// fires) and from an ordinary aligned heap buffer (copy path),
+    /// cross-checking data written through one path and read through the
+    /// other; then unregisters and shows the same mapping falls back to
+    /// copying.
+    fn ramdisk_shmem_zc_check(
+        ctrl: &UblkCtrl,
+        bufs: &libublk::ShmemBufs,
+        index: u16,
+        shmem_base: usize,
+        shmem_size: usize,
+        stats: &ShmemStats,
+    ) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::Ordering;
+
+        let bdev = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(ctrl.get_bdev_path())
+            .unwrap();
+        let fd = bdev.as_raw_fd();
+        let pwrite = |buf: *const u8, len: usize, off: u64| {
+            let n = unsafe { libc::pwrite(fd, buf as *const _, len, off as libc::off_t) };
+            assert_eq!(
+                n as usize,
+                len,
+                "pwrite: {}",
+                std::io::Error::last_os_error()
+            );
+        };
+        let pread = |buf: *mut u8, len: usize, off: u64| {
+            let n = unsafe { libc::pread(fd, buf as *mut _, len, off as libc::off_t) };
+            assert_eq!(
+                n as usize,
+                len,
+                "pread: {}",
+                std::io::Error::last_os_error()
+            );
+        };
+        let fill = |buf: *mut u8, len: usize, seed: u8| {
+            for i in 0..len {
+                unsafe { *buf.add(i) = seed.wrapping_add((i / 512) as u8) ^ (i as u8) };
+            }
+        };
+        let equal = |a: *const u8, b: *const u8, len: usize| unsafe {
+            std::slice::from_raw_parts(a, len) == std::slice::from_raw_parts(b, len)
+        };
+
+        let io_len = 256_usize << 10;
+        let heap = IoBuf::<u8>::new(io_len);
+        let heap_ptr = heap.as_mut_ptr();
+        // shmem offsets: one page in, so the encoded offset is non-zero
+        let zc_a = (shmem_base + page_size()) as *mut u8;
+        let zc_b = (shmem_base + shmem_size - io_len) as *mut u8;
+
+        // write through shmem (zero copy), read back through the heap (copy)
+        fill(zc_a, io_len, 0x11);
+        pwrite(zc_a, io_len, 1 << 20);
+        fill(heap_ptr, io_len, 0);
+        pread(heap_ptr, io_len, 1 << 20);
+        assert!(equal(zc_a, heap_ptr, io_len));
+
+        // write through the heap (copy), read back into shmem (zero copy)
+        fill(heap_ptr, io_len, 0x77);
+        pwrite(heap_ptr, io_len, 8 << 20);
+        fill(zc_b, io_len, 0);
+        pread(zc_b, io_len, 8 << 20);
+        assert!(equal(heap_ptr, zc_b, io_len));
+
+        // shmem to shmem, at a 4k granularity the driver has to match
+        // bvec by bvec
+        for i in 0..8_u64 {
+            fill(unsafe { zc_a.add(i as usize * 4096) }, 4096, 0xa0 + i as u8);
+            pwrite(
+                unsafe { zc_a.add(i as usize * 4096) },
+                4096,
+                (16 << 20) + i * 4096,
+            );
+        }
+        pread(zc_b, 8 * 4096, 16 << 20);
+        assert!(equal(zc_a, zc_b, 8 * 4096));
+
+        assert!(stats.zc.load(Ordering::Relaxed) >= 11);
+        assert!(stats.copy.load(Ordering::Relaxed) >= 2);
+
+        // once unregistered, IO from the mapping takes the copy path
+        let kept = bufs.unregister(ctrl, index).unwrap();
+        let zc_before = stats.zc.load(Ordering::Relaxed);
+        let copy_before = stats.copy.load(Ordering::Relaxed);
+        pread(zc_a, io_len, 8 << 20);
+        assert!(equal(heap_ptr, zc_a, io_len));
+        assert_eq!(stats.zc.load(Ordering::Relaxed), zc_before);
+        assert!(stats.copy.load(Ordering::Relaxed) > copy_before);
+        drop(kept);
+    }
+
+    /// The ramdisk test with a memfd registered: both the zero-copy and the
+    /// copy path are exercised, then the usual format/mount pass.
+    #[test]
+    fn test_ublk_ramdisk_shmem_zc() {
+        if !shmem_zc_supported() {
+            return;
+        }
+        __test_ublk_ramdisk(UblkFlags::UBLK_DEV_F_ADD_DEV, Some(ShmemKind::Memfd));
+    }
+
+    /// Same with a hugetlb-backed memfd, skipped when hugepages cannot be
+    /// reserved.
+    #[test]
+    fn test_ublk_ramdisk_shmem_zc_hugetlb() {
+        if !shmem_zc_supported() {
+            return;
+        }
+        __test_ublk_ramdisk(UblkFlags::UBLK_DEV_F_ADD_DEV, Some(ShmemKind::Hugetlb));
     }
 
     /// make FnMut closure for IO handling
@@ -1321,7 +1677,7 @@ mod integration {
     #[test]
     fn test_ublk_null_mlock_io_buffer() {
         let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER;
-        __test_ublk_ramdisk(dev_flags);
+        __test_ublk_ramdisk(dev_flags, None);
     }
 
     /// Test mlock IO buffer feature incompatibility with other features

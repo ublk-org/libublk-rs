@@ -106,6 +106,25 @@ fn main() {
 `rublk`[^4] is based on libublk, and supports null, loop, zoned, qcow2,
 compress & vram targets so far.
 
+## Shared-memory zero copy (`UBLK_F_SHMEM_ZC`)
+
+With `UBLK_F_SHMEM_ZC` in `ctrl_flags`, the server registers page-aligned
+shared mappings — a hugetlbfs file, a memfd — with the driver
+(`UblkCtrl::register_shmem_buf()`, or the `libublk::ShmemBufs` table that
+keeps them by index). Whenever an application issues a block request whose
+pages all lie inside a registered buffer, e.g. `fio --mem=mmaphuge:<file>`
+over the same hugetlbfs file, the driver delivers it with
+`UBLK_IO_F_SHMEM_ZC` set and `(index, offset)` encoded in `iod.addr`
+instead of a buffer address, and copies nothing in either direction. The
+queue handler resolves that to a pointer into its own mapping
+(`ShmemBufs::resolve()`) and moves the data itself.
+
+The match is per request and opportunistic: requests from other memory
+keep taking whatever buffer path the handler passes in FETCH/COMMIT, so a
+target checks `UBLK_IO_F_SHMEM_ZC` first and otherwise behaves as before.
+See the `libublk::shmem` module docs and the `shmem_zc` tests in
+[`tests/basic.rs`](tests/basic.rs).
+
 ## unprivileged ublk support
 
 In unprivileged mode(`UBLK_F_UNPRIVILEGED_DEV`), ublk device can be created

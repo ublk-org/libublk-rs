@@ -18,6 +18,7 @@ pub mod ops;
 pub mod reactor;
 #[cfg(feature = "tokio")]
 pub mod runtime;
+pub mod shmem;
 pub mod sys;
 // The shared test helpers drive devices through UblkRuntime; the
 // reactor-only build tests the reactor directly instead.
@@ -51,6 +52,9 @@ pub use io::{
 
 // Re-export control ring initialization and access
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};
+
+// Re-export the shared-memory zero-copy types
+pub use shmem::{ShmemBuf, ShmemBufs, ShmemZcAddr};
 
 // Re-export executor contract and utilities
 pub use executor::{

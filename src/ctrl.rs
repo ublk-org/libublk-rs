@@ -11,6 +11,7 @@
 //! query or recovery tool does, never deletes anything when dropped.
 
 use super::io::{UblkDev, UblkTgt};
+use super::shmem::ShmemBuf;
 use super::{sys, UblkError, UblkFlags};
 use crate::op::{Op, Resources};
 use bitmaps::Bitmap;
@@ -472,6 +473,43 @@ impl UblkCtrlCmdData {
         let addr = self.addr;
         self.addr = buf as u64;
         (addr, Some(new_buf))
+    }
+
+    /// Move a buffer command's payload into a box the op will own for as
+    /// long as the command is in flight.
+    ///
+    /// Every control command except the GET_* queries is executed on
+    /// io-wq (`ublk_ctrl_uring_cmd_may_sleep()`), so the driver reads
+    /// `ctrl_cmd.addr` *after* `io_uring_enter()` has returned. A payload
+    /// on an async caller's stack frame is gone as soon as that future is
+    /// dropped mid-await; a box handed to the op is not. Returns the
+    /// caller's address for [`Self::unown_payload`], or `None` when the
+    /// command carries no buffer.
+    fn own_payload(&mut self) -> Option<(u64, Box<[u8]>)> {
+        if self.flags & CTRL_CMD_HAS_BUF == 0 || self.len == 0 {
+            return None;
+        }
+        let len = self.len as usize;
+        let mut buf = vec![0_u8; len].into_boxed_slice();
+        // SAFETY: the command's addr/len describe the caller's live
+        // payload, exactly what the kernel would read.
+        unsafe { std::ptr::copy_nonoverlapping(self.addr as *const u8, buf.as_mut_ptr(), len) };
+        let caller_addr = self.addr;
+        self.addr = buf.as_ptr() as u64;
+        Some((caller_addr, buf))
+    }
+
+    /// Undo [`Self::own_payload`]: copy a read command's result back to
+    /// the caller and point the command at the caller's memory again.
+    fn unown_payload(&mut self, caller_addr: u64, buf: &[u8]) {
+        if self.flags & CTRL_CMD_BUF_READ != 0 {
+            // SAFETY: `caller_addr` is the writable buffer a read command
+            // was issued with.
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), caller_addr as *mut u8, buf.len())
+            };
+        }
+        self.addr = caller_addr;
     }
 
     fn unprep_un_privileged_dev_path(&mut self, dev: &UblkCtrlInner, buf: u64) {
@@ -1043,7 +1081,8 @@ impl UblkCtrlInner {
         | sys::UBLK_F_UPDATE_SIZE
         | sys::UBLK_F_AUTO_BUF_REG
         | sys::UBLK_F_QUIESCE
-        | sys::UBLK_F_BATCH_IO) as u64;
+        | sys::UBLK_F_BATCH_IO
+        | sys::UBLK_F_SHMEM_ZC) as u64;
 
     /// Create device info structure from parameters
     fn create_device_info(
@@ -1425,31 +1464,36 @@ impl UblkCtrlInner {
 
         for _ in 0..2 {
             let (old_buf, path_buf) = new_data.prep_un_privileged_dev_path(self);
+            // The op owns the payload buffer while the command is in
+            // flight -- dropping this future mid-await can no longer free
+            // memory the kernel still reads from io-wq -- and hands it
+            // back for the read-back copy below. The unprivileged prep
+            // already produced such a box (path + payload); every other
+            // buffer command gets one here.
+            let owned = match path_buf {
+                Some(buf) => Some((None, buf)),
+                None => new_data
+                    .own_payload()
+                    .map(|(caller_addr, buf)| (Some(caller_addr), buf)),
+            };
             let fd = self.file.as_raw_fd();
             let payload = Self::ublk_ctrl_cmd_payload(self.dev_info.dev_id, &new_data);
-            res = match path_buf {
-                // The op owns the path+data buffer while the command is
-                // in flight — dropping this future mid-await can no
-                // longer free memory the kernel still reads — and hands
-                // it back for the read-back copy in unprep below.
+            res = match owned {
                 // SAFETY: the payload's addr points into `buf`, whose
                 // liveness the op guarantees.
-                Some(buf) => {
+                Some((caller_addr, buf)) => {
                     let (res, buf) =
                         unsafe { crate::ops::uring_cmd80_buf(fd, new_data.cmd_op, payload, buf) }?
                             .await;
-                    new_data.unprep_un_privileged_dev_path(self, old_buf);
+                    match caller_addr {
+                        Some(addr) => new_data.unown_payload(addr, &buf),
+                        None => new_data.unprep_un_privileged_dev_path(self, old_buf),
+                    }
                     drop(buf);
                     res
                 }
-                // SAFETY: any buffer the payload references is caller
-                // memory that outlives this blocking retry loop.
-                None => {
-                    let res =
-                        unsafe { crate::ops::uring_cmd80(fd, new_data.cmd_op, payload) }?.await;
-                    new_data.unprep_un_privileged_dev_path(self, old_buf);
-                    res
-                }
+                // SAFETY: the payload references no memory at all.
+                None => unsafe { crate::ops::uring_cmd80(fd, new_data.cmd_op, payload) }?.await,
             };
 
             trace!("ublk_ctrl_cmd_async: cmd {:x} res {}", data.cmd_op, res);
@@ -1493,8 +1537,10 @@ impl UblkCtrlInner {
     }
 
     /// Prepare ADD_DEV command data
+    /// ADD_DEV is a read-back command: the driver fills in the assigned
+    /// dev_id and its own view of the info before completing.
     fn prepare_add_cmd(&self) -> UblkCtrlCmdData {
-        UblkCtrlCmdData::new_write_buffer_cmd(
+        UblkCtrlCmdData::new_read_buffer_cmd(
             sys::UBLK_U_CMD_ADD_DEV,
             std::ptr::addr_of!(self.dev_info) as u64,
             core::mem::size_of::<sys::ublksrv_ctrl_dev_info>() as u32,
@@ -1774,6 +1820,81 @@ impl UblkCtrlInner {
 
         let data = Self::prepare_update_size_cmd(dev_size, p.basic.logical_bs_shift)?;
         self.ublk_ctrl_cmd_async(&data).await
+    }
+
+    /// Describe `buf` for REG_BUF: the mapping's own address and length,
+    /// read-only mappings pinned without FOLL_WRITE.
+    fn shmem_buf_reg(buf: &ShmemBuf) -> sys::ublk_shmem_buf_reg {
+        sys::ublk_shmem_buf_reg {
+            addr: buf.as_ptr() as u64,
+            len: buf.len() as u64,
+            flags: if buf.is_read_only() {
+                sys::UBLK_SHMEM_BUF_READ_ONLY
+            } else {
+                0
+            },
+            reserved: 0,
+        }
+    }
+
+    /// Prepare REG_BUF command data.  `reg` is passed by address, so it has
+    /// to outlive the submission.
+    fn prepare_reg_buf_cmd(reg: &sys::ublk_shmem_buf_reg) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_write_buffer_cmd(
+            sys::UBLK_U_CMD_REG_BUF,
+            std::ptr::addr_of!(*reg) as u64,
+            core::mem::size_of::<sys::ublk_shmem_buf_reg>() as u32,
+            false, // need dev_path
+        )
+    }
+
+    /// Prepare UNREG_BUF command data: the driver reads the index from data[0].
+    fn prepare_unreg_buf_cmd(index: u16) -> UblkCtrlCmdData {
+        UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_UNREG_BUF, index as u64)
+    }
+
+    /// REG_BUF answers with the buffer index in the CQE result.  Map it
+    /// ourselves rather than trusting `ublk_err_to_result()`, which lets
+    /// -EBUSY through as a success for the sake of QUIESCE_DEV.
+    fn shmem_index_from_result(res: i32) -> Result<u16, UblkError> {
+        match u16::try_from(res) {
+            Ok(index) => Ok(index),
+            Err(_) if res < 0 => Err(UblkError::UringIOError(res)),
+            // The driver allocates indexes below USHRT_MAX; anything larger
+            // is not a shmem buffer this crate knows how to address.
+            Err(_) => Err(UblkError::OtherError(-libc::ERANGE)),
+        }
+    }
+
+    fn register_shmem_buf(&mut self, buf: &ShmemBuf) -> Result<u16, UblkError> {
+        let reg = Self::shmem_buf_reg(buf);
+        let data = Self::prepare_reg_buf_cmd(&reg);
+        Self::shmem_index_from_result(self.ublk_ctrl_cmd(&data)?)
+    }
+
+    pub(crate) async fn register_shmem_buf_async(
+        &mut self,
+        buf: &ShmemBuf,
+    ) -> Result<u16, UblkError> {
+        let reg = Self::shmem_buf_reg(buf);
+        let data = Self::prepare_reg_buf_cmd(&reg);
+        Self::shmem_index_from_result(self.ublk_ctrl_cmd_async(&data).await?)
+    }
+
+    fn unregister_shmem_buf(&mut self, index: u16) -> Result<(), UblkError> {
+        let data = Self::prepare_unreg_buf_cmd(index);
+        match self.ublk_ctrl_cmd(&data)? {
+            0 => Ok(()),
+            res => Err(UblkError::UringIOError(res)),
+        }
+    }
+
+    pub(crate) async fn unregister_shmem_buf_async(&mut self, index: u16) -> Result<(), UblkError> {
+        let data = Self::prepare_unreg_buf_cmd(index);
+        match self.ublk_ctrl_cmd_async(&data).await? {
+            0 => Ok(()),
+            res => Err(UblkError::UringIOError(res)),
+        }
     }
 
     /// Prepare GET_PARAMS command data
@@ -2689,6 +2810,61 @@ impl UblkCtrl {
         self.get_inner_mut().update_size(dev_size)
     }
 
+    /// Register a shared-memory mapping for `UBLK_F_SHMEM_ZC` and return
+    /// the buffer index the driver assigned to it.
+    ///
+    /// From then on any block request whose pages all lie inside `buf` --
+    /// typically because the application issuing it maps the same
+    /// hugetlbfs file or memfd -- is delivered with `UBLK_IO_F_SHMEM_ZC`
+    /// set and `(index, offset)` encoded in `ublksrv_io_desc.addr`; see
+    /// [`ShmemZcAddr`](crate::shmem::ShmemZcAddr). The kernel copies nothing
+    /// for such a request, so the queue handler must move the data through
+    /// `buf` itself. Requests that do not match keep using whatever
+    /// [`BufDesc`](crate::BufDesc) the handler passes in FETCH/COMMIT.
+    ///
+    /// The driver pins every page of the mapping for as long as it stays
+    /// registered (`FOLL_LONGTERM`, and `FOLL_WRITE` unless `buf` is
+    /// read-only). `buf` has to outlive the registration: unregister it or
+    /// let the device go away before dropping the mapping.
+    ///
+    /// Registration is allowed before and after `START_DEV`, but not from
+    /// just anywhere: on a live device the driver **freezes the request
+    /// queue** while it edits its lookup tree, and a freeze only completes
+    /// once every request in flight has been committed by the server. So
+    /// this must not be called from a thread that is itself responsible
+    /// for completing io -- the single-thread ctrl+io model deadlocks on it
+    /// -- nor on a quiesced device awaiting recovery, whose requeued
+    /// requests never drain; and every application using the device stalls
+    /// for the duration. Registering before `START_DEV`, when there is no
+    /// disk to freeze, has none of these problems.
+    ///
+    /// # Errors
+    ///
+    /// `EOPNOTSUPP` if the device was created without `UBLK_F_SHMEM_ZC` in
+    /// its `ctrl_flags`, `EINVAL` for a mapping the driver will not take
+    /// (not page aligned, or larger than 4 GiB), `EFAULT` if the pages could
+    /// not all be pinned.
+    pub fn register_shmem_buf(&self, buf: &ShmemBuf) -> Result<u16, UblkError> {
+        self.get_inner_mut().register_shmem_buf(buf)
+    }
+
+    /// Unregister the shared-memory buffer `index`, obtained from
+    /// [`Self::register_shmem_buf`].
+    ///
+    /// The same queue freeze as for registration applies (see
+    /// [`Self::register_shmem_buf`]), which is also what makes this safe:
+    /// by the time it returns no request matched to the buffer is in
+    /// flight any more and new ones no longer match, so the mapping can be
+    /// dropped right away.
+    ///
+    /// # Errors
+    ///
+    /// `ENOENT` if `index` is not registered, `EOPNOTSUPP` if the device
+    /// lacks `UBLK_F_SHMEM_ZC`.
+    pub fn unregister_shmem_buf(&self, index: u16) -> Result<(), UblkError> {
+        self.get_inner_mut().unregister_shmem_buf(index)
+    }
+
     /// Give up ownership of the device, so dropping this control leaves it
     /// in place
     ///
@@ -2917,7 +3093,8 @@ impl UblkCtrl {
 #[cfg(test)]
 mod tests {
     use crate::ctrl::{
-        UblkCtrlBuilder, UblkCtrlCmdData, UblkCtrlInner, UblkQueueAffinity, CTRL_CMD_HAS_DATA,
+        UblkCtrlBuilder, UblkCtrlCmdData, UblkCtrlInner, UblkQueueAffinity, CTRL_CMD_HAS_BUF,
+        CTRL_CMD_HAS_DATA,
     };
     use crate::io::{UblkDev, UblkIOCtx, UblkQueue};
     use crate::UblkError;
@@ -2982,6 +3159,129 @@ mod tests {
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_UPDATE_SIZE as u64,
             0
         );
+    }
+
+    /// The async path hands the op a copy of every buffer payload, so a
+    /// dropped future cannot free memory io-wq still reads; read commands
+    /// get the result copied back and the caller's address restored.
+    #[test]
+    fn test_own_payload_round_trip() {
+        let mut src = [1_u8, 2, 3, 4];
+        let mut data = UblkCtrlCmdData::new_write_buffer_cmd(
+            crate::sys::UBLK_U_CMD_SET_PARAMS,
+            src.as_ptr() as u64,
+            4,
+            false,
+        );
+        let (caller, mut buf) = data.own_payload().unwrap();
+        assert_eq!(caller, src.as_ptr() as u64);
+        assert_eq!(data.addr, buf.as_ptr() as u64);
+        assert_eq!(&buf[..], &[1, 2, 3, 4]);
+        // a write command's caller memory is left alone
+        buf[0] = 9;
+        data.unown_payload(caller, &buf);
+        assert_eq!(data.addr, caller);
+        assert_eq!(src, [1, 2, 3, 4]);
+
+        // a read command's result lands in the caller's buffer
+        let mut data = UblkCtrlCmdData::new_read_buffer_cmd(
+            crate::sys::UBLK_U_CMD_GET_PARAMS,
+            src.as_mut_ptr() as u64,
+            4,
+            false,
+        );
+        let (caller, mut buf) = data.own_payload().unwrap();
+        buf.copy_from_slice(&[5, 6, 7, 8]);
+        data.unown_payload(caller, &buf);
+        assert_eq!(src, [5, 6, 7, 8]);
+
+        // no buffer, nothing to own
+        assert!(
+            UblkCtrlCmdData::new_data_cmd(crate::sys::UBLK_U_CMD_UPDATE_SIZE, 1)
+                .own_payload()
+                .is_none()
+        );
+    }
+
+    /// `register_shmem_buf()` is unreachable unless the flag can be passed to
+    /// `UblkCtrlBuilder::ctrl_flags()`: the driver answers REG_BUF with
+    /// EOPNOTSUPP on a device created without it.
+    #[test]
+    fn test_shmem_zc_in_driver_flags() {
+        assert_ne!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_SHMEM_ZC as u64,
+            0
+        );
+    }
+
+    /// REG_BUF takes its payload through ctrl_cmd.addr/len (so the
+    /// unprivileged path can be prepended without clobbering the VA), and the
+    /// payload describes the mapping itself, with READ_ONLY following the
+    /// mapping's protection.
+    #[test]
+    fn test_prepare_reg_buf_cmd() {
+        use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let fd = unsafe { libc::memfd_create(c"libublk-ctrl-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        assert_eq!(
+            unsafe { libc::ftruncate(fd.as_raw_fd(), (2 * page) as libc::off_t) },
+            0
+        );
+
+        for read_only in [false, true] {
+            let buf = crate::shmem::ShmemBuf::from_fd(fd.as_fd(), 0, read_only).unwrap();
+            let reg = UblkCtrlInner::shmem_buf_reg(&buf);
+            assert_eq!(reg.addr, buf.as_ptr() as u64);
+            assert_eq!(reg.len, (2 * page) as u64);
+            assert_eq!(
+                reg.flags,
+                if read_only {
+                    crate::sys::UBLK_SHMEM_BUF_READ_ONLY
+                } else {
+                    0
+                }
+            );
+            assert_eq!(reg.reserved, 0);
+
+            let data = UblkCtrlInner::prepare_reg_buf_cmd(&reg);
+            assert_eq!(data.cmd_op, crate::sys::UBLK_U_CMD_REG_BUF);
+            assert_eq!(data.flags, CTRL_CMD_HAS_BUF);
+            assert_eq!(data.addr, std::ptr::addr_of!(reg) as u64);
+            assert_eq!(data.len, 24);
+            assert_eq!(data.data, 0);
+        }
+    }
+
+    /// UNREG_BUF carries the index in data[0].
+    #[test]
+    fn test_prepare_unreg_buf_cmd() {
+        let data = UblkCtrlInner::prepare_unreg_buf_cmd(7);
+        assert_eq!(data.cmd_op, crate::sys::UBLK_U_CMD_UNREG_BUF);
+        assert_eq!(data.flags, CTRL_CMD_HAS_DATA);
+        assert_eq!(data.data, 7);
+        assert_eq!(data.addr, 0);
+    }
+
+    /// The CQE result of REG_BUF is the index; a negative result is an
+    /// error even though the generic path forgives -EBUSY.
+    #[test]
+    fn test_shmem_index_from_result() {
+        assert_eq!(UblkCtrlInner::shmem_index_from_result(0).unwrap(), 0);
+        assert_eq!(
+            UblkCtrlInner::shmem_index_from_result(65535).unwrap(),
+            65535
+        );
+        assert!(matches!(
+            UblkCtrlInner::shmem_index_from_result(-libc::EBUSY),
+            Err(UblkError::UringIOError(e)) if e == -libc::EBUSY
+        ));
+        assert!(matches!(
+            UblkCtrlInner::shmem_index_from_result(0x10000),
+            Err(UblkError::OtherError(e)) if e == -libc::ERANGE
+        ));
     }
 
     /// The driver stores `data[0]` directly as `dev_sectors`, so the byte size
