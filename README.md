@@ -176,6 +176,26 @@ running same test over ublk device created by blktests `miniublk`[^3], which
 is written by pure C. And the ublk device is null, which has 2 queues, each
 queue's depth is 64.
 
+### Benchmarking caveat: one submitter measures one queue
+
+blk-mq maps a request to the hw queue of the *submitting* CPU, so a single
+fio/`t/io_uring` thread drives exactly one ublk queue thread, and IOPS is
+capped by that one thread's per-IO CPU cost (roughly 450K 4k-IOPS for the
+copy-based `loop` example) regardless of `-q`.
+
+The cap moves in a counter-intuitive way with `-d`: when the submitter's
+queue depth *exceeds* the ublk queue depth, the excess requests fail tag
+allocation with `-EAGAIN`, io_uring punts them to `iou-wrk` threads on other
+CPUs, and those land on *other* ublk queues. So `t/io_uring -d 128` against
+a `-d 64` device quietly uses several queue threads and reports higher IOPS
+than the same test against a `-d 128` device, where all 128 IOs fit in one
+queue. That is the benchmark spreading itself out, not a slower daemon.
+
+To measure the device rather than one queue, use several submitters
+(`t/io_uring -n 8 ...`, or fio `numjobs=`) so every queue is loaded. Under
+that load a deeper queue wins as expected (`-d 128` ≈ 3M vs `-d 64` ≈ 1.9M
+4k-IOPS on the same NVMe with 8 queues).
+
 ## Example
 
 ### loop
