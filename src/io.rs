@@ -216,6 +216,35 @@ std::thread_local! {
     /// io commands without holding a `&UblkQueue`.
     pub(crate) static QUEUE_STATE: RefCell<Option<Rc<RefCell<UblkQueueState>>>> =
         const { RefCell::new(None) };
+
+    /// Index of this thread among the io threads serving its queue
+    /// (`0..UblkDev::io_threads_per_queue()`), set by
+    /// `UblkCtrl::run_target` before the queue handler runs and read by
+    /// [`UblkQueue::new`] to pick the tag partition this thread owns.
+    static IO_THREAD_IDX: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// Record which io thread of its queue the current thread is, so that
+/// [`UblkQueue::new`] (and therefore `run_io_tasks`) serves partition
+/// `idx` of the queue's tags.
+///
+/// `UblkCtrl::run_target` calls this for every thread it spawns. Only
+/// code that spawns the io threads itself — e.g. a target driving an
+/// `UblkCtrlAsync` — needs to call it, once per thread before creating
+/// the thread's `UblkQueue`, with a distinct `idx` in
+/// `0..UblkDev::io_threads_per_queue()` for each thread of a queue.
+/// Creating two `UblkQueue`s for the same partition fails with `-EBUSY`
+/// rather than leaving the device waiting for a partition nobody
+/// serves.
+pub fn set_io_thread_idx(idx: u16) {
+    IO_THREAD_IDX.with(|c| c.set(idx));
+}
+
+/// Index of the current thread among the io threads serving its queue,
+/// `0` unless `UblkCtrl::run_target` spawned it with
+/// `UblkCtrlBuilder::io_threads_per_queue(n > 1)`.
+pub fn io_thread_idx() -> u16 {
+    IO_THREAD_IDX.with(|c| c.get())
 }
 
 pub(crate) fn defer_queue_cqe(cqe: cqueue::Entry) {
@@ -858,6 +887,15 @@ pub struct UblkDev {
 
     /// Synchronization for buffer registration completion
     pub(crate) buf_reg_sync: Arc<(Mutex<BufferRegState>, Condvar)>,
+    /// How many io threads serve each queue (`UBLK_F_PER_IO_DAEMON`
+    /// tag partitioning); `1` is the classic one-thread-per-queue model.
+    io_threads_per_queue: u16,
+    /// Which (queue, partition) slots currently have a live `UblkQueue`,
+    /// `nr_hw_queues * io_threads_per_queue` entries. Guards against two
+    /// threads serving the same partition — the driver would reject the
+    /// second FETCH of every tag, but the partition nobody else serves
+    /// would keep the device from ever starting.
+    partition_claims: Mutex<Vec<bool>>,
 }
 
 unsafe impl Send for UblkDev {}
@@ -872,6 +910,8 @@ impl UblkDev {
     /// * `dev_info`: device information
     /// * `cdev_path`: character device path
     /// * `dev_flags`: device flags
+    /// * `io_threads_per_queue`: io threads serving each queue, see
+    ///   `UblkCtrlBuilder::io_threads_per_queue`
     /// * `ops`: target operation functions
     ///
     /// This helper extracts the common device creation logic that can be
@@ -881,6 +921,7 @@ impl UblkDev {
         dev_info: sys::ublksrv_ctrl_dev_info,
         cdev_path: String,
         dev_flags: UblkFlags,
+        io_threads_per_queue: u16,
         ops: F,
     ) -> Result<UblkDev, UblkError>
     where
@@ -932,6 +973,12 @@ impl UblkDev {
                 }),
                 Condvar::new(),
             )),
+            io_threads_per_queue: io_threads_per_queue.max(1),
+            partition_claims: Mutex::new(vec![
+                false;
+                dev_info.nr_hw_queues as usize
+                    * io_threads_per_queue.max(1) as usize
+            ]),
         };
 
         ops(&mut dev)?;
@@ -960,6 +1007,7 @@ impl UblkDev {
             ctrl.dev_info(),
             ctrl.get_cdev_path(),
             ctrl.get_dev_flags(),
+            ctrl.io_threads_per_queue(),
             ops,
         )
     }
@@ -989,8 +1037,47 @@ impl UblkDev {
             ctrl.dev_info(),
             ctrl.get_cdev_path(),
             ctrl.get_dev_flags(),
+            ctrl.io_threads_per_queue(),
             ops,
         )
+    }
+
+    /// How many io threads serve each queue. With `n > 1` the queue's
+    /// tags are split into `n` interleaved partitions (thread `k` owns
+    /// tags `k, k + n, k + 2n, ...`), each FETCHed and served by its own
+    /// thread (`UBLK_F_PER_IO_DAEMON`), so one hw queue's load — e.g. a
+    /// single submitter whose queue depth fits in the ublk queue — is
+    /// spread over `n` CPUs of the queue's affinity mask instead of
+    /// saturating one.
+    #[inline]
+    pub fn io_threads_per_queue(&self) -> u16 {
+        self.io_threads_per_queue
+    }
+
+    /// Mark partition `idx` of queue `q_id` as served by the caller.
+    /// `-EBUSY` if a live `UblkQueue` already serves it.
+    fn claim_partition(self: &Arc<Self>, q_id: u16, idx: u16) -> Result<PartitionClaim, UblkError> {
+        let slot = q_id as usize * self.io_threads_per_queue as usize + idx as usize;
+        let mut claims = self.partition_claims.lock().unwrap();
+        match claims.get_mut(slot) {
+            Some(taken) if !*taken => {
+                *taken = true;
+                Ok(PartitionClaim {
+                    dev: Arc::clone(self),
+                    slot,
+                })
+            }
+            Some(_) => {
+                log::error!(
+                    "dev {} queue {}: io thread partition {} is already served",
+                    self.dev_info.dev_id,
+                    q_id,
+                    idx
+                );
+                Err(UblkError::OtherError(-libc::EBUSY))
+            }
+            None => Err(UblkError::OtherError(-libc::EINVAL)),
+        }
     }
 
     //private method for drop
@@ -1052,7 +1139,11 @@ impl UblkDev {
     }
 
     /// Wait for all queues to complete buffer registration
+    ///
+    /// Every io thread of every queue reports once, so the expected
+    /// count is `nr_hw_queues * io_threads_per_queue`.
     pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
+        let nr_hw_queues = nr_hw_queues * self.io_threads_per_queue as usize;
         if (self.dev_info.flags
             & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64)
             != 0
@@ -1214,6 +1305,21 @@ impl UblkQueueState {
     }
 }
 
+/// A `UblkQueue`'s hold on its (queue, partition) slot in
+/// `UblkDev::partition_claims`; released when the queue is dropped.
+pub(crate) struct PartitionClaim {
+    dev: Arc<UblkDev>,
+    slot: usize,
+}
+
+impl Drop for PartitionClaim {
+    fn drop(&mut self) {
+        if let Some(taken) = self.dev.partition_claims.lock().unwrap().get_mut(self.slot) {
+            *taken = false;
+        }
+    }
+}
+
 /// UBLK queue abstraction
 ///
 /// UblkQueue is the core part of the whole stack, which communicates with
@@ -1230,6 +1336,17 @@ pub struct UblkQueue {
     flags: UblkFlags,
     q_id: u16,
     q_depth: u32,
+    /// First tag served by this queue instance's thread (its io thread
+    /// index); it then owns every `tag_step`-th tag after it.
+    tag_start: u16,
+    /// Distance between two tags of this thread: the number of io
+    /// threads serving the queue (1 when one thread serves it all).
+    tag_step: u16,
+    /// Number of tags served by this queue instance's thread; equals
+    /// `q_depth` unless the queue is split across several io threads.
+    nr_tags: u32,
+    /// Hold on this thread's partition slot, released on drop.
+    _partition_claim: PartitionClaim,
     io_cmd_buf: u64,
     //ops: Box<dyn UblkQueueImpl>,
     dev: Arc<UblkDev>,
@@ -1327,10 +1444,64 @@ impl UblkQueue {
     ///
     ///ublk queue is handling IO from driver, so far we use dedicated
     ///io_uring for handling both IO command and IO
-    #[allow(clippy::uninit_vec)]
     pub fn new(q_id: u16, dev: &Arc<UblkDev>) -> Result<UblkQueue, UblkError> {
+        Self::new_for_thread(q_id, dev, io_thread_idx())
+    }
+
+    /// Tags owned by io thread `idx` of `nr_threads` serving a queue of
+    /// `depth` tags, as `(first, step, count)`: the interleaved set
+    /// `idx, idx + n, idx + 2n, ...`, balanced to within one tag.
+    ///
+    /// Interleaved rather than contiguous on purpose. blk-mq's sbitmap
+    /// allocates tags sequentially from a per-CPU hint, so when fewer
+    /// tags are in flight than the queue holds (submitter QD < depth)
+    /// the live tags form a contiguous window that rotates through the
+    /// tag space; contiguous partitions then leave all but
+    /// `QD / (depth / n)` threads idle at any instant (measured: 4
+    /// threads on a 256-deep queue at QD 128 ran at ~50% each and did
+    /// no better than 2 threads). Interleaving spreads every such window
+    /// evenly over the threads, and it keeps each plug's requests
+    /// balanced across them. Neighbouring tags' descriptors sharing a
+    /// cache line across threads costs little as long as the threads
+    /// stay in the queue's affinity mask (one L3 domain).
+    pub(crate) fn tag_partition(depth: u32, nr_threads: u16, idx: u16) -> (u16, u16, u32) {
+        let n = nr_threads.max(1);
+        let count = if (idx as u32) < depth {
+            (depth - idx as u32).div_ceil(n as u32)
+        } else {
+            0
+        };
+        (idx, n, count)
+    }
+
+    /// New one ublk queue served by io thread `thread_idx` of the
+    /// `dev.io_threads_per_queue()` threads for queue `q_id`.
+    ///
+    /// [`Self::new`] is this with the index recorded by
+    /// `UblkCtrl::run_target` for the calling thread; call this directly
+    /// only when spawning the io threads yourself. Each instance owns the
+    /// interleaved tag set from [`Self::tags`], submits FETCH for those
+    /// tags only, and expects buffer registrations for those tags only.
+    #[allow(clippy::uninit_vec)]
+    pub fn new_for_thread(
+        q_id: u16,
+        dev: &Arc<UblkDev>,
+        thread_idx: u16,
+    ) -> Result<UblkQueue, UblkError> {
         let tgt = &dev.tgt;
         let sq_depth = tgt.sq_depth;
+        let nr_threads = dev.io_threads_per_queue();
+        if thread_idx >= nr_threads {
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+        let (tag_start, tag_step, nr_tags) =
+            Self::tag_partition(dev.dev_info.queue_depth as u32, nr_threads, thread_idx);
+        if nr_tags == 0 {
+            // More io threads than tags: this thread has nothing to serve.
+            return Err(UblkError::OtherError(-libc::EINVAL));
+        }
+        // Released on drop, so every early return below gives the slot back.
+        let partition_claim = dev.claim_partition(q_id, thread_idx)?;
         let cq_depth = tgt.cq_depth;
 
         // Initialize the thread-local queue ring with default parameters
@@ -1421,6 +1592,10 @@ impl UblkQueue {
                 },
             q_id,
             q_depth: depth,
+            tag_start,
+            tag_step,
+            nr_tags,
+            _partition_claim: partition_claim,
             io_cmd_buf: io_cmd_buf as u64,
             dev: Arc::clone(dev),
             dev_flags: dev.dev_info.flags,
@@ -1435,7 +1610,16 @@ impl UblkQueue {
 
         QUEUE_STATE.with(|cell| cell.borrow_mut().replace(Rc::clone(&q.state)));
 
-        log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
+        log::info!(
+            "dev {} queue {} started (io thread {}/{}: {} tags from {} step {})",
+            dev.dev_info.dev_id,
+            q_id,
+            thread_idx,
+            nr_threads,
+            nr_tags,
+            tag_start,
+            tag_step
+        );
 
         Ok(q)
     }
@@ -1468,6 +1652,30 @@ impl UblkQueue {
     #[inline(always)]
     pub fn get_depth(&self) -> u32 {
         self.q_depth
+    }
+
+    /// Tags served by this queue instance's thread, ascending: the whole
+    /// `0..depth` in the one-thread-per-queue model, every `n`-th tag
+    /// starting at the thread's index when the queue is split across
+    /// `n` io threads (`UblkCtrlBuilder::io_threads_per_queue`). Io
+    /// tasks and per-tag buffers belong to these tags only.
+    #[inline(always)]
+    pub fn tags(&self) -> impl Iterator<Item = u16> + Clone {
+        (self.tag_start..self.q_depth as u16).step_by(self.tag_step.max(1) as usize)
+    }
+
+    /// Whether `tag` is served by this queue instance's thread.
+    #[inline(always)]
+    pub fn owns_tag(&self, tag: u16) -> bool {
+        tag < self.q_depth as u16
+            && tag >= self.tag_start
+            && (tag - self.tag_start) % self.tag_step.max(1) == 0
+    }
+
+    /// Number of tags in [`Self::tags`].
+    #[inline(always)]
+    pub fn nr_tags(&self) -> u32 {
+        self.nr_tags
     }
 
     /// Return queue id
@@ -1569,14 +1777,15 @@ impl UblkQueue {
         let mut counter = self.buf_reg_counter.borrow_mut();
         *counter += 1;
 
-        // Only check if all buffers are registered when counter reaches queue depth
-        if *counter >= self.q_depth {
+        // Only check if all buffers are registered when counter reaches
+        // the number of tags this thread serves
+        if *counter >= self.nr_tags {
             // Double-check that all buffers are actually registered
             let bufs = self.bufs.borrow();
-            let all_registered = (0..self.q_depth).all(|i| !bufs[i as usize].is_null());
+            let all_registered = self.tags().all(|i| !bufs[i as usize].is_null());
 
             if all_registered {
-                self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+                self.buf_reg_semaphore.add_permits(self.nr_tags as usize);
                 if self.dev_flags & sys::UBLK_F_BATCH_IO as u64 == 0 {
                     // Notify device that this queue completed buffer registration
                     self.dev
@@ -1612,11 +1821,11 @@ impl UblkQueue {
         if self.support_auto_buf_zc() {
             return;
         }
-        if *self.buf_reg_counter.borrow() >= self.q_depth {
+        if *self.buf_reg_counter.borrow() >= self.nr_tags {
             return;
         }
         self.mark_stopping();
-        self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+        self.buf_reg_semaphore.add_permits(self.nr_tags as usize);
     }
 
     /// Register IO buffer, so that pages in this buffer can
@@ -1639,8 +1848,8 @@ impl UblkQueue {
         if self.support_auto_buf_zc() {
             return;
         }
-        for tag in 0..self.q_depth {
-            self.unregister_io_buf(tag.try_into().unwrap());
+        for tag in self.tags() {
+            self.unregister_io_buf(tag);
         }
         // Reset counter to 0 after unregistering all buffers
         *self.buf_reg_counter.borrow_mut() = 0;
@@ -1650,8 +1859,8 @@ impl UblkQueue {
     fn register_io_bufs(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Self {
         if !self.support_auto_buf_zc() {
             if let Some(b) = bufs {
-                for tag in 0..self.q_depth {
-                    self.register_io_buf_internal(tag.try_into().unwrap(), &b[tag as usize]);
+                for tag in self.tags() {
+                    self.register_io_buf_internal(tag, &b[tag as usize]);
                 }
             }
         }
@@ -2114,7 +2323,7 @@ impl UblkQueue {
     /// COMMIT_AND_FETCH_REQ command is used for both committing io command
     /// result and fetching new incoming IO
     fn submit_fetch_commands(self, bufs: Option<&Vec<IoBuf<u8>>>) -> Result<Self, UblkError> {
-        for i in 0..self.q_depth {
+        for i in self.tags() {
             let buf_addr = match bufs {
                 Some(b) => b[i as usize].as_mut_ptr(),
                 None => std::ptr::null_mut(),
@@ -2123,7 +2332,7 @@ impl UblkQueue {
             assert!(
                 ((self.dev_flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0) == bufs.is_none()
             );
-            self.queue_io_cmd(i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr as u64, -1)?;
+            self.queue_io_cmd(i, sys::UBLK_U_IO_FETCH_REQ, buf_addr as u64, -1)?;
         }
         Ok(self)
     }
@@ -2154,13 +2363,13 @@ impl UblkQueue {
             "Buffer registration data list too short"
         );
 
-        for i in 0..self.q_depth {
+        for i in self.tags() {
             let buf_reg_data = &buf_reg_data_list[i as usize];
             let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
-            let data = UblkIOCtx::build_user_data(i as u16, sys::UBLK_U_IO_FETCH_REQ, 0, false);
+            let data = UblkIOCtx::build_user_data(i, sys::UBLK_U_IO_FETCH_REQ, 0, false);
 
             self.__queue_io_cmd(
-                i as u16,
+                i,
                 sys::UBLK_U_IO_FETCH_REQ,
                 0,
                 Some(auto_buf_addr),
@@ -2216,7 +2425,7 @@ impl UblkQueue {
                 // For batch registration that doesn't use register_io_buf (when slice_opt is None),
                 // we need to add permits since the check won't happen automatically
                 if slice_opt.is_none() {
-                    self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+                    self.buf_reg_semaphore.add_permits(self.nr_tags as usize);
                 }
 
                 // Automatically register IO buffers if provided and not in zero-copy mode
@@ -2231,7 +2440,7 @@ impl UblkQueue {
                 }
 
                 // For auto buffer registration, add permits since buffers aren't registered through register_io_buf
-                self.buf_reg_semaphore.add_permits(self.q_depth as usize);
+                self.buf_reg_semaphore.add_permits(self.nr_tags as usize);
 
                 self.submit_fetch_commands_with_auto_buf_reg(auto_reg_slice)
             }
@@ -2239,9 +2448,9 @@ impl UblkQueue {
     }
 
     fn __submit_fetch_commands(&self) -> Result<(), UblkError> {
-        for i in 0..self.q_depth {
-            let buf_addr = self.get_io_buf_addr(i as u16) as u64;
-            self.queue_io_cmd(i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr, -1)?;
+        for i in self.tags() {
+            let buf_addr = self.get_io_buf_addr(i) as u64;
+            self.queue_io_cmd(i, sys::UBLK_U_IO_FETCH_REQ, buf_addr, -1)?;
         }
         Ok(())
     }
@@ -2452,7 +2661,7 @@ impl UblkQueue {
             .dev
             .flags
             .intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER)
-            && state.get_nr_cmd_inflight() == self.q_depth
+            && state.get_nr_cmd_inflight() == self.nr_tags
             && !state.is_idle()
         {
             log::debug!(
@@ -3306,5 +3515,46 @@ mod tests {
             .await
             .unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod tag_partition_tests {
+    use super::UblkQueue;
+
+    /// Partitions cover `0..depth` exactly once, interleaved, balanced to
+    /// within one tag; one thread owns the whole queue.
+    #[test]
+    fn tag_partition_covers_depth_once() {
+        for depth in [1u32, 2, 3, 64, 65, 100, 128, 4096] {
+            for n in [1u16, 2, 3, 4, 7, 8, 16] {
+                let mut seen = vec![0u32; depth as usize];
+                let mut sizes = Vec::new();
+                for k in 0..n {
+                    let (first, step, count) = UblkQueue::tag_partition(depth, n, k);
+                    assert_eq!((first, step), (k, n));
+                    let tags: Vec<u32> = (first as u32..depth).step_by(step as usize).collect();
+                    assert_eq!(tags.len() as u32, count, "depth {depth} n {n} k {k}");
+                    for t in tags {
+                        seen[t as usize] += 1;
+                    }
+                    sizes.push(count);
+                }
+                assert!(
+                    seen.iter().all(|&c| c == 1),
+                    "depth {depth} n {n}: {seen:?}"
+                );
+                let (lo, hi) = (*sizes.iter().min().unwrap(), *sizes.iter().max().unwrap());
+                assert!(hi - lo <= 1, "depth {depth} n {n}: {sizes:?}");
+            }
+        }
+        assert_eq!(UblkQueue::tag_partition(128, 1, 0), (0, 1, 128));
+        assert_eq!(UblkQueue::tag_partition(128, 2, 1), (1, 2, 64));
+        assert_eq!(UblkQueue::tag_partition(65, 4, 0), (0, 4, 17));
+        assert_eq!(UblkQueue::tag_partition(65, 4, 3), (3, 4, 16));
+        // more threads than tags: the extra thread owns nothing
+        assert_eq!(UblkQueue::tag_partition(2, 3, 2), (2, 3, 0));
+        // nr_threads 0 is treated as 1
+        assert_eq!(UblkQueue::tag_partition(128, 0, 0), (0, 1, 128));
     }
 }

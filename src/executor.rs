@@ -214,7 +214,11 @@ pub trait UblkExecutor: UblkSpawner + Sized {
                 let q = Rc::new(crate::io::UblkQueue::new(qid, &dev)?);
                 // First io-task failure, reported once every task ended.
                 let first_err = Rc::new(std::cell::RefCell::new(None));
-                let handles: Vec<TaskHandle> = (0..dev.dev_info.queue_depth)
+                // One task per tag this thread serves: the whole queue,
+                // or its partition when the queue is split across io
+                // threads.
+                let handles: Vec<TaskHandle> = q
+                    .tags()
                     .map(|tag| {
                         let task = io_task(q.clone(), tag);
                         let q = q.clone();
