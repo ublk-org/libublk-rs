@@ -202,6 +202,27 @@ threads inside the queue's affinity mask is what makes it work (the mask
 contains the submitter's CPU; a thread outside that L3 domain halves its
 IPC on this workload).
 
+The interleaving is what makes a *partially* loaded queue spread: blk-mq
+allocates tags sequentially, so with submitter QD < depth the live tags are
+a contiguous window rotating through the tag space, and contiguous
+partitions leave most threads idle. `UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION`
+(loop example: `-S`) gives each thread one contiguous block of tags instead,
+so threads stop sharing io-descriptor cache lines and each owns one
+contiguous range of the io buffer — but a batch of requests submitted
+together also gets contiguous tags, i.e. lands on *one* thread, so it loses
+whenever a single submitter batches, even with the queue full. Measured on
+the machine above (`-T 4`, 3-round medians, `t/io_uring -p0`):
+
+| case | interleaved | `-S` sequential |
+|---|---|---|
+| `-d 128`, one submitter QD 128 (queue full) | 1.03M | 893K (−13%) |
+| `-d 256`, one submitter QD 128 (QD < depth) | 1.04M | 765K (−27%) |
+| `-d 128 -T 2`, one submitter QD 128 | 782K | 766K (noise) |
+| `-q 1 -d 128`, four submitters QD 32 each (6 rounds) | 271K | 274K (parity; ~10% less CPU per thread) |
+
+Keep the default unless your own measurement of your own workload says
+otherwise; the flag exists so that measurement is a one-flag experiment.
+
 > **⚠️ Only for batched workloads.** Enable `io_threads_per_queue` only
 > when the workload keeps many requests in flight per queue — **batched
 > submission** or high queue depth. **Otherwise leave it at the default
