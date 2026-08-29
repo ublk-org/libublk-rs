@@ -454,10 +454,14 @@ mod integration {
     /// Several io threads per queue (`UBLK_F_PER_IO_DAEMON`): each
     /// thread FETCHes and serves its own tag partition, every partition
     /// must be counted for device start, and IO must flow through all
-    /// of them. Depth 65 with 4 threads gives unequal interleaved
-    /// partitions (17/16/16/16), exercising the balancing math end to end.
-    #[test]
-    fn test_ublk_null_io_threads_per_queue() {
+    /// of them. Depth 65 with 4 threads gives unequal partitions
+    /// (17/16/16/16), exercising the balancing math end to end.
+    /// `check_partition` gets each thread's ascending tag list and
+    /// asserts the layout selected by `extra_flags`.
+    fn __test_ublk_null_io_threads_per_queue(
+        extra_flags: UblkFlags,
+        check_partition: fn(threads: u16, tags: &[u16]),
+    ) {
         if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_PER_IO_DAEMON as u64 == 0 {
             println!("skipping: kernel does not advertise UBLK_F_PER_IO_DAEMON");
             return;
@@ -480,7 +484,9 @@ mod integration {
             }
         }
 
-        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV;
+        let dev_flags = UblkFlags::UBLK_DEV_F_ADD_DEV | extra_flags;
+        // 65 / 4 -> 17/16/16/16; the sequential variant hardcodes the
+        // block starts 0/17/33/49 that follow from these two numbers.
         let (depth, nr_queues, threads) = (65_u16, 2_u16, 4_u16);
         let ctrl = UblkCtrlBuilder::default()
             .name("null")
@@ -519,8 +525,8 @@ mod integration {
                     .collect();
                 tags.sort_unstable();
                 assert_eq!(tags, (0..depth).collect::<Vec<u16>>(), "queue {qid}");
-                // ... by `threads` distinct threads owning interleaved
-                // partitions of 17/16/16/16 tags: thread k has tags k, k+4, ...
+                // ... by `threads` distinct threads owning partitions of
+                // 17/16/16/16 tags in the layout `check_partition` expects
                 let mut per_tid: std::collections::BTreeMap<libc::pid_t, Vec<u16>> =
                     Default::default();
                 for (q, tid, t) in &seen {
@@ -532,17 +538,48 @@ mod integration {
                 let mut sizes: Vec<usize> = per_tid.values().map(|v| v.len()).collect();
                 sizes.sort_unstable();
                 assert_eq!(sizes, vec![16, 16, 16, 17], "queue {qid}");
-                for tags in per_tid.values() {
-                    let k = tags[0] % threads;
-                    assert!(
-                        tags.iter().all(|t| t % threads == k),
-                        "queue {qid}: not an interleaved partition: {tags:?}"
-                    );
+                for tags in per_tid.values_mut() {
+                    tags.sort_unstable();
+                    check_partition(threads, tags);
                 }
             }
             ctrl.kill_dev().unwrap();
         })
         .unwrap();
+    }
+
+    /// Default layout: thread k owns the interleaved tags k, k+n, k+2n, ...
+    #[test]
+    fn test_ublk_null_io_threads_per_queue() {
+        __test_ublk_null_io_threads_per_queue(UblkFlags::empty(), |threads, tags| {
+            let k = tags[0] % threads;
+            assert!(
+                tags.iter().all(|t| t % threads == k),
+                "not an interleaved partition: {tags:?}"
+            );
+        });
+    }
+
+    /// `UBLK_DEV_F_SEQ_TAG_PARTITION`: thread k owns one contiguous block
+    /// of tags, `[k * 16 + min(k, 1), ...)` for depth 65 and 4 threads.
+    #[test]
+    fn test_ublk_null_io_threads_per_queue_sequential() {
+        __test_ublk_null_io_threads_per_queue(
+            UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION,
+            |_threads, tags| {
+                let (first, last) = (*tags.first().unwrap(), *tags.last().unwrap());
+                assert_eq!(
+                    (last - first + 1) as usize,
+                    tags.len(),
+                    "not a contiguous partition: {tags:?}"
+                );
+                // block boundaries of a 17/16/16/16 split of 65 tags
+                assert!(
+                    [0, 17, 33, 49].contains(&first),
+                    "block does not start on a partition boundary: {tags:?}"
+                );
+            },
+        );
     }
 
     /// Asking for more io threads than the driver supports must fail at

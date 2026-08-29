@@ -81,7 +81,16 @@ The `build.rs` lives in `libublk-rs-sys/`, not the root.
   hands out tags sequentially, so with submitter QD < depth the live tags
   are a rotating contiguous window and contiguous partitions idle most
   threads (d256 -T4 at QD128: 753K, no thread above 55%; interleaved:
-  1.04M, all ~85%).
+  1.04M, all ~85%). `UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION` (loop `-S`)
+  opts into contiguous blocks anyway, as an experiment knob: measured
+  2026-08-29 on tomsrv it was slower for one submitter even with the
+  queue full (d128 T4 QD128: 893K vs 1.03M — a submitted batch gets
+  contiguous tags, so one thread takes the whole batch) and only parity
+  with four submitters on one queue (q1 d128 T4: 271K vs 274K, 6 rounds);
+  see the README table. Do not recommend it without a measurement.
+  Both layouts are `(first, step, count)` inside `UblkQueue`; everything
+  iterates `tags()` / `owns_tag()` / `nr_tags()`, so nothing else knows
+  which layout is in use.
   All `n` threads get the queue's CPU affinity — keep them there: the mask
   contains the submitter's CPU and threads outside its L3 domain roughly
   halve their IPC. Why it exists: blk-mq maps a request to the hctx of the

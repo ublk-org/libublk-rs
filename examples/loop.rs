@@ -32,6 +32,7 @@ bitflags! {
         const FOREGROUND = 0b00000010;
         const ONESHOT = 0b00001000;
         const MLOCK = 0b00010000;
+        const SEQ_TAGS = 0b00100000;
     }
 }
 
@@ -319,6 +320,11 @@ fn __loop_add(
             UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER
         } else {
             UblkFlags::empty()
+        }
+        | if lo_flags.intersects(LoFlags::SEQ_TAGS) {
+            UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION
+        } else {
+            UblkFlags::empty()
         };
     let ctrl = libublk::ctrl::UblkCtrlBuilder::default()
         .name("example_loop")
@@ -440,6 +446,17 @@ fn main() {
                         .action(ArgAction::Set),
                 )
                 .arg(
+                    Arg::new("seq_tags")
+                        .long("seq-tags")
+                        .short('S')
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "with -T N, give each io thread one contiguous block of \
+                             tags instead of the default interleaved set (tags k, k+N, \
+                             ...); only pays off when the queue runs saturated",
+                        ),
+                )
+                .arg(
                     Arg::new("buf_size")
                         .long("buf_size")
                         .short('b')
@@ -543,6 +560,9 @@ fn main() {
             };
             if add_matches.get_flag("mlock_io_buffer") {
                 lo_flags |= LoFlags::MLOCK;
+            }
+            if add_matches.get_flag("seq_tags") {
+                lo_flags |= LoFlags::SEQ_TAGS;
             }
             let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
                 libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64

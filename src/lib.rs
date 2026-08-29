@@ -96,6 +96,28 @@ bitflags! {
         /// It is required for ublk to be used as swap disk
         const UBLK_DEV_F_MLOCK_IO_BUFFER = 0b00100000;
 
+        /// with `UblkCtrlBuilder::io_threads_per_queue(n > 1)`, give each
+        /// io thread one contiguous block of its queue's tags (thread `k`
+        /// owns `depth / n` tags from `k * (depth / n) + min(k, depth % n)`,
+        /// the first `depth % n` threads one tag more) instead of the
+        /// default interleaved set (`k, k + n, k + 2n, ...`). The default
+        /// is the right choice when the submitter's queue depth is below
+        /// the ublk queue depth (blk-mq allocates tags sequentially, so
+        /// the tags in flight form a rotating window that a contiguous
+        /// split leaves on one or two threads); sequential blocks avoid
+        /// sharing io-descriptor cache lines between threads and map each
+        /// thread to one contiguous range of the io buffer. But a batch of
+        /// requests submitted together also gets contiguous tags, so one
+        /// thread takes the whole batch: measured with one batching
+        /// submitter it was 13% slower even with the queue full, and 27%
+        /// slower at QD < depth (see README). Treat it as an experiment
+        /// knob for workloads with several submitters per hw queue, and
+        /// measure before switching. No effect with one io thread per
+        /// queue. Like
+        /// `io_threads_per_queue`, it is not recorded in the exported
+        /// JSON: pass it again when recovering the device.
+        const UBLK_DEV_F_SEQ_TAG_PARTITION = 0b01000000;
+
         /// Reserved for libublk's own use; targets must not set the
         /// top 8 bits.
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
