@@ -1013,8 +1013,9 @@ impl UblkDev {
     }
 
     /// How many io threads serve each queue. With `n > 1` the queue's
-    /// tags are split into `n` interleaved partitions (thread `k` owns
-    /// tags `k, k + n, k + 2n, ...`), each FETCHed and served by its own
+    /// tags are split into `n` partitions — interleaved (thread `k` owns
+    /// tags `k, k + n, k + 2n, ...`), or contiguous blocks under
+    /// `UBLK_DEV_F_SEQ_TAG_PARTITION` — each FETCHed and served by its own
     /// thread (`UBLK_F_PER_IO_DAEMON`), so one hw queue's load — e.g. a
     /// single submitter whose queue depth fits in the ublk queue — is
     /// spread over `n` CPUs of the queue's affinity mask instead of
@@ -1271,11 +1272,14 @@ pub struct UblkQueue<'a> {
     flags: UblkFlags,
     q_id: u16,
     q_depth: u32,
-    /// First tag served by this queue instance's thread (its io thread
-    /// index); it then owns every `tag_step`-th tag after it.
+    /// First tag served by this queue instance's thread; it then owns
+    /// every `tag_step`-th tag after it up to `tag_end`.
     tag_start: u16,
+    /// One past the last tag served by this thread.
+    tag_end: u16,
     /// Distance between two tags of this thread: the number of io
-    /// threads serving the queue (1 when one thread serves it all).
+    /// threads serving the queue, or 1 when one thread serves it all or
+    /// the partition is sequential (`UBLK_DEV_F_SEQ_TAG_PARTITION`).
     tag_step: u16,
     /// Number of tags served by this queue instance's thread; equals
     /// `q_depth` unless the queue is split across several io threads.
@@ -1376,10 +1380,13 @@ impl UblkQueue<'_> {
     }
 
     /// Tags owned by io thread `idx` of `nr_threads` serving a queue of
-    /// `depth` tags, as `(first, step, count)`: the interleaved set
-    /// `idx, idx + n, idx + 2n, ...`, balanced to within one tag.
+    /// `depth` tags, as `(first, step, count)`: the tags are `first + i *
+    /// step` for `i` in `0..count`. Both layouts are balanced to within
+    /// one tag, and the `depth % n` threads with the extra tag are the
+    /// lowest-indexed ones.
     ///
-    /// Interleaved rather than contiguous on purpose. blk-mq's sbitmap
+    /// The default (`sequential == false`) is the interleaved set
+    /// `idx, idx + n, idx + 2n, ...`, on purpose. blk-mq's sbitmap
     /// allocates tags sequentially from a per-CPU hint, so when fewer
     /// tags are in flight than the queue holds (submitter QD < depth)
     /// the live tags form a contiguous window that rotates through the
@@ -1391,14 +1398,33 @@ impl UblkQueue<'_> {
     /// balanced across them. Neighbouring tags' descriptors sharing a
     /// cache line across threads costs little as long as the threads
     /// stay in the queue's affinity mask (one L3 domain).
-    pub(crate) fn tag_partition(depth: u32, nr_threads: u16, idx: u16) -> (u16, u16, u32) {
-        let n = nr_threads.max(1);
-        let count = if (idx as u32) < depth {
-            (depth - idx as u32).div_ceil(n as u32)
+    ///
+    /// `sequential == true` (`UBLK_DEV_F_SEQ_TAG_PARTITION`) gives thread
+    /// `idx` one contiguous block instead, for workloads that keep the
+    /// queue full or feed one hw queue from several submitters, where no
+    /// rotating window exists and disjoint descriptor cache lines and one
+    /// contiguous io-buffer range per thread are worth more.
+    pub(crate) fn tag_partition(
+        depth: u32,
+        nr_threads: u16,
+        idx: u16,
+        sequential: bool,
+    ) -> (u16, u16, u32) {
+        let n = nr_threads.max(1) as u32;
+        let idx = idx as u32;
+        if sequential {
+            let (base, rem) = (depth / n, depth % n);
+            let first = idx * base + idx.min(rem);
+            let count = base + u32::from(idx < rem);
+            (first as u16, 1, count)
         } else {
-            0
-        };
-        (idx, n, count)
+            let count = if idx < depth {
+                (depth - idx).div_ceil(n)
+            } else {
+                0
+            };
+            (idx as u16, n as u16, count)
+        }
     }
 
     /// New one ublk queue served by io thread `thread_idx` of the
@@ -1407,7 +1433,8 @@ impl UblkQueue<'_> {
     /// [`Self::new`] is this with the index recorded by
     /// `UblkCtrl::run_target` for the calling thread; call this directly
     /// only when spawning the io threads yourself. Each instance owns the
-    /// interleaved tag set from [`Self::tags`], submits FETCH for those
+    /// tag set from [`Self::tags`] (interleaved, or one contiguous block
+    /// under `UBLK_DEV_F_SEQ_TAG_PARTITION`), submits FETCH for those
     /// tags only, and expects buffer registrations for those tags only.
     #[allow(clippy::uninit_vec)]
     pub fn new_for_thread(
@@ -1421,12 +1448,21 @@ impl UblkQueue<'_> {
         if thread_idx >= nr_threads {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
-        let (tag_start, tag_step, nr_tags) =
-            Self::tag_partition(dev.dev_info.queue_depth as u32, nr_threads, thread_idx);
+        let (tag_start, tag_step, nr_tags) = Self::tag_partition(
+            dev.dev_info.queue_depth as u32,
+            nr_threads,
+            thread_idx,
+            dev.flags
+                .intersects(UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION),
+        );
         if nr_tags == 0 {
             // More io threads than tags: this thread has nothing to serve.
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
+        // One past the last owned tag, so tags() and owns_tag() need not
+        // know which layout produced (tag_start, tag_step, nr_tags).
+        let tag_end = (tag_start as u32 + (nr_tags - 1) * tag_step as u32 + 1) as u16;
+        debug_assert!(tag_end as u32 <= dev.dev_info.queue_depth as u32);
         // Released on drop, so every early return below gives the slot back.
         let partition_claim = dev.claim_partition(q_id, thread_idx)?;
         let cq_depth = tgt.cq_depth;
@@ -1498,6 +1534,7 @@ impl UblkQueue<'_> {
             q_id,
             q_depth: depth,
             tag_start,
+            tag_end,
             tag_step,
             nr_tags,
             _partition_claim: partition_claim,
@@ -1574,19 +1611,21 @@ impl UblkQueue<'_> {
     }
 
     /// Tags served by this queue instance's thread, ascending: the whole
-    /// `0..depth` in the one-thread-per-queue model, every `n`-th tag
-    /// starting at the thread's index when the queue is split across
-    /// `n` io threads (`UblkCtrlBuilder::io_threads_per_queue`). Io
+    /// `0..depth` in the one-thread-per-queue model; when the queue is
+    /// split across `n` io threads (`UblkCtrlBuilder::io_threads_per_queue`)
+    /// every `n`-th tag starting at the thread's index, or one contiguous
+    /// block of `depth / n` (or one more) tags under
+    /// `UBLK_DEV_F_SEQ_TAG_PARTITION`. Io
     /// tasks and per-tag buffers belong to these tags only.
     #[inline(always)]
     pub fn tags(&self) -> impl Iterator<Item = u16> + Clone {
-        (self.tag_start..self.q_depth as u16).step_by(self.tag_step.max(1) as usize)
+        (self.tag_start..self.tag_end).step_by(self.tag_step.max(1) as usize)
     }
 
     /// Whether `tag` is served by this queue instance's thread.
     #[inline(always)]
     pub fn owns_tag(&self, tag: u16) -> bool {
-        tag < self.q_depth as u16
+        tag < self.tag_end
             && tag >= self.tag_start
             && (tag - self.tag_start) % self.tag_step.max(1) == 0
     }
@@ -3477,39 +3516,66 @@ mod tests {
 mod tag_partition_tests {
     use super::UblkQueue;
 
-    /// Partitions cover `0..depth` exactly once, interleaved, balanced to
-    /// within one tag; one thread owns the whole queue.
+    /// Partitions cover `0..depth` exactly once and are balanced to
+    /// within one tag in both layouts; one thread owns the whole queue.
+    /// Interleaved: thread `k` owns `k, k + n, ...`. Sequential: thread
+    /// `k` owns one contiguous block, and the blocks are in thread order.
     #[test]
     fn tag_partition_covers_depth_once() {
-        for depth in [1u32, 2, 3, 64, 65, 100, 128, 4096] {
-            for n in [1u16, 2, 3, 4, 7, 8, 16] {
-                let mut seen = vec![0u32; depth as usize];
-                let mut sizes = Vec::new();
-                for k in 0..n {
-                    let (first, step, count) = UblkQueue::tag_partition(depth, n, k);
-                    assert_eq!((first, step), (k, n));
-                    let tags: Vec<u32> = (first as u32..depth).step_by(step as usize).collect();
-                    assert_eq!(tags.len() as u32, count, "depth {depth} n {n} k {k}");
-                    for t in tags {
-                        seen[t as usize] += 1;
+        for sequential in [false, true] {
+            for depth in [1u32, 2, 3, 64, 65, 100, 128, 4096] {
+                for n in [1u16, 2, 3, 4, 7, 8, 16] {
+                    let mut seen = vec![0u32; depth as usize];
+                    let mut sizes = Vec::new();
+                    let mut next_first = 0u32;
+                    for k in 0..n {
+                        let (first, step, count) =
+                            UblkQueue::tag_partition(depth, n, k, sequential);
+                        let tags: Vec<u32> =
+                            (0..count).map(|i| first as u32 + i * step as u32).collect();
+                        if sequential {
+                            assert_eq!(step, 1);
+                            if count > 0 {
+                                assert_eq!(first as u32, next_first, "depth {depth} n {n} k {k}");
+                                next_first += count;
+                            }
+                        } else {
+                            assert_eq!((first, step), (k, n));
+                            assert!(tags.iter().all(|t| t % n as u32 == k as u32));
+                        }
+                        for t in tags {
+                            seen[t as usize] += 1;
+                        }
+                        sizes.push(count);
                     }
-                    sizes.push(count);
+                    assert!(
+                        seen.iter().all(|&c| c == 1),
+                        "sequential {sequential} depth {depth} n {n}: {seen:?}"
+                    );
+                    let (lo, hi) = (*sizes.iter().min().unwrap(), *sizes.iter().max().unwrap());
+                    assert!(
+                        hi - lo <= 1,
+                        "sequential {sequential} depth {depth} n {n}: {sizes:?}"
+                    );
                 }
-                assert!(
-                    seen.iter().all(|&c| c == 1),
-                    "depth {depth} n {n}: {seen:?}"
-                );
-                let (lo, hi) = (*sizes.iter().min().unwrap(), *sizes.iter().max().unwrap());
-                assert!(hi - lo <= 1, "depth {depth} n {n}: {sizes:?}");
             }
         }
-        assert_eq!(UblkQueue::tag_partition(128, 1, 0), (0, 1, 128));
-        assert_eq!(UblkQueue::tag_partition(128, 2, 1), (1, 2, 64));
-        assert_eq!(UblkQueue::tag_partition(65, 4, 0), (0, 4, 17));
-        assert_eq!(UblkQueue::tag_partition(65, 4, 3), (3, 4, 16));
+        assert_eq!(UblkQueue::tag_partition(128, 1, 0, false), (0, 1, 128));
+        assert_eq!(UblkQueue::tag_partition(128, 2, 1, false), (1, 2, 64));
+        assert_eq!(UblkQueue::tag_partition(65, 4, 0, false), (0, 4, 17));
+        assert_eq!(UblkQueue::tag_partition(65, 4, 3, false), (3, 4, 16));
         // more threads than tags: the extra thread owns nothing
-        assert_eq!(UblkQueue::tag_partition(2, 3, 2), (2, 3, 0));
+        assert_eq!(UblkQueue::tag_partition(2, 3, 2, false), (2, 3, 0));
         // nr_threads 0 is treated as 1
-        assert_eq!(UblkQueue::tag_partition(128, 0, 0), (0, 1, 128));
+        assert_eq!(UblkQueue::tag_partition(128, 0, 0, false), (0, 1, 128));
+
+        // sequential: the first `depth % n` threads get one extra tag
+        assert_eq!(UblkQueue::tag_partition(128, 1, 0, true), (0, 1, 128));
+        assert_eq!(UblkQueue::tag_partition(128, 2, 1, true), (64, 1, 64));
+        assert_eq!(UblkQueue::tag_partition(65, 4, 0, true), (0, 1, 17));
+        assert_eq!(UblkQueue::tag_partition(65, 4, 1, true), (17, 1, 16));
+        assert_eq!(UblkQueue::tag_partition(65, 4, 3, true), (49, 1, 16));
+        assert_eq!(UblkQueue::tag_partition(2, 3, 2, true), (2, 1, 0));
+        assert_eq!(UblkQueue::tag_partition(128, 0, 0, true), (0, 1, 128));
     }
 }
