@@ -821,10 +821,12 @@ pub struct UblkCtrlBuilder<'a> {
 
     /// io threads per queue, default 1 (one thread serves a whole queue).
     ///
-    /// With `n > 1` each queue's tags are split into `n` interleaved
-    /// partitions and [`UblkCtrl::run_target`] spawns `n` threads per
-    /// queue, all bound to the queue's CPU affinity, each FETCHing and
-    /// serving its own partition (the driver's `UBLK_F_PER_IO_DAEMON`).
+    /// With `n > 1` each queue's tags are split into `n` partitions —
+    /// interleaved by default, contiguous blocks with
+    /// `UblkFlags::UBLK_DEV_F_SEQ_TAG_PARTITION` — and
+    /// [`UblkCtrl::run_target`] spawns `n` threads per queue, all bound
+    /// to the queue's CPU affinity, each FETCHing and serving its own
+    /// partition (the driver's `UBLK_F_PER_IO_DAEMON`).
     /// Use it when one hw queue is the bottleneck: a submitter whose
     /// queue depth fits in the ublk queue drives exactly one hw queue,
     /// so its IOPS is capped by one thread's per-IO CPU cost. Keeping the
