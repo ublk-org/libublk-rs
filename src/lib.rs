@@ -113,9 +113,10 @@ bitflags! {
         /// slower at QD < depth (see README). Treat it as an experiment
         /// knob for workloads with several submitters per hw queue, and
         /// measure before switching. No effect with one io thread per
-        /// queue. Like
-        /// `io_threads_per_queue`, it is not recorded in the exported
-        /// JSON: pass it again when recovering the device.
+        /// queue. It does reach the exported JSON, inside `target_flags`,
+        /// but libublk never restores `dev_flags` from there, so — like
+        /// `io_threads_per_queue`, which is not exported at all — pass it
+        /// again when recovering the device.
         const UBLK_DEV_F_SEQ_TAG_PARTITION = 0b01000000;
 
         /// Reserved for libublk's own use; targets must not set the
