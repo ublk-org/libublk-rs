@@ -2322,6 +2322,9 @@ impl UblkQueue {
     /// target bit set); it is delivered back to the IO closure via
     /// `UblkIOCtx::user_data()` when the CQE arrives, while the on-ring
     /// `user_data` is a slab key owned by the op layer.
+    ///
+    /// An SQE that posts several CQEs (multishot, `SEND_ZC`) invokes the
+    /// IO closure once per CQE, each time with the same `data`.
     #[inline]
     pub fn ublk_submit_sqe_sync(
         &self,

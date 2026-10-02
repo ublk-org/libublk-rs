@@ -1382,6 +1382,51 @@ mod integration {
         __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, 1, null_queue_mut_io);
     }
 
+    /// A sync handler may submit an SQE that posts more than one CQE.
+    /// Every request here rides a two-shot multishot timeout and is
+    /// completed on the second (terminal) CQE, so the device only keeps
+    /// serving IO if the sync loop delivers both.
+    #[test]
+    fn test_ublk_null_sync_multi_cqe_sqe() {
+        fn null_queue_multi_cqe(qid: u16, dev: &Arc<UblkDev>) {
+            use io_uring::types::{TimeoutFlags, Timespec};
+
+            // Referenced by in-flight timeouts, so it must outlive them.
+            static TS: Timespec = Timespec::new().nsec(100_000);
+            let mut nr_cqes = vec![0u8; dev.dev_info.queue_depth as usize];
+
+            let io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+                if !io.is_tgt_io() {
+                    let sqe = opcode::Timeout::new(&TS)
+                        .count(2)
+                        .flags(TimeoutFlags::MULTISHOT)
+                        .build();
+                    let data = UblkIOCtx::build_user_data(tag, 0, 0, true);
+                    q.ublk_submit_sqe_sync(sqe, data).unwrap();
+                    return;
+                }
+
+                assert_eq!(io.result(), -libc::ETIME);
+                let seen = &mut nr_cqes[tag as usize];
+                *seen += 1;
+                if *seen == 2 {
+                    *seen = 0;
+                    let bytes = (q.get_iod(tag).nr_sectors << 9) as i32;
+                    q.complete_io_cmd_unified(tag, BufDesc::Slice(&[]), bytes)
+                        .unwrap();
+                }
+            };
+
+            UblkQueue::new(qid, dev)
+                .unwrap()
+                .submit_fetch_commands_unified(BufDescList::Slices(None))
+                .unwrap()
+                .wait_and_handle_io(io_handler);
+        }
+
+        __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, 1, null_queue_multi_cqe);
+    }
+
     fn get_curr_bin_dir() -> Option<std::path::PathBuf> {
         if let Err(_current_exe) = env::current_exe() {
             None

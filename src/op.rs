@@ -287,7 +287,7 @@ fn insert_entry(resources: Resources, is_io_cmd: bool, sync_data: Option<u64>) -
 /// Submit a sync-mode SQE on the queue ring: the slab entry carries
 /// `sync_data` (the handler-facing word) instead of a future, and is
 /// reclaimed by [`take_sync_entry`] when the queue's sync event loop
-/// drains the CQE. Any memory the SQE references must stay valid until
+/// drains its terminal CQE. Any memory the SQE references must stay valid until
 /// then — sync targets use queue-slot buffers, which satisfy this by
 /// construction.
 pub(crate) fn submit_sync(
@@ -305,9 +305,10 @@ pub(crate) fn submit_sync(
 
 /// Resolve one CQE for the sync event loop: `(handler_word, is_io_cmd)`.
 /// The handler word is `Some` only for sync-mode entries, which are
-/// removed here; op-future entries are completed and woken exactly as
-/// [`ublk_reap_and_wake`] would, so a stray async op in a sync-driven
-/// queue is delivered to its future rather than corrupting state.
+/// removed here on their terminal CQE (`!more`); op-future entries are
+/// completed and woken exactly as [`ublk_reap_and_wake`] would, so a
+/// stray async op in a sync-driven queue is delivered to its future
+/// rather than corrupting state.
 ///
 /// `is_io_cmd` reports the entry's accounting flag for EVERY entry the
 /// key resolves — sync, async and orphaned alike. The async submit path
@@ -326,7 +327,7 @@ pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u6
             return ((None, false, false), None);
         };
         let is_io_cmd = entry.is_io_cmd;
-        if entry.sync_data.is_none() {
+        let Some(data) = entry.sync_data else {
             if entry.orphaned {
                 if !more {
                     slab.remove(key).discard_result(result);
@@ -336,9 +337,15 @@ pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u6
             entry.terminated = !more;
             entry.push_result(result);
             return ((None, is_io_cmd, false), entry.waker.take());
+        };
+        // A multi-CQE SQE (multishot, SEND_ZC) delivers the handler word
+        // once per CQE; the key stays reserved until the terminal one,
+        // or the handler's next submission would reuse it and the
+        // remaining CQEs would resolve to the wrong entry.
+        if !more {
+            slab.remove(key);
         }
-        let entry = slab.remove(key);
-        ((Some(entry.sync_data.unwrap()), is_io_cmd, false), None)
+        ((Some(data), is_io_cmd, false), None)
     });
     // Wake outside the slab borrow: an inline waker may drop a future
     // whose Op re-enters the slab (orphan_entry).
@@ -804,5 +811,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An SQE submitted through the sync path may post several CQEs
+    /// (multishot poll/timeout, SEND_ZC's notification). The key has to
+    /// stay reserved until the terminal one: freed early, the slab hands
+    /// it to the handler's next io command and the remaining CQEs are
+    /// mistaken for that command's completion.
+    #[test]
+    fn sync_entry_stays_reserved_until_the_terminal_cqe() {
+        let word = (crate::UblkUringData::Target as u64) | 0x42;
+        let key = insert_entry(Resources::None, false, Some(word));
+
+        // Intermediate CQE (IORING_CQE_F_MORE): delivered, entry kept.
+        assert_eq!(take_sync_entry(key, 4096, true), (Some(word), false, false));
+        let next = insert_entry(Resources::None, true, Some(0x5));
+        assert_ne!(next, key, "key reused while its SQE still has CQEs due");
+
+        // Terminal CQE: delivered once more, entry reclaimed.
+        assert_eq!(take_sync_entry(key, 0, false), (Some(word), false, false));
+        assert!(OP_SLAB.with(|slab| !slab.borrow().contains(key)));
+
+        assert_eq!(take_sync_entry(next, 0, false), (Some(0x5), true, false));
     }
 }
