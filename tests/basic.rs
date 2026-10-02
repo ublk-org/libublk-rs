@@ -1384,16 +1384,16 @@ mod integration {
 
     /// A sync handler may submit an SQE that posts more than one CQE.
     /// Every request here rides a two-shot multishot timeout and is
-    /// completed on the second (terminal) CQE, so the device only keeps
-    /// serving IO if the sync loop delivers both.
+    /// completed on the terminal CQE, which `UblkIOCtx::has_more()`
+    /// identifies, so the device only keeps serving IO if the sync loop
+    /// delivers both.
     #[test]
     fn test_ublk_null_sync_multi_cqe_sqe() {
         fn null_queue_multi_cqe(qid: u16, dev: &Arc<UblkDev>) {
             use io_uring::types::{TimeoutFlags, Timespec};
 
-            // Referenced by in-flight timeouts, so it must outlive them.
             static TS: Timespec = Timespec::new().nsec(100_000);
-            let mut nr_cqes = vec![0u8; dev.dev_info.queue_depth as usize];
+            let mut seen_more = vec![false; dev.dev_info.queue_depth as usize];
 
             let io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
                 if !io.is_tgt_io() {
@@ -1406,15 +1406,23 @@ mod integration {
                     return;
                 }
 
-                assert_eq!(io.result(), -libc::ETIME);
-                let seen = &mut nr_cqes[tag as usize];
-                *seen += 1;
-                if *seen == 2 {
-                    *seen = 0;
-                    let bytes = (q.get_iod(tag).nr_sectors << 9) as i32;
-                    q.complete_io_cmd_unified(tag, BufDesc::Slice(&[]), bytes)
-                        .unwrap();
+                let seen = &mut seen_more[tag as usize];
+                if io.has_more() {
+                    assert_eq!(io.result(), -libc::ETIME);
+                    *seen = true;
+                    return;
                 }
+                // Before Linux 6.4 there is no IORING_TIMEOUT_MULTISHOT:
+                // the timeout fails with one -EINVAL CQE, which leaves
+                // nothing to check but must not wedge the request.
+                if io.result() != -libc::EINVAL {
+                    assert_eq!(io.result(), -libc::ETIME);
+                    assert!(*seen, "terminal CQE without an intermediate one");
+                }
+                *seen = false;
+                let bytes = (q.get_iod(tag).nr_sectors << 9) as i32;
+                q.complete_io_cmd_unified(tag, BufDesc::Slice(&[]), bytes)
+                    .unwrap();
             };
 
             UblkQueue::new(qid, dev)

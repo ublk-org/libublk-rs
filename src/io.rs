@@ -740,6 +740,21 @@ impl<'a> UblkIOCtx<'a> {
         Self::is_target_io(self.1)
     }
 
+    /// Raw `IORING_CQE_F_*` flags of this CQE, e.g. to tell a `SEND_ZC`
+    /// notification (`IORING_CQE_F_NOTIF`) from the send result.
+    #[inline(always)]
+    pub fn cqe_flags(&self) -> u32 {
+        self.0.flags()
+    }
+
+    /// If the SQE behind this CQE will post more CQEs
+    /// (`IORING_CQE_F_MORE`): the IO closure runs once for each CQE of a
+    /// multishot or `SEND_ZC` SQE, and this is false only for the last.
+    #[inline(always)]
+    pub fn has_more(&self) -> bool {
+        cqueue::more(self.0.flags())
+    }
+
     /// if this IO represented by CQE is the last one in current batch
     #[inline(always)]
     pub fn is_last_cqe(&self) -> bool {
@@ -2324,7 +2339,8 @@ impl UblkQueue {
     /// `user_data` is a slab key owned by the op layer.
     ///
     /// An SQE that posts several CQEs (multishot, `SEND_ZC`) invokes the
-    /// IO closure once per CQE, each time with the same `data`.
+    /// IO closure once per CQE, each time with the same `data`;
+    /// [`UblkIOCtx::has_more`] is false for the last one.
     #[inline]
     pub fn ublk_submit_sqe_sync(
         &self,
@@ -3092,6 +3108,40 @@ mod user_data_tests {
             UblkIOCtx::build_user_data(0, 0, 0x0100, false),
             UblkIOCtx::build_user_data(0, 0, 0x0200, false),
         );
+    }
+
+    /// The sync IO closure runs once per CQE of a multi-CQE SQE, and
+    /// the CQE flags are the only way to tell those calls apart.
+    #[test]
+    fn io_ctx_exposes_cqe_flags() {
+        use io_uring::types::{TimeoutFlags, Timespec};
+
+        let mut ring = io_uring::IoUring::new(4).unwrap();
+        let ts = Timespec::new().nsec(100_000);
+        let sqe = io_uring::opcode::Timeout::new(&ts)
+            .count(2)
+            .flags(TimeoutFlags::MULTISHOT)
+            .build();
+        unsafe { ring.submission().push(&sqe).unwrap() };
+        let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::new();
+        loop {
+            ring.submit_and_wait(1).unwrap();
+            cqes.extend(ring.completion());
+            if !io_uring::cqueue::more(cqes.last().unwrap().flags()) {
+                break;
+            }
+        }
+        if cqes[0].result() == -libc::EINVAL {
+            return; // no IORING_TIMEOUT_MULTISHOT before Linux 6.4
+        }
+        assert_eq!(cqes.len(), 2);
+
+        let first = UblkIOCtx(&cqes[0], 0, 0);
+        assert!(first.has_more());
+        assert_eq!(first.cqe_flags(), cqes[0].flags());
+        let last = UblkIOCtx(&cqes[1], 0, 0);
+        assert!(!last.has_more());
+        assert_eq!(last.cqe_flags(), cqes[1].flags());
     }
 }
 
