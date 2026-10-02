@@ -165,8 +165,8 @@ pub fn wait_and_reap_events() -> ParkOutcome {
 /// CQE and doing the io-command accounting the explicit event loops used
 /// to do. Returns the number of CQEs handled and of wakers woken.
 fn reap_queue_ring() -> (usize, usize) {
-    let (n, wakers, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
-        let Some(ring_cell) = cell.get() else {
+    let (n, wakers, cmd_cnt, aborted) = crate::io::with_queue_ring_cell(|cell| {
+        let Some(ring_cell) = cell else {
             return (0, WakerBatch::empty(), 0, false);
         };
         let mut ring = ring_cell.borrow_mut();
@@ -212,7 +212,7 @@ fn reap_ctrl_ring() -> (usize, usize) {
 /// (or the safety timeout fires). Returns `false` when the thread has no
 /// ring to wait on.
 fn wait_for_cqe() -> bool {
-    let has_queue = crate::io::QUEUE_RING.with(|cell| cell.get().is_some());
+    let has_queue = crate::io::with_queue_ring_cell(|cell| cell.is_some());
     let has_ctrl = crate::ctrl::CTRL_URING.with(|cell| cell.borrow().is_some());
 
     if has_ctrl {
@@ -228,9 +228,8 @@ fn wait_for_cqe() -> bool {
             let sqe = opcode::PollAdd::new(types::Fd(ctrl_fd), libc::POLLIN as _)
                 .build()
                 .user_data(CTRL_POLL_DATA);
-            let pushed = crate::io::QUEUE_RING.with(|cell| {
-                let ring_cell = cell.get().unwrap();
-                let mut ring = ring_cell.borrow_mut();
+            let pushed = crate::io::with_queue_ring_cell(|cell| {
+                let mut ring = cell.unwrap().borrow_mut();
                 // SAFETY: the SQE references no user memory.
                 let pushed = unsafe { ring.submission().push(&sqe).is_ok() };
                 pushed
@@ -243,9 +242,8 @@ fn wait_for_cqe() -> bool {
     let timeout = types::Timespec::new().sec(PARK_SAFETY_SECS);
     let args = types::SubmitArgs::new().timespec(&timeout);
     let res = if has_queue {
-        crate::io::QUEUE_RING.with(|cell| {
-            let ring_cell = cell.get().unwrap();
-            let ring = ring_cell.borrow_mut();
+        crate::io::with_queue_ring_cell(|cell| {
+            let ring = cell.unwrap().borrow_mut();
             ring.submitter().submit_with_args(1, &args)
         })
     } else if has_ctrl {

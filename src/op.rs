@@ -35,6 +35,7 @@ use io_uring::{cqueue, opcode, squeue, IoUring};
 use slab::Slab;
 use std::cell::{Cell, RefCell};
 use std::task::{Context, Poll, Waker};
+use std::thread::LocalKey;
 
 /// Bottom of the reserved `user_data` range: values at or above this are
 /// never slab keys. [`ublk_reap_and_wake`] passes their CQEs through to
@@ -207,10 +208,34 @@ std::thread_local! {
     static OP_SLAB: RefCell<OpSlab> = const { RefCell::new(OpSlab(Slab::new())) };
 }
 
+/// Run `f` on this thread's value of `key`.
+///
+/// `LocalKey::with` is instantiated once per closure and LLVM leaves the
+/// larger instantiations out of line, so each submit and poll paid a
+/// call, a prologue and an indirect call to the TLS accessor. Fetching
+/// only the address through `with` keeps the access itself inlined.
+/// `with` still runs on every access, so lazy init and the
+/// use-after-destruction panic are unchanged, and the reference cannot
+/// leave `f`.
+#[inline(always)]
+pub(crate) fn with_local<T: 'static, R>(key: &'static LocalKey<T>, f: impl FnOnce(&T) -> R) -> R {
+    let value = key.with(|value| value as *const T);
+    // SAFETY: `with` returned, so the value is alive (it panics once the
+    // value is destroyed), and thread-local destructors only run after
+    // the thread's code has returned, so none can start while `f` runs.
+    f(unsafe { &*value })
+}
+
+/// Run `f` on this thread's op slab.
+#[inline(always)]
+fn with_slab<R>(f: impl FnOnce(&RefCell<OpSlab>) -> R) -> R {
+    with_local(&OP_SLAB, f)
+}
+
 /// Whether any op is still in flight on this thread (park-loop guard).
 #[inline]
 pub(crate) fn has_pending_ops() -> bool {
-    OP_SLAB.with(|slab| !slab.borrow().is_empty())
+    with_slab(|slab| !slab.borrow().is_empty())
 }
 
 /// Which thread-local ring an op was submitted on.
@@ -245,7 +270,7 @@ fn push_ctrl_sqe(sqe: &squeue::Entry128) -> Result<(), UblkError> {
 
 #[inline]
 fn insert_entry(resources: Resources, is_io_cmd: bool, sync_data: Option<u64>) -> usize {
-    OP_SLAB.with(|slab| {
+    with_slab(|slab| {
         slab.borrow_mut().insert(OpEntry {
             result: None,
             extra_results: Vec::new(),
@@ -272,7 +297,7 @@ pub(crate) fn submit_sync(
 ) -> Result<(), UblkError> {
     let key = insert_entry(Resources::None, is_io_cmd, Some(sync_data));
     if let Err(e) = push_queue_sqe(&build(key as u64)) {
-        OP_SLAB.with(|slab| slab.borrow_mut().remove(key));
+        with_slab(|slab| slab.borrow_mut().remove(key));
         return Err(e);
     }
     Ok(())
@@ -294,7 +319,7 @@ pub(crate) fn submit_sync(
 /// current-queue state.
 #[inline]
 pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u64>, bool, bool) {
-    let (ret, waker) = OP_SLAB.with(|slab| {
+    let (ret, waker) = with_slab(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
             debug_assert!(false, "CQE for unknown op {}", key);
@@ -345,7 +370,7 @@ impl Op {
     ) -> Result<Op, UblkError> {
         let key = insert_entry(resources, is_io_cmd, None);
         if let Err(e) = build_and_push(key as u64) {
-            OP_SLAB.with(|slab| slab.borrow_mut().remove(key));
+            with_slab(|slab| slab.borrow_mut().remove(key));
             return Err(e);
         }
         Ok(Op {
@@ -396,7 +421,7 @@ impl Op {
     /// instead of parking an executor.
     pub(crate) fn try_take_result(&mut self) -> Option<i32> {
         assert!(!self.done, "op polled after completion");
-        OP_SLAB.with(|slab| {
+        with_slab(|slab| {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
             entry.result?;
@@ -413,7 +438,7 @@ impl Op {
     #[inline]
     pub(crate) fn poll_single(&mut self, cx: &mut Context<'_>) -> Poll<(i32, Resources)> {
         assert!(!self.done, "op polled after completion");
-        OP_SLAB.with(|slab| {
+        with_slab(|slab| {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
             match entry.result {
@@ -473,7 +498,7 @@ impl Drop for Op {
 /// terminal CQE) and issue a best-effort ASYNC_CANCEL; reclaims the
 /// entry directly when its terminal CQE has already been reaped.
 fn orphan_entry(ring: OpRing, key: usize) {
-    let completed = OP_SLAB.with(|slab| {
+    let completed = with_slab(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
             return true;
@@ -523,7 +548,7 @@ impl MultiOp {
     pub(crate) fn submit(build: impl FnOnce(u64) -> squeue::Entry) -> Result<MultiOp, UblkError> {
         let key = insert_entry(Resources::None, false, None);
         if let Err(e) = push_queue_sqe(&build(key as u64)) {
-            OP_SLAB.with(|slab| slab.borrow_mut().remove(key));
+            with_slab(|slab| slab.borrow_mut().remove(key));
             return Err(e);
         }
         Ok(MultiOp { key, done: false })
@@ -535,7 +560,7 @@ impl MultiOp {
         if self.done {
             return Poll::Ready(None);
         }
-        OP_SLAB.with(|slab| {
+        with_slab(|slab| {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
             if let Some(result) = entry.pop_result() {
@@ -636,7 +661,7 @@ where
     S: squeue::EntryMarker,
     F: FnMut(&cqueue::Entry, bool, bool),
 {
-    OP_SLAB.with(|slab| {
+    with_slab(|slab| {
         let mut slab = slab.borrow_mut();
         let cq = ring.completion();
         let mut n = 0;

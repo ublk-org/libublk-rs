@@ -266,29 +266,42 @@ pub(crate) fn update_queue_state(cnt: u32, aborted: bool) {
     })
 }
 
+/// Run `f` on this thread's queue ring cell, `None` if no ring has been
+/// set up.
+///
+/// Only the address is fetched through `LocalKey::with`, which keeps the
+/// TLS access inlined into every caller; see `op::with_local`.
+#[inline(always)]
+pub(crate) fn with_queue_ring_cell<R>(
+    f: impl FnOnce(Option<&RefCell<IoUring<squeue::Entry>>>) -> R,
+) -> R {
+    // `#[inline(always)]`: without it LLVM leaves this closure (and the
+    // caller's `f` inlined into it) out of line, which puts the call and
+    // prologue this helper exists to avoid back on every SQE push.
+    crate::op::with_local(&QUEUE_RING, #[inline(always)] |cell| f(cell.get()))
+}
+
 // Internal macro versions for backwards compatibility within the crate
 macro_rules! with_queue_ring_internal {
     ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
+        $crate::io::with_queue_ring_cell(|cell| match cell {
+            Some(ring_cell) => {
                 let ring = ring_cell.borrow();
                 $closure(&*ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
             }
+            None => panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue."),
         })
     };
 }
 
 macro_rules! with_queue_ring_mut_internal {
     ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
+        $crate::io::with_queue_ring_cell(|cell| match cell {
+            Some(ring_cell) => {
                 let mut ring = ring_cell.borrow_mut();
                 $closure(&mut *ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
             }
+            None => panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue."),
         })
     };
 }
