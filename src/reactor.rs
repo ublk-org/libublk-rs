@@ -47,7 +47,7 @@
 //! ring is bridged into it with a `PollAdd` on the control ring fd, so
 //! control-command completions wake the parked thread promptly.
 
-use crate::op::{ublk_reap_and_wake, RESERVED_USER_DATA_MIN};
+use crate::op::{ublk_reap_and_wake, WakerBatch, RESERVED_USER_DATA_MIN};
 use io_uring::{opcode, types};
 use std::cell::Cell;
 use std::os::fd::AsRawFd;
@@ -167,7 +167,7 @@ pub fn wait_and_reap_events() -> ParkOutcome {
 fn reap_queue_ring() -> (usize, usize) {
     let (n, wakers, cmd_cnt, aborted) = crate::io::QUEUE_RING.with(|cell| {
         let Some(ring_cell) = cell.get() else {
-            return (0, Vec::new(), 0, false);
+            return (0, WakerBatch::empty(), 0, false);
         };
         let mut ring = ring_cell.borrow_mut();
         let mut cmd_cnt = 0u32;
@@ -192,11 +192,7 @@ fn reap_queue_ring() -> (usize, usize) {
     }
     // Wake with every RefCell borrow released: an inline waker may drop
     // an op future, which re-borrows the slab and the ring.
-    let woken = wakers.len();
-    for waker in wakers {
-        waker.wake();
-    }
-    (n, woken)
+    (n, wakers.wake_all())
 }
 
 /// Drain the control ring's completion queue, waking the future behind
@@ -205,15 +201,11 @@ fn reap_ctrl_ring() -> (usize, usize) {
     let (n, wakers) = crate::ctrl::CTRL_URING.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(ring) = guard.as_mut() else {
-            return (0, Vec::new());
+            return (0, WakerBatch::empty());
         };
         ublk_reap_and_wake(ring, |_, _, _| {})
     });
-    let woken = wakers.len();
-    for waker in wakers {
-        waker.wake();
-    }
-    (n, woken)
+    (n, wakers.wake_all())
 }
 
 /// Flush pending SQEs and sleep in `io_uring_enter` until a CQE arrives

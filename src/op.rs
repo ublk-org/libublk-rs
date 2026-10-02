@@ -33,7 +33,7 @@
 use crate::UblkError;
 use io_uring::{cqueue, opcode, squeue, IoUring};
 use slab::Slab;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::task::{Context, Poll, Waker};
 
 /// Bottom of the reserved `user_data` range: values at or above this are
@@ -570,18 +570,68 @@ impl Drop for MultiOp {
     }
 }
 
+std::thread_local! {
+    /// The buffer of the last [`WakerBatch`] on this thread, kept so the
+    /// next reap does not allocate (and regrow) one of its own.
+    static WAKER_BUF: Cell<Vec<Waker>> = const { Cell::new(Vec::new()) };
+}
+
+/// The wakers one reap collected, to be woken by its caller.
+pub(crate) struct WakerBatch(Vec<Waker>);
+
+impl WakerBatch {
+    /// Takes the thread's spare buffer. A reap nested inside a waker
+    /// finds none and simply allocates.
+    fn new() -> Self {
+        WakerBatch(WAKER_BUF.with(|buf| buf.take()))
+    }
+
+    /// A batch for a caller that had no ring to reap.
+    pub(crate) fn empty() -> Self {
+        WakerBatch(Vec::new())
+    }
+
+    #[inline]
+    fn push(&mut self, waker: Waker) {
+        self.0.push(waker);
+    }
+
+    /// Wake every collected waker, returning how many there were. Call
+    /// with no slab or ring borrow held: a waker may run inline.
+    pub(crate) fn wake_all(mut self) -> usize {
+        let n = self.0.len();
+        for waker in self.0.drain(..) {
+            waker.wake();
+        }
+        n
+    }
+}
+
+impl Drop for WakerBatch {
+    fn drop(&mut self) {
+        if self.0.capacity() == 0 {
+            return;
+        }
+        self.0.clear();
+        // try_with: a batch may be dropped during thread teardown.
+        let _ = WAKER_BUF.try_with(|buf| buf.set(std::mem::take(&mut self.0)));
+    }
+}
+
 /// Drain `ring`'s completion queue, collecting the waker of the future
 /// behind each CQE. `per_cqe` runs for every CQE with two flags:
 /// whether it completed a ublk io command (for the queue-state
 /// accounting) and whether the entry was orphaned (counted, but its
-/// result — e.g. a stale ABORT — must not drive current-queue state). Returns the number of CQEs drained and the wakers to
-/// invoke — the caller MUST wake them, and only after releasing its
-/// ring borrow (see the comment on `wakers` below). Reserved sentinels,
-/// orphans and not-yet-polled futures drain without producing a waker,
-/// and an executor park hook must not treat them as runnable work. The
-/// slab and the completion queue are borrowed once for the whole batch;
-/// CQEs posted mid-drain are picked up by the caller's next pass.
-pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, Vec<Waker>)
+/// result — e.g. a stale ABORT — must not drive current-queue state).
+/// Returns the number of CQEs drained and the wakers to invoke — the
+/// caller MUST [`WakerBatch::wake_all`] them, and only after releasing
+/// its ring borrow (see the comment on `wakers` below). Reserved
+/// sentinels, orphans and not-yet-polled futures drain without producing
+/// a waker, and an executor park hook must not treat them as runnable
+/// work. The slab and the completion queue are borrowed once for the
+/// whole batch; CQEs posted mid-drain are picked up by the caller's next
+/// pass.
+pub(crate) fn ublk_reap_and_wake<S, F>(ring: &mut IoUring<S>, mut per_cqe: F) -> (usize, WakerBatch)
 where
     S: squeue::EntryMarker,
     F: FnMut(&cqueue::Entry, bool, bool),
@@ -596,7 +646,7 @@ where
         // waking under the slab — or the caller's ring — RefCell borrow
         // would panic with a double borrow. The caller wakes these
         // after releasing its ring borrow.
-        let mut wakers: Vec<Waker> = Vec::new();
+        let mut wakers = WakerBatch::new();
         for cqe in cq {
             n += 1;
             let key = match classify_user_data(cqe.user_data()) {
@@ -647,6 +697,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reap runs for every batch of completions, so collecting its
+    /// wakers must not allocate each time: the buffer a batch grew is
+    /// handed to the next one on the same thread.
+    #[test]
+    fn waker_batch_wakes_all_and_recycles_its_buffer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+
+        let mut batch = WakerBatch::new();
+        for _ in 0..100 {
+            batch.push(Waker::from(count.clone()));
+        }
+        let buf = batch.0.as_ptr();
+        assert_eq!(batch.wake_all(), 100);
+        assert_eq!(count.0.load(Ordering::Relaxed), 100);
+
+        let next = WakerBatch::new();
+        assert!(next.0.is_empty());
+        assert_eq!(next.0.as_ptr(), buf, "buffer was not recycled");
+    }
 
     /// Both reapers route CQEs through [`classify_user_data`], so a
     /// target-owned word must never be mistaken for a slab key: the

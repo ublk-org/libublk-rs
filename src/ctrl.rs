@@ -1498,9 +1498,7 @@ impl UblkCtrlInner {
             })?;
             // Async op futures drained alongside this sync command wake
             // outside the ring borrow (a waker may run inline).
-            for waker in wakers {
-                waker.wake();
-            }
+            wakers.wake_all();
         }
     }
 
