@@ -311,6 +311,79 @@ impl std::ops::DerefMut for OpSlab {
     }
 }
 
+/// What one op-slab CQE amounts to for the reaper that drained it.
+struct OpCqe {
+    /// A sync-mode entry's handler word (legacy tag-encoded `user_data`),
+    /// for the sync event loop's handler; `None` for an op future's
+    /// entry.
+    sync_data: Option<u64>,
+    /// The entry's accounting flag, reported for sync, async and orphaned
+    /// entries alike: the submit incremented `cmd_inflight` either way,
+    /// so the completion must be counted or the queue never reaches
+    /// `is_idle()`.
+    is_io_cmd: bool,
+    /// Nobody is serving the entry any more: its completion is counted,
+    /// but its result (e.g. a stale ABORT from a command of a previously
+    /// dropped queue on this thread) must not drive current-queue state.
+    orphaned: bool,
+    /// The consumer to wake, if the CQE gave it something to see. Wake it
+    /// outside the slab borrow: an inline waker may drop a future whose
+    /// Op re-enters the slab (orphan_entry).
+    waker: Option<Waker>,
+}
+
+impl OpSlab {
+    /// Hand one CQE to the entry under `key`: a sync-mode entry yields
+    /// its handler word; a live op entry takes it ([`OpEntry::deliver`]);
+    /// an orphaned one absorbs it. Both a sync-mode and an orphaned entry
+    /// are reclaimed on their terminal CQE only, so a multi-CQE chain
+    /// (multishot, SEND_ZC) cannot land on a recycled key -- for a sync
+    /// entry the handler's next submission would otherwise reuse it and
+    /// the remaining CQEs would resolve to the wrong entry. `None` for a
+    /// key nobody holds.
+    #[inline]
+    fn complete(&mut self, key: usize, res: i32, flags: u32) -> Option<OpCqe> {
+        let Some(entry) = self.get_mut(key) else {
+            debug_assert!(false, "CQE for unknown op {}", key);
+            return None;
+        };
+        let is_io_cmd = entry.is_io_cmd;
+        if let Some(data) = entry.sync_data() {
+            if !cqueue::more(flags) {
+                self.remove(key);
+            }
+            return Some(OpCqe {
+                sync_data: Some(data),
+                is_io_cmd,
+                orphaned: false,
+                waker: None,
+            });
+        }
+        if entry.orphaned {
+            if entry.absorb_orphaned(res, flags) {
+                self.remove(key).discard_pending();
+            }
+            return Some(OpCqe {
+                sync_data: None,
+                is_io_cmd,
+                orphaned: true,
+                waker: None,
+            });
+        }
+        let waker = if entry.deliver(res, flags) {
+            entry.waker.take()
+        } else {
+            None
+        };
+        Some(OpCqe {
+            sync_data: None,
+            is_io_cmd,
+            orphaned: false,
+            waker,
+        })
+    }
+}
+
 impl Drop for OpSlab {
     fn drop(&mut self) {
         // Thread exit with ops still in flight: TLS destructor order
@@ -428,58 +501,21 @@ pub(crate) fn submit_sync(
     Ok(())
 }
 
-/// Resolve one CQE for the sync event loop: `(handler_word, is_io_cmd)`.
-/// The handler word is `Some` only for sync-mode entries, which are
-/// removed here on their terminal CQE (`!more`); op-future entries are
-/// completed and woken exactly as [`ublk_reap_and_wake`] would, so a
-/// stray async op in a sync-driven queue is delivered to its future
-/// rather than corrupting state.
-///
-/// `is_io_cmd` reports the entry's accounting flag for EVERY entry the
-/// key resolves — sync, async and orphaned alike. The async submit path
-/// incremented `cmd_inflight` just like the sync one, so the sync
-/// loop's batch accounting must observe the completion either way, or
-/// the count leaks and the queue never reaches `is_idle()`. The third
-/// flag marks orphaned entries, whose result (e.g. a stale ABORT from
-/// a previous queue on this thread) must be counted but must not drive
-/// current-queue state.
+/// Resolve one CQE for the sync event loop: `(handler_word, is_io_cmd,
+/// orphaned)`, the fields of [`OpCqe`]. The handler word is `Some` only
+/// for sync-mode entries; op-future entries are completed and woken
+/// exactly as [`ublk_reap_and_wake`] would (both go through
+/// [`OpSlab::complete`]), so a stray async op in a sync-driven queue is
+/// delivered to its future rather than corrupting state.
 #[inline]
 pub(crate) fn take_sync_entry(key: usize, result: i32, flags: u32) -> (Option<u64>, bool, bool) {
-    let (ret, waker) = with_slab(|slab| {
-        let mut slab = slab.borrow_mut();
-        let Some(entry) = slab.get_mut(key) else {
-            debug_assert!(false, "CQE for unknown op {}", key);
-            return ((None, false, false), None);
-        };
-        let is_io_cmd = entry.is_io_cmd;
-        let Some(data) = entry.sync_data() else {
-            if entry.orphaned {
-                if entry.absorb_orphaned(result, flags) {
-                    slab.remove(key).discard_pending();
-                }
-                return ((None, is_io_cmd, true), None);
-            }
-            let wake = entry.deliver(result, flags);
-            return (
-                (None, is_io_cmd, false),
-                if wake { entry.waker.take() } else { None },
-            );
-        };
-        // A multi-CQE SQE (multishot, SEND_ZC) delivers the handler word
-        // once per CQE; the key stays reserved until the terminal one,
-        // or the handler's next submission would reuse it and the
-        // remaining CQEs would resolve to the wrong entry.
-        if !cqueue::more(flags) {
-            slab.remove(key);
-        }
-        ((Some(data), is_io_cmd, false), None)
-    });
-    // Wake outside the slab borrow: an inline waker may drop a future
-    // whose Op re-enters the slab (orphan_entry).
-    if let Some(waker) = waker {
+    let Some(cqe) = with_slab(|slab| slab.borrow_mut().complete(key, result, flags)) else {
+        return (None, false, false);
+    };
+    if let Some(waker) = cqe.waker {
         waker.wake();
     }
-    ret
+    (cqe.sync_data, cqe.is_io_cmd, cqe.orphaned)
 }
 
 /// Handle to one submitted single-shot operation.
@@ -874,35 +910,20 @@ where
                     continue;
                 }
             };
-            let Some(entry) = slab.get_mut(key) else {
-                debug_assert!(false, "CQE for unknown op {}", key);
+            let Some(done) = slab.complete(key, cqe.result(), cqe.flags()) else {
                 per_cqe(&cqe, false, false);
                 continue;
             };
             // The third flag marks orphaned entries: their completion
-            // must still be counted (the submit incremented the
-            // inflight count), but nobody is serving the command any
-            // more — in particular a stale ABORT from a command of a
-            // previously dropped queue on this thread must not flip a
-            // freshly registered queue into stopping.
-            per_cqe(&cqe, entry.is_io_cmd, entry.orphaned);
-            if entry.orphaned || entry.is_sync {
-                // Orphaned future, or a sync-mode entry drained by the
-                // runtime reaper (a queue should not mix the models; the
-                // sync handler is not available here, so the entry is
-                // only reclaimed and accounted) -- reclaimed on the
-                // terminal CQE only, so a multi-CQE chain cannot land on
-                // a recycled key. A sync entry owns nothing, so absorbing
-                // the CQE as orphaned is a no-op for it.
-                if entry.absorb_orphaned(cqe.result(), cqe.flags()) {
-                    slab.remove(key).discard_pending();
-                }
-                continue;
-            }
-            if entry.deliver(cqe.result(), cqe.flags()) {
-                if let Some(waker) = entry.waker.take() {
-                    wakers.push(waker);
-                }
+            // must still be counted, but in particular a stale ABORT
+            // from a command of a previously dropped queue on this
+            // thread must not flip a freshly registered queue into
+            // stopping. A sync-mode entry's handler word has no consumer
+            // here (a queue should not mix the models): the entry is
+            // only reclaimed and accounted.
+            per_cqe(&cqe, done.is_io_cmd, done.orphaned);
+            if let Some(waker) = done.waker {
+                wakers.push(waker);
             }
         }
         (n, wakers)
