@@ -690,8 +690,6 @@ impl<F: InlineFold> MultiOp<F> {
 
     /// As [`Self::submit`] for a timeout SQE: `ts` is kept with the entry
     /// until it is reclaimed, and `build` gets a reference to it.
-    // Only crate-internal multishot timeouts (and tests) use this yet.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn submit_timeout(
         ts: io_uring::types::Timespec,
         build: impl FnOnce(u64, &io_uring::types::Timespec) -> squeue::Entry,

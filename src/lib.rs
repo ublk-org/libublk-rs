@@ -13,8 +13,6 @@ pub mod ctrl_async;
 pub mod executor;
 pub mod helpers;
 pub mod io;
-// Multishot ops are crate-internal for now; tests exercise them.
-#[cfg_attr(not(test), allow(dead_code))]
 mod multishot;
 mod op;
 pub mod ops;

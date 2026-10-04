@@ -1,4 +1,5 @@
-//! Multishot ops: one SQE, a stream of CQEs.
+//! Multishot ops: one SQE, a stream of CQEs. Public through
+//! [`crate::ops::timeout_multi`] and [`crate::ops::poll_multi`].
 //!
 //! Each op folds its CQEs into the entry's inline slots with an
 //! [`InlineFold`] and reads them back through a typed handle built on
@@ -12,15 +13,15 @@
 //!   since the last call.
 
 use crate::op::{InlineFold, MultiOp, Slots};
+use crate::ops::TgtFd;
 use crate::UblkError;
 use io_uring::{opcode, types};
-use std::os::fd::RawFd;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-/// What a stream item reports: a folded value, or the errno the op ended
-/// with (e.g. `-ECANCELED`).
-pub(crate) type Item = Result<u32, i32>;
+/// One stream item: a folded value, or the error the op ended with
+/// (e.g. `-ECANCELED`) as [`UblkError::UringIOError`].
+pub type MultishotItem = Result<u32, UblkError>;
 
 /// Slot layout shared by the folds here: slot 0 holds the folded value
 /// (present while `tag & VALUE`), slot 1 the first error (while
@@ -38,16 +39,33 @@ fn keep_error(slots: &mut Slots, res: i32) {
 /// Hand out the folded value if there is one, else the op's error;
 /// `None` once both are spent, so [`MultiOp::poll_with`] ends the stream
 /// or waits for the next CQE.
-fn take_folded(slots: &mut Slots) -> Option<Item> {
+fn take_folded(slots: &mut Slots) -> Option<MultishotItem> {
     if slots.tag & VALUE != 0 {
         slots.tag &= !VALUE;
         Some(Ok(std::mem::take(&mut slots.v[0]) as u32))
     } else if slots.tag & ERROR != 0 {
         slots.tag &= !ERROR;
-        Some(Err(slots.v[1]))
+        Some(Err(UblkError::UringIOError(slots.v[1])))
     } else {
         None
     }
+}
+
+/// The stream half of a multishot handle, a newtype over `MultiOp<F>`
+/// whose fold uses [`take_folded`]'s slot layout. The handle supplies
+/// `poll_next`'s doc; `next` is the same for all of them.
+macro_rules! multishot_stream {
+    ($(#[$doc:meta])*) => {
+        $(#[$doc])*
+        pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<MultishotItem>> {
+            self.0.poll_with(cx, take_folded)
+        }
+
+        /// Await the next item; see [`Self::poll_next`].
+        pub async fn next(&mut self) -> Option<MultishotItem> {
+            std::future::poll_fn(|cx| self.poll_next(cx)).await
+        }
+    };
 }
 
 /// Counts timeout expiries.
@@ -71,9 +89,11 @@ impl InlineFold for TimeoutFold {
     }
 }
 
-/// A repeating timer (`IORING_TIMEOUT_MULTISHOT`): fires every
-/// `interval`, `count` times (0: until dropped).
-pub(crate) struct TimeoutMulti(MultiOp<TimeoutFold>);
+/// A repeating timer (`IORING_TIMEOUT_MULTISHOT`, Linux 6.4+), from
+/// [`crate::ops::timeout_multi`]. Expiries that fire before the consumer
+/// gets to them are counted, not queued: each `next()` yields how many
+/// fired since the last one. Dropping it cancels the timer.
+pub struct TimeoutMulti(MultiOp<TimeoutFold>);
 
 impl TimeoutMulti {
     pub(crate) fn new(interval: Duration, count: u32) -> Result<Self, UblkError> {
@@ -87,14 +107,11 @@ impl TimeoutMulti {
         Ok(TimeoutMulti(op))
     }
 
-    /// Ticks fired since the last call (`Ok(n)`, n > 0), the error the
-    /// timer ended with, or `None` once it is done.
-    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Item>> {
-        self.0.poll_with(cx, take_folded)
-    }
-
-    pub(crate) async fn next(&mut self) -> Option<Item> {
-        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    multishot_stream! {
+        /// Poll for the expiries fired since the last call (`Ok(n)`, n > 0),
+        /// the error the timer ended with, or `None` once it is done -- after
+        /// `count` expiries, or on a kernel without multishot timeouts, which
+        /// reports `-EINVAL` first.
     }
 }
 
@@ -117,28 +134,27 @@ impl InlineFold for PollFold {
 }
 
 /// Repeated readiness notifications for one fd (multishot
-/// `IORING_OP_POLL_ADD`), until dropped or the kernel ends it.
-pub(crate) struct PollMulti(MultiOp<PollFold>);
+/// `IORING_OP_POLL_ADD`), from [`crate::ops::poll_multi`]. Wakeups that
+/// arrive before the consumer gets to them are merged: each `next()`
+/// yields every event seen since the last one. Dropping it cancels the
+/// poll.
+pub struct PollMulti(MultiOp<PollFold>);
 
 impl PollMulti {
-    pub(crate) fn new(fd: RawFd, mask: u32) -> Result<Self, UblkError> {
+    pub(crate) fn new(fd: TgtFd, events: u32) -> Result<Self, UblkError> {
         let op = MultiOp::submit(|key| {
-            opcode::PollAdd::new(types::Fd(fd), mask)
-                .multi(true)
-                .build()
-                .user_data(key)
+            let sqe = match fd {
+                TgtFd::Raw(raw) => opcode::PollAdd::new(types::Fd(raw), events),
+                TgtFd::Fixed(idx) => opcode::PollAdd::new(types::Fixed(idx.into()), events),
+            };
+            sqe.multi(true).build().user_data(key)
         })?;
         Ok(PollMulti(op))
     }
 
-    /// Every event seen since the last call (`Ok(mask)`), the error the
-    /// poll ended with, or `None` once it is done.
-    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Item>> {
-        self.0.poll_with(cx, take_folded)
-    }
-
-    pub(crate) async fn next(&mut self) -> Option<Item> {
-        std::future::poll_fn(|cx| self.poll_next(cx)).await
+    multishot_stream! {
+        /// Poll for every event seen since the last call (`Ok(mask)`), the
+        /// error the poll ended with, or `None` once the kernel has ended it.
     }
 }
 
@@ -148,6 +164,11 @@ mod tests {
     use crate::op::testing;
     use std::task::{Context, Poll};
     use std::time::Duration;
+
+    /// Make a stream poll comparable: errors as their errno.
+    fn errno_of(p: Poll<Option<Result<u32, UblkError>>>) -> Poll<Option<Result<u32, i32>>> {
+        p.map(|o| o.map(|r| r.map_err(|e| e.errno())))
+    }
 
     /// A burst of 64 timeout ticks reaped before the consumer runs folds
     /// into one count: the op keeps a counter, not a queue, however far
@@ -162,12 +183,12 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(30));
         testing::reap(64);
-        let first = t.poll_next(&mut cx);
+        let first = errno_of(t.poll_next(&mut cx));
         if first == Poll::Ready(Some(Err(-libc::EINVAL))) {
             return; // no IORING_TIMEOUT_MULTISHOT before Linux 6.4
         }
         assert_eq!(first, Poll::Ready(Some(Ok(64))));
-        assert_eq!(t.poll_next(&mut cx), Poll::Ready(None));
+        assert_eq!(errno_of(t.poll_next(&mut cx)), Poll::Ready(None));
         drop(t);
         assert!(!crate::op::has_pending_ops());
     }
@@ -198,7 +219,7 @@ mod tests {
             while let Some(item) = t.next().await {
                 match item {
                     Ok(n) => total += n,
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(e.errno()),
                 }
             }
             Ok(total)
@@ -211,7 +232,7 @@ mod tests {
 
         let efd = unsafe { libc::eventfd(1, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(efd >= 0);
-        let mut p = PollMulti::new(efd, libc::POLLIN as u32).unwrap();
+        let mut p = PollMulti::new(TgtFd::Raw(efd), libc::POLLIN as u32).unwrap();
         let first = block_on_reaping(p.next());
         assert!(matches!(first, Some(Ok(m)) if m & libc::POLLIN as u32 != 0));
         drop(p);
@@ -228,7 +249,7 @@ mod tests {
         testing::install_ring(64);
         let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         assert!(efd >= 0);
-        let mut p = PollMulti::new(efd, libc::POLLIN as u32).unwrap();
+        let mut p = PollMulti::new(TgtFd::Raw(efd), libc::POLLIN as u32).unwrap();
         let waker = testing::noop_waker();
         let mut cx = Context::from_waker(&waker);
         assert!(p.poll_next(&mut cx).is_pending());
@@ -239,7 +260,7 @@ mod tests {
             assert_eq!(n, 8);
             testing::reap(1);
         }
-        match p.poll_next(&mut cx) {
+        match errno_of(p.poll_next(&mut cx)) {
             Poll::Ready(Some(Ok(mask))) => assert_ne!(mask & libc::POLLIN as u32, 0),
             other => panic!("expected a folded POLLIN mask, got {:?}", other),
         }

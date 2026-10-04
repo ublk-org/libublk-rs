@@ -318,6 +318,34 @@ pub fn poll_add(fd: TgtFd, events: u32) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(fd, |f| opcode::PollAdd::new(f, events).build()))
 }
 
+pub use crate::multishot::{MultishotItem, PollMulti, TimeoutMulti};
+
+/// Repeating timer via multishot `IORING_OP_TIMEOUT`
+/// (`IORING_TIMEOUT_MULTISHOT`, Linux 6.4+): fires every `interval`,
+/// `count` times (0: until the handle is dropped). Expiries are counted,
+/// so a slow consumer never makes anything queue up:
+///
+/// ```no_run
+/// # async fn f() -> Result<(), libublk::UblkError> {
+/// let mut t = libublk::ops::timeout_multi(std::time::Duration::from_millis(10), 0)?;
+/// while let Some(ticks) = t.next().await {
+///     let fired = ticks?; // expiries since the last iteration
+///     # let _ = fired;
+/// }
+/// # Ok(()) }
+/// ```
+pub fn timeout_multi(interval: Duration, count: u32) -> Result<TimeoutMulti, UblkError> {
+    TimeoutMulti::new(interval, count)
+}
+
+/// Keep watching `fd` for the given `poll(2)` event mask (multishot
+/// `IORING_OP_POLL_ADD`): unlike [`poll_add`], one submission reports
+/// readiness again and again until the handle is dropped. Wakeups that
+/// arrive between two `next()` calls are merged into one event mask.
+pub fn poll_multi(fd: TgtFd, events: u32) -> Result<PollMulti, UblkError> {
+    PollMulti::new(fd, events)
+}
+
 /// Future resolving to one accepted connection.
 pub struct Accept {
     op: RawOp,
@@ -769,8 +797,10 @@ pub unsafe fn uring_cmd80_buf(
 ///
 /// The returned handle is single-shot: the SQE must produce exactly
 /// one completion. Do not submit multishot opcodes (`.multi(true)`
-/// poll/accept/recv) or two-CQE opcodes (`SendZc`/`SendMsgZc` — use
-/// [`send_zc`]/[`sendmsg_zc`]) through it: the first CQE resolves the
+/// poll/accept/recv, multishot timeouts -- use [`poll_multi`] /
+/// [`timeout_multi`]; multishot accept and recv are not supported) or
+/// two-CQE opcodes (`SendZc`/`SendMsgZc` — use [`send_zc`]/[`sendmsg_zc`])
+/// through it: the first CQE resolves the
 /// future and every later completion for the SQE is dropped (debug
 /// builds assert).
 ///
@@ -803,6 +833,69 @@ mod tests {
         let a = std::net::TcpStream::connect(addr).unwrap();
         let (b, _) = listener.accept().unwrap();
         (a, b)
+    }
+
+    /// A multishot timer under the real runtime: awaiting `next()` until
+    /// the end yields every tick exactly once, however the park hook
+    /// batches them.
+    #[test]
+    fn test_ops_timeout_multi() -> Result<(), UblkError> {
+        let rt = test_runtime()?;
+        let ticks = rt.block_on(async {
+            let mut t = timeout_multi(Duration::from_micros(200), 5)?;
+            let mut total = 0;
+            while let Some(item) = t.next().await {
+                total += item?;
+            }
+            Ok::<u32, UblkError>(total)
+        });
+        match ticks {
+            // No IORING_TIMEOUT_MULTISHOT before Linux 6.4.
+            Err(e) if e.errno() == -libc::EINVAL => Ok(()),
+            res => {
+                assert_eq!(res?, 5);
+                Ok(())
+            }
+        }
+    }
+
+    /// A multishot poll under the real runtime reports readiness of a
+    /// written eventfd, keeps reporting after more writes, and is
+    /// cancelled cleanly when dropped.
+    #[test]
+    fn test_ops_poll_multi() -> Result<(), UblkError> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let rt = test_runtime()?;
+        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(efd >= 0);
+        let efd = unsafe { OwnedFd::from_raw_fd(efd) };
+        let write = |fd: &OwnedFd| {
+            let one: u64 = 1;
+            let n = unsafe { libc::write(fd.as_raw_fd(), &one as *const u64 as *const _, 8) };
+            assert_eq!(n, 8);
+        };
+        rt.block_on(async {
+            let mut p = poll_multi(TgtFd::Raw(efd.as_raw_fd()), libc::POLLIN as u32)?;
+            for _ in 0..2 {
+                write(&efd);
+                let mask = p.next().await.expect("poll ended")?;
+                assert_ne!(mask & libc::POLLIN as u32, 0);
+            }
+            Ok::<(), UblkError>(())
+        })?;
+        // Dropping the handle cancelled the poll; let the runtime reap it.
+        rt.block_on(async {
+            for _ in 0..100 {
+                if !crate::reactor::has_pending_ops() {
+                    break;
+                }
+                let _ = sleep(Duration::from_millis(1))?.await;
+            }
+            Ok::<(), UblkError>(())
+        })?;
+        assert!(!crate::reactor::has_pending_ops());
+        Ok(())
     }
 
     /// The send result and the notification land in their own slots by
