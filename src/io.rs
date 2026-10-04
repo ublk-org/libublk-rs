@@ -3008,7 +3008,7 @@ impl UblkQueue {
                 crate::op::CqeOwner::Target => (Some(user_data), false, false),
                 crate::op::CqeOwner::Sentinel => (None, false, false),
                 crate::op::CqeOwner::Op(key) => {
-                    crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
+                    crate::op::take_sync_entry(key, cqe.result(), cqe.flags())
                 }
             };
             // Account io-command completions whether or not the entry

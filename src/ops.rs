@@ -42,9 +42,9 @@ use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
-use io_uring::{opcode, squeue, types};
+use io_uring::{cqueue, opcode, squeue, types};
 
-use crate::op::{MultiOp, Op, Resources};
+use crate::op::{InlineFold, MultiOp, Op, Resources, Slots};
 use crate::UblkError;
 
 /// A target IO's file: a raw fd, or an index into the queue ring's
@@ -503,14 +503,14 @@ const NOTIF_ZC_COPIED: i32 = 1 << 31;
 /// `ASYNC_CANCEL`, which cannot un-pin pages the kernel already holds,
 /// so the send may still be reading the buffer afterwards.
 pub struct SendZcOp {
-    op: MultiOp,
+    op: MultiOp<ZcFold>,
 }
 
 impl SendZcOp {
     /// Await the send CQE: bytes accepted into the socket, or a negative
     /// errno. Call once, before [`Self::into_notif`].
     pub async fn sent(&mut self) -> i32 {
-        std::future::poll_fn(|cx| self.op.poll_next(cx))
+        std::future::poll_fn(|cx| self.op.poll_with(cx, ZcFold::take_sent))
             .await
             // The result CQE always precedes termination; a bare
             // termination means the op was cancelled under teardown.
@@ -530,18 +530,54 @@ impl SendZcOp {
 /// kernel reports it copied the data rather than sending zero-copy
 /// (always the case on loopback).
 pub struct ZcNotif {
-    op: MultiOp,
+    op: MultiOp<ZcFold>,
 }
 
 impl Future for ZcNotif {
     type Output = bool;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut copied = false;
-        while let Some(result) = ready!(self.op.poll_next(cx)) {
-            copied = result & NOTIF_ZC_COPIED != 0;
+        let copied = ready!(self.op.poll_with(cx, ZcFold::take_copied));
+        // No notification at all: the send failed without pinning pages.
+        Poll::Ready(copied.unwrap_or(false))
+    }
+}
+
+/// A zero-copy send's two CQEs, told apart by what they are rather than
+/// by arrival order: the send result goes to slot 0, the notification
+/// (`IORING_CQE_F_NOTIF`) to slot 1.
+pub(crate) struct ZcFold;
+
+impl ZcFold {
+    const SENT: u8 = 1;
+    const NOTIF: u8 = 2;
+
+    pub(crate) fn take_sent(slots: &mut Slots) -> Option<i32> {
+        (slots.tag & Self::SENT != 0).then(|| {
+            slots.tag &= !Self::SENT;
+            slots.v[0]
+        })
+    }
+
+    pub(crate) fn take_copied(slots: &mut Slots) -> Option<bool> {
+        (slots.tag & Self::NOTIF != 0).then(|| {
+            slots.tag &= !Self::NOTIF;
+            slots.v[1] & NOTIF_ZC_COPIED != 0
+        })
+    }
+}
+
+impl InlineFold for ZcFold {
+    fn on_cqe(slots: &mut Slots, res: i32, flags: u32, _orphaned: bool) -> bool {
+        // Nothing to release when orphaned: neither CQE carries a resource.
+        if cqueue::notif(flags) {
+            slots.v[1] = res;
+            slots.tag |= Self::NOTIF;
+        } else {
+            slots.v[0] = res;
+            slots.tag |= Self::SENT;
         }
-        Poll::Ready(copied)
+        true
     }
 }
 
@@ -767,6 +803,30 @@ mod tests {
         let a = std::net::TcpStream::connect(addr).unwrap();
         let (b, _) = listener.accept().unwrap();
         (a, b)
+    }
+
+    /// The send result and the notification land in their own slots by
+    /// what the CQE is (IORING_CQE_F_NOTIF), not by arrival order, and
+    /// the copied bit is read from the notification.
+    #[test]
+    fn zc_fold_tells_the_notification_apart() {
+        use crate::op::{InlineFold, Slots};
+        // uapi values of IORING_CQE_F_MORE / IORING_CQE_F_NOTIF.
+        let more = 1 << 1;
+        let notif = 1 << 3;
+
+        let mut s = Slots::default();
+        assert!(ZcFold::on_cqe(&mut s, 4096, more, false));
+        assert!(ZcFold::on_cqe(&mut s, NOTIF_ZC_COPIED, notif, false));
+        assert_eq!(ZcFold::take_sent(&mut s), Some(4096));
+        assert_eq!(ZcFold::take_sent(&mut s), None);
+        assert_eq!(ZcFold::take_copied(&mut s), Some(true));
+
+        // A notification never reorders into the send result's slot.
+        let mut s = Slots::default();
+        ZcFold::on_cqe(&mut s, 0, notif, false);
+        assert_eq!(ZcFold::take_sent(&mut s), None);
+        assert_eq!(ZcFold::take_copied(&mut s), Some(false));
     }
 
     /// Zero-copy send: both CQEs (send result + notification) must be

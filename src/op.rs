@@ -101,6 +101,36 @@ pub(crate) enum Resources {
     ResultFd,
 }
 
+/// The entry's inline completion storage: two 32-bit values and a tag
+/// byte. A single-shot op queues up to two results in order (`tag`
+/// counts them); a multi-CQE op's [`InlineFold`] uses all three as it
+/// likes.
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Slots {
+    pub(crate) v: [i32; 2],
+    pub(crate) tag: u8,
+}
+
+/// [`InlineFold::on_cqe`] of one fold type, stored in the entry.
+pub(crate) type FoldFn = fn(&mut Slots, i32, u32, bool) -> bool;
+
+/// How a multi-CQE op keeps its CQEs: folded into the entry's inline
+/// [`Slots`], the way [`crate::ops::SendZcOp`] keeps its send result and
+/// notification. A multishot SQE can post any number of CQEs before its
+/// consumer runs, so an op's fold must keep a bounded summary -- OR poll
+/// events into a mask, count timeout ticks -- rather than queue them;
+/// the op's typed handle then reads the slots through
+/// [`MultiOp::poll_with`]. No allocation, no dynamic dispatch: the entry
+/// stores a plain function pointer chosen at submit.
+pub(crate) trait InlineFold {
+    /// Fold one CQE into `slots`. Runs inside the reaper, under the op
+    /// slab borrow: it must not call back into the op layer.
+    /// `orphaned`: the consumer is gone (its handle was dropped); release
+    /// anything the CQE carries instead of keeping it. Returns whether
+    /// the consumer should be woken (the terminal CQE always wakes it).
+    fn on_cqe(slots: &mut Slots, res: i32, flags: u32, orphaned: bool) -> bool;
+}
+
 impl Resources {
     pub(crate) fn into_buffer(self) -> Box<[u8]> {
         match self {
@@ -111,27 +141,35 @@ impl Resources {
 }
 
 /// Per-op slab entry. Owns everything the kernel may still look at.
+///
+/// Exactly one cache line: an async IO touches its entries at insert,
+/// reap and poll, and an entry straddling two lines costs two misses
+/// where one would do.
+#[repr(align(64))]
 pub(crate) struct OpEntry {
-    result: Option<i32>,
-    /// Results beyond `result` for multi-CQE ops (`IORING_CQE_F_MORE`
-    /// chains); an empty `Vec` never allocates, so single-shot ops pay
-    /// nothing.
-    extra_results: Vec<i32>,
+    waker: Option<Waker>,
+    resources: Resources,
+    /// Inline completion storage: a single-shot op's pending results, or
+    /// whatever a multi-CQE op's [`InlineFold`] keeps.
+    slots: Slots,
+    /// A multi-CQE op's [`InlineFold`]: its CQEs are folded into
+    /// `slots` instead of queued there.
+    fold: Option<FoldFn>,
     /// The terminal CQE (no `IORING_CQE_F_MORE`) has been reaped; no
     /// more completions are coming for this entry.
     terminated: bool,
-    waker: Option<Waker>,
     /// The owning future was dropped; the reaper frees the entry on the
     /// terminal CQE.
     orphaned: bool,
     /// This op is a ublk io command (FETCH_REQ/COMMIT_AND_FETCH_REQ/...)
     /// whose completion the queue-state accounting must observe.
     is_io_cmd: bool,
-    /// `Some` marks a sync-mode entry: no future is attached, and the
-    /// stored word (legacy tag-encoded `user_data`) is delivered to the
-    /// sync event loop's handler in place of the on-ring slab key.
-    sync_data: Option<u64>,
-    resources: Resources,
+    /// A sync-mode entry: no future is attached, and the handler word
+    /// (legacy tag-encoded `user_data`, see [`Self::sync_data`]) is
+    /// delivered to the sync event loop's handler in place of the
+    /// on-ring slab key. The word lives in `slots`, which a sync entry
+    /// never uses for results, so it costs no extra bytes.
+    is_sync: bool,
 }
 
 impl OpEntry {
@@ -147,22 +185,112 @@ impl OpEntry {
         }
     }
 
+    /// Discard every pending result nobody will consume (see
+    /// [`Self::discard_result`]). A fold's slots hold folded values, not
+    /// queued results, and are left alone.
+    fn discard_pending(&mut self) {
+        if self.fold.is_some() {
+            return;
+        }
+        while let Some(result) = self.pop_result() {
+            self.discard_result(result);
+        }
+    }
+
+    #[inline]
+    fn new(resources: Resources, is_io_cmd: bool) -> Self {
+        OpEntry {
+            waker: None,
+            resources,
+            slots: Slots::default(),
+            fold: None,
+            terminated: false,
+            orphaned: false,
+            is_io_cmd,
+            is_sync: false,
+        }
+    }
+
+    /// A sync-mode entry: the handler word rides in the result slots,
+    /// which such an entry never uses otherwise, so a sync submission
+    /// costs no more than an async one and the entry stays one cache
+    /// line.
+    #[inline]
+    fn new_sync(sync_data: u64, is_io_cmd: bool) -> Self {
+        let mut entry = Self::new(Resources::None, is_io_cmd);
+        entry.is_sync = true;
+        entry.slots.v = [sync_data as i32, (sync_data >> 32) as i32];
+        entry
+    }
+
+    /// The handler word of a sync-mode entry (see [`Self::new_sync`]),
+    /// `None` for an op future's entry.
+    #[inline]
+    fn sync_data(&self) -> Option<u64> {
+        self.is_sync
+            .then(|| (self.slots.v[0] as u32 as u64) | ((self.slots.v[1] as u32 as u64) << 32))
+    }
+
+    /// The oldest pending result, without consuming it.
+    #[inline]
+    fn first_result(&self) -> Option<i32> {
+        (self.slots.tag > 0).then_some(self.slots.v[0])
+    }
+
+    /// Queue a CQE result in the inline slots, in arrival order.
     #[inline]
     fn push_result(&mut self, result: i32) {
-        if self.result.is_none() && self.extra_results.is_empty() {
-            self.result = Some(result);
+        if (self.slots.tag as usize) < self.slots.v.len() {
+            self.slots.v[self.slots.tag as usize] = result;
+            self.slots.tag += 1;
         } else {
-            self.extra_results.push(result);
+            // A multishot SQE pushed through a single-shot path, against
+            // the documented contract: there is nowhere to keep the
+            // result, so release it like any unconsumed one.
+            debug_assert!(false, "third pending CQE for an op without a fold");
+            self.discard_result(result);
         }
     }
 
     #[inline]
     fn pop_result(&mut self) -> Option<i32> {
-        let result = self.result.take()?;
-        if !self.extra_results.is_empty() {
-            self.result = Some(self.extra_results.remove(0));
-        }
+        let result = self.first_result()?;
+        self.slots.v[0] = self.slots.v[1];
+        self.slots.tag -= 1;
         Some(result)
+    }
+
+    /// Hand one CQE to a live entry: a multi-CQE op's fold absorbs it,
+    /// any other op queues its result. Returns whether the consumer
+    /// should be woken.
+    #[inline]
+    fn deliver(&mut self, res: i32, flags: u32) -> bool {
+        self.terminated = !cqueue::more(flags);
+        match self.fold {
+            Some(fold) => fold(&mut self.slots, res, flags, false) || self.terminated,
+            None => {
+                self.push_result(res);
+                true
+            }
+        }
+    }
+
+    /// One CQE for an orphaned entry, whose consumer is gone. A fold
+    /// still sees it (flagged orphaned) so it can release what the CQE
+    /// carries; any other op's terminal result is discarded.
+    /// Returns true on the terminal CQE: the caller must then remove the
+    /// entry and [`Self::discard_pending`] it.
+    #[inline]
+    fn absorb_orphaned(&mut self, res: i32, flags: u32) -> bool {
+        let terminal = !cqueue::more(flags);
+        match self.fold {
+            Some(fold) => {
+                fold(&mut self.slots, res, flags, true);
+            }
+            None if terminal => self.discard_result(res),
+            None => {}
+        }
+        terminal
     }
 }
 
@@ -269,18 +397,15 @@ fn push_ctrl_sqe(sqe: &squeue::Entry128) -> Result<(), UblkError> {
 }
 
 #[inline]
-fn insert_entry(resources: Resources, is_io_cmd: bool, sync_data: Option<u64>) -> usize {
+fn insert_entry(resources: Resources, is_io_cmd: bool) -> usize {
+    with_slab(|slab| slab.borrow_mut().insert(OpEntry::new(resources, is_io_cmd)))
+}
+
+#[inline]
+fn insert_sync(sync_data: u64, is_io_cmd: bool) -> usize {
     with_slab(|slab| {
-        slab.borrow_mut().insert(OpEntry {
-            result: None,
-            extra_results: Vec::new(),
-            terminated: false,
-            waker: None,
-            orphaned: false,
-            is_io_cmd,
-            sync_data,
-            resources,
-        })
+        slab.borrow_mut()
+            .insert(OpEntry::new_sync(sync_data, is_io_cmd))
     })
 }
 
@@ -295,7 +420,7 @@ pub(crate) fn submit_sync(
     sync_data: u64,
     is_io_cmd: bool,
 ) -> Result<(), UblkError> {
-    let key = insert_entry(Resources::None, is_io_cmd, Some(sync_data));
+    let key = insert_sync(sync_data, is_io_cmd);
     if let Err(e) = push_queue_sqe(&build(key as u64)) {
         with_slab(|slab| slab.borrow_mut().remove(key));
         return Err(e);
@@ -319,7 +444,7 @@ pub(crate) fn submit_sync(
 /// a previous queue on this thread) must be counted but must not drive
 /// current-queue state.
 #[inline]
-pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u64>, bool, bool) {
+pub(crate) fn take_sync_entry(key: usize, result: i32, flags: u32) -> (Option<u64>, bool, bool) {
     let (ret, waker) = with_slab(|slab| {
         let mut slab = slab.borrow_mut();
         let Some(entry) = slab.get_mut(key) else {
@@ -327,22 +452,24 @@ pub(crate) fn take_sync_entry(key: usize, result: i32, more: bool) -> (Option<u6
             return ((None, false, false), None);
         };
         let is_io_cmd = entry.is_io_cmd;
-        let Some(data) = entry.sync_data else {
+        let Some(data) = entry.sync_data() else {
             if entry.orphaned {
-                if !more {
-                    slab.remove(key).discard_result(result);
+                if entry.absorb_orphaned(result, flags) {
+                    slab.remove(key).discard_pending();
                 }
                 return ((None, is_io_cmd, true), None);
             }
-            entry.terminated = !more;
-            entry.push_result(result);
-            return ((None, is_io_cmd, false), entry.waker.take());
+            let wake = entry.deliver(result, flags);
+            return (
+                (None, is_io_cmd, false),
+                if wake { entry.waker.take() } else { None },
+            );
         };
         // A multi-CQE SQE (multishot, SEND_ZC) delivers the handler word
         // once per CQE; the key stays reserved until the terminal one,
         // or the handler's next submission would reuse it and the
         // remaining CQEs would resolve to the wrong entry.
-        if !more {
+        if !cqueue::more(flags) {
             slab.remove(key);
         }
         ((Some(data), is_io_cmd, false), None)
@@ -375,7 +502,7 @@ impl Op {
         is_io_cmd: bool,
         build_and_push: impl FnOnce(u64) -> Result<(), UblkError>,
     ) -> Result<Op, UblkError> {
-        let key = insert_entry(resources, is_io_cmd, None);
+        let key = insert_entry(resources, is_io_cmd);
         if let Err(e) = build_and_push(key as u64) {
             with_slab(|slab| slab.borrow_mut().remove(key));
             return Err(e);
@@ -431,13 +558,13 @@ impl Op {
         with_slab(|slab| {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
-            entry.result?;
+            entry.first_result()?;
             // Control commands are all single-completion uring_cmds, so
             // unlike poll_single this path needs no multi-CQE fallback.
             debug_assert!(entry.terminated, "multi-CQE ctrl cmd");
             let entry = slab.remove(self.key);
             self.done = true;
-            entry.result
+            entry.first_result()
         })
     }
 
@@ -448,7 +575,7 @@ impl Op {
         with_slab(|slab| {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
-            match entry.result {
+            match entry.first_result() {
                 None => {
                     // Only clone the waker when the stored one would not
                     // wake this task (repeated polls are common under
@@ -483,6 +610,10 @@ impl Op {
                              later completions are dropped",
                             self.key
                         );
+                        // The consumer owns `result` now: take it out of the
+                        // entry, or reclaiming the entry would discard it
+                        // again (closing a delivered fd).
+                        entry.pop_result();
                         entry.orphaned = true;
                         entry.waker = None;
                         Poll::Ready((result, Resources::None))
@@ -513,10 +644,8 @@ fn orphan_entry(ring: OpRing, key: usize) {
         if entry.terminated {
             // Result already reaped but never consumed (future dropped
             // after completion, before its final poll).
-            let entry = slab.remove(key);
-            if let Some(result) = entry.result {
-                entry.discard_result(result);
-            }
+            let mut entry = slab.remove(key);
+            entry.discard_pending();
             return true;
         }
         entry.orphaned = true;
@@ -537,45 +666,90 @@ fn orphan_entry(ring: OpRing, key: usize) {
     };
 }
 
-/// Handle to a submitted operation that completes with one or more CQEs
-/// (`IORING_CQE_F_MORE` chains: zero-copy sends, multishot ops).
+/// Handle to a submitted op that completes with one or more CQEs
+/// (`IORING_CQE_F_MORE` chains: zero-copy sends, multishot ops), each
+/// folded into the entry's [`Slots`] by `F`.
 ///
-/// [`poll_next`](MultiOp::poll_next) yields each CQE result in arrival
-/// order and `None` once the terminal CQE has been consumed. Dropping
-/// the handle mid-chain orphans the entry like a single-shot [`Op`].
-pub(crate) struct MultiOp {
+/// Typed handles are built on [`Self::poll_with`]: it lends the consumer
+/// the slots, registers the waker when there is nothing to hand out yet,
+/// and reclaims the entry once the stream has ended. Dropping
+/// the handle before that orphans the entry and cancels the SQE; `F`
+/// keeps seeing the CQEs (as orphaned) until the terminal one.
+pub(crate) struct MultiOp<F> {
     key: usize,
     done: bool,
+    _fold: std::marker::PhantomData<fn() -> F>,
 }
 
-impl MultiOp {
-    /// Reserve a slab entry and push the SQE built by `build` (which
-    /// receives the `user_data` key) on the queue ring, as [`Op::submit`]
-    /// does for single-shot ops.
-    pub(crate) fn submit(build: impl FnOnce(u64) -> squeue::Entry) -> Result<MultiOp, UblkError> {
-        let key = insert_entry(Resources::None, false, None);
-        if let Err(e) = push_queue_sqe(&build(key as u64)) {
+impl<F: InlineFold> MultiOp<F> {
+    /// Reserve an entry and push the SQE built by `build` (which receives
+    /// the `user_data` key) on the queue ring.
+    pub(crate) fn submit(build: impl FnOnce(u64) -> squeue::Entry) -> Result<Self, UblkError> {
+        Self::submit_inner(None, |key, _| build(key))
+    }
+
+    /// As [`Self::submit`] for a timeout SQE: `ts` is kept with the entry
+    /// until it is reclaimed, and `build` gets a reference to it.
+    // Only crate-internal multishot timeouts (and tests) use this yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn submit_timeout(
+        ts: io_uring::types::Timespec,
+        build: impl FnOnce(u64, &io_uring::types::Timespec) -> squeue::Entry,
+    ) -> Result<Self, UblkError> {
+        Self::submit_inner(Some(Box::new(ts)), |key, ts| {
+            build(key, ts.expect("timeout without its timespec"))
+        })
+    }
+
+    fn submit_inner(
+        ts: Option<Box<io_uring::types::Timespec>>,
+        build: impl FnOnce(u64, Option<&io_uring::types::Timespec>) -> squeue::Entry,
+    ) -> Result<Self, UblkError> {
+        let resources = ts.map_or(Resources::None, Resources::Timespec);
+        let (key, ts_ptr) = with_slab(|slab| {
+            let mut entry = OpEntry::new(resources, false);
+            entry.fold = Some(F::on_cqe);
+            let mut slab = slab.borrow_mut();
+            let key = slab.insert(entry);
+            let ts_ptr = match &slab[key].resources {
+                Resources::Timespec(ts) => Some(&**ts as *const io_uring::types::Timespec),
+                _ => None,
+            };
+            (key, ts_ptr)
+        });
+        // SAFETY: the timespec's box lives in the entry, which stays in
+        // the slab (and the box at its heap address) until reclaimed after
+        // the terminal CQE -- long after this SQE is built and submitted;
+        // the kernel reads it when it prepares the SQE.
+        let sqe = build(key as u64, ts_ptr.map(|ts| unsafe { &*ts }));
+        if let Err(e) = push_queue_sqe(&sqe) {
             with_slab(|slab| slab.borrow_mut().remove(key));
             return Err(e);
         }
-        Ok(MultiOp { key, done: false })
+        Ok(MultiOp {
+            key,
+            done: false,
+            _fold: std::marker::PhantomData,
+        })
     }
 
-    /// Poll for the next completion; `Ready(None)` after the terminal
-    /// CQE has been consumed.
-    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<i32>> {
+    /// Let `take` lift an item out of what the fold kept: `Some` hands it
+    /// out. `None` with the terminal CQE reaped ends the stream and
+    /// reclaims the entry; `None` before that registers the waker for
+    /// the next CQE.
+    pub(crate) fn poll_with<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        take: impl FnOnce(&mut Slots) -> Option<T>,
+    ) -> Poll<Option<T>> {
         if self.done {
             return Poll::Ready(None);
         }
         with_slab(|slab| {
             let mut slab = slab.borrow_mut();
             let entry = slab.get_mut(self.key).expect("op entry vanished");
-            if let Some(result) = entry.pop_result() {
-                if entry.terminated && entry.result.is_none() {
-                    slab.remove(self.key);
-                    self.done = true;
-                }
-                return Poll::Ready(Some(result));
+            if let Some(item) = take(&mut entry.slots) {
+                return Poll::Ready(Some(item));
             }
             if entry.terminated {
                 slab.remove(self.key);
@@ -594,7 +768,7 @@ impl MultiOp {
     }
 }
 
-impl Drop for MultiOp {
+impl<F> Drop for MultiOp<F> {
     fn drop(&mut self) {
         if !self.done {
             orphan_entry(OpRing::Queue, self.key);
@@ -703,32 +877,88 @@ where
             // previously dropped queue on this thread must not flip a
             // freshly registered queue into stopping.
             per_cqe(&cqe, entry.is_io_cmd, entry.orphaned);
-            let more = cqueue::more(cqe.flags());
-            if entry.orphaned || entry.sync_data.is_some() {
+            if entry.orphaned || entry.is_sync {
                 // Orphaned future, or a sync-mode entry drained by the
                 // runtime reaper (a queue should not mix the models; the
                 // sync handler is not available here, so the entry is
                 // only reclaimed and accounted) -- reclaimed on the
                 // terminal CQE only, so a multi-CQE chain cannot land on
-                // a recycled key.
-                if !more {
-                    slab.remove(key).discard_result(cqe.result());
+                // a recycled key. A sync entry owns nothing, so absorbing
+                // the CQE as orphaned is a no-op for it.
+                if entry.absorb_orphaned(cqe.result(), cqe.flags()) {
+                    slab.remove(key).discard_pending();
                 }
                 continue;
             }
-            entry.terminated = !more;
-            entry.push_result(cqe.result());
-            if let Some(waker) = entry.waker.take() {
-                wakers.push(waker);
+            if entry.deliver(cqe.result(), cqe.flags()) {
+                if let Some(waker) = entry.waker.take() {
+                    wakers.push(waker);
+                }
             }
         }
         (n, wakers)
     })
 }
 
+/// Device-free test plumbing: a plain ring stands in for the queue ring.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use io_uring::types::{SubmitArgs, Timespec};
+
+    pub(crate) fn install_ring(cq_entries: u32) {
+        let ring = IoUring::builder()
+            .setup_cqsize(cq_entries)
+            .build(16)
+            .unwrap();
+        crate::io::QUEUE_RING.with(|cell| {
+            assert!(cell.set(RefCell::new(ring)).is_ok());
+        });
+    }
+
+    /// Wait until `want` CQEs are ready (each wait bounded at 1 s, so a
+    /// kernel that posts fewer cannot hang a test), then reap and wake.
+    /// Returns how many CQEs were reaped.
+    pub(crate) fn reap(want: usize) -> usize {
+        let bound = Timespec::new().sec(1);
+        let args = SubmitArgs::new().timespec(&bound);
+        let (n, wakers) =
+            crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+                // Wait for all of them at once (with `1`, a CQE already
+                // queued satisfies the wait at once: a busy loop), and stop
+                // when a bounded wait brings nothing new -- the kernel
+                // reports a timed-out wait as success when some CQEs are
+                // queued, so the error alone does not end the loop.
+                loop {
+                    let ready = r.completion().len();
+                    if ready >= want
+                        || r.submitter().submit_with_args(want, &args).is_err()
+                        || r.completion().len() == ready
+                    {
+                        break;
+                    }
+                }
+                ublk_reap_and_wake(r, |_, _, _| {})
+            });
+        wakers.wake_all();
+        n
+    }
+
+    pub(crate) fn noop_waker() -> Waker {
+        struct Noop;
+        impl std::task::Wake for Noop {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+        Waker::from(std::sync::Arc::new(Noop))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// uapi IORING_CQE_F_MORE: more CQEs follow for this SQE.
+    const MORE: u32 = 1 << 1;
 
     /// A reap runs for every batch of completions, so collecting its
     /// wakers must not allocate each time: the buffer a batch grew is
@@ -821,17 +1051,255 @@ mod tests {
     #[test]
     fn sync_entry_stays_reserved_until_the_terminal_cqe() {
         let word = (crate::UblkUringData::Target as u64) | 0x42;
-        let key = insert_entry(Resources::None, false, Some(word));
+        let key = insert_sync(word, false);
 
         // Intermediate CQE (IORING_CQE_F_MORE): delivered, entry kept.
-        assert_eq!(take_sync_entry(key, 4096, true), (Some(word), false, false));
-        let next = insert_entry(Resources::None, true, Some(0x5));
+        assert_eq!(take_sync_entry(key, 4096, MORE), (Some(word), false, false));
+        let next = insert_sync(0x5, true);
         assert_ne!(next, key, "key reused while its SQE still has CQEs due");
 
         // Terminal CQE: delivered once more, entry reclaimed.
-        assert_eq!(take_sync_entry(key, 0, false), (Some(word), false, false));
+        assert_eq!(take_sync_entry(key, 0, 0), (Some(word), false, false));
         assert!(OP_SLAB.with(|slab| !slab.borrow().contains(key)));
 
-        assert_eq!(take_sync_entry(next, 0, false), (Some(0x5), true, false));
+        assert_eq!(take_sync_entry(next, 0, 0), (Some(0x5), true, false));
+    }
+
+    fn blank_entry() -> OpEntry {
+        OpEntry::new(Resources::None, false)
+    }
+
+    /// Each op-slab entry is touched several times per IO (insert, reap,
+    /// poll); at 64 bytes and 64-byte aligned it is exactly one cache
+    /// line, and the slab's enum wrapper must not add a word that would
+    /// push it to two.
+    #[test]
+    fn op_entry_is_one_cache_line() {
+        assert_eq!(std::mem::size_of::<OpEntry>(), 64);
+        assert_eq!(std::mem::align_of::<OpEntry>(), 64);
+        let mut slab: Slab<OpEntry> = Slab::with_capacity(4);
+        let a = slab.insert(blank_entry());
+        let b = slab.insert(blank_entry());
+        let stride = (&slab[b] as *const OpEntry as usize) - (&slab[a] as *const OpEntry as usize);
+        assert_eq!(stride, 64);
+        assert_eq!(&slab[a] as *const OpEntry as usize % 64, 0);
+    }
+
+    /// The two inline result slots hand results back in arrival order,
+    /// across interleaved pushes and pops.
+    #[test]
+    fn op_entry_results_keep_arrival_order() {
+        let mut e = blank_entry();
+        assert_eq!(e.pop_result(), None);
+        e.push_result(1);
+        e.push_result(2);
+        assert_eq!(e.pop_result(), Some(1));
+        e.push_result(3);
+        assert_eq!([e.pop_result(), e.pop_result()], [Some(2), Some(3)]);
+        assert_eq!(e.pop_result(), None);
+        e.push_result(4);
+        assert_eq!(e.pop_result(), Some(4));
+        assert_eq!(e.pop_result(), None);
+    }
+
+    /// An entry released with results nobody consumed must discard all
+    /// of them, not just the first: for an op owning its result fds,
+    /// the second would otherwise leak. (A multishot op's state releases
+    /// what it holds itself, when it is dropped.)
+    #[test]
+    fn op_entry_discards_every_pending_result() {
+        let open_fd = || {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0);
+            fd
+        };
+        let is_open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+
+        let mut e = OpEntry::new(Resources::ResultFd, false);
+        let fds = [open_fd(), open_fd()];
+        for fd in fds {
+            e.push_result(fd);
+        }
+        e.discard_pending();
+        assert_eq!(e.first_result(), None);
+        for fd in fds {
+            assert!(!is_open(fd), "fd {} leaked", fd);
+        }
+    }
+
+    /// The test helper's wait is bounded even when fewer CQEs than asked
+    /// for ever arrive (one already queued must not turn the wait into
+    /// a busy loop), so a kernel that posts fewer cannot hang a test.
+    #[test]
+    fn testing_reap_gives_up_on_missing_cqes() {
+        testing::install_ring(16);
+        let _op = crate::ops::nop().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(testing::reap(3), 1);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// A multi-CQE SQE awaited through the single-shot path (a contract
+    /// violation) hands its first result to the consumer and orphans the
+    /// entry; when the terminal CQE later reclaims it, that first result
+    /// must not be discarded again -- for an fd result, that would close
+    /// an fd the consumer now owns. (Debug builds assert on the misuse
+    /// itself, so this runs in release builds.)
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn misused_single_shot_does_not_discard_a_delivered_result() {
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0);
+        let key = insert_entry(Resources::ResultFd, false);
+        with_slab(|slab| slab.borrow_mut()[key].push_result(fd));
+        let mut op = Op {
+            ring: OpRing::Queue,
+            key,
+            done: false,
+        };
+        let waker = testing::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match op.poll_single(&mut cx) {
+            Poll::Ready((res, _)) => assert_eq!(res, fd),
+            Poll::Pending => panic!("first result not delivered"),
+        }
+        // The terminal CQE (no IORING_CQE_F_MORE) reclaims the entry.
+        take_sync_entry(key, -libc::ECANCELED, 0);
+        assert!(with_slab(|slab| !slab.borrow().contains(key)));
+        assert!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0,
+            "delivered fd was closed"
+        );
+        unsafe { libc::close(fd) };
+    }
+
+    /// A fold's slots hold folded values, not queued results: releasing
+    /// the entry must leave them alone.
+    #[test]
+    fn discarding_a_fold_entry_leaves_its_slots_alone() {
+        let mut e = blank_entry();
+        e.fold = Some(RecordFold::on_cqe);
+        e.slots = Slots { v: [5, 6], tag: 3 };
+        e.discard_pending();
+        assert_eq!(e.slots, Slots { v: [5, 6], tag: 3 });
+    }
+
+    /// Up to two pending results (every single-shot op, and a zero-copy
+    /// send's result plus notification) are held inline.
+    #[test]
+    fn op_entry_two_results_stay_inline() {
+        let mut e = blank_entry();
+        e.push_result(7);
+        e.push_result(8);
+        assert_eq!(e.first_result(), Some(7));
+        assert_eq!(e.pop_result(), Some(7));
+        e.push_result(9);
+        assert_eq!([e.pop_result(), e.pop_result()], [Some(8), Some(9)]);
+        assert_eq!(e.first_result(), None);
+    }
+
+    /// Only an op with an InlineFold can absorb more than two results; a
+    /// third pending result on any other op is a contract violation (a
+    /// multishot SQE pushed through a single-shot path), which debug
+    /// builds catch.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "op without a fold")]
+    fn op_entry_third_result_needs_a_fold() {
+        let mut e = blank_entry();
+        for r in 0..3 {
+            e.push_result(r);
+        }
+    }
+
+    std::thread_local! {
+        /// Every CQE RecordFold saw on this test thread: (res, orphaned).
+        static SEEN: RefCell<Vec<(i32, bool)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Records every CQE handed to it.
+    struct RecordFold;
+
+    impl InlineFold for RecordFold {
+        fn on_cqe(slots: &mut Slots, res: i32, _flags: u32, orphaned: bool) -> bool {
+            SEEN.with(|seen| seen.borrow_mut().push((res, orphaned)));
+            slots.tag = slots.tag.wrapping_add(1);
+            true
+        }
+    }
+
+    fn recording_timeout(count: u32) -> MultiOp<RecordFold> {
+        let ts = io_uring::types::Timespec::new().nsec(100_000);
+        MultiOp::submit_timeout(ts, |key, ts| {
+            opcode::Timeout::new(ts)
+                .count(count)
+                .flags(io_uring::types::TimeoutFlags::MULTISHOT)
+                .build()
+                .user_data(key)
+        })
+        .unwrap()
+    }
+
+    /// A consumer that takes nothing: it only sees the stream end.
+    fn take_nothing(_: &mut Slots) -> Option<()> {
+        None
+    }
+
+    /// Every CQE of a multi-CQE op reaches its fold, with nothing queued
+    /// in the entry however many arrive before the consumer runs; the
+    /// consumer sees the end once the terminal CQE is in, and the entry
+    /// is reclaimed.
+    #[test]
+    fn fold_gets_every_cqe() {
+        testing::install_ring(64);
+        let mut op = recording_timeout(6);
+        let waker = testing::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(op.poll_with(&mut cx, take_nothing).is_pending());
+        testing::reap(6);
+        loop {
+            match op.poll_with(&mut cx, take_nothing) {
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(())) => unreachable!(),
+                Poll::Pending => assert!(testing::reap(1) > 0, "op never ended"),
+            }
+        }
+        let seen = SEEN.with(|s| s.borrow().clone());
+        if seen == [(-libc::EINVAL, false)] {
+            return; // no IORING_TIMEOUT_MULTISHOT before Linux 6.4
+        }
+        assert_eq!(seen, vec![(-libc::ETIME, false); 6]);
+        drop(op);
+        assert!(!has_pending_ops());
+    }
+
+    /// A multi-CQE op dropped mid-stream is orphaned and cancelled; the
+    /// CQEs that follow still reach its fold, flagged as orphaned (so it
+    /// can release what they carry), and the terminal one reclaims the
+    /// entry.
+    #[test]
+    fn orphaned_fold_sees_the_rest() {
+        testing::install_ring(64);
+        let mut op = recording_timeout(0);
+        let waker = testing::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(op.poll_with(&mut cx, take_nothing).is_pending());
+        testing::reap(1);
+        if SEEN.with(|s| s.borrow().clone()) == [(-libc::EINVAL, false)] {
+            return; // no IORING_TIMEOUT_MULTISHOT before Linux 6.4
+        }
+        let live = SEEN.with(|s| s.borrow().len());
+        drop(op);
+        for _ in 0..100 {
+            if !has_pending_ops() {
+                break;
+            }
+            testing::reap(1);
+        }
+        assert!(!has_pending_ops(), "orphaned op never ended");
+        let seen = SEEN.with(|s| s.borrow().clone());
+        assert!(seen[..live].iter().all(|&(_, orphaned)| !orphaned));
+        assert!(seen[live..].iter().all(|&(_, orphaned)| orphaned));
+        assert_eq!(seen.last(), Some(&(-libc::ECANCELED, true)));
     }
 }
