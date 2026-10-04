@@ -530,6 +530,13 @@ const NOTIF_ZC_COPIED: i32 = 1 << 31;
 /// alternative: it only orphans the slab entry and issues a best-effort
 /// `ASYNC_CANCEL`, which cannot un-pin pages the kernel already holds,
 /// so the send may still be reading the buffer afterwards.
+///
+/// Not `Send`: the op lives in its thread's ring and slab.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<libublk::ops::SendZcOp>();
+/// ```
 pub struct SendZcOp {
     op: MultiOp<ZcFold>,
 }

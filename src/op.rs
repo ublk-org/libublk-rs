@@ -490,7 +490,15 @@ pub(crate) struct Op {
     ring: OpRing,
     key: usize,
     done: bool,
+    _local: ThreadLocalOp,
 }
+
+/// Keeps op handles on the thread that submitted them (neither `Send` nor
+/// `Sync`). The op's entry lives in that thread's slab and its SQE in that
+/// thread's ring: polled elsewhere, a handle would read whatever entry
+/// another thread keeps under the same key, and dropped elsewhere it could
+/// not cancel its SQE, leaving the op running and its entry leaked.
+type ThreadLocalOp = std::marker::PhantomData<*const ()>;
 
 impl Op {
     /// Reserve a slab entry, then build-and-push the SQE with the entry's
@@ -511,6 +519,7 @@ impl Op {
             ring,
             key,
             done: false,
+            _local: std::marker::PhantomData,
         })
     }
 
@@ -679,6 +688,7 @@ pub(crate) struct MultiOp<F> {
     key: usize,
     done: bool,
     _fold: std::marker::PhantomData<fn() -> F>,
+    _local: ThreadLocalOp,
 }
 
 impl<F: InlineFold> MultiOp<F> {
@@ -728,6 +738,7 @@ impl<F: InlineFold> MultiOp<F> {
             key,
             done: false,
             _fold: std::marker::PhantomData,
+            _local: std::marker::PhantomData,
         })
     }
 
@@ -1154,6 +1165,7 @@ mod tests {
             ring: OpRing::Queue,
             key,
             done: false,
+            _local: std::marker::PhantomData,
         };
         let waker = testing::noop_waker();
         let mut cx = Context::from_waker(&waker);

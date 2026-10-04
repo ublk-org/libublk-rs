@@ -93,6 +93,14 @@ impl InlineFold for TimeoutFold {
 /// [`crate::ops::timeout_multi`]. Expiries that fire before the consumer
 /// gets to them are counted, not queued: each `next()` yields how many
 /// fired since the last one. Dropping it cancels the timer.
+///
+/// Like every op handle it belongs to the thread whose ring it was
+/// submitted on, so it is neither `Send` nor `Sync`:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<libublk::ops::TimeoutMulti>();
+/// ```
 pub struct TimeoutMulti(MultiOp<TimeoutFold>);
 
 impl TimeoutMulti {
