@@ -746,7 +746,7 @@ The tag identifies a request at three levels:
 | `user_data` value | Owner | Meaning |
 |---|---|---|
 | `>= u64::MAX - 15` | sentinel | No op state (e.g. `CTRL_POLL_DATA`, ASYNC_CANCEL) |
-| bit 63 (`UblkUringData::Target`) | target | Raw SQE pushed by the batch transport; delivered untouched |
+| bit 63 (`UblkUringData::Target`) | target | Target-owned word: no table lookup, no accounting, delivered untouched. **Sync loop only**: `wait_and_handle_io` and `flush_and_wake_io_tasks` deliver it; the reactor (`UblkRuntime`, any `UblkExecutor`) drops the CQE and does not count the SQE as pending. Set by `build_user_data(.., true)` and by the batch transport's raw SQEs |
 | anything else | op slab | The slab key of an `OpEntry`: an async op (io command or `ops::*`) whose entry holds a waker, or a sync-mode SQE whose entry holds the handler word (`tag \| op << 16 \| tgt_data << 24`) |
 
    Both reapers use the same `classify_user_data`, so the sync loop

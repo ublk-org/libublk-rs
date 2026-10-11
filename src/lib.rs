@@ -71,7 +71,25 @@ pub use executor::{
 #[repr(u64)]
 #[non_exhaustive]
 pub enum UblkUringData {
-    /// Target IO bit flag - indicates user_data is from target IO
+    /// The `user_data` word is owned by the target: the library
+    /// interprets none of its other bits, does not account its
+    /// completion, and hands the word back untouched. It reaches the
+    /// ring in two ways: `UblkIOCtx::build_user_data(.., true)` builds a
+    /// sync-mode target-IO word for `UblkQueue::ublk_submit_sqe_sync`
+    /// (the library stores it and keys the SQE itself), and a raw SQE
+    /// pushed on the queue ring (e.g. by the batch transport) must carry
+    /// it in its own `user_data`.
+    ///
+    /// **Sync event loop only.** Such a word is delivered by
+    /// `UblkQueue::wait_and_handle_io` (the closure sees it with
+    /// `UblkIOCtx::is_tgt_io()` set) and by the `flush_and_wake_io_tasks`
+    /// wake handler. The reactor -- `UblkRuntime` and any other
+    /// `UblkExecutor`, i.e. `reactor::wait_and_reap_events` -- has no
+    /// consumer for it: a raw target-owned CQE is dropped and its SQE is
+    /// invisible to `reactor::has_pending_ops`; a `ublk_submit_sqe_sync`
+    /// entry is reclaimed on its CQE without delivering the word. Async
+    /// targets use neither; they submit their own IO through `ops::*` or
+    /// `ops::submit_sqe`, whose entries are slab-keyed and awaited.
     Target = 1_u64 << 63,
 }
 
