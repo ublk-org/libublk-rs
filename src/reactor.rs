@@ -198,7 +198,7 @@ fn reap_queue_ring() -> (usize, usize) {
 /// Drain the control ring's completion queue, waking the future behind
 /// each CQE. Returns the number of CQEs handled and of wakers woken.
 fn reap_ctrl_ring() -> (usize, usize) {
-    let (n, wakers) = crate::ctrl::CTRL_URING.with(|cell| {
+    let (n, wakers) = crate::ctrl::with_ctrl_ring_cell(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(ring) = guard.as_mut() else {
             return (0, WakerBatch::empty());
@@ -213,12 +213,12 @@ fn reap_ctrl_ring() -> (usize, usize) {
 /// ring to wait on.
 fn wait_for_cqe() -> bool {
     let has_queue = crate::io::with_queue_ring_cell(|cell| cell.is_some());
-    let has_ctrl = crate::ctrl::CTRL_URING.with(|cell| cell.borrow().is_some());
+    let has_ctrl = crate::ctrl::with_ctrl_ring_cell(|cell| cell.borrow().is_some());
 
     if has_ctrl {
         // Flush control SQEs; when parking on the queue ring, also bridge
         // control completions into it so they wake the sleep below.
-        let ctrl_fd = crate::ctrl::CTRL_URING.with(|cell| {
+        let ctrl_fd = crate::ctrl::with_ctrl_ring_cell(|cell| {
             let mut guard = cell.borrow_mut();
             let ring = guard.as_mut().unwrap();
             let _ = ring.submit();
@@ -247,7 +247,7 @@ fn wait_for_cqe() -> bool {
             ring.submitter().submit_with_args(1, &args)
         })
     } else if has_ctrl {
-        crate::ctrl::CTRL_URING.with(|cell| {
+        crate::ctrl::with_ctrl_ring_cell(|cell| {
             let mut guard = cell.borrow_mut();
             let ring = guard.as_mut().unwrap();
             ring.submitter().submit_with_args(1, &args)

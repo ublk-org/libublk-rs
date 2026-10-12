@@ -207,7 +207,7 @@ pub use batch::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatc
 // Thread-local queue ring using OnceCell for conditional initialization
 std::thread_local! {
     pub(crate) static QUEUE_RING: OnceCell<RefCell<IoUring<squeue::Entry>>> =
-        OnceCell::new();
+        const { OnceCell::new() };
     static DEFERRED_QUEUE_CQES: RefCell<VecDeque<cqueue::Entry>> =
         const { RefCell::new(VecDeque::new()) };
 
@@ -258,8 +258,10 @@ pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
 /// Account `cnt` completed io commands against the thread's registered
 /// queue state; `aborted` marks the queue as stopping. Called from the
 /// runtime park hook when reaping io-command CQEs.
+#[inline]
 pub(crate) fn update_queue_state(cnt: u32, aborted: bool) {
-    QUEUE_STATE.with(|cell| {
+    // Inlined TLS access (see `op::with_local`): this runs on every reap.
+    crate::op::with_local(&QUEUE_STATE, |cell| {
         if let Some(state) = cell.borrow().as_ref() {
             state.borrow_mut().account_io_cmds(cnt, aborted);
         }
