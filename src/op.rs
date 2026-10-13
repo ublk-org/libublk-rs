@@ -32,7 +32,6 @@
 
 use crate::UblkError;
 use io_uring::{cqueue, opcode, squeue, IoUring};
-use slab::Slab;
 use std::cell::{Cell, RefCell};
 use std::task::{Context, Poll, Waker};
 use std::thread::LocalKey;
@@ -155,24 +154,112 @@ pub(crate) struct OpEntry {
     /// A multi-CQE op's [`InlineFold`]: its CQEs are folded into
     /// `slots` instead of queued there.
     fold: Option<FoldFn>,
+    /// The entry's state bits ([`Self::LIVE`] and friends), packed so a
+    /// vacant entry is told apart in the line itself and the flags are
+    /// one store at insert.
+    flags: u8,
+}
+
+impl OpEntry {
+    /// The entry is held by an op (or a sync submission); a clear bit is
+    /// a vacant entry on the slab's free list.
+    const LIVE: u8 = 1 << 0;
     /// The terminal CQE (no `IORING_CQE_F_MORE`) has been reaped; no
     /// more completions are coming for this entry.
-    terminated: bool,
+    const TERMINATED: u8 = 1 << 1;
     /// The owning future was dropped; the reaper frees the entry on the
     /// terminal CQE.
-    orphaned: bool,
+    const ORPHANED: u8 = 1 << 2;
     /// This op is a ublk io command (FETCH_REQ/COMMIT_AND_FETCH_REQ/...)
     /// whose completion the queue-state accounting must observe.
-    is_io_cmd: bool,
+    const IS_IO_CMD: u8 = 1 << 3;
     /// A sync-mode entry: no future is attached, and the handler word
     /// (legacy tag-encoded `user_data`, see [`Self::sync_data`]) is
     /// delivered to the sync event loop's handler in place of the
     /// on-ring slab key. The word lives in `slots`, which a sync entry
     /// never uses for results, so it costs no extra bytes.
-    is_sync: bool,
-}
+    const IS_SYNC: u8 = 1 << 4;
 
-impl OpEntry {
+    /// A vacant entry: nothing to drop, every flag clear.
+    const fn vacant() -> Self {
+        OpEntry {
+            waker: None,
+            resources: Resources::None,
+            slots: Slots { v: [0; 2], tag: 0 },
+            fold: None,
+            flags: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn is_live(&self) -> bool {
+        self.flags & Self::LIVE != 0
+    }
+
+    #[inline(always)]
+    fn terminated(&self) -> bool {
+        self.flags & Self::TERMINATED != 0
+    }
+
+    #[inline(always)]
+    fn orphaned(&self) -> bool {
+        self.flags & Self::ORPHANED != 0
+    }
+
+    #[inline(always)]
+    fn is_io_cmd(&self) -> bool {
+        self.flags & Self::IS_IO_CMD != 0
+    }
+
+    #[inline(always)]
+    fn is_sync(&self) -> bool {
+        self.flags & Self::IS_SYNC != 0
+    }
+
+    #[inline(always)]
+    fn set_orphaned(&mut self) {
+        self.flags |= Self::ORPHANED;
+    }
+
+    /// Take a vacant entry for an op: it is written in place, field by
+    /// field, rather than built on the stack and copied in. The copy
+    /// was the daemon's top user-space stall: the fresh entry's narrow
+    /// stores were re-read by the slab's 16-byte copy loads before they
+    /// had retired (a store-forwarding stall on every submit).
+    /// [`OpSlab::reclaim`] leaves a vacant entry clean (no waker, no
+    /// resources, no fold, flags clear), so only what this op sets is
+    /// stored. The result slots are the exception: they are reset whole
+    /// here, whatever the previous op left in them, because a fold
+    /// ([`TimeoutFold`], [`PollFold`]) reads a value slot before it
+    /// looks at the tag.
+    #[inline(always)]
+    fn init(&mut self, resources: Resources, is_io_cmd: bool) {
+        debug_assert!(!self.is_live());
+        debug_assert!(self.waker.is_none() && self.fold.is_none());
+        debug_assert!(matches!(self.resources, Resources::None));
+        self.resources = resources;
+        self.slots = Slots::default();
+        self.flags = Self::LIVE | if is_io_cmd { Self::IS_IO_CMD } else { 0 };
+    }
+
+    /// As [`Self::init`] for a sync-mode entry: the handler word rides
+    /// in the result slots, which such an entry never uses otherwise,
+    /// so a sync submission costs no more than an async one and the
+    /// entry stays one cache line.
+    #[inline(always)]
+    fn init_sync(&mut self, sync_data: u64, is_io_cmd: bool) {
+        self.init(Resources::None, is_io_cmd);
+        self.flags |= Self::IS_SYNC;
+        self.slots.v = [sync_data as i32, (sync_data >> 32) as i32];
+    }
+
+    #[cfg(test)]
+    fn new(resources: Resources, is_io_cmd: bool) -> Self {
+        let mut entry = Self::vacant();
+        entry.init(resources, is_io_cmd);
+        entry
+    }
+
     /// Release a completion nobody will consume. A discarded successful
     /// accept result is a live connection fd: dropping the value would
     /// leak it permanently (fd-table exhaustion under `select!`-style
@@ -197,37 +284,11 @@ impl OpEntry {
         }
     }
 
-    #[inline]
-    fn new(resources: Resources, is_io_cmd: bool) -> Self {
-        OpEntry {
-            waker: None,
-            resources,
-            slots: Slots::default(),
-            fold: None,
-            terminated: false,
-            orphaned: false,
-            is_io_cmd,
-            is_sync: false,
-        }
-    }
-
-    /// A sync-mode entry: the handler word rides in the result slots,
-    /// which such an entry never uses otherwise, so a sync submission
-    /// costs no more than an async one and the entry stays one cache
-    /// line.
-    #[inline]
-    fn new_sync(sync_data: u64, is_io_cmd: bool) -> Self {
-        let mut entry = Self::new(Resources::None, is_io_cmd);
-        entry.is_sync = true;
-        entry.slots.v = [sync_data as i32, (sync_data >> 32) as i32];
-        entry
-    }
-
-    /// The handler word of a sync-mode entry (see [`Self::new_sync`]),
+    /// The handler word of a sync-mode entry (see [`Self::init_sync`]),
     /// `None` for an op future's entry.
     #[inline]
     fn sync_data(&self) -> Option<u64> {
-        self.is_sync
+        self.is_sync()
             .then(|| (self.slots.v[0] as u32 as u64) | ((self.slots.v[1] as u32 as u64) << 32))
     }
 
@@ -265,9 +326,12 @@ impl OpEntry {
     /// should be woken.
     #[inline]
     fn deliver(&mut self, res: i32, flags: u32) -> bool {
-        self.terminated = !cqueue::more(flags);
+        let terminated = !cqueue::more(flags);
+        if terminated {
+            self.flags |= Self::TERMINATED;
+        }
         match self.fold {
-            Some(fold) => fold(&mut self.slots, res, flags, false) || self.terminated,
+            Some(fold) => fold(&mut self.slots, res, flags, false) || terminated,
             None => {
                 self.push_result(res);
                 true
@@ -278,8 +342,8 @@ impl OpEntry {
     /// One CQE for an orphaned entry, whose consumer is gone. A fold
     /// still sees it (flagged orphaned) so it can release what the CQE
     /// carries; any other op's terminal result is discarded.
-    /// Returns true on the terminal CQE: the caller must then remove the
-    /// entry and [`Self::discard_pending`] it.
+    /// Returns true on the terminal CQE: the caller must then
+    /// [`Self::discard_pending`] the entry and reclaim it.
     #[inline]
     fn absorb_orphaned(&mut self, res: i32, flags: u32) -> bool {
         let terminal = !cqueue::more(flags);
@@ -294,21 +358,22 @@ impl OpEntry {
     }
 }
 
-/// The op slab, wrapped so thread exit cannot free memory the kernel
-/// may still be using.
-struct OpSlab(Slab<OpEntry>);
-
-impl std::ops::Deref for OpSlab {
-    type Target = Slab<OpEntry>;
-    fn deref(&self) -> &Slab<OpEntry> {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for OpSlab {
-    fn deref_mut(&mut self) -> &mut Slab<OpEntry> {
-        &mut self.0
-    }
+/// The op slab: a table of [`OpEntry`] indexed by key, with a stack of
+/// vacant keys. Insert and release never move an entry: an op takes a
+/// vacant entry and writes it in place ([`OpEntry::init`]), and
+/// [`Self::reclaim`] cleans it in place and pushes its key, so no entry
+/// is ever built on the stack and copied in. The table itself does move:
+/// it only grows (to the thread's peak in-flight ops), and growing
+/// reallocates every entry, so nothing may keep a pointer into an entry
+/// -- anything an SQE references ([`Resources`]) is boxed. Thread exit
+/// must not free memory the kernel may still be using (see `Drop`).
+struct OpSlab {
+    entries: Vec<OpEntry>,
+    /// Vacant keys, most recently freed on top: the next insert reuses
+    /// the line that was just touched.
+    free: Vec<u32>,
+    /// Live entries.
+    len: usize,
 }
 
 /// What one op-slab CQE amounts to for the reaper that drained it.
@@ -333,6 +398,78 @@ struct OpCqe {
 }
 
 impl OpSlab {
+    const fn new() -> Self {
+        OpSlab {
+            entries: Vec::new(),
+            free: Vec::new(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: usize) -> bool {
+        self.entries.get(key).is_some_and(OpEntry::is_live)
+    }
+
+    /// The live entry under `key`, `None` for a key nobody holds.
+    #[inline]
+    fn get_mut(&mut self, key: usize) -> Option<&mut OpEntry> {
+        self.entries.get_mut(key).filter(|e| e.is_live())
+    }
+
+    /// Keys are minted here only, and must fit the free list's `u32` and
+    /// the handle's key field ([`Op::KEY_MASK`]): more live ops than
+    /// that on one thread is not a case to recover from, so growth past
+    /// the limit panics.
+    const MAX_KEY: usize = u32::MAX as usize;
+
+    /// Take a vacant entry (clean, see [`Self::reclaim`]) for the caller
+    /// to [`OpEntry::init`] in place; its key is the SQE's `user_data`.
+    #[inline(always)]
+    fn alloc(&mut self) -> (usize, &mut OpEntry) {
+        self.len += 1;
+        let key = match self.free.pop() {
+            Some(key) => key as usize,
+            None => {
+                let key = self.entries.len();
+                assert!(key <= Self::MAX_KEY, "op slab key space exhausted");
+                self.entries.push(OpEntry::vacant());
+                key
+            }
+        };
+        let entry = &mut self.entries[key];
+        debug_assert!(!entry.is_live());
+        (key, entry)
+    }
+
+    /// Release the live entry under `key`, handing back its resources.
+    /// The entry is left clean for its next [`OpEntry::init`]: no waker,
+    /// no resources, no fold, flags clear. The result slots are not
+    /// touched: `init` rewrites them whole, and nothing reads a vacant
+    /// entry's slots ([`Self::get_mut`] filters on `LIVE`).
+    #[inline(always)]
+    fn reclaim(&mut self, key: usize) -> Resources {
+        let entry = &mut self.entries[key];
+        debug_assert!(entry.is_live());
+        entry.waker = None;
+        entry.fold = None;
+        entry.flags = 0;
+        let resources = std::mem::replace(&mut entry.resources, Resources::None);
+        self.free.push(key as u32);
+        self.len -= 1;
+        resources
+    }
+
     /// Hand one CQE to the entry under `key`: a sync-mode entry yields
     /// its handler word; a live op entry takes it ([`OpEntry::deliver`]);
     /// an orphaned one absorbs it. Both a sync-mode and an orphaned entry
@@ -347,10 +484,10 @@ impl OpSlab {
             debug_assert!(false, "CQE for unknown op {}", key);
             return None;
         };
-        let is_io_cmd = entry.is_io_cmd;
+        let is_io_cmd = entry.is_io_cmd();
         if let Some(data) = entry.sync_data() {
             if !cqueue::more(flags) {
-                self.remove(key);
+                self.reclaim(key);
             }
             return Some(OpCqe {
                 sync_data: Some(data),
@@ -359,9 +496,10 @@ impl OpSlab {
                 waker: None,
             });
         }
-        if entry.orphaned {
+        if entry.orphaned() {
             if entry.absorb_orphaned(res, flags) {
-                self.remove(key).discard_pending();
+                entry.discard_pending();
+                self.reclaim(key);
             }
             return Some(OpCqe {
                 sync_data: None,
@@ -395,18 +533,18 @@ impl Drop for OpSlab {
         // safe code (drop a pending recv's future, return from
         // block_on, let the thread exit). Leak them instead: bounded by
         // what was genuinely in flight, and sound.
-        if !self.0.is_empty() {
+        if !self.is_empty() {
             log::warn!(
                 "thread exiting with {} ops in flight: leaking their buffers",
-                self.0.len()
+                self.len()
             );
-            std::mem::forget(std::mem::take(&mut self.0));
+            std::mem::forget(std::mem::take(&mut self.entries));
         }
     }
 }
 
 std::thread_local! {
-    static OP_SLAB: RefCell<OpSlab> = const { RefCell::new(OpSlab(Slab::new())) };
+    static OP_SLAB: RefCell<OpSlab> = const { RefCell::new(OpSlab::new()) };
 }
 
 /// Run `f` on this thread's value of `key`.
@@ -469,16 +607,28 @@ fn push_ctrl_sqe(sqe: &squeue::Entry128) -> Result<(), UblkError> {
     crate::ctrl::with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| push_sqe(r, sqe))
 }
 
-#[inline]
+/// Take an entry for an op and write it in place. Kept `inline(always)`
+/// up through [`Op::submit_on`], so that once the `#[inline]` submitters
+/// above it are inlined into their caller (which the hot paths are) the
+/// `Resources::None` literal folds into a discriminant store instead of
+/// a 24-byte enum copied through the stack.
+#[inline(always)]
 fn insert_entry(resources: Resources, is_io_cmd: bool) -> usize {
-    with_slab(|slab| slab.borrow_mut().insert(OpEntry::new(resources, is_io_cmd)))
+    with_slab(|slab| {
+        let mut slab = slab.borrow_mut();
+        let (key, entry) = slab.alloc();
+        entry.init(resources, is_io_cmd);
+        key
+    })
 }
 
-#[inline]
+#[inline(always)]
 fn insert_sync(sync_data: u64, is_io_cmd: bool) -> usize {
     with_slab(|slab| {
-        slab.borrow_mut()
-            .insert(OpEntry::new_sync(sync_data, is_io_cmd))
+        let mut slab = slab.borrow_mut();
+        let (key, entry) = slab.alloc();
+        entry.init_sync(sync_data, is_io_cmd);
+        key
     })
 }
 
@@ -495,7 +645,7 @@ pub(crate) fn submit_sync(
 ) -> Result<(), UblkError> {
     let key = insert_sync(sync_data, is_io_cmd);
     if let Err(e) = push_queue_sqe(&build(key as u64)) {
-        with_slab(|slab| slab.borrow_mut().remove(key));
+        with_slab(|slab| slab.borrow_mut().reclaim(key));
         return Err(e);
     }
     Ok(())
@@ -539,7 +689,7 @@ type ThreadLocalOp = std::marker::PhantomData<*const ()>;
 impl Op {
     /// Reserve a slab entry, then build-and-push the SQE with the entry's
     /// key as `user_data`; the entry is reclaimed if the push fails.
-    #[inline]
+    #[inline(always)]
     fn submit_on(
         ring: OpRing,
         resources: Resources,
@@ -548,7 +698,7 @@ impl Op {
     ) -> Result<Op, UblkError> {
         let key = insert_entry(resources, is_io_cmd);
         if let Err(e) = build_and_push(key as u64) {
-            with_slab(|slab| slab.borrow_mut().remove(key));
+            with_slab(|slab| slab.borrow_mut().reclaim(key));
             return Err(e);
         }
         Ok(Op {
@@ -606,10 +756,11 @@ impl Op {
             entry.first_result()?;
             // Control commands are all single-completion uring_cmds, so
             // unlike poll_single this path needs no multi-CQE fallback.
-            debug_assert!(entry.terminated, "multi-CQE ctrl cmd");
-            let entry = slab.remove(self.key);
+            debug_assert!(entry.terminated(), "multi-CQE ctrl cmd");
+            let result = entry.first_result();
+            slab.reclaim(self.key);
             self.done = true;
-            entry.first_result()
+            result
         })
     }
 
@@ -636,9 +787,8 @@ impl Op {
                 }
                 Some(result) => {
                     self.done = true;
-                    if entry.terminated {
-                        let entry = slab.remove(self.key);
-                        Poll::Ready((result, entry.resources))
+                    if entry.terminated() {
+                        Poll::Ready((result, slab.reclaim(self.key)))
                     } else {
                         // A multi-CQE SQE (send_zc, multishot) was
                         // submitted through the single-shot path — a
@@ -659,7 +809,7 @@ impl Op {
                         // entry, or reclaiming the entry would discard it
                         // again (closing a delivered fd).
                         entry.pop_result();
-                        entry.orphaned = true;
+                        entry.set_orphaned();
                         entry.waker = None;
                         Poll::Ready((result, Resources::None))
                     }
@@ -686,14 +836,14 @@ fn orphan_entry(ring: OpRing, key: usize) {
         let Some(entry) = slab.get_mut(key) else {
             return true;
         };
-        if entry.terminated {
+        if entry.terminated() {
             // Result already reaped but never consumed (future dropped
             // after completion, before its final poll).
-            let mut entry = slab.remove(key);
             entry.discard_pending();
+            slab.reclaim(key);
             return true;
         }
-        entry.orphaned = true;
+        entry.set_orphaned();
         entry.waker = None;
         false
     });
@@ -751,11 +901,11 @@ impl<F: InlineFold> MultiOp<F> {
     ) -> Result<Self, UblkError> {
         let resources = ts.map_or(Resources::None, Resources::Timespec);
         let (key, ts_ptr) = with_slab(|slab| {
-            let mut entry = OpEntry::new(resources, false);
-            entry.fold = Some(F::on_cqe);
             let mut slab = slab.borrow_mut();
-            let key = slab.insert(entry);
-            let ts_ptr = match &slab[key].resources {
+            let (key, entry) = slab.alloc();
+            entry.init(resources, false);
+            entry.fold = Some(F::on_cqe);
+            let ts_ptr = match &entry.resources {
                 Resources::Timespec(ts) => Some(&**ts as *const io_uring::types::Timespec),
                 _ => None,
             };
@@ -767,7 +917,7 @@ impl<F: InlineFold> MultiOp<F> {
         // the kernel reads it when it prepares the SQE.
         let sqe = build(key as u64, ts_ptr.map(|ts| unsafe { &*ts }));
         if let Err(e) = push_queue_sqe(&sqe) {
-            with_slab(|slab| slab.borrow_mut().remove(key));
+            with_slab(|slab| slab.borrow_mut().reclaim(key));
             return Err(e);
         }
         Ok(MultiOp {
@@ -796,8 +946,8 @@ impl<F: InlineFold> MultiOp<F> {
             if let Some(item) = take(&mut entry.slots) {
                 return Poll::Ready(Some(item));
             }
-            if entry.terminated {
-                slab.remove(self.key);
+            if entry.terminated() {
+                slab.reclaim(self.key);
                 self.done = true;
                 return Poll::Ready(None);
             }
@@ -1107,12 +1257,13 @@ mod tests {
     fn op_entry_is_one_cache_line() {
         assert_eq!(std::mem::size_of::<OpEntry>(), 64);
         assert_eq!(std::mem::align_of::<OpEntry>(), 64);
-        let mut slab: Slab<OpEntry> = Slab::with_capacity(4);
-        let a = slab.insert(blank_entry());
-        let b = slab.insert(blank_entry());
-        let stride = (&slab[b] as *const OpEntry as usize) - (&slab[a] as *const OpEntry as usize);
+        let mut slab = OpSlab::new();
+        let (a, _) = slab.alloc();
+        let (b, _) = slab.alloc();
+        let stride = (&slab.entries[b] as *const OpEntry as usize)
+            - (&slab.entries[a] as *const OpEntry as usize);
         assert_eq!(stride, 64);
-        assert_eq!(&slab[a] as *const OpEntry as usize % 64, 0);
+        assert_eq!(&slab.entries[a] as *const OpEntry as usize % 64, 0);
     }
 
     /// The two inline result slots hand results back in arrival order,
@@ -1181,7 +1332,7 @@ mod tests {
         let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         assert!(fd >= 0);
         let key = insert_entry(Resources::ResultFd, false);
-        with_slab(|slab| slab.borrow_mut()[key].push_result(fd));
+        with_slab(|slab| slab.borrow_mut().get_mut(key).unwrap().push_result(fd));
         let mut op = Op {
             ring: OpRing::Queue,
             key,
