@@ -681,9 +681,12 @@ pub(crate) fn take_sync_entry(key: usize, result: i32, flags: u32) -> (Option<u6
 /// Dropping it before completion orphans the slab entry and issues a
 /// best-effort ASYNC_CANCEL on the ring it was submitted on.
 pub(crate) struct Op {
-    ring: OpRing,
-    key: usize,
-    done: bool,
+    /// `key | ring << 32 | done << 33`: one word, so an op is returned
+    /// in a register and any copy of it is a single load. As three
+    /// fields it was written with narrow stores and then moved into the
+    /// awaiting frame with one 16-byte load, a store-forwarding stall on
+    /// every submit that was the io task's hottest instruction.
+    bits: u64,
     _local: ThreadLocalOp,
 }
 
@@ -695,6 +698,48 @@ pub(crate) struct Op {
 type ThreadLocalOp = std::marker::PhantomData<*const ()>;
 
 impl Op {
+    const KEY_MASK: u64 = u32::MAX as u64;
+    const RING_CTRL: u64 = 1 << 32;
+    const DONE: u64 = 1 << 33;
+
+    /// `key` was minted by [`OpSlab::alloc`], which guarantees it fits
+    /// [`Self::KEY_MASK`].
+    #[inline(always)]
+    fn new(ring: OpRing, key: usize) -> Self {
+        let ring = match ring {
+            OpRing::Queue => 0,
+            OpRing::Ctrl => Self::RING_CTRL,
+        };
+        Op {
+            bits: key as u64 | ring,
+            _local: std::marker::PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    fn key(&self) -> usize {
+        (self.bits & Self::KEY_MASK) as usize
+    }
+
+    #[inline(always)]
+    fn ring(&self) -> OpRing {
+        if self.bits & Self::RING_CTRL != 0 {
+            OpRing::Ctrl
+        } else {
+            OpRing::Queue
+        }
+    }
+
+    #[inline(always)]
+    fn done(&self) -> bool {
+        self.bits & Self::DONE != 0
+    }
+
+    #[inline(always)]
+    fn set_done(&mut self) {
+        self.bits |= Self::DONE;
+    }
+
     /// Reserve a slab entry, then build-and-push the SQE with the entry's
     /// key as `user_data`; the entry is reclaimed if the push fails.
     #[inline(always)]
@@ -709,12 +754,7 @@ impl Op {
             with_slab(|slab| slab.borrow_mut().reclaim(key));
             return Err(e);
         }
-        Ok(Op {
-            ring,
-            key,
-            done: false,
-            _local: std::marker::PhantomData,
-        })
+        Ok(Op::new(ring, key))
     }
 
     /// Submit an SQE built by `build` (which receives the `user_data` key)
@@ -757,17 +797,17 @@ impl Op {
     /// blocking control-command path, which drives the ring itself
     /// instead of parking an executor.
     pub(crate) fn try_take_result(&mut self) -> Option<i32> {
-        assert!(!self.done, "op polled after completion");
+        assert!(!self.done(), "op polled after completion");
         with_slab(|slab| {
             let mut slab = slab.borrow_mut();
-            let entry = slab.get_mut(self.key).expect("op entry vanished");
+            let entry = slab.get_mut(self.key()).expect("op entry vanished");
             entry.first_result()?;
             // Control commands are all single-completion uring_cmds, so
             // unlike poll_single this path needs no multi-CQE fallback.
             debug_assert!(entry.terminated(), "multi-CQE ctrl cmd");
             let result = entry.first_result();
-            slab.reclaim(self.key);
-            self.done = true;
+            slab.reclaim(self.key());
+            self.set_done();
             result
         })
     }
@@ -775,10 +815,10 @@ impl Op {
     /// Poll for the single completion, handing back the kept resources.
     #[inline]
     pub(crate) fn poll_single(&mut self, cx: &mut Context<'_>) -> Poll<(i32, Resources)> {
-        assert!(!self.done, "op polled after completion");
+        assert!(!self.done(), "op polled after completion");
         with_slab(|slab| {
             let mut slab = slab.borrow_mut();
-            let entry = slab.get_mut(self.key).expect("op entry vanished");
+            let entry = slab.get_mut(self.key()).expect("op entry vanished");
             match entry.first_result() {
                 None => {
                     // Only clone the waker when the stored one would not
@@ -794,9 +834,9 @@ impl Op {
                     Poll::Pending
                 }
                 Some(result) => {
-                    self.done = true;
+                    self.set_done();
                     if entry.terminated() {
-                        Poll::Ready((result, slab.reclaim(self.key)))
+                        Poll::Ready((result, slab.reclaim(self.key())))
                     } else {
                         // A multi-CQE SQE (send_zc, multishot) was
                         // submitted through the single-shot path — a
@@ -811,7 +851,7 @@ impl Op {
                         log::error!(
                             "op {}: multi-CQE sqe awaited through single-shot Op; \
                              later completions are dropped",
-                            self.key
+                            self.key()
                         );
                         // The consumer owns `result` now: take it out of the
                         // entry, or reclaiming the entry would discard it
@@ -829,8 +869,8 @@ impl Op {
 
 impl Drop for Op {
     fn drop(&mut self) {
-        if !self.done {
-            orphan_entry(self.ring, self.key);
+        if !self.done() {
+            orphan_entry(self.ring(), self.key());
         }
     }
 }
@@ -1341,12 +1381,7 @@ mod tests {
         assert!(fd >= 0);
         let key = insert_entry(Resources::ResultFd, false);
         with_slab(|slab| slab.borrow_mut().get_mut(key).unwrap().push_result(fd));
-        let mut op = Op {
-            ring: OpRing::Queue,
-            key,
-            done: false,
-            _local: std::marker::PhantomData,
-        };
+        let mut op = Op::new(OpRing::Queue, key);
         let waker = testing::noop_waker();
         let mut cx = Context::from_waker(&waker);
         match op.poll_single(&mut cx) {
