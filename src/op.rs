@@ -237,7 +237,15 @@ impl OpEntry {
         debug_assert!(!self.is_live());
         debug_assert!(self.waker.is_none() && self.fold.is_none());
         debug_assert!(matches!(self.resources, Resources::None));
-        self.resources = resources;
+        // A vacant entry already holds `Resources::None`, and the ublk
+        // command and raw-op submitters pass that literal: matching on
+        // it lets the inlined path drop the write altogether. Assigning
+        // unconditionally made LLVM materialize the 24-byte enum on the
+        // stack and copy it in with 16-byte loads, which re-created the
+        // store-forwarding stall this in-place init exists to remove.
+        if !matches!(resources, Resources::None) {
+            self.resources = resources;
+        }
         self.slots = Slots::default();
         self.flags = Self::LIVE | if is_io_cmd { Self::IS_IO_CMD } else { 0 };
     }
