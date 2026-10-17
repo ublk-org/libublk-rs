@@ -207,7 +207,7 @@ pub use batch::{UblkBatchBuffers, UblkBatchCompletion, UblkBatchConfig, UblkBatc
 // Thread-local queue ring using OnceCell for conditional initialization
 std::thread_local! {
     pub(crate) static QUEUE_RING: OnceCell<RefCell<IoUring<squeue::Entry>>> =
-        OnceCell::new();
+        const { OnceCell::new() };
     static DEFERRED_QUEUE_CQES: RefCell<VecDeque<cqueue::Entry>> =
         const { RefCell::new(VecDeque::new()) };
 
@@ -258,37 +258,52 @@ pub(crate) fn pop_deferred_queue_cqe() -> Option<cqueue::Entry> {
 /// Account `cnt` completed io commands against the thread's registered
 /// queue state; `aborted` marks the queue as stopping. Called from the
 /// runtime park hook when reaping io-command CQEs.
+#[inline]
 pub(crate) fn update_queue_state(cnt: u32, aborted: bool) {
-    QUEUE_STATE.with(|cell| {
+    // Inlined TLS access (see `op::with_local`): this runs on every reap.
+    crate::op::with_local(&QUEUE_STATE, |cell| {
         if let Some(state) = cell.borrow().as_ref() {
             state.borrow_mut().account_io_cmds(cnt, aborted);
         }
     })
 }
 
+/// Run `f` on this thread's queue ring cell, `None` if no ring has been
+/// set up.
+///
+/// Only the address is fetched through `LocalKey::with`, which keeps the
+/// TLS access inlined into every caller; see `op::with_local`.
+#[inline(always)]
+pub(crate) fn with_queue_ring_cell<R>(
+    f: impl FnOnce(Option<&RefCell<IoUring<squeue::Entry>>>) -> R,
+) -> R {
+    // `#[inline(always)]`: without it LLVM leaves this closure (and the
+    // caller's `f` inlined into it) out of line, which puts the call and
+    // prologue this helper exists to avoid back on every SQE push.
+    crate::op::with_local(&QUEUE_RING, #[inline(always)] |cell| f(cell.get()))
+}
+
 // Internal macro versions for backwards compatibility within the crate
 macro_rules! with_queue_ring_internal {
     ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
+        $crate::io::with_queue_ring_cell(|cell| match cell {
+            Some(ring_cell) => {
                 let ring = ring_cell.borrow();
                 $closure(&*ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
             }
+            None => panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue."),
         })
     };
 }
 
 macro_rules! with_queue_ring_mut_internal {
     ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
+        $crate::io::with_queue_ring_cell(|cell| match cell {
+            Some(ring_cell) => {
                 let mut ring = ring_cell.borrow_mut();
                 $closure(&mut *ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
             }
+            None => panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue."),
         })
     };
 }
@@ -725,6 +740,21 @@ impl<'a> UblkIOCtx<'a> {
     #[inline(always)]
     pub fn is_tgt_io(&self) -> bool {
         Self::is_target_io(self.1)
+    }
+
+    /// Raw `IORING_CQE_F_*` flags of this CQE, e.g. to tell a `SEND_ZC`
+    /// notification (`IORING_CQE_F_NOTIF`) from the send result.
+    #[inline(always)]
+    pub fn cqe_flags(&self) -> u32 {
+        self.0.flags()
+    }
+
+    /// If the SQE behind this CQE will post more CQEs
+    /// (`IORING_CQE_F_MORE`): the IO closure runs once for each CQE of a
+    /// multishot or `SEND_ZC` SQE, and this is false only for the last.
+    #[inline(always)]
+    pub fn has_more(&self) -> bool {
+        cqueue::more(self.0.flags())
     }
 
     /// if this IO represented by CQE is the last one in current batch
@@ -2309,6 +2339,10 @@ impl UblkQueue {
     /// target bit set); it is delivered back to the IO closure via
     /// `UblkIOCtx::user_data()` when the CQE arrives, while the on-ring
     /// `user_data` is a slab key owned by the op layer.
+    ///
+    /// An SQE that posts several CQEs (multishot, `SEND_ZC`) invokes the
+    /// IO closure once per CQE, each time with the same `data`;
+    /// [`UblkIOCtx::has_more`] is false for the last one.
     #[inline]
     pub fn ublk_submit_sqe_sync(
         &self,
@@ -2976,7 +3010,7 @@ impl UblkQueue {
                 crate::op::CqeOwner::Target => (Some(user_data), false, false),
                 crate::op::CqeOwner::Sentinel => (None, false, false),
                 crate::op::CqeOwner::Op(key) => {
-                    crate::op::take_sync_entry(key, cqe.result(), cqueue::more(cqe.flags()))
+                    crate::op::take_sync_entry(key, cqe.result(), cqe.flags())
                 }
             };
             // Account io-command completions whether or not the entry
@@ -3076,6 +3110,40 @@ mod user_data_tests {
             UblkIOCtx::build_user_data(0, 0, 0x0100, false),
             UblkIOCtx::build_user_data(0, 0, 0x0200, false),
         );
+    }
+
+    /// The sync IO closure runs once per CQE of a multi-CQE SQE, and
+    /// the CQE flags are the only way to tell those calls apart.
+    #[test]
+    fn io_ctx_exposes_cqe_flags() {
+        use io_uring::types::{TimeoutFlags, Timespec};
+
+        let mut ring = io_uring::IoUring::new(4).unwrap();
+        let ts = Timespec::new().nsec(100_000);
+        let sqe = io_uring::opcode::Timeout::new(&ts)
+            .count(2)
+            .flags(TimeoutFlags::MULTISHOT)
+            .build();
+        unsafe { ring.submission().push(&sqe).unwrap() };
+        let mut cqes: Vec<io_uring::cqueue::Entry> = Vec::new();
+        loop {
+            ring.submit_and_wait(1).unwrap();
+            cqes.extend(ring.completion());
+            if !io_uring::cqueue::more(cqes.last().unwrap().flags()) {
+                break;
+            }
+        }
+        if cqes[0].result() == -libc::EINVAL {
+            return; // no IORING_TIMEOUT_MULTISHOT before Linux 6.4
+        }
+        assert_eq!(cqes.len(), 2);
+
+        let first = UblkIOCtx(&cqes[0], 0, 0);
+        assert!(first.has_more());
+        assert_eq!(first.cqe_flags(), cqes[0].flags());
+        let last = UblkIOCtx(&cqes[1], 0, 0);
+        assert!(!last.has_more());
+        assert_eq!(last.cqe_flags(), cqes[1].flags());
     }
 }
 

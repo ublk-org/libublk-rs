@@ -33,6 +33,7 @@ bitflags! {
         const ONESHOT = 0b00001000;
         const MLOCK = 0b00010000;
         const SEQ_TAGS = 0b00100000;
+        const ZERO_COPY = 0b01000000;
     }
 }
 
@@ -130,6 +131,22 @@ fn __lo_prep_submit_io_cmd(iod: &libublk::sys::ublksrv_io_desc) -> i32 {
     };
 }
 
+/// Per-tag `ublk_auto_buf_reg` for `UBLK_F_AUTO_BUF_REG` zero copy: the
+/// request's pages are registered as fixed buffer `tag` of the io thread's
+/// ring while the io is in flight, so the backing-file op addresses them
+/// through `ReadFixed`/`WriteFixed` with a null pointer and never touches
+/// a copy. No `UBLK_AUTO_BUF_REG_FALLBACK`: this target has no way to serve
+/// an io without a buffer, so let the kernel fail the request itself when
+/// registration fails instead of delivering it with `UBLK_IO_F_NEED_REG_BUF`.
+#[inline]
+fn lo_auto_buf_reg(tag: u16) -> libublk::sys::ublk_auto_buf_reg {
+    libublk::sys::ublk_auto_buf_reg {
+        index: tag,
+        flags: 0,
+        ..Default::default()
+    }
+}
+
 #[inline]
 fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_uring::squeue::Entry {
     match op {
@@ -149,19 +166,55 @@ fn __lo_make_io_sqe(op: u32, off: u64, bytes: u32, buf_addr: *mut u8) -> io_urin
     }
 }
 
-/// Handle I/O operations asynchronously using slice-based buffer management.
+/// Zero-copy variant of [`__lo_make_io_sqe`]: data ops go through the
+/// auto-registered fixed buffer `buf_index` (== tag) instead of a user
+/// buffer.
+#[inline]
+fn __lo_make_io_sqe_zc(op: u32, off: u64, bytes: u32, buf_index: u16) -> io_uring::squeue::Entry {
+    match op {
+        libublk::sys::UBLK_IO_OP_FLUSH => opcode::SyncFileRange::new(types::Fixed(1), bytes)
+            .offset(off)
+            .build()
+            .flags(squeue::Flags::FIXED_FILE),
+        libublk::sys::UBLK_IO_OP_READ => {
+            opcode::ReadFixed::new(types::Fixed(1), std::ptr::null_mut(), bytes, buf_index)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+        }
+        libublk::sys::UBLK_IO_OP_WRITE => {
+            opcode::WriteFixed::new(types::Fixed(1), std::ptr::null(), bytes, buf_index)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+        }
+        _ => panic!(),
+    }
+}
+
+/// Handle I/O operations asynchronously.
+///
+/// `io_buf` is this tag's `IoBuf` slice in the copy modes, or `None` under
+/// `UBLK_F_AUTO_BUF_REG` zero copy, where the request pages are already
+/// registered as fixed buffer `tag` and the op addresses them by index.
 ///
 /// This function demonstrates slice-based async I/O patterns for educational purposes:
-/// - Uses safe slice access instead of raw pointer manipulation  
+/// - Uses safe slice access instead of raw pointer manipulation
 /// - Leverages IoBuf's slice methods for memory safety
 /// - Shows when slice-to-pointer conversion is necessary for libublk API calls
 /// - Maintains async/await patterns for high-performance I/O
-async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_slice: &mut [u8]) -> i32 {
+async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_buf: Option<&mut [u8]>) -> i32 {
     let iod = q.get_iod(tag);
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
         return res;
     }
+
+    // Convert to a raw pointer once, only because the raw ops need one.
+    let (zc, buf_addr) = match io_buf {
+        Some(slice) => (false, slice.as_mut_ptr()),
+        None => (true, std::ptr::null_mut()),
+    };
 
     for _ in 0..4 {
         let op = iod.op_flags & 0xff;
@@ -172,10 +225,17 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_slice: &mut [u8]) ->
         // Backing-file IO through the typed op catalog; the file is
         // registered as fixed file 1 at target init.
         // SAFETY: the raw ops reference this tag's queue-slot buffer,
-        // which outlives the queue.
-        let buf_addr = io_slice.as_mut_ptr();
+        // which outlives the queue; the fixed ops reference the
+        // auto-registered slot `tag`, which the kernel keeps registered
+        // until this io is committed.
         let f = match op {
             libublk::sys::UBLK_IO_OP_FLUSH => ops::sync_file_range(TgtFd::Fixed(1), off, bytes, 0),
+            libublk::sys::UBLK_IO_OP_READ if zc => unsafe {
+                ops::read_at_fixed(TgtFd::Fixed(1), tag, std::ptr::null_mut(), bytes, off)
+            },
+            libublk::sys::UBLK_IO_OP_WRITE if zc => unsafe {
+                ops::write_at_fixed(TgtFd::Fixed(1), tag, std::ptr::null(), bytes, off)
+            },
             libublk::sys::UBLK_IO_OP_READ => unsafe {
                 ops::read_at_raw(TgtFd::Fixed(1), buf_addr, bytes, off)
             },
@@ -198,10 +258,21 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_slice: &mut [u8]) ->
 
 /// Handle I/O operations synchronously (for comparison with async slice patterns).
 ///
+/// `buf_desc` is what FETCH/COMMIT carry for this tag (`Slice` in copy
+/// mode, `AutoReg` under zero copy); `io_slice` is the tag's buffer in
+/// copy mode and `None` under zero copy, where the SQE addresses fixed
+/// buffer `tag` instead.
+///
 /// Note: This sync handler still uses raw pointers as it follows the traditional
 /// synchronous I/O pattern. The async handler above demonstrates the preferred
 /// slice-based approach for new implementations.
-fn lo_handle_io_cmd_sync(q: &UblkQueue, tag: u16, i: &UblkIOCtx, io_slice: &[u8]) {
+fn lo_handle_io_cmd_sync(
+    q: &UblkQueue,
+    tag: u16,
+    i: &UblkIOCtx,
+    buf_desc: BufDesc,
+    io_slice: Option<&[u8]>,
+) {
     let iod = q.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let data = UblkIOCtx::build_user_data(tag as u16, op, 0, true);
@@ -213,27 +284,30 @@ fn lo_handle_io_cmd_sync(q: &UblkQueue, tag: u16, i: &UblkIOCtx, io_slice: &[u8]
         assert!(cqe_tag == tag as u32);
 
         if res != -(libc::EAGAIN) {
-            q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), res)
-                .unwrap();
+            q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
             return;
         }
     }
 
     let res = __lo_prep_submit_io_cmd(iod);
     if res < 0 {
-        q.complete_io_cmd_unified(tag, BufDesc::Slice(io_slice), res)
-            .unwrap();
+        q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
     } else {
         let op = iod.op_flags & 0xff;
         // either start to handle or retry
         let off = (iod.start_sector << 9) as u64;
         let bytes = (iod.nr_sectors << 9) as u32;
-        let sqe = __lo_make_io_sqe(op, off, bytes, io_slice.as_ptr() as *mut u8);
+        let sqe = match io_slice {
+            Some(slice) => __lo_make_io_sqe(op, off, bytes, slice.as_ptr() as *mut u8),
+            None => __lo_make_io_sqe_zc(op, off, bytes, tag),
+        };
         q.ublk_submit_sqe_sync(sqe, data).unwrap();
     }
 }
 
-fn q_fn(qid: u16, dev: &Arc<UblkDev>) {
+/// Sync queue handler, copy mode: one `IoBuf` per tag, registered with
+/// FETCH so the kernel copies request data in and out of it.
+fn q_fn_buf(qid: u16, dev: &Arc<UblkDev>) {
     let bufs_rc = Rc::new(dev.alloc_queue_io_bufs());
     let bufs = bufs_rc.clone();
 
@@ -248,7 +322,7 @@ fn q_fn(qid: u16, dev: &Arc<UblkDev>) {
         // Convert to raw pointer only when required by legacy sync handler API
         // This demonstrates the pattern: use slices for safety, convert to pointers
         // only when absolutely necessary for API compatibility
-        lo_handle_io_cmd_sync(q, tag, io, &io_slice);
+        lo_handle_io_cmd_sync(q, tag, io, BufDesc::Slice(io_slice), Some(io_slice));
     };
 
     let queue = match UblkQueue::new(qid, dev)
@@ -265,7 +339,47 @@ fn q_fn(qid: u16, dev: &Arc<UblkDev>) {
     queue.wait_and_handle_io(lo_io_handler);
 }
 
-async fn lo_io_task(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
+/// Sync queue handler, `UBLK_F_AUTO_BUF_REG` zero copy: no io buffers
+/// at all; FETCH carries a per-tag `ublk_auto_buf_reg` and each request's
+/// pages show up as fixed buffer `tag` of this thread's ring.
+fn q_fn_zc(qid: u16, dev: &Arc<UblkDev>) {
+    let auto_buf_reg_list_rc = Rc::new(
+        (0..dev.dev_info.queue_depth)
+            .map(lo_auto_buf_reg)
+            .collect::<Vec<_>>(),
+    );
+
+    let auto_buf_reg_list = auto_buf_reg_list_rc.clone();
+    let lo_io_handler = move |q: &UblkQueue, tag: u16, io: &UblkIOCtx| {
+        let buf_desc = BufDesc::AutoReg(auto_buf_reg_list[tag as usize]);
+        lo_handle_io_cmd_sync(q, tag, io, buf_desc, None);
+    };
+
+    let queue = match UblkQueue::new(qid, dev)
+        .unwrap()
+        .submit_fetch_commands_unified(BufDescList::AutoRegs(&auto_buf_reg_list_rc))
+    {
+        Ok(q) => q,
+        Err(e) => {
+            log::error!("submit_fetch_commands_unified failed: {}", e);
+            return;
+        }
+    };
+
+    queue.wait_and_handle_io(lo_io_handler);
+}
+
+fn q_fn(qid: u16, dev: &Arc<UblkDev>) {
+    if (dev.dev_info.flags & libublk::sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+        q_fn_zc(qid, dev)
+    } else {
+        q_fn_buf(qid, dev)
+    }
+}
+
+/// Async per-tag task, copy mode: one `IoBuf` per tag, registered by the
+/// prep command, with the handler working on its slice.
+async fn lo_io_task_buf(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     // Use IoBuf for safe I/O buffer management with automatic memory alignment
     let mut buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
@@ -279,11 +393,33 @@ async fn lo_io_task(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
         // IoBuf's as_mut_slice() provides bounds-checked access eliminating
         // the need for unsafe pointer operations in the I/O handler
         let io_slice = buf.as_mut_slice();
-        let res = lo_handle_io_cmd_async(&q, tag, io_slice).await;
+        let res = lo_handle_io_cmd_async(&q, tag, Some(io_slice)).await;
 
         // Any error (including QueueIsDown) will break the loop by exiting the function
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buf.as_slice()), res)
             .await?;
+    }
+}
+
+/// Async per-tag task, `UBLK_F_AUTO_BUF_REG` zero copy: no buffer is
+/// allocated; prep/commit carry the tag's `ublk_auto_buf_reg` and the
+/// handler reads/writes the backing file through fixed buffer `tag`.
+async fn lo_io_task_zc(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
+    let buf_desc = BufDesc::AutoReg(lo_auto_buf_reg(tag));
+
+    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, None).await?;
+
+    loop {
+        let res = lo_handle_io_cmd_async(&q, tag, None).await;
+        q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;
+    }
+}
+
+async fn lo_io_task(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
+    if q.support_auto_buf_zc() {
+        lo_io_task_zc(q, tag).await
+    } else {
+        lo_io_task_buf(q, tag).await
     }
 }
 
@@ -305,6 +441,18 @@ fn __loop_add(
 ) {
     let aio = lo_flags.intersects(LoFlags::ASYNC);
     let oneshot = lo_flags.intersects(LoFlags::ONESHOT);
+    // Zero copy registers each request's pages as a fixed buffer of the
+    // io ring; there is no io buffer to lock, so the two are exclusive.
+    if lo_flags.contains(LoFlags::ZERO_COPY | LoFlags::MLOCK) {
+        eprintln!("--zero-copy and --mlock-io-buffer are mutually exclusive");
+        std::process::exit(1);
+    }
+    let ctrl_flags = ctrl_flags
+        | if lo_flags.intersects(LoFlags::ZERO_COPY) {
+            libublk::sys::UBLK_F_AUTO_BUF_REG as u64
+        } else {
+            0
+        };
     // LooTgt has to live in the whole device lifetime
     let lo = LoopTgt {
         back_file: std::fs::OpenOptions::new()
@@ -504,6 +652,17 @@ fn main() {
                         .short('m')
                         .action(ArgAction::SetTrue)
                         .help("enable UBLK_DEV_F_MLOCK_IO_BUFFER to lock IO buffers in memory"),
+                )
+                .arg(
+                    Arg::new("zero_copy")
+                        .long("zero-copy")
+                        .short('z')
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "enable zero copy via UBLK_F_AUTO_BUF_REG: backing-file IO \
+                             goes straight to the request pages through fixed buffers, \
+                             no per-tag io buffer (incompatible with -m)",
+                        ),
                 ),
         )
         .subcommand(
@@ -563,6 +722,9 @@ fn main() {
             }
             if add_matches.get_flag("seq_tags") {
                 lo_flags |= LoFlags::SEQ_TAGS;
+            }
+            if add_matches.get_flag("zero_copy") {
+                lo_flags |= LoFlags::ZERO_COPY;
             }
             let ctrl_flags: u64 = if add_matches.get_flag("unprivileged") {
                 libublk::sys::UBLK_F_UNPRIVILEGED_DEV as u64

@@ -42,9 +42,9 @@ use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
-use io_uring::{opcode, squeue, types};
+use io_uring::{cqueue, opcode, squeue, types};
 
-use crate::op::{MultiOp, Op, Resources};
+use crate::op::{InlineFold, MultiOp, Op, Resources, Slots};
 use crate::UblkError;
 
 /// A target IO's file: a raw fd, or an index into the queue ring's
@@ -318,6 +318,34 @@ pub fn poll_add(fd: TgtFd, events: u32) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(fd, |f| opcode::PollAdd::new(f, events).build()))
 }
 
+pub use crate::multishot::{MultishotItem, PollMulti, TimeoutMulti};
+
+/// Repeating timer via multishot `IORING_OP_TIMEOUT`
+/// (`IORING_TIMEOUT_MULTISHOT`, Linux 6.4+): fires every `interval`,
+/// `count` times (0: until the handle is dropped). Expiries are counted,
+/// so a slow consumer never makes anything queue up:
+///
+/// ```no_run
+/// # async fn f() -> Result<(), libublk::UblkError> {
+/// let mut t = libublk::ops::timeout_multi(std::time::Duration::from_millis(10), 0)?;
+/// while let Some(ticks) = t.next().await {
+///     let fired = ticks?; // expiries since the last iteration
+///     # let _ = fired;
+/// }
+/// # Ok(()) }
+/// ```
+pub fn timeout_multi(interval: Duration, count: u32) -> Result<TimeoutMulti, UblkError> {
+    TimeoutMulti::new(interval, count)
+}
+
+/// Keep watching `fd` for the given `poll(2)` event mask (multishot
+/// `IORING_OP_POLL_ADD`): unlike [`poll_add`], one submission reports
+/// readiness again and again until the handle is dropped. Wakeups that
+/// arrive between two `next()` calls are merged into one event mask.
+pub fn poll_multi(fd: TgtFd, events: u32) -> Result<PollMulti, UblkError> {
+    PollMulti::new(fd, events)
+}
+
 /// Future resolving to one accepted connection.
 pub struct Accept {
     op: RawOp,
@@ -502,15 +530,22 @@ const NOTIF_ZC_COPIED: i32 = 1 << 31;
 /// alternative: it only orphans the slab entry and issues a best-effort
 /// `ASYNC_CANCEL`, which cannot un-pin pages the kernel already holds,
 /// so the send may still be reading the buffer afterwards.
+///
+/// Not `Send`: the op lives in its thread's ring and slab.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<libublk::ops::SendZcOp>();
+/// ```
 pub struct SendZcOp {
-    op: MultiOp,
+    op: MultiOp<ZcFold>,
 }
 
 impl SendZcOp {
     /// Await the send CQE: bytes accepted into the socket, or a negative
     /// errno. Call once, before [`Self::into_notif`].
     pub async fn sent(&mut self) -> i32 {
-        std::future::poll_fn(|cx| self.op.poll_next(cx))
+        std::future::poll_fn(|cx| self.op.poll_with(cx, ZcFold::take_sent))
             .await
             // The result CQE always precedes termination; a bare
             // termination means the op was cancelled under teardown.
@@ -530,18 +565,54 @@ impl SendZcOp {
 /// kernel reports it copied the data rather than sending zero-copy
 /// (always the case on loopback).
 pub struct ZcNotif {
-    op: MultiOp,
+    op: MultiOp<ZcFold>,
 }
 
 impl Future for ZcNotif {
     type Output = bool;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut copied = false;
-        while let Some(result) = ready!(self.op.poll_next(cx)) {
-            copied = result & NOTIF_ZC_COPIED != 0;
+        let copied = ready!(self.op.poll_with(cx, ZcFold::take_copied));
+        // No notification at all: the send failed without pinning pages.
+        Poll::Ready(copied.unwrap_or(false))
+    }
+}
+
+/// A zero-copy send's two CQEs, told apart by what they are rather than
+/// by arrival order: the send result goes to slot 0, the notification
+/// (`IORING_CQE_F_NOTIF`) to slot 1.
+pub(crate) struct ZcFold;
+
+impl ZcFold {
+    const SENT: u8 = 1;
+    const NOTIF: u8 = 2;
+
+    pub(crate) fn take_sent(slots: &mut Slots) -> Option<i32> {
+        (slots.tag & Self::SENT != 0).then(|| {
+            slots.tag &= !Self::SENT;
+            slots.v[0]
+        })
+    }
+
+    pub(crate) fn take_copied(slots: &mut Slots) -> Option<bool> {
+        (slots.tag & Self::NOTIF != 0).then(|| {
+            slots.tag &= !Self::NOTIF;
+            slots.v[1] & NOTIF_ZC_COPIED != 0
+        })
+    }
+}
+
+impl InlineFold for ZcFold {
+    fn on_cqe(slots: &mut Slots, res: i32, flags: u32, _orphaned: bool) -> bool {
+        // Nothing to release when orphaned: neither CQE carries a resource.
+        if cqueue::notif(flags) {
+            slots.v[1] = res;
+            slots.tag |= Self::NOTIF;
+        } else {
+            slots.v[0] = res;
+            slots.tag |= Self::SENT;
         }
-        Poll::Ready(copied)
+        true
     }
 }
 
@@ -733,8 +804,10 @@ pub unsafe fn uring_cmd80_buf(
 ///
 /// The returned handle is single-shot: the SQE must produce exactly
 /// one completion. Do not submit multishot opcodes (`.multi(true)`
-/// poll/accept/recv) or two-CQE opcodes (`SendZc`/`SendMsgZc` — use
-/// [`send_zc`]/[`sendmsg_zc`]) through it: the first CQE resolves the
+/// poll/accept/recv, multishot timeouts -- use [`poll_multi`] /
+/// [`timeout_multi`]; multishot accept and recv are not supported) or
+/// two-CQE opcodes (`SendZc`/`SendMsgZc` — use [`send_zc`]/[`sendmsg_zc`])
+/// through it: the first CQE resolves the
 /// future and every later completion for the SQE is dropped (debug
 /// builds assert).
 ///
@@ -767,6 +840,93 @@ mod tests {
         let a = std::net::TcpStream::connect(addr).unwrap();
         let (b, _) = listener.accept().unwrap();
         (a, b)
+    }
+
+    /// A multishot timer under the real runtime: awaiting `next()` until
+    /// the end yields every tick exactly once, however the park hook
+    /// batches them.
+    #[test]
+    fn test_ops_timeout_multi() -> Result<(), UblkError> {
+        let rt = test_runtime()?;
+        let ticks = rt.block_on(async {
+            let mut t = timeout_multi(Duration::from_micros(200), 5)?;
+            let mut total = 0;
+            while let Some(item) = t.next().await {
+                total += item?;
+            }
+            Ok::<u32, UblkError>(total)
+        });
+        match ticks {
+            // No IORING_TIMEOUT_MULTISHOT before Linux 6.4.
+            Err(e) if e.errno() == -libc::EINVAL => Ok(()),
+            res => {
+                assert_eq!(res?, 5);
+                Ok(())
+            }
+        }
+    }
+
+    /// A multishot poll under the real runtime reports readiness of a
+    /// written eventfd, keeps reporting after more writes, and is
+    /// cancelled cleanly when dropped.
+    #[test]
+    fn test_ops_poll_multi() -> Result<(), UblkError> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let rt = test_runtime()?;
+        let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(efd >= 0);
+        let efd = unsafe { OwnedFd::from_raw_fd(efd) };
+        let write = |fd: &OwnedFd| {
+            let one: u64 = 1;
+            let n = unsafe { libc::write(fd.as_raw_fd(), &one as *const u64 as *const _, 8) };
+            assert_eq!(n, 8);
+        };
+        rt.block_on(async {
+            let mut p = poll_multi(TgtFd::Raw(efd.as_raw_fd()), libc::POLLIN as u32)?;
+            for _ in 0..2 {
+                write(&efd);
+                let mask = p.next().await.expect("poll ended")?;
+                assert_ne!(mask & libc::POLLIN as u32, 0);
+            }
+            Ok::<(), UblkError>(())
+        })?;
+        // Dropping the handle cancelled the poll; let the runtime reap it.
+        rt.block_on(async {
+            for _ in 0..100 {
+                if !crate::reactor::has_pending_ops() {
+                    break;
+                }
+                let _ = sleep(Duration::from_millis(1))?.await;
+            }
+            Ok::<(), UblkError>(())
+        })?;
+        assert!(!crate::reactor::has_pending_ops());
+        Ok(())
+    }
+
+    /// The send result and the notification land in their own slots by
+    /// what the CQE is (IORING_CQE_F_NOTIF), not by arrival order, and
+    /// the copied bit is read from the notification.
+    #[test]
+    fn zc_fold_tells_the_notification_apart() {
+        use crate::op::{InlineFold, Slots};
+        // uapi values of IORING_CQE_F_MORE / IORING_CQE_F_NOTIF.
+        let more = 1 << 1;
+        let notif = 1 << 3;
+
+        let mut s = Slots::default();
+        assert!(ZcFold::on_cqe(&mut s, 4096, more, false));
+        assert!(ZcFold::on_cqe(&mut s, NOTIF_ZC_COPIED, notif, false));
+        assert_eq!(ZcFold::take_sent(&mut s), Some(4096));
+        assert_eq!(ZcFold::take_sent(&mut s), None);
+        assert_eq!(ZcFold::take_copied(&mut s), Some(true));
+
+        // A notification never reorders into the send result's slot.
+        let mut s = Slots::default();
+        ZcFold::on_cqe(&mut s, 0, notif, false);
+        assert_eq!(ZcFold::take_sent(&mut s), None);
+        assert_eq!(ZcFold::take_copied(&mut s), Some(false));
     }
 
     /// Zero-copy send: both CQEs (send result + notification) must be

@@ -32,17 +32,34 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
 
-// per-thread control uring - thread_local! is already lazy
+// per-thread control uring, set up by ublk_init_ctrl_task_ring()
 //
 std::thread_local! {
     pub(crate) static CTRL_URING: RefCell<Option<IoUring::<squeue::Entry128>>> =
-        RefCell::new(None);
+        const { RefCell::new(None) };
+}
+
+/// Run `f` on this thread's control ring cell (`None` inside until the
+/// ring is set up).
+///
+/// Only the address is fetched through `LocalKey::with`, which keeps the
+/// TLS access inlined into every caller; see `op::with_local`.
+#[inline(always)]
+pub(crate) fn with_ctrl_ring_cell<R>(
+    f: impl FnOnce(&RefCell<Option<IoUring<squeue::Entry128>>>) -> R,
+) -> R {
+    // `#[inline(always)]`: as in `io::with_queue_ring_cell`.
+    crate::op::with_local(
+        &CTRL_URING,
+        #[inline(always)]
+        |cell| f(cell),
+    )
 }
 
 // Internal macro versions for backwards compatibility within the crate
 macro_rules! with_ctrl_ring_internal {
     ($closure:expr) => {
-        $crate::ctrl::CTRL_URING.with(|cell| {
+        $crate::ctrl::with_ctrl_ring_cell(|cell| {
             let ring_ref = cell.borrow();
             if let Some(ref ring) = *ring_ref {
                 $closure(ring)
@@ -55,7 +72,7 @@ macro_rules! with_ctrl_ring_internal {
 
 macro_rules! with_ctrl_ring_mut_internal {
     ($closure:expr) => {
-        $crate::ctrl::CTRL_URING.with(|cell| {
+        $crate::ctrl::with_ctrl_ring_cell(|cell| {
             let mut ring_ref = cell.borrow_mut();
             if let Some(ref mut ring) = *ring_ref {
                 $closure(ring)
@@ -1498,9 +1515,7 @@ impl UblkCtrlInner {
             })?;
             // Async op futures drained alongside this sync command wake
             // outside the ring borrow (a waker may run inline).
-            for waker in wakers {
-                waker.wake();
-            }
+            wakers.wake_all();
         }
     }
 

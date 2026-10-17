@@ -220,32 +220,16 @@ pub trait UblkExecutor: UblkSpawner + Sized {
                 let handles: Vec<TaskHandle> = q
                     .tags()
                     .map(|tag| {
-                        let task = io_task(q.clone(), tag);
-                        let q = q.clone();
-                        let dev = dev.clone();
-                        let first_err = first_err.clone();
                         // Spawn on `rt` directly rather than through the
                         // ambient spawn_local: the library's own path must
                         // not depend on block_on having installed the
                         // ambient spawner, which the compiler cannot check.
-                        rt.spawn(async move {
-                            match task.await {
-                                Err(UblkError::QueueIsDown) | Ok(_) => {}
-                                Err(e) => {
-                                    log::error!("io task failed for tag {}: {}", tag, e);
-                                    // A task dying before registering its
-                                    // buffer stalls the per-queue counter
-                                    // forever; unpark the sibling tasks
-                                    // waiting on the registration
-                                    // semaphore (they exit QueueIsDown)
-                                    // and fail the device handshake NOW —
-                                    // block_on cannot return while they
-                                    // are parked.
-                                    q.fail_buffer_registration();
-                                    dev.notify_queue_setup_failed();
-                                    first_err.borrow_mut().get_or_insert(e);
-                                }
-                            }
+                        rt.spawn(IoTask {
+                            task: io_task(q.clone(), tag),
+                            q: q.clone(),
+                            dev: dev.clone(),
+                            first_err: first_err.clone(),
+                            tag,
                         })
                     })
                     .collect();
@@ -264,6 +248,49 @@ pub trait UblkExecutor: UblkSpawner + Sized {
             dev.notify_queue_setup_failed();
         }
         res
+    }
+}
+
+/// One spawned io task: the target's future plus what its failure
+/// handling needs. A hand-written future rather than
+/// `async move { task.await ... }`: an async block that captures a
+/// future and then awaits it keeps two copies of it in its frame (the
+/// moved-from upvar and the awaitee), which doubled every per-tag task
+/// to 640 bytes and put 128 tags' frames well past L1D. Here the task
+/// is held once.
+struct IoTask<Fut> {
+    task: Fut,
+    q: Rc<crate::io::UblkQueue>,
+    dev: Arc<crate::io::UblkDev>,
+    /// First io-task failure, reported once every task ended.
+    first_err: Rc<std::cell::RefCell<Option<UblkError>>>,
+    tag: u16,
+}
+
+impl<Fut: Future<Output = Result<(), UblkError>>> Future for IoTask<Fut> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: `task` is pinned structurally: it is never moved out
+        // of `self`, and `self` is pinned for as long as the executor
+        // holds it.
+        let this = unsafe { self.get_unchecked_mut() };
+        let task = unsafe { Pin::new_unchecked(&mut this.task) };
+        match std::task::ready!(task.poll(cx)) {
+            Err(UblkError::QueueIsDown) | Ok(_) => {}
+            Err(e) => {
+                log::error!("io task failed for tag {}: {}", this.tag, e);
+                // A task dying before registering its buffer stalls the
+                // per-queue counter forever; unpark the sibling tasks
+                // waiting on the registration semaphore (they exit
+                // QueueIsDown) and fail the device handshake NOW —
+                // block_on cannot return while they are parked.
+                this.q.fail_buffer_registration();
+                this.dev.notify_queue_setup_failed();
+                this.first_err.borrow_mut().get_or_insert(e);
+            }
+        }
+        Poll::Ready(())
     }
 }
 

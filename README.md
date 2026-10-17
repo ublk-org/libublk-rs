@@ -12,6 +12,9 @@ CONFIG_BLK_DEV_UBLK.
 
 ## Documentations
 
+[libublk framework and core design](docs/framework.md): how the
+library is built and how a block request flows through it
+
 [ublk doc
 links](https://github.com/ming1/ubdsrv/blob/master/doc/external_links.rst)
 
@@ -97,7 +100,10 @@ fn main() {
  * [`examples/loop.rs`](examples/loop.rs): real example using
    async/await & io_uring, with target IO going through the typed
    operation catalog in [`libublk::ops`](src/ops.rs) (`read_at_raw`,
-   `write_at_raw`, `sync_file_range`, ...).
+   `write_at_raw`, `sync_file_range`, ...). `-z` enables
+   `UBLK_F_AUTO_BUF_REG` zero copy: no per-tag io buffer, the backing
+   file is read/written straight from the request pages through
+   `read_at_fixed` / `write_at_fixed` (buffer index = tag).
 
  * [`examples/ramdisk.rs`](examples/ramdisk.rs): single thread &
    async/.await for both ctrl and IO, this technique will be extended to

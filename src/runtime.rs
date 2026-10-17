@@ -88,7 +88,9 @@ impl UblkRuntime {
                 let mut future = std::pin::pin!(future);
                 std::future::poll_fn(move |cx| {
                     // (Re-)register the root waker for the park hook's kick.
-                    PARK_KICK_WAKER.with(|w| {
+                    // Inlined TLS access (see `op::with_local`): this
+                    // runs on every poll of the root future.
+                    crate::op::with_local(&PARK_KICK_WAKER, |w| {
                         let mut slot = w.borrow_mut();
                         if !slot
                             .as_ref()
