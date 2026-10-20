@@ -1535,7 +1535,17 @@ impl UblkCtrlInner {
         //
         // 2) this is new command which has been issued via ioctl encoding
         // already
-        if res >= 0 || res == -libc::EBUSY || (legacy_op > sys::UBLK_CMD_GET_DEV_INFO2) {
+        //
+        // 3) the driver understood the command and found no such device:
+        // the legacy opcode would answer the same, and the retry's
+        // -EOPNOTSUPP on a kernel without legacy opcodes would hide the
+        // real reason from the caller (e.g. DEL_DEV racing the device's
+        // own removal)
+        if res >= 0
+            || res == -libc::EBUSY
+            || res == -libc::ENODEV
+            || (legacy_op > sys::UBLK_CMD_GET_DEV_INFO2)
+        {
             false
         } else {
             *new_data = *data;
@@ -3410,6 +3420,38 @@ mod tests {
         assert_eq!(data.flags, CTRL_CMD_HAS_DATA);
         assert_eq!(data.data, 7);
         assert_eq!(data.addr, 0);
+    }
+
+    /// A legacy-range command is retried with the legacy opcode only
+    /// when the kernel may not have understood the ioctl encoding: not
+    /// on success, not on -EBUSY, and not on -ENODEV, which the driver
+    /// can only return after decoding the command.
+    #[test]
+    fn test_ublk_ctrl_need_retry() {
+        let data = UblkCtrlCmdData::new_simple_cmd(crate::sys::UBLK_U_CMD_DEL_DEV);
+        let mut new_data = UblkCtrlCmdData::new_simple_cmd(crate::sys::UBLK_U_CMD_DEL_DEV);
+
+        for res in [0, 1, -libc::EBUSY, -libc::ENODEV] {
+            assert!(!UblkCtrlInner::ublk_ctrl_need_retry(
+                &mut new_data,
+                &data,
+                res
+            ));
+        }
+        assert!(UblkCtrlInner::ublk_ctrl_need_retry(
+            &mut new_data,
+            &data,
+            -libc::EOPNOTSUPP
+        ));
+        assert_eq!(new_data.cmd_op, crate::sys::UBLK_CMD_DEL_DEV);
+
+        // ioctl-only commands are never retried
+        let data = UblkCtrlCmdData::new_simple_cmd(crate::sys::UBLK_U_CMD_DEL_DEV_ASYNC);
+        assert!(!UblkCtrlInner::ublk_ctrl_need_retry(
+            &mut new_data,
+            &data,
+            -libc::EOPNOTSUPP
+        ));
     }
 
     /// The CQE result of REG_BUF is the index; a negative result is an
