@@ -1176,6 +1176,7 @@ impl UblkCtrlInner {
         | sys::UBLK_F_URING_CMD_COMP_IN_TASK
         | sys::UBLK_F_USER_RECOVERY
         | sys::UBLK_F_USER_RECOVERY_REISSUE
+        | sys::UBLK_F_USER_RECOVERY_FAIL_IO
         | sys::UBLK_F_UNPRIVILEGED_DEV
         | sys::UBLK_F_CMD_IOCTL_ENCODE
         | sys::UBLK_F_USER_COPY
@@ -1440,6 +1441,7 @@ impl UblkCtrlInner {
             sys::UBLK_S_DEV_DEAD => "DEAD".to_string(),
             sys::UBLK_S_DEV_LIVE => "LIVE".to_string(),
             sys::UBLK_S_DEV_QUIESCED => "QUIESCED".to_string(),
+            sys::UBLK_S_DEV_FAIL_IO => "FAIL_IO".to_string(),
             _ => "UNKNOWN".to_string(),
         }
     }
@@ -3244,6 +3246,16 @@ mod tests {
     fn test_quiesce_in_driver_flags() {
         assert_ne!(
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_QUIESCE as u64,
+            0
+        );
+    }
+
+    /// With FAIL_IO the driver keeps the disk when the server dies and
+    /// fails its IO instead of stopping the device through del_gendisk().
+    #[test]
+    fn test_recovery_fail_io_in_driver_flags() {
+        assert_ne!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_USER_RECOVERY_FAIL_IO as u64,
             0
         );
     }
