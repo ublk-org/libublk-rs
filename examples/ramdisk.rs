@@ -172,6 +172,14 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
     let storage_ptr = ramdisk_storage.as_mut_ptr();
     let storage_len = ramdisk_storage.len();
 
+    // RAMDISK_FAIL_IO: fail IO instead of queueing it while no server runs;
+    // see test_ublk_ramdisk_recovery_fail_io.
+    let fail_io = if std::env::var_os("RAMDISK_FAIL_IO").is_some() {
+        libublk::sys::UBLK_F_USER_RECOVERY_FAIL_IO as u64
+    } else {
+        0
+    };
+
     let rt = libublk::UblkRuntime::new().unwrap();
     rt.block_on(async move {
         let ctrl = Rc::new(
@@ -184,7 +192,8 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
                 // QUIESCE rides on USER_RECOVERY and lets the device be quiesced
                 // gracefully; see test_ublk_ramdisk_quiesce.
                 .ctrl_flags(
-                    (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_QUIESCE) as u64,
+                    (libublk::sys::UBLK_F_USER_RECOVERY | libublk::sys::UBLK_F_QUIESCE) as u64
+                        | fail_io,
                 )
                 .build_async()
                 .await
@@ -258,12 +267,13 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
         // over, so hand it off instead of deleting it on the way down.
         //
         // This is unconditional because the server cannot tell the two cases
-        // apart here: the driver only reports UBLK_S_DEV_QUIESCED once the last
-        // reference to /dev/ublkcN is gone, which is after this process exits.
-        // So a device that was merely stopped is also left behind, and `ramdisk
-        // del <id>` is what removes it either way. A server that can distinguish
-        // its own shutdown from a handoff should call disown() only for the
-        // latter, and let the drop clean up otherwise.
+        // apart here: the driver only reports UBLK_S_DEV_QUIESCED (or
+        // UBLK_S_DEV_FAIL_IO) once the last reference to /dev/ublkcN is gone,
+        // which is after this process exits. So a device that was merely
+        // stopped is also left behind, and `ramdisk del <id>` is what removes
+        // it either way. A server that can distinguish its own shutdown from a
+        // handoff should call disown() only for the latter, and let the drop
+        // clean up otherwise.
         ctrl.disown();
     });
 }

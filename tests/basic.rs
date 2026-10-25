@@ -1467,8 +1467,17 @@ mod integration {
 
     /// Spawn `examples/ramdisk <cmd> ...` and return its (dev_id, queue tid).
     fn ramdisk_spawn(rd_path: &str, args: &[&str]) -> (i32, libc::pid_t) {
+        ramdisk_spawn_env(rd_path, args, &[])
+    }
+
+    fn ramdisk_spawn_env(
+        rd_path: &str,
+        args: &[&str],
+        envs: &[(&str, &str)],
+    ) -> (i32, libc::pid_t) {
         let mut cmd = Command::new(rd_path)
             .args(args)
+            .envs(envs.iter().copied())
             .stdout(Stdio::piped())
             .spawn()
             .expect("fail to run ublk ramdisk");
@@ -1696,6 +1705,131 @@ mod integration {
         ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 20000);
 
         ctrl.del_dev().unwrap();
+    }
+
+    /// O_DIRECT read of the first 4k of `path`.
+    fn bdev_read_4k(path: &str) -> std::io::Result<usize> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)?;
+        let mut buf = IoBuf::<u8>::new(4096);
+        f.read(buf.as_mut_slice())
+    }
+
+    /// Recovery of a `UBLK_F_USER_RECOVERY_FAIL_IO` device: the server dies,
+    /// the device goes to `UBLK_S_DEV_FAIL_IO` and fails IO, then a new
+    /// server recovers it back to LIVE.
+    #[test]
+    fn test_ublk_ramdisk_recovery_fail_io() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_USER_RECOVERY_FAIL_IO as u64
+            == 0
+        {
+            println!("skipping: kernel lacks UBLK_F_USER_RECOVERY_FAIL_IO");
+            return;
+        }
+        let tgt_dir = get_curr_bin_dir().unwrap();
+        let rd_path = tgt_dir.display().to_string() + &"/examples/ramdisk".to_string();
+        let (id, tid) =
+            ramdisk_spawn_env(&rd_path, &["add", "-1", "32"], &[("RAMDISK_FAIL_IO", "1")]);
+        assert!(tid != 0 && id >= 0);
+
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
+        assert!(ctrl.dev_info().flags & sys::UBLK_F_USER_RECOVERY_FAIL_IO as u64 != 0);
+        let dev_path = ctrl.get_bdev_path();
+        assert!(bdev_read_4k(&dev_path).is_ok());
+
+        unsafe {
+            libc::kill(tid, libc::SIGKILL);
+        }
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_FAIL_IO as u16, 6000);
+
+        // The disk stays, but IO fails right away instead of queueing.
+        assert!(Path::new(&dev_path).exists());
+        let fail_io_err = bdev_read_4k(&dev_path).err();
+
+        let out = Command::new(&rd_path)
+            .args(["recover", &id.to_string().as_str()])
+            .output()
+            .expect("fail to recover ramdisk");
+        ctrl.read_dev_info().unwrap();
+        let state = ctrl.dev_info().state;
+        let io_ok = bdev_read_4k(&dev_path).is_ok();
+        ctrl.del_dev().unwrap();
+
+        assert!(fail_io_err.is_some(), "IO must fail in FAIL_IO");
+        assert!(
+            out.status.success(),
+            "ramdisk recover failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(state, sys::UBLK_S_DEV_LIVE as u16, "not recovered to LIVE");
+        assert!(io_ok);
+    }
+
+    /// Same as [`test_ublk_ramdisk_recovery_fail_io`], but the new server is
+    /// in this process and recovers through the sync `run_target()` path.
+    ///
+    /// The dying server is still `examples/ramdisk`: `run_target()` sends
+    /// STOP_DEV once its queues are gone, so it cannot hand a device off.
+    #[test]
+    fn test_ublk_sync_recovery_fail_io() {
+        if UblkCtrl::get_features().unwrap_or_default() & sys::UBLK_F_USER_RECOVERY_FAIL_IO as u64
+            == 0
+        {
+            println!("skipping: kernel lacks UBLK_F_USER_RECOVERY_FAIL_IO");
+            return;
+        }
+        let tgt_dir = get_curr_bin_dir().unwrap();
+        let rd_path = tgt_dir.display().to_string() + &"/examples/ramdisk".to_string();
+        let (id, tid) =
+            ramdisk_spawn_env(&rd_path, &["add", "-1", "32"], &[("RAMDISK_FAIL_IO", "1")]);
+        assert!(tid != 0 && id >= 0);
+
+        let ctrl = UblkCtrl::new_simple(id).unwrap();
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_LIVE as u16, 2000);
+        unsafe {
+            libc::kill(tid, libc::SIGKILL);
+        }
+        ublk_state_wait_until(&ctrl, sys::UBLK_S_DEV_FAIL_IO as u16, 6000);
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(32 << 20);
+            Ok(())
+        };
+        let state = Arc::new(Mutex::new((0_u16, false)));
+        let state_c = state.clone();
+        let res = UblkCtrlBuilder::default()
+            .name("async_ramdisk")
+            .id(id)
+            .nr_queues(1)
+            .depth(128)
+            .dev_flags(UblkFlags::UBLK_DEV_F_RECOVER_DEV)
+            .build()
+            .and_then(|rctrl| {
+                rctrl.start_user_recover()?;
+                rctrl.run_target(tgt_init, null_handle_queue, move |c: &UblkCtrl| {
+                    c.read_dev_info().unwrap();
+                    let io_ok = bdev_read_4k(&c.get_bdev_path()).is_ok();
+                    *state_c.lock().unwrap() = (c.dev_info().state, io_ok);
+                    c.kill_dev().unwrap();
+                })
+            });
+        // A failed run_target() returns without joining its queue threads,
+        // which keep /dev/ublkcN open, and DEL_DEV would wait for them.
+        if res.is_ok() {
+            ctrl.del_dev().unwrap();
+        } else {
+            ctrl.del_dev_async().unwrap();
+        }
+
+        res.expect("sync recovery of a FAIL_IO device failed");
+        let (st, io_ok) = *state.lock().unwrap();
+        assert_eq!(st, sys::UBLK_S_DEV_LIVE as u16);
+        assert!(io_ok);
     }
 
     /// run examples/ramdisk recovery test
