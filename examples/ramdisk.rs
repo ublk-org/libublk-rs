@@ -326,7 +326,10 @@ fn test_add(recover: usize) {
         }
         daemonize::Outcome::Parent(Ok(_)) => match read_dev_id(efd) {
             Ok(id) => UblkCtrl::new_simple(id).unwrap().dump(),
-            Err(e) => eprintln!("Failed to add ublk device: {}", e),
+            Err(e) => {
+                eprintln!("Failed to add ublk device: {}", e);
+                std::process::exit(1);
+            }
         },
         _ => panic!(),
     }
