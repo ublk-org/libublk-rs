@@ -2130,13 +2130,18 @@ impl UblkCtrlInner {
         self.ublk_ctrl_cmd_async(&data).await
     }
 
+    /// States START/END_USER_RECOVERY accept, as `ublk_dev_in_recoverable_state()`.
+    fn in_recoverable_state(state: u16) -> bool {
+        state == sys::UBLK_S_DEV_QUIESCED as u16 || state == sys::UBLK_S_DEV_FAIL_IO as u16
+    }
+
     fn prep_start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
         self.read_dev_info()?;
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
             return Ok(0);
         }
 
-        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        if !Self::in_recoverable_state(self.dev_info.state) {
             self.set_params(&dev.tgt.params)?;
             self.flush_json()?;
         } else if self.for_recover_dev() {
@@ -2155,7 +2160,7 @@ impl UblkCtrlInner {
             return Ok(0);
         }
 
-        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        if !Self::in_recoverable_state(self.dev_info.state) {
             self.set_params_async(&dev.tgt.params).await?;
             self.flush_json()?;
         } else if self.for_recover_dev() {
@@ -2170,7 +2175,7 @@ impl UblkCtrlInner {
     pub(crate) async fn start_dev_async(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
         self.prep_start_dev_async(dev).await?;
 
-        if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        if !Self::in_recoverable_state(self.dev_info.state) {
             self.start_async(unsafe { libc::getpid() as i32 }).await
         } else if self.for_recover_dev() {
             self.end_user_recover_async(unsafe { libc::getpid() as i32 })
@@ -2789,7 +2794,7 @@ impl UblkCtrl {
         // Wait for all queue buffer registrations to complete
         dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
 
-        if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        if !UblkCtrlInner::in_recoverable_state(ctrl.dev_info.state) {
             ctrl.start(unsafe { libc::getpid() as i32 })
         } else if ctrl.for_recover_dev() {
             ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
