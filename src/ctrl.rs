@@ -1185,7 +1185,8 @@ impl UblkCtrlInner {
         | sys::UBLK_F_AUTO_BUF_REG
         | sys::UBLK_F_QUIESCE
         | sys::UBLK_F_BATCH_IO
-        | sys::UBLK_F_SHMEM_ZC) as u64;
+        | sys::UBLK_F_SHMEM_ZC
+        | sys::UBLK_F_NO_AUTO_PART_SCAN) as u64;
 
     /// Create device info structure from parameters
     fn create_device_info(
@@ -3291,6 +3292,18 @@ mod tests {
     fn test_update_size_in_driver_flags() {
         assert_ne!(
             UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_UPDATE_SIZE as u64,
+            0
+        );
+    }
+
+    /// The driver skips the partition scan of `add_disk()` for a device added
+    /// with this flag (a server whose reads are slow right after start, or that
+    /// must not expose a partition table to the host). It has to survive
+    /// `validate_new_params()` to reach ADD_DEV at all.
+    #[test]
+    fn test_no_auto_part_scan_in_driver_flags() {
+        assert_ne!(
+            UblkCtrlInner::UBLK_DRV_F_ALL & crate::sys::UBLK_F_NO_AUTO_PART_SCAN as u64,
             0
         );
     }
