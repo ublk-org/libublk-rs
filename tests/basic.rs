@@ -130,6 +130,35 @@ mod integration {
         __test_ublk_null(UblkFlags::UBLK_DEV_F_ADD_DEV, 1, null_handle_queue);
     }
 
+    /// A device added with UBLK_F_NO_AUTO_PART_SCAN starts and serves IO: the
+    /// flag gets through validate_new_params() and reaches the driver.
+    #[test]
+    fn test_ublk_null_no_auto_part_scan() {
+        let flag = sys::UBLK_F_NO_AUTO_PART_SCAN as u64;
+        if UblkCtrl::get_features().unwrap_or_default() & flag == 0 {
+            println!("skipping: kernel does not advertise UBLK_F_NO_AUTO_PART_SCAN");
+            return;
+        }
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(1)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .ctrl_flags(sys::UBLK_F_USER_COPY as u64 | flag)
+            .build()
+            .unwrap();
+        assert_ne!(ctrl.dev_info().flags & flag, 0);
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+        let q_fn = move |qid: u16, dev: &Arc<UblkDev>| null_handle_queue(qid, dev);
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            read_ublk_disk(ctrl, true);
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+    }
+
     /// The sync user-copy handler with three io threads per queue: FETCH,
     /// the no-buffer permit path of `submit_fetch_commands_unified` and
     /// `wait_and_handle_io` all run per partition.
