@@ -204,7 +204,6 @@ impl UblkCtrlAsync {
     ///
     /// * `qid`: queue id
     /// * `tid`: tid of the queue's pthread context
-    /// * `pthread_id`: pthread handle for setting affinity
     ///
     /// Note: this method has to be called in queue daemon context
     pub async fn configure_queue_async(
@@ -281,8 +280,6 @@ impl UblkCtrlAsync {
     /// This method performs the same functionality as get_params() but returns a Future
     /// that resolves to the result. It uses the async uring infrastructure to avoid
     /// blocking the calling thread while waiting for the ublk driver response.
-    ///
-    /// Can't pass params by reference(&mut), why?
     pub async fn get_params_async(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         self.get_inner_mut().get_params_async(params).await
     }
@@ -348,9 +345,6 @@ impl UblkCtrlAsync {
     ///
     /// Waits for all queue buffer registrations to complete before starting.
     /// If any queue fails mlock, this method will fail immediately.
-    ///
-    /// This is the only one async API allowed without UBLK_CTRL_ASYNC_AWAIT
-    ///
     pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
 
@@ -458,13 +452,12 @@ impl UblkCtrlAsync {
         self.get_inner_mut().disown()
     }
 
-    /// Delete ublk device using async/await pattern
+    /// Delete the ublk device (`UBLK_U_CMD_DEL_DEV`) with async/await.
     ///
-    /// This method provides true async/await support for device deletion,
-    /// using the async uring infrastructure for non-blocking operations.
-    /// This is an alternative to del_dev_async() that follows the established
-    /// async/await patterns used by other async methods in the API.
-    ///
+    /// The counterpart of [`UblkCtrl::del_dev`](crate::ctrl::UblkCtrl::del_dev).
+    /// The kernel's deferred deletion, `UBLK_U_CMD_DEL_DEV_ASYNC` issued
+    /// by [`UblkCtrl::del_dev_async`](crate::ctrl::UblkCtrl::del_dev_async),
+    /// has no async/await form here.
     pub async fn del_dev_async_await(&self) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
 

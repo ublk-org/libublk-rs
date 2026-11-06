@@ -547,7 +547,7 @@ pub enum BufDescList<'a> {
     /// List of IoBuf for traditional buffer management
     ///
     /// Contains an optional reference to a vector of `IoBuf<u8>` instances.
-    /// Used with submit_fetch_commands for copy-based operations where data
+    /// Used with `submit_fetch_commands_unified` for copy-based operations where data
     /// is explicitly transferred between userspace and kernel buffers.
     ///
     /// # When to Use
@@ -565,7 +565,7 @@ pub enum BufDescList<'a> {
     ///
     /// Contains a slice of `sys::ublk_auto_buf_reg` structures that define
     /// buffer registration parameters for high-performance zero-copy I/O.
-    /// Used with submit_fetch_commands_with_auto_buf_reg for direct kernel
+    /// Used with `submit_fetch_commands_unified` for direct kernel
     /// access to userspace buffers.
     ///
     /// # When to Use
@@ -850,6 +850,10 @@ impl<'a> UblkIOCtx<'a> {
 /// queue ring registers, and the ublk parameters. A target fills this
 /// in from its `tgt_init` closure; it is serialized into the device's
 /// JSON for recovery.
+///
+/// Non-exhaustive: targets assign the fields they need on `dev.tgt`
+/// rather than constructing the struct, so fields can be added.
+#[non_exhaustive]
 pub struct UblkTgt {
     /// target type
     pub tgt_type: String,
@@ -878,7 +882,8 @@ pub struct UblkTgt {
     /// Number of valid entries in [`Self::fds`].
     pub nr_fds: i32,
 
-    /// could become bigger, is it one issue?
+    /// Device parameters, sent to the driver with SET_PARAMS before
+    /// START_DEV.
     pub params: sys::ublk_params,
 }
 
@@ -905,7 +910,7 @@ pub struct UblkDev {
     /// feature flags.
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
-    /// reserved for supporting new features
+    /// The [`UblkFlags`] (`UBLK_DEV_F_*`) this device was built with.
     pub flags: UblkFlags,
 
     //fds[0] points to /dev/ublkcN
@@ -1021,13 +1026,13 @@ impl UblkDev {
     ///
     /// # Arguments:
     ///
-    /// * `ops`: target operation functions
+    /// * `tgt_name`: target type name, such as "loop", "null", ...
+    /// * `ops`: target initialization closure, called with the new
+    ///   device to set its size and parameters
     /// * `ctrl`: control device reference
-    /// * `tgt_type`: target type, such as 'loop', 'null', ...
     ///
-    /// ublk device is abstraction for target, and prepare for setting
-    /// up target. Any target private data can be defined in the data
-    /// structure which implements UblkTgtImpl.
+    /// ublk device is the abstraction of a target, and prepares for
+    /// setting up the target.
     pub fn new<F>(tgt_name: String, ops: F, ctrl: &UblkCtrl) -> Result<UblkDev, UblkError>
     where
         F: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
@@ -1173,7 +1178,10 @@ impl UblkDev {
     ///
     /// Every io thread of every queue reports once, so the expected
     /// count is `nr_hw_queues * io_threads_per_queue`.
-    pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
+    pub(crate) fn wait_for_buffer_registration(
+        &self,
+        nr_hw_queues: usize,
+    ) -> Result<(), UblkError> {
         let nr_hw_queues = nr_hw_queues * self.io_threads_per_queue as usize;
         if (self.dev_info.flags
             & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64)
@@ -1208,7 +1216,7 @@ impl UblkDev {
     }
 
     /// Notify that a queue has completed buffer registration
-    pub fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
+    pub(crate) fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
         let (lock, cvar) = &*self.buf_reg_sync;
         let mut state = lock.lock().unwrap();
         state.registered_queues += 1;
@@ -1897,8 +1905,10 @@ impl UblkQueue {
         self.buf_reg_semaphore.add_permits(self.nr_tags as usize);
     }
 
-    /// Register IO buffer, so that pages in this buffer can
-    /// be discarded in case queue becomes idle
+    /// Unregister the IO buffer of `tag` (registered by
+    /// [`submit_io_prep_cmd`](Self::submit_io_prep_cmd)), so that its
+    /// pages can be discarded while the queue is idle. No-op with
+    /// `UBLK_F_AUTO_BUF_REG`.
     pub fn unregister_io_buf(&self, tag: u16) {
         if self.support_auto_buf_zc() {
             return;
@@ -2838,57 +2848,37 @@ impl UblkQueue {
         }
     }
 
-    /// Process the incoming IOs(io commands & target IOs) from io_uring
+    /// Wait and handle incoming IO (io commands and target IOs) from the
+    /// queue ring: the sync event loop.
     ///
     /// # Arguments:
     ///
-    /// * `ops`: IO handling Closure
+    /// * `ops`: IO handling closure, called for every incoming CQE
     ///
-    /// * `to_wait`: passed to io_uring_enter(), wait until how many events are
-    /// available
+    /// Called in queue context. Does not return until the queue is down
+    /// or an error is observed.
     ///
-    /// When either io command or target io is coming, we are called for
-    /// handling both. Basically the IO handling closure is called for
-    /// every incoming io_uring CQE.
+    /// # The IO handling closure
     ///
-    /// About IO handling Closure
+    /// Target IO handling is implemented in the closure. If an IO is
+    /// fast to complete (ramdisk, null), it can be handled right there
+    /// and the io command completed with the raw result (bytes
+    /// transferred, or a negative errno) via
+    /// [`complete_io_cmd_unified`](Self::complete_io_cmd_unified).
     ///
-    /// Target IO handling needs target code to implement the IO handling
-    /// closure.
-    ///
-    /// If IO is super fast to complete, such as ramdisk, this request can
-    /// be handled directly in the closure, and the io command originated
-    /// from ublk driver is completed with the raw result (bytes
-    /// transferred, or a negative errno). Another example is null
-    /// target(null.rs).
-    ///
-    /// Most of times, IO is slow, so it needs to be handled asynchronously.
-    /// The preferred way is to submit target IO by io_uring in IO handling
-    /// closure by using the same IO slot(represented by `tag`). After this
-    /// target IO is completed, one io_uring CQE will be received, and the
-    /// same IO closure is called for handling this target IO, which can be
-    /// checked by `UblkIOCtx::is_tgt_io()` method. Finally if the coming
-    /// target IO completion means the original IO command is done, the io
-    /// command is completed with the raw result, otherwise the IO handling
-    /// closure can continue to submit IO or whatever for driving its IO
+    /// Most IO is slow and is handled asynchronously: submit the target
+    /// IO through the queue ring from the closure with
+    /// [`ublk_submit_sqe_sync`](Self::ublk_submit_sqe_sync), keyed by a
+    /// `user_data` built with [`UblkIOCtx::build_user_data`] on the same
+    /// tag. When that target IO completes, the closure is called again
+    /// with its CQE, recognisable by [`UblkIOCtx::is_tgt_io`]; it then
+    /// either completes the io command or submits more IO to drive its
     /// logic.
     ///
-    /// Not all target IO logics can be done by io_uring, such as some
-    /// handling needs extra computation, which often require to offload IO
-    /// in another context. However, when target IO is done in remote offload
-    /// context, the io command has to be completed from the queue/
-    /// io_uring context. One approach is to use eventfd to wakeup & notify
-    /// ublk queue/io_uring. Here, eventfd can be thought as one special target
-
-    /// Wait and handle incoming IO
-    ///
-    /// # Arguments:
-    ///
-    /// * `ops`: IO handling closure
-    ///
-    /// Called in queue context. won't return unless error is observed.
-    /// Wait and handle any incoming cqe until queue is down.
-    ///
+    /// Work that cannot be done through io_uring (extra computation,
+    /// IO offloaded to another thread) still has to complete the io
+    /// command from the queue context: poll an eventfd through the ring
+    /// and complete the commands from the closure when it fires.
     pub fn wait_and_handle_io<F>(&self, mut ops: F)
     where
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),

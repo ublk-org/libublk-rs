@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 /// The name of `T`, for logging a target's concrete type.
-pub fn type_of_this<T>(_: &T) -> String {
+pub(crate) fn type_of_this<T>(_: &T) -> String {
     std::any::type_name::<T>().to_string()
 }
 

@@ -272,13 +272,13 @@ impl UblkQueueAffinity {
     }
 
     /// Size in bytes of the raw cpumask buffer.
-    pub fn buf_len(&self) -> usize {
+    pub(crate) fn buf_len(&self) -> usize {
         1024 / 8
     }
 
     /// Pointer to the raw cpumask buffer, for the control command that
     /// fills it.
-    pub fn addr(&self) -> *const u8 {
+    pub(crate) fn addr(&self) -> *const u8 {
         self.affinity.as_bytes().as_ptr()
     }
 
@@ -797,13 +797,11 @@ impl UblkCtrlConfig {
     }
 }
 
-/// UblkSession: build one new ublk control device or recover the old one.
+/// Builder for [`UblkCtrl`] (and, via [`build_async`](Self::build_async),
+/// [`UblkCtrlAsync`](crate::ctrl_async::UblkCtrlAsync)): create one new
+/// ublk control device or recover an existing one.
 ///
 /// High level API.
-///
-/// One limit is that IO handling closure doesn't support FnMut, and low
-/// level API doesn't have such limit.
-///
 #[derive(Setters, Debug, PartialEq, Eq)]
 pub struct UblkCtrlBuilder<'a> {
     /// target type, such as null, loop, ramdisk, or nbd,...
@@ -2614,7 +2612,6 @@ impl UblkCtrl {
     ///
     /// * `qid`: queue id
     /// * `tid`: tid of the queue's pthread context
-    /// * `pthread_id`: pthread handle for setting affinity
     ///
     /// Note: this method has to be called in queue daemon context
     pub fn configure_queue(&self, dev: &UblkDev, qid: u16, tid: i32) -> Result<i32, UblkError> {
@@ -2683,8 +2680,6 @@ impl UblkCtrl {
 
     /// Retrieve this device's parameter from ublk driver by
     /// sending command
-    ///
-    /// Can't pass params by reference(&mut), why?
     pub fn get_params(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
         self.get_inner_mut().get_params(params)
     }
@@ -2826,7 +2821,9 @@ impl UblkCtrl {
     /// Waits for all queue buffer registrations to complete before starting.
     /// If any queue fails mlock, this method will fail immediately.
     ///
-    /// This is the only one async API allowed without UBLK_CTRL_ASYNC_AWAIT
+    /// The one `async fn` on the sync handle, for a target that drives
+    /// control and io from one thread; `UblkCtrlAsync` is the fully
+    /// async form.
     ///
     pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
