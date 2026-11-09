@@ -194,29 +194,37 @@ pub unsafe fn write_at_raw(
 /// Read from `file` at `offset` into the ring-registered fixed buffer
 /// `buf_index` (`IORING_OP_READ_FIXED`).
 ///
+/// `addr` follows the fixed-buffer convention of the registration type:
+/// an address inside a user-registered buffer, or the plain byte offset
+/// into a kernel-registered one (ublk `UBLK_F_AUTO_BUF_REG` request
+/// buffers, which have no userspace mapping: `0` is the start of the
+/// request's data). Every `_fixed` op takes `addr` this way.
+///
 /// # Safety
 ///
 /// The fixed-buffer slot must stay registered, and any memory it maps
-/// valid, until this op's CQE has been reaped. `ptr` addresses into the
-/// registered buffer; ublk `UBLK_F_AUTO_BUF_REG` slots take a null
-/// pointer.
+/// valid, until this op's CQE has been reaped.
 #[inline]
 pub unsafe fn read_at_fixed(
     file: TgtFd,
     buf_index: u16,
-    ptr: *mut u8,
+    addr: u64,
     len: u32,
     offset: u64,
 ) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(file, |fd| opcode::ReadFixed::new(
-        fd, ptr, len, buf_index
+        fd,
+        addr as *mut u8,
+        len,
+        buf_index
     )
     .offset(offset)
     .build()))
 }
 
 /// Write to `file` at `offset` from the ring-registered fixed buffer
-/// `buf_index` (`IORING_OP_WRITE_FIXED`).
+/// `buf_index` (`IORING_OP_WRITE_FIXED`); `addr` as for
+/// [`read_at_fixed`].
 ///
 /// # Safety
 ///
@@ -225,12 +233,15 @@ pub unsafe fn read_at_fixed(
 pub unsafe fn write_at_fixed(
     file: TgtFd,
     buf_index: u16,
-    ptr: *const u8,
+    addr: u64,
     len: u32,
     offset: u64,
 ) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(file, |fd| opcode::WriteFixed::new(
-        fd, ptr, len, buf_index
+        fd,
+        addr as *const u8,
+        len,
+        buf_index
     )
     .offset(offset)
     .build()))
@@ -418,12 +429,8 @@ pub unsafe fn recv_raw(fd: TgtFd, ptr: *mut u8, len: u32, flags: i32) -> Result<
 }
 
 /// Receive into the ring-registered fixed buffer `buf_index`. `addr`
-/// follows the fixed-buffer convention of the registration type: an
-/// address inside a user-registered buffer, or the plain byte offset
-/// for kernel-registered buffers (ublk `UBLK_F_AUTO_BUF_REG` request
-/// buffers, which have no userspace mapping) -- resuming a partial
-/// receive continues at the consumed byte count. `flags` as for
-/// [`recv`].
+/// as for [`read_at_fixed`] -- resuming a partial receive continues at
+/// the consumed byte count. `flags` as for [`recv`].
 ///
 /// # Safety
 ///
@@ -475,10 +482,9 @@ fn link_sqe(sqe: squeue::Entry, linked: bool) -> squeue::Entry {
 
 /// Send from the ring-registered fixed buffer `buf_index` with a plain
 /// single-completion send -- the zero-copy-registration write path for
-/// sockets where `SEND_ZC` is unavailable (AF_UNIX). `addr` follows the
-/// registration type's convention, as for [`recv_fixed`]; `flags` as
-/// for [`recv`]; `linked` chains the send before the next pushed SQE
-/// (`IOSQE_IO_LINK`).
+/// sockets where `SEND_ZC` is unavailable (AF_UNIX). `addr` as for
+/// [`read_at_fixed`]; `flags` as for [`recv`]; `linked` chains the send
+/// before the next pushed SQE (`IOSQE_IO_LINK`).
 ///
 /// A link partner must be pushed from the same poll, with no `await` in
 /// between. The library also pushes SQEs on the queue ring -- the
@@ -647,9 +653,9 @@ pub unsafe fn send_zc(
 
 /// Zero-copy send from the ring-registered fixed buffer `buf_index`
 /// (`IORING_OP_SEND_ZC` with a registered buffer): the kernel reuses the
-/// registration instead of pinning pages per send. `addr` follows the
-/// registration type's convention, as for [`recv_fixed`]; `flags`,
-/// `linked` and the two-CQE completion are as for [`send_zc`].
+/// registration instead of pinning pages per send. `addr` as for
+/// [`read_at_fixed`]; `flags`, `linked` and the two-CQE completion are
+/// as for [`send_zc`].
 ///
 /// # Safety
 ///

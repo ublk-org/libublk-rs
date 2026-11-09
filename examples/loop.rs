@@ -231,10 +231,10 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_buf: Option<&mut [u8
         let f = match op {
             libublk::sys::UBLK_IO_OP_FLUSH => ops::sync_file_range(TgtFd::Fixed(1), off, bytes, 0),
             libublk::sys::UBLK_IO_OP_READ if zc => unsafe {
-                ops::read_at_fixed(TgtFd::Fixed(1), tag, std::ptr::null_mut(), bytes, off)
+                ops::read_at_fixed(TgtFd::Fixed(1), tag, 0, bytes, off)
             },
             libublk::sys::UBLK_IO_OP_WRITE if zc => unsafe {
-                ops::write_at_fixed(TgtFd::Fixed(1), tag, std::ptr::null(), bytes, off)
+                ops::write_at_fixed(TgtFd::Fixed(1), tag, 0, bytes, off)
             },
             libublk::sys::UBLK_IO_OP_READ => unsafe {
                 ops::read_at_raw(TgtFd::Fixed(1), buf_addr, bytes, off)
