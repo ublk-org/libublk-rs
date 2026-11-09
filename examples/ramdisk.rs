@@ -235,9 +235,9 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
             // so any path that returns without writing hangs `ramdisk add`.
             let started = async {
                 ctrl_clone
-                    .configure_queue_async(&dev_clone, 0, unsafe { libc::gettid() })
+                    .configure_queue(&dev_clone, 0, unsafe { libc::gettid() })
                     .await?;
-                ctrl_clone.start_dev_async(&dev_clone).await
+                ctrl_clone.start_dev(&dev_clone).await
             }
             .await;
 

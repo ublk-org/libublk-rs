@@ -281,9 +281,9 @@ A control command travels like this (`ublk_submit_cmd_sync`):
 
 `UblkCtrlAsync` sends the same payloads through `ops::uring_cmd80` and
 `.await`s them. It has no `run_target`: the caller spawns the queue
-threads and calls `configure_queue_async` and `start_dev_async` itself,
-as [`examples/ramdisk.rs`](../examples/ramdisk.rs) does; pinning is
-available separately through `set_thread_affinity_async`.
+threads and calls `configure_queue` and `start_dev` itself, as
+[`examples/ramdisk.rs`](../examples/ramdisk.rs) does; pinning is
+available separately through `set_thread_affinity`.
 
 ### 5.3 Queues, threads, and start
 

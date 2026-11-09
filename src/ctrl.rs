@@ -908,7 +908,7 @@ impl UblkCtrlBuilder<'_> {
     /// Build the device as a [`UblkCtrlAsync`](super::ctrl_async::UblkCtrlAsync),
     /// the `.await`-driven control handle.
     pub async fn build_async(self) -> Result<super::ctrl_async::UblkCtrlAsync, UblkError> {
-        let ctrl = super::ctrl_async::UblkCtrlAsync::new_async(
+        let ctrl = super::ctrl_async::UblkCtrlAsync::new(
             Some(self.name.to_string()),
             self.id,
             self.nr_queues,

@@ -47,7 +47,7 @@
 //! use libublk::UblkFlags;
 //!
 //! async fn example_async() -> Result<(), Box<dyn std::error::Error>> {
-//!     let ctrl = UblkCtrlAsync::new_async(
+//!     let ctrl = UblkCtrlAsync::new(
 //!         Some("example_async".to_string()),
 //!         -1, // Let driver allocate ID
 //!         1,  // nr_queues
