@@ -211,7 +211,7 @@ impl UblkCtrlAsync {
         dev: &UblkDev,
         qid: u16,
         tid: i32,
-    ) -> Result<i32, UblkError> {
+    ) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.store_queue_tid(qid, tid);
@@ -223,7 +223,7 @@ impl UblkCtrlAsync {
             ctrl.build_json_async(dev).await?;
         }
 
-        Ok(0)
+        Ok(())
     }
 
     /// Dump this device info asynchronously
@@ -270,8 +270,8 @@ impl UblkCtrlAsync {
     /// that resolves to the result. It uses the same fallback mechanism as the synchronous
     /// version, trying UBLK_U_CMD_GET_DEV_INFO2 first and falling back to UBLK_U_CMD_GET_DEV_INFO.
     ///
-    pub async fn read_dev_info_async(&self) -> Result<i32, UblkError> {
-        self.get_inner_mut().read_dev_info_async().await
+    pub async fn read_dev_info_async(&self) -> Result<(), UblkError> {
+        self.get_inner_mut().read_dev_info_async().await.map(drop)
     }
 
     /// Retrieve this device's parameter from ublk driver by
@@ -280,8 +280,11 @@ impl UblkCtrlAsync {
     /// This method performs the same functionality as get_params() but returns a Future
     /// that resolves to the result. It uses the async uring infrastructure to avoid
     /// blocking the calling thread while waiting for the ublk driver response.
-    pub async fn get_params_async(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
-        self.get_inner_mut().get_params_async(params).await
+    pub async fn get_params_async(&self, params: &mut sys::ublk_params) -> Result<(), UblkError> {
+        self.get_inner_mut()
+            .get_params_async(params)
+            .await
+            .map(drop)
     }
 
     /// Send this device's parameter to ublk driver asynchronously
@@ -291,8 +294,11 @@ impl UblkCtrlAsync {
     /// blocking the calling thread while waiting for the ublk driver response.
     ///
     /// Note: device parameter has to send to driver before starting this device
-    pub async fn set_params_async(&self, params: &sys::ublk_params) -> Result<i32, UblkError> {
-        self.get_inner_mut().set_params_async(params).await
+    pub async fn set_params_async(&self, params: &sys::ublk_params) -> Result<(), UblkError> {
+        self.get_inner_mut()
+            .set_params_async(params)
+            .await
+            .map(drop)
     }
 
     /// Retrieving the specified queue's affinity from ublk driver in async/.await
@@ -309,28 +315,32 @@ impl UblkCtrlAsync {
         &self,
         q: u32,
         bm: &mut UblkQueueAffinity,
-    ) -> Result<i32, UblkError> {
-        self.get_inner_mut().get_queue_affinity_async(q, bm).await
+    ) -> Result<(), UblkError> {
+        self.get_inner_mut()
+            .get_queue_affinity_async(q, bm)
+            .await
+            .map(drop)
     }
 
     /// Start user recover for this device asynchronously
     ///
-    pub async fn start_user_recover_async(&self) -> Result<i32, UblkError> {
+    /// As [`UblkCtrl::start_user_recover`](crate::ctrl::UblkCtrl::start_user_recover),
+    /// `-EBUSY` is retried for up to 30 s.
+    pub async fn start_user_recover_async(&self) -> Result<(), UblkError> {
         let mut count = 0u32;
         let unit = 100_u32;
 
         loop {
+            // Bind first: a guard in the match scrutinee would stay
+            // held across the sleep.
             let res = self.get_inner_mut().__start_user_recover_async().await;
-            if let Ok(r) = res {
-                if r == -libc::EBUSY {
+            match res {
+                Err(UblkError::UringIOError(e)) if e == -libc::EBUSY && count < 30000 => {
                     futures_timer::Delay::new(std::time::Duration::from_millis(unit as u64)).await;
                     count += unit;
-                    if count < 30000 {
-                        continue;
-                    }
                 }
+                res => return res.map(drop),
             }
-            return res;
         }
     }
 
@@ -345,7 +355,7 @@ impl UblkCtrlAsync {
     ///
     /// Waits for all queue buffer registrations to complete before starting.
     /// If any queue fails mlock, this method will fail immediately.
-    pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
+    pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.force_async = true;
@@ -355,21 +365,21 @@ impl UblkCtrlAsync {
 
         let res = ctrl.start_dev_async(dev).await;
         ctrl.force_async = false;
-        res
+        res.map(drop)
     }
 
     /// Stop ublk device asynchronously
     ///
     /// Remove json export, and send stop command to control device asynchronously
     ///
-    pub async fn stop_dev_async(&self) -> Result<i32, UblkError> {
+    pub async fn stop_dev_async(&self) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
         let rp = ctrl.run_path();
 
         if ctrl.for_add_dev() && Path::new(&rp).exists() {
             fs::remove_file(rp)?;
         }
-        ctrl.stop_async().await
+        ctrl.stop_async().await.map(drop)
     }
 
     /// Kill this device asynchronously
@@ -380,8 +390,8 @@ impl UblkCtrlAsync {
     /// But device may not be really removed yet, and the device ID
     /// can still be in-use after kill_dev_async() returns.
     ///
-    pub async fn kill_dev_async(&self) -> Result<i32, UblkError> {
-        self.get_inner_mut().stop_async().await
+    pub async fn kill_dev_async(&self) -> Result<(), UblkError> {
+        self.get_inner_mut().stop_async().await.map(drop)
     }
 
     /// Quiesce a live ublk device without deleting it, asynchronously
@@ -391,8 +401,11 @@ impl UblkCtrlAsync {
     /// and the `EBUSY` / `EINTR` failure semantics.
     ///
     /// [`UblkCtrl::quiesce_dev`]: crate::ctrl::UblkCtrl::quiesce_dev
-    pub async fn quiesce_dev_async(&self, timeout_ms: u64) -> Result<i32, UblkError> {
-        self.get_inner_mut().quiesce_async(timeout_ms).await
+    pub async fn quiesce_dev_async(&self, timeout_ms: u64) -> Result<(), UblkError> {
+        self.get_inner_mut()
+            .quiesce_async(timeout_ms)
+            .await
+            .map(drop)
     }
 
     /// Resize a live ublk device, asynchronously
@@ -413,8 +426,11 @@ impl UblkCtrlAsync {
     /// command itself, so the device state is checked first.
     ///
     /// [`UblkCtrl::update_size`]: crate::ctrl::UblkCtrl::update_size
-    pub async fn update_size_async(&self, dev_size: u64) -> Result<i32, UblkError> {
-        self.get_inner_mut().update_size_async(dev_size).await
+    pub async fn update_size_async(&self, dev_size: u64) -> Result<(), UblkError> {
+        self.get_inner_mut()
+            .update_size_async(dev_size)
+            .await
+            .map(drop)
     }
 
     /// Async counterpart of [`UblkCtrl::register_shmem_buf`], which documents
@@ -458,14 +474,14 @@ impl UblkCtrlAsync {
     /// The kernel's deferred deletion, `UBLK_U_CMD_DEL_DEV_ASYNC` issued
     /// by [`UblkCtrl::del_dev_async`](crate::ctrl::UblkCtrl::del_dev_async),
     /// has no async/await form here.
-    pub async fn del_dev_async_await(&self) -> Result<i32, UblkError> {
+    pub async fn del_dev_async_await(&self) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del_async_await().await?;
         if Path::new(&ctrl.run_path()).exists() {
             fs::remove_file(ctrl.run_path())?;
         }
-        Ok(0)
+        Ok(())
     }
 
     /// Calculate queue affinity based on device settings asynchronously

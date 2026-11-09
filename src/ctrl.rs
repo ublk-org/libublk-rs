@@ -1552,9 +1552,11 @@ impl UblkCtrlInner {
         }
     }
 
-    /// Convert uring result to UblkError
+    /// Map a control command's CQE result: a negative errno is an
+    /// error, `-EBUSY` included (`start_user_recover` retries on it,
+    /// `quiesce_dev` reports it as the timeout it is).
     fn ublk_err_to_result(res: i32) -> Result<i32, UblkError> {
-        if res >= 0 || res == -libc::EBUSY {
+        if res >= 0 {
             Ok(res)
         } else {
             Err(UblkError::UringIOError(res))
@@ -1966,9 +1968,8 @@ impl UblkCtrlInner {
         UblkCtrlCmdData::new_data_cmd(sys::UBLK_U_CMD_UNREG_BUF, index as u64)
     }
 
-    /// REG_BUF answers with the buffer index in the CQE result.  Map it
-    /// ourselves rather than trusting `ublk_err_to_result()`, which lets
-    /// -EBUSY through as a success for the sake of QUIESCE_DEV.
+    /// REG_BUF answers with the buffer index in the CQE result; a value
+    /// the driver cannot have produced is an error too.
     fn shmem_index_from_result(res: i32) -> Result<u16, UblkError> {
         match u16::try_from(res) {
             Ok(index) => Ok(index),
@@ -2423,17 +2424,6 @@ impl UblkCtrlInner {
         Ok(())
     }
 
-    /// Consolidated error handling helpers
-
-    /// Convert system call result to UblkError::OtherError
-    fn sys_result_to_error(res: i32) -> Result<i32, UblkError> {
-        if res >= 0 {
-            Ok(res)
-        } else {
-            Err(UblkError::OtherError(res))
-        }
-    }
-
     /// Validate queue ID bounds
     fn validate_queue_id(qid: u16, max_queues: u16) -> Result<(), UblkError> {
         if (qid as usize) < (max_queues as usize) {
@@ -2614,7 +2604,7 @@ impl UblkCtrl {
     /// * `tid`: tid of the queue's pthread context
     ///
     /// Note: this method has to be called in queue daemon context
-    pub fn configure_queue(&self, dev: &UblkDev, qid: u16, tid: i32) -> Result<i32, UblkError> {
+    pub fn configure_queue(&self, dev: &UblkDev, qid: u16, tid: i32) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.store_queue_tid(qid, tid);
@@ -2626,7 +2616,7 @@ impl UblkCtrl {
             ctrl.build_json(dev)?;
         }
 
-        Ok(0)
+        Ok(())
     }
 
     /// Log this device's info and parameters, as `rublk list` prints them.
@@ -2674,28 +2664,28 @@ impl UblkCtrl {
 
     /// Retrieving device info from ublk driver
     ///
-    pub fn read_dev_info(&self) -> Result<i32, UblkError> {
-        self.get_inner_mut().read_dev_info()
+    pub fn read_dev_info(&self) -> Result<(), UblkError> {
+        self.get_inner_mut().read_dev_info().map(drop)
     }
 
     /// Retrieve this device's parameter from ublk driver by
     /// sending command
-    pub fn get_params(&self, params: &mut sys::ublk_params) -> Result<i32, UblkError> {
-        self.get_inner_mut().get_params(params)
+    pub fn get_params(&self, params: &mut sys::ublk_params) -> Result<(), UblkError> {
+        self.get_inner_mut().get_params(params).map(drop)
     }
 
     /// Send this device's parameter to ublk driver
     ///
     /// Note: device parameter has to send to driver before starting
     /// this device
-    pub fn set_params(&self, params: &sys::ublk_params) -> Result<i32, UblkError> {
-        self.get_inner_mut().set_params(params)
+    pub fn set_params(&self, params: &sys::ublk_params) -> Result<(), UblkError> {
+        self.get_inner_mut().set_params(params).map(drop)
     }
 
     /// Retrieving the specified queue's affinity from ublk driver
     ///
-    pub fn get_queue_affinity(&self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
-        self.get_inner_mut().get_queue_affinity(q, bm)
+    pub fn get_queue_affinity(&self, q: u32, bm: &mut UblkQueueAffinity) -> Result<(), UblkError> {
+        self.get_inner_mut().get_queue_affinity(q, bm).map(drop)
     }
 
     /// Set single CPU affinity for a specific queue
@@ -2726,14 +2716,11 @@ impl UblkCtrl {
     /// # Arguments
     /// * `qid` - Queue ID (0-based)
     /// * `affinity` - UblkQueueAffinity to store the result
-    ///
-    /// # Returns
-    /// 0 on success, or error code on failure
     pub fn get_queue_effective_affinity(
         &self,
         qid: u16,
         affinity: &mut UblkQueueAffinity,
-    ) -> Result<i32, UblkError> {
+    ) -> Result<(), UblkError> {
         let inner = self.get_inner();
 
         // Validate queue ID
@@ -2754,30 +2741,32 @@ impl UblkCtrl {
         };
 
         if result == 0 {
-            Ok(0)
+            Ok(())
         } else {
-            UblkCtrlInner::sys_result_to_error(-unsafe { *libc::__errno_location() })
+            Err(UblkError::OtherError(-unsafe { *libc::__errno_location() }))
         }
     }
 
     /// Start user recover for this device
     ///
-    pub fn start_user_recover(&self) -> Result<i32, UblkError> {
+    /// The driver answers `-EBUSY` while the device is still winding
+    /// down from its previous server; that is retried for up to 30 s
+    /// before being returned.
+    pub fn start_user_recover(&self) -> Result<(), UblkError> {
         let mut count = 0u32;
         let unit = 100_u32;
 
         loop {
+            // Bind first: a guard in the match scrutinee would stay
+            // held across the sleep.
             let res = self.get_inner_mut().__start_user_recover();
-            if let Ok(r) = res {
-                if r == -libc::EBUSY {
+            match res {
+                Err(UblkError::UringIOError(e)) if e == -libc::EBUSY && count < 30000 => {
                     std::thread::sleep(std::time::Duration::from_millis(unit as u64));
                     count += unit;
-                    if count < 30000 {
-                        continue;
-                    }
                 }
+                res => return res.map(drop),
             }
-            return res;
         }
     }
 
@@ -2793,7 +2782,7 @@ impl UblkCtrl {
     /// Waits for all queue buffer registrations to complete before starting.
     /// If any queue fails mlock, this method will fail immediately.
     ///
-    pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
+    pub fn start_dev(&self, dev: &UblkDev) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
         ctrl.prep_start_dev(dev)?;
 
@@ -2801,9 +2790,10 @@ impl UblkCtrl {
         dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
 
         if !UblkCtrlInner::in_recoverable_state(ctrl.dev_info.state) {
-            ctrl.start(unsafe { libc::getpid() as i32 })
+            ctrl.start(unsafe { libc::getpid() as i32 }).map(drop)
         } else if ctrl.for_recover_dev() {
             ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
+                .map(drop)
         } else {
             Err(crate::UblkError::OtherError(-libc::EINVAL))
         }
@@ -2825,7 +2815,7 @@ impl UblkCtrl {
     /// control and io from one thread; `UblkCtrlAsync` is the fully
     /// async form.
     ///
-    pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<i32, UblkError> {
+    pub async fn start_dev_async(&self, dev: &UblkDev) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.force_async = true;
@@ -2835,21 +2825,21 @@ impl UblkCtrl {
 
         let res = ctrl.start_dev_async(dev).await;
         ctrl.force_async = false;
-        res
+        res.map(drop)
     }
 
     /// Stop ublk device
     ///
     /// Remove json export, and send stop command to control device
     ///
-    pub fn stop_dev(&self) -> Result<i32, UblkError> {
+    pub fn stop_dev(&self) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
         let rp = ctrl.run_path();
 
         if ctrl.for_add_dev() && Path::new(&rp).exists() {
             fs::remove_file(rp)?;
         }
-        ctrl.stop()
+        ctrl.stop().map(drop)
     }
 
     /// Quiesce a live ublk device without deleting it
@@ -2880,8 +2870,8 @@ impl UblkCtrl {
     /// the driver marks the device canceling before it starts waiting and does
     /// not undo that on failure, so a device that fails to quiesce is left
     /// refusing new IO. Retry the call, or stop the device.
-    pub fn quiesce_dev(&self, timeout_ms: u64) -> Result<i32, UblkError> {
-        self.get_inner_mut().quiesce(timeout_ms)
+    pub fn quiesce_dev(&self, timeout_ms: u64) -> Result<(), UblkError> {
+        self.get_inner_mut().quiesce(timeout_ms).map(drop)
     }
 
     /// Resize a live ublk device
@@ -2930,8 +2920,8 @@ impl UblkCtrl {
     /// all keep the old size.
     ///
     /// [`UblkDev::set_default_params`]: crate::io::UblkDev::set_default_params
-    pub fn update_size(&self, dev_size: u64) -> Result<i32, UblkError> {
-        self.get_inner_mut().update_size(dev_size)
+    pub fn update_size(&self, dev_size: u64) -> Result<(), UblkError> {
+        self.get_inner_mut().update_size(dev_size).map(drop)
     }
 
     /// Register a shared-memory mapping for `UBLK_F_SHMEM_ZC` and return
@@ -3015,8 +3005,8 @@ impl UblkCtrl {
     /// But device may not be really removed yet, and the device ID
     /// can still be in-use after kill_dev() returns.
     ///
-    pub fn kill_dev(&self) -> Result<i32, UblkError> {
-        self.get_inner_mut().stop()
+    pub fn kill_dev(&self) -> Result<(), UblkError> {
+        self.get_inner_mut().stop().map(drop)
     }
 
     /// Remove this device and its exported json file
@@ -3027,26 +3017,26 @@ impl UblkCtrl {
     /// for-add control device is live, and it is always safe
     /// to kill device via .kill_dev().
     ///
-    pub fn del_dev(&self) -> Result<i32, UblkError> {
+    pub fn del_dev(&self) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del()?;
         if Path::new(&ctrl.run_path()).exists() {
             fs::remove_file(ctrl.run_path())?;
         }
-        Ok(0)
+        Ok(())
     }
 
     /// Remove this device and its exported json file in async
     /// way
-    pub fn del_dev_async(&self) -> Result<i32, UblkError> {
+    pub fn del_dev_async(&self) -> Result<(), UblkError> {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del_async()?;
         if Path::new(&ctrl.run_path()).exists() {
             fs::remove_file(ctrl.run_path())?;
         }
-        Ok(0)
+        Ok(())
     }
 
     /// Calculate queue affinity based on device settings
@@ -3173,7 +3163,7 @@ impl UblkCtrl {
     /// This one is the preferred interface for creating ublk daemon, and
     /// is friendly for user, such as, user can customize queue setup and
     /// io handler, such as setup async/await for handling io command.
-    pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<i32, UblkError>
+    pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<(), UblkError>
     where
         T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
         Q: FnOnce(u16, &Arc<UblkDev>) + Send + Sync + Clone + 'static,
@@ -3196,7 +3186,7 @@ impl UblkCtrl {
         //to see -ENOENT failure here
         let _ = self.stop_dev();
 
-        Ok(0)
+        Ok(())
     }
 
     /// Iterator over each ublk device ID
@@ -3452,7 +3442,7 @@ mod tests {
     }
 
     /// The CQE result of REG_BUF is the index; a negative result is an
-    /// error even though the generic path forgives -EBUSY.
+    /// error, and so is an index the driver cannot hand out.
     #[test]
     fn test_shmem_index_from_result() {
         assert_eq!(UblkCtrlInner::shmem_index_from_result(0).unwrap(), 0);

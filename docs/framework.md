@@ -276,7 +276,8 @@ A control command travels like this (`ublk_submit_cmd_sync`):
    result; async ops completed in the same batch are woken too.
 4. An ioctl-encoded opcode rejected by an old kernel is retried once as
    the legacy one-byte opcode. A negative result becomes
-   `UblkError::UringIOError`; `-EBUSY` counts as success.
+   `UblkError::UringIOError`; only `start_user_recover` retries one
+   (`-EBUSY`, for up to 30 s).
 
 `UblkCtrlAsync` sends the same payloads through `ops::uring_cmd80` and
 `.await`s them. It has no `run_target`: the caller spawns the queue
