@@ -222,7 +222,7 @@ the data itself moves depends on the buffer mode (section 6.4).
 | `UblkTgt` (`src/io.rs`) | Target-visible parameters: `dev_size`, `ublk_params`, extra fixed fds (`fds[0]` is the char device, target files start at 1). Edited by `tgt_init`; serialized to the recovery JSON. |
 | `UblkQueue` (`src/io.rs`) | One queue, or one thread's share of it: the mapped descriptor array, the owned tag set, per-tag buffer pointers, the queue state. Builds and submits FETCH / COMMIT_AND_FETCH. `Rc`, not `Send`. |
 | `UblkQueueState` (`src/io.rs`) | `cmd_inflight` plus the STOPPING / IDLE / MLOCK_FAIL flags. Both processing models record completions here: `deliver_cqes` (sync loop) and `update_queue_state` (reactor). `is_stopping()` and `queue_is_done()` drive shutdown. |
-| `BufDesc` / `BufDescList` (`src/io.rs`) | Where a request's data lives: `Slice` (copy mode: the tag's buffer, an `IoBuf` or any other target-owned memory, which the prep command registers and, under `UBLK_DEV_F_MLOCK_IO_BUFFER`, locks; empty for user copy), `AutoReg` (kernel-registered buffer index), `ZonedAppendLba`, `RawAddress`. `validate_compatibility` rejects a variant the device flags do not support. |
+| `BufDesc` / `BufDescList` (`src/io.rs`) | Where a request's data lives: `Slice` (copy mode: the tag's buffer, an `IoBuf` or any other target-owned memory, which the prep command registers and, under `UBLK_DEV_F_MLOCK_IO_BUFFER`, locks; empty for user copy), `AutoReg` (kernel-registered buffer index), `ZonedAppendLba`. `validate_compatibility` rejects a variant the device flags do not support. |
 | `ublksrv_io_desc` (`ublk_cmd.h`) | The request, written by the kernel: `op_flags` (op in bits 0-7, flags above), `nr_sectors`, `start_sector`, `addr`. Read in place through `UblkQueue::get_iod(tag)`. |
 | `UblkIOCtx` (`src/io.rs`) | Sync model only: one completion plus its handler word, passed to the target's closure (section 6.3). |
 | `Op` / `OpEntry` / `RawOp` (`src/op.rs`, `src/ops.rs`) | One awaited `io_uring` operation. `OpEntry` is the slab slot (waker, inline result slots, owned resources); `Op` the crate-private handle; `RawOp` the public future yielding the CQE result. Created by `UblkQueue::submit_io_cmd_async` and every `ops::*` function. |
@@ -503,8 +503,8 @@ file 0 (the char device) with a 16-byte payload, built by
 struct ublksrv_io_cmd { u16 q_id; u16 tag; s32 result; u64 addr; }
 ```
 
-`addr` is the copy-mode buffer, 0 for user copy and auto-buf-reg, the
-zone-append LBA for zoned devices, or a raw address. For
+`addr` is the copy-mode buffer, 0 for user copy and auto-buf-reg, or
+the zone-append LBA for zoned devices. For
 `BufDesc::AutoReg` the `ublk_auto_buf_reg` descriptor goes in
 `sqe->addr` instead. The opcode is `UBLK_U_IO_*` (ioctl-encoded),
 truncated to its low byte on kernels without

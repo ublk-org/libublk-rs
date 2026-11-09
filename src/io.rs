@@ -437,36 +437,6 @@ pub enum BufDesc<'a> {
     /// Only used for zone append operations and passed through the `addr` field
     /// of `ublksrv_io_desc` when using `submit_io_prep_cmd()`, `submit_io_commit_cmd()`, or `complete_io_cmd_unified()`.
     ZonedAppendLba(u64),
-
-    /// Raw memory address for unsafe low-level operations
-    ///
-    /// **WARNING: This variant should be avoided whenever possible.**
-    ///
-    /// Contains a raw pointer to memory that will be used directly without
-    /// safety checks or lifetime guarantees. This is an escape hatch for
-    /// cases where only a raw address is available and other buffer types
-    /// cannot be used.
-    ///
-    /// # Safety
-    ///
-    /// * The caller must ensure the memory pointed to by this address is valid
-    /// * The memory must remain valid for the entire duration of the I/O operation
-    /// * The memory must be properly aligned for the intended operations
-    /// * No bounds checking is performed - buffer overruns are possible
-    ///
-    /// # When to Use
-    ///
-    /// This variant should only be used as a last resort when:
-    /// * Interfacing with C libraries that only provide raw pointers
-    /// * Working with memory-mapped regions where slice creation is impractical
-    /// * Performance-critical code where slice overhead must be avoided
-    ///
-    /// # Preferred Alternatives
-    ///
-    /// * Use `Slice(&[u8])` when you have a safe slice reference
-    /// * Use `AutoReg(ublk_auto_buf_reg)` for zero-copy operations
-    /// * Consider creating a safe slice using `std::slice::from_raw_parts()` if length is known
-    RawAddress(*const u8),
 }
 
 impl<'a> BufDesc<'a> {
@@ -486,7 +456,6 @@ impl<'a> BufDesc<'a> {
     /// * `BufDesc::Slice` requires either no special flags or `UBLK_F_USER_COPY`
     /// * `BufDesc::AutoReg` requires `UBLK_F_AUTO_BUF_REG` to be enabled
     /// * `BufDesc::ZonedAppendLba` requires `UBLK_F_ZONED` to be enabled
-    /// * `BufDesc::RawAddress` is compatible with all device configurations (unsafe)
     #[inline]
     pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
         let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
@@ -520,12 +489,6 @@ impl<'a> BufDesc<'a> {
                 } else {
                     Err(UblkError::OtherError(-libc::ENOTSUP))
                 }
-            }
-            BufDesc::RawAddress(_) => {
-                // RawAddress operations are compatible with all device configurations
-                // but provide no safety guarantees - the caller is responsible for
-                // ensuring the address is valid and properly aligned
-                Ok(())
             }
         }
     }
@@ -2193,7 +2156,6 @@ impl UblkQueue {
     ///
     /// * `BufDesc::Slice` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
     /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
-    /// * `BufDesc::RawAddress` - Compatible with all device configurations (unsafe)
     ///
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
@@ -2229,8 +2191,6 @@ impl UblkQueue {
             ),
             // For zoned append, the LBA rides the buffer address field
             BufDesc::ZonedAppendLba(lba) => (lba, None),
-            // SAFETY: the caller is responsible for the raw address' validity
-            BufDesc::RawAddress(addr) => (addr as u64, None),
         };
 
         self.submit_io_cmd_async(tag, cmd_op, buf_addr, sqe_addr, result)
@@ -2694,7 +2654,6 @@ impl UblkQueue {
     ///
     /// * `BufDesc::Slice` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
     /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
-    /// * `BufDesc::RawAddress` - Compatible with all device configurations (unsafe)
     ///
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
@@ -2737,11 +2696,6 @@ impl UblkQueue {
             BufDesc::ZonedAppendLba(lba) => {
                 // For zoned append LBA, pass the LBA value as the buffer address
                 self.complete_io_cmd(tag, lba as *mut u8, res)
-            }
-            BufDesc::RawAddress(addr) => {
-                // For raw address operations, use the address directly
-                // SAFETY: The caller is responsible for ensuring the address is valid
-                self.complete_io_cmd(tag, addr as *mut u8, res)
             }
         }
     }
@@ -3352,16 +3306,6 @@ mod tests {
             .validate_compatibility(auto_buf_reg_flags)
             .is_ok());
 
-        // Test RawAddress variant (should be compatible with all configurations)
-        let raw_addr_desc = BufDesc::RawAddress(buffer.as_ptr());
-        assert!(raw_addr_desc.validate_compatibility(no_flags).is_ok());
-        assert!(raw_addr_desc
-            .validate_compatibility(user_copy_flags)
-            .is_ok());
-        assert!(raw_addr_desc
-            .validate_compatibility(auto_buf_reg_flags)
-            .is_ok());
-
         // Test with UBLK_F_USER_COPY and UBLK_F_AUTO_BUF_REG
         let zc_uc_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
         assert!(slice_desc.validate_compatibility(zc_uc_flags).is_ok());
@@ -3386,9 +3330,6 @@ mod tests {
         // Test from_io_buf helper
         let io_buf = IoBuf::<u8>::new(512);
         let _desc_from_io_buf = BufDesc::from_io_buf(&io_buf);
-
-        // Test RawAddress variant
-        let _raw_addr_desc = BufDesc::RawAddress(buffer.as_ptr());
     }
 
     #[test]
