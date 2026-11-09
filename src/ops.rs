@@ -444,7 +444,9 @@ pub unsafe fn recv_fixed(
     submit_raw(sqe)
 }
 
-/// Send from caller-managed memory; `flags` as for [`recv`].
+/// Send from caller-managed memory; `flags` as for [`recv`], `linked`
+/// as for [`send_fixed`] (including the same-poll rule for the link
+/// partner).
 ///
 /// # Safety
 ///
@@ -455,10 +457,20 @@ pub unsafe fn send_raw(
     ptr: *const u8,
     len: u32,
     flags: i32,
+    linked: bool,
 ) -> Result<RawOp, UblkError> {
-    submit_raw(with_tgt_fd!(fd, |f| opcode::Send::new(f, ptr, len)
-        .flags(flags)
-        .build()))
+    let sqe = with_tgt_fd!(fd, |f| opcode::Send::new(f, ptr, len).flags(flags).build());
+    submit_raw(link_sqe(sqe, linked))
+}
+
+/// Chain `sqe` to the SQE pushed after it (`IOSQE_IO_LINK`) when `linked`.
+#[inline]
+fn link_sqe(sqe: squeue::Entry, linked: bool) -> squeue::Entry {
+    if linked {
+        sqe.flags(squeue::Flags::IO_LINK)
+    } else {
+        sqe
+    }
 }
 
 /// Send from the ring-registered fixed buffer `buf_index` with a plain
@@ -497,11 +509,7 @@ pub unsafe fn send_fixed(
     let sqe = with_tgt_fd!(fd, |f| opcode::Send::new(f, addr as *const u8, len)
         .flags(flags)
         .build());
-    let mut sqe = if linked {
-        sqe.flags(squeue::Flags::IO_LINK)
-    } else {
-        sqe
-    };
+    let mut sqe = link_sqe(sqe, linked);
     crate::override_sqe!(&mut sqe, ioprio, |=, IORING_RECVSEND_FIXED_BUF);
     crate::override_sqe!(&mut sqe, buf_index, buf_index);
     submit_raw(sqe)
@@ -675,12 +683,7 @@ unsafe fn send_zc_sqe(
             .flags(flags)
             .zc_flags(SEND_ZC_REPORT_USAGE)
             .build());
-        let sqe = if linked {
-            sqe.flags(squeue::Flags::IO_LINK)
-        } else {
-            sqe
-        };
-        sqe.user_data(key)
+        link_sqe(sqe, linked).user_data(key)
     })?;
     Ok(SendZcOp { op })
 }
@@ -688,7 +691,8 @@ unsafe fn send_zc_sqe(
 /// Vectored send described by a caller-managed `msghdr`
 /// (`IORING_OP_SENDMSG`) -- the gather primitive for stream protocols:
 /// one op ships many frames' headers and payloads in order. `flags` as
-/// for [`recv`] (`MSG_WAITALL` makes the kernel resume short sends).
+/// for [`recv`] (`MSG_WAITALL` makes the kernel resume short sends);
+/// `linked` as for [`send_fixed`].
 ///
 /// # Safety
 ///
@@ -698,14 +702,16 @@ pub unsafe fn sendmsg_raw(
     fd: TgtFd,
     msg: *const libc::msghdr,
     flags: i32,
+    linked: bool,
 ) -> Result<RawOp, UblkError> {
-    submit_raw(with_tgt_fd!(fd, |f| opcode::SendMsg::new(f, msg)
+    let sqe = with_tgt_fd!(fd, |f| opcode::SendMsg::new(f, msg)
         .flags(flags as u32)
-        .build()))
+        .build());
+    submit_raw(link_sqe(sqe, linked))
 }
 
-/// Zero-copy vectored send (`IORING_OP_SENDMSG_ZC`); two CQEs, as
-/// [`send_zc`].
+/// Zero-copy vectored send (`IORING_OP_SENDMSG_ZC`); two CQEs and
+/// `linked` as for [`send_zc`].
 ///
 /// # Safety
 ///
@@ -715,11 +721,13 @@ pub unsafe fn sendmsg_zc(
     fd: TgtFd,
     msg: *const libc::msghdr,
     flags: i32,
+    linked: bool,
 ) -> Result<SendZcOp, UblkError> {
     let op = MultiOp::submit(|key| {
-        let mut sqe = with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
+        let sqe = with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
             .flags(flags as u32)
             .build());
+        let mut sqe = link_sqe(sqe, linked);
         // SENDMSG_ZC takes its zc flags in ioprio like SEND_ZC does; the
         // io-uring crate's SendMsgZc builder calls the field `ioprio`
         // rather than exposing a zc_flags() alias, so OR the bit in the
