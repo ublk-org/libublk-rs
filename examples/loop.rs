@@ -281,7 +281,7 @@ fn lo_handle_io_cmd_sync(
         let res = i.result();
         let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
 
-        assert!(cqe_tag == tag as u32);
+        assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
             q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();

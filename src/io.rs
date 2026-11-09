@@ -171,7 +171,7 @@
 //!     // For zero-copy operations
 //!     let auto_regs: Vec<sys::ublk_auto_buf_reg> = (0..queue.get_depth())
 //!         .map(|i| sys::ublk_auto_buf_reg {
-//!             index: i as u16, flags: 0, reserved0: 0, reserved1: 0,
+//!             index: i, flags: 0, reserved0: 0, reserved1: 0,
 //!         })
 //!         .collect();
 //!     let auto_list = BufDescList::AutoRegs(&auto_regs);
@@ -723,7 +723,7 @@ impl<'a> UblkIOCtx<'a> {
     /// When target IO uses io_uring for handling IO, this tag should be inherited
     /// by passing `tag` via `Self::build_user_data()`
     #[inline(always)]
-    pub fn get_tag(&self) -> u32 {
+    pub fn get_tag(&self) -> u16 {
         UblkIOCtx::user_data_to_tag(self.1)
     }
 
@@ -828,8 +828,8 @@ impl<'a> UblkIOCtx<'a> {
 
     /// Extract tag from userdata
     #[inline(always)]
-    pub fn user_data_to_tag(user_data: u64) -> u32 {
-        (user_data & 0xffff) as u32
+    pub fn user_data_to_tag(user_data: u64) -> u16 {
+        (user_data & 0xffff) as u16
     }
 
     /// Extract operation code from userdata
@@ -1374,7 +1374,7 @@ impl Drop for PartitionClaim {
 pub struct UblkQueue {
     flags: UblkFlags,
     q_id: u16,
-    q_depth: u32,
+    q_depth: u16,
     /// First tag served by this queue instance's thread; it then owns
     /// every `tag_step`-th tag after it up to `tag_end`.
     tag_start: u16,
@@ -1386,7 +1386,7 @@ pub struct UblkQueue {
     tag_step: u16,
     /// Number of tags served by this queue instance's thread; equals
     /// `q_depth` unless the queue is split across several io threads.
-    nr_tags: u32,
+    nr_tags: u16,
     /// Hold on this thread's partition slot, released on drop.
     _partition_claim: PartitionClaim,
     io_cmd_buf: u64,
@@ -1400,7 +1400,7 @@ pub struct UblkQueue {
     /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
     buf_reg_semaphore: Semaphore,
     /// Counter tracking number of registered buffers for optimization
-    buf_reg_counter: RefCell<u32>,
+    buf_reg_counter: RefCell<u16>,
 }
 
 impl AsRawFd for UblkQueue {
@@ -1516,25 +1516,26 @@ impl UblkQueue {
     /// rotating window exists and disjoint descriptor cache lines and one
     /// contiguous io-buffer range per thread are worth more.
     pub(crate) fn tag_partition(
-        depth: u32,
+        depth: u16,
         nr_threads: u16,
         idx: u16,
         sequential: bool,
-    ) -> (u16, u16, u32) {
-        let n = nr_threads.max(1) as u32;
-        let idx = idx as u32;
+    ) -> (u16, u16, u16) {
+        // Widen for the arithmetic; every result is at most `depth`.
+        let nr_threads = nr_threads.max(1);
+        let (depth, n, idx) = (u32::from(depth), u32::from(nr_threads), u32::from(idx));
         if sequential {
             let (base, rem) = (depth / n, depth % n);
             let first = idx * base + idx.min(rem);
             let count = base + u32::from(idx < rem);
-            (first as u16, 1, count)
+            (first as u16, 1, count as u16)
         } else {
             let count = if idx < depth {
                 (depth - idx).div_ceil(n)
             } else {
                 0
             };
-            (idx as u16, n as u16, count)
+            (idx as u16, nr_threads, count as u16)
         }
     }
 
@@ -1560,7 +1561,7 @@ impl UblkQueue {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
         let (tag_start, tag_step, nr_tags) = Self::tag_partition(
-            dev.dev_info.queue_depth as u32,
+            dev.dev_info.queue_depth,
             nr_threads,
             thread_idx,
             dev.flags
@@ -1572,8 +1573,9 @@ impl UblkQueue {
         }
         // One past the last owned tag, so tags() and owns_tag() need not
         // know which layout produced (tag_start, tag_step, nr_tags).
-        let tag_end = (tag_start as u32 + (nr_tags - 1) * tag_step as u32 + 1) as u16;
-        debug_assert!(tag_end as u32 <= dev.dev_info.queue_depth as u32);
+        let tag_end =
+            (u32::from(tag_start) + u32::from(nr_tags - 1) * u32::from(tag_step) + 1) as u16;
+        debug_assert!(tag_end <= dev.dev_info.queue_depth);
         // Released on drop, so every early return below gives the slot back.
         let partition_claim = dev.claim_partition(q_id, thread_idx)?;
         let cq_depth = tgt.cq_depth;
@@ -1582,9 +1584,9 @@ impl UblkQueue {
         // Users can call init_task_ring() before UblkQueue::new() to customize initialization
         init_task_ring_default(sq_depth as u32, cq_depth as u32)?;
 
-        let depth = dev.dev_info.queue_depth as u32;
+        let depth = dev.dev_info.queue_depth;
         let cdev_fd = dev.cdev_file.as_raw_fd();
-        let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
+        let cmd_buf_sz = UblkQueue::cmd_buf_sz(u32::from(depth)) as usize;
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
         // Register files and buffers with the thread-local ring
@@ -1612,7 +1614,7 @@ impl UblkQueue {
         if auto_buf_reg {
             if let Err(e) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                 ring.submitter()
-                    .register_buffers_sparse(depth)
+                    .register_buffers_sparse(u32::from(depth))
                     .map_err(UblkError::IOError)
             }) {
                 with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
@@ -1640,7 +1642,7 @@ impl UblkQueue {
             return Err(UblkError::IOError(e));
         }
 
-        let nr_ios = depth + tgt.extra_ios as u32;
+        let nr_ios = u32::from(depth) + u32::from(tgt.extra_ios);
         let mut bufs = Vec::<*mut u8>::with_capacity(nr_ios as usize);
         unsafe {
             bufs.set_len(nr_ios as usize);
@@ -1725,7 +1727,7 @@ impl UblkQueue {
     ///
     /// Queue depth decides the max count of inflight io command
     #[inline(always)]
-    pub fn get_depth(&self) -> u32 {
+    pub fn get_depth(&self) -> u16 {
         self.q_depth
     }
 
@@ -1751,7 +1753,7 @@ impl UblkQueue {
 
     /// Number of tags in [`Self::tags`].
     #[inline(always)]
-    pub fn nr_tags(&self) -> u32 {
+    pub fn nr_tags(&self) -> u16 {
         self.nr_tags
     }
 
@@ -1780,7 +1782,7 @@ impl UblkQueue {
     ///
     #[inline(always)]
     pub fn get_iod(&self, tag: u16) -> &sys::ublksrv_io_desc {
-        assert!((tag as u32) < self.q_depth);
+        assert!(tag < self.q_depth);
         let iod = (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc;
         unsafe { &*iod }
     }
@@ -2729,13 +2731,13 @@ impl UblkQueue {
                     UblkIOCtx::user_data_to_op(data)
                 );
             }
-            ops(self, tag as u16, e);
+            ops(self, tag, e);
             return;
         }
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops(self, tag as u16, e);
+            ops(self, tag, e);
         }
     }
 
@@ -2754,7 +2756,7 @@ impl UblkQueue {
             .dev
             .flags
             .intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER)
-            && state.get_nr_cmd_inflight() == self.nr_tags
+            && state.get_nr_cmd_inflight() == u32::from(self.nr_tags)
             && !state.is_idle()
         {
             log::debug!(
@@ -3636,7 +3638,7 @@ mod tag_partition_tests {
     #[test]
     fn tag_partition_covers_depth_once() {
         for sequential in [false, true] {
-            for depth in [1u32, 2, 3, 64, 65, 100, 128, 4096] {
+            for depth in [1u16, 2, 3, 64, 65, 100, 128, 4096] {
                 for n in [1u16, 2, 3, 4, 7, 8, 16] {
                     let mut seen = vec![0u32; depth as usize];
                     let mut sizes = Vec::new();
@@ -3644,13 +3646,14 @@ mod tag_partition_tests {
                     for k in 0..n {
                         let (first, step, count) =
                             UblkQueue::tag_partition(depth, n, k, sequential);
-                        let tags: Vec<u32> =
-                            (0..count).map(|i| first as u32 + i * step as u32).collect();
+                        let tags: Vec<u32> = (0..count)
+                            .map(|i| u32::from(first) + u32::from(i) * u32::from(step))
+                            .collect();
                         if sequential {
                             assert_eq!(step, 1);
                             if count > 0 {
                                 assert_eq!(first as u32, next_first, "depth {depth} n {n} k {k}");
-                                next_first += count;
+                                next_first += u32::from(count);
                             }
                         } else {
                             assert_eq!((first, step), (k, n));

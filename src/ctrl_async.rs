@@ -89,8 +89,8 @@ impl UblkCtrlAsync {
     pub async fn new_async(
         name: Option<String>,
         id: i32,
-        nr_queues: u32,
-        depth: u32,
+        nr_queues: u16,
+        depth: u16,
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
@@ -163,9 +163,9 @@ impl UblkCtrlAsync {
     ///
     /// * `qid`: queue id
     ///
-    pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
+    pub fn get_queue_tid(&self, qid: u16) -> Result<i32, UblkError> {
         let ctrl = self.get_inner();
-        ctrl.json_manager.get_queue_tid_from_json(qid as u16)
+        ctrl.json_manager.get_queue_tid_from_json(qid)
     }
 
     /// Get target flags from exported json file for this device
@@ -313,7 +313,7 @@ impl UblkCtrlAsync {
     ///
     pub async fn get_queue_affinity_async(
         &self,
-        q: u32,
+        q: u16,
         bm: &mut UblkQueueAffinity,
     ) -> Result<(), UblkError> {
         self.get_inner_mut()

@@ -765,8 +765,8 @@ impl UblkJsonManager {
 struct UblkCtrlConfig {
     name: Option<String>,
     id: i32,
-    nr_queues: u32,
-    depth: u32,
+    nr_queues: u16,
+    depth: u16,
     io_buf_bytes: u32,
     flags: u64,
     tgt_flags: u64,
@@ -777,8 +777,8 @@ impl UblkCtrlConfig {
     fn new(
         name: Option<String>,
         id: i32,
-        nr_queues: u32,
-        depth: u32,
+        nr_queues: u16,
+        depth: u16,
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
@@ -894,8 +894,8 @@ impl UblkCtrlBuilder<'_> {
         let ctrl = UblkCtrl::new(
             Some(self.name.to_string()),
             self.id,
-            self.nr_queues.into(),
-            self.depth.into(),
+            self.nr_queues,
+            self.depth,
             self.io_buf_bytes,
             self.ctrl_flags,
             self.ctrl_target_flags,
@@ -911,8 +911,8 @@ impl UblkCtrlBuilder<'_> {
         let ctrl = super::ctrl_async::UblkCtrlAsync::new_async(
             Some(self.name.to_string()),
             self.id,
-            self.nr_queues.into(),
-            self.depth.into(),
+            self.nr_queues,
+            self.depth,
             self.io_buf_bytes,
             self.ctrl_flags,
             self.ctrl_target_flags,
@@ -1012,7 +1012,7 @@ impl UblkCtrlInner {
         qid: u16,
     ) -> Result<UblkQueueAffinity, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+        self.get_queue_affinity_async(qid, &mut kernel_affinity)
             .await?;
 
         if self
@@ -1029,7 +1029,7 @@ impl UblkCtrlInner {
     /// Get queue affinity from kernel and optionally transform for single CPU mode
     fn get_queue_affinity_effective(&mut self, qid: u16) -> Result<UblkQueueAffinity, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+        self.get_queue_affinity(qid, &mut kernel_affinity)?;
 
         if self
             .dev_flags
@@ -1050,7 +1050,7 @@ impl UblkCtrlInner {
         cpu: Option<usize>,
     ) -> Result<usize, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+        self.get_queue_affinity_async(qid, &mut kernel_affinity)
             .await?;
 
         let selected_cpu = if let Some(cpu) = cpu {
@@ -1081,7 +1081,7 @@ impl UblkCtrlInner {
         cpu: Option<usize>,
     ) -> Result<usize, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+        self.get_queue_affinity(qid, &mut kernel_affinity)?;
 
         let selected_cpu = if let Some(cpu) = cpu {
             // Validate that the specified CPU is in the affinity mask
@@ -1117,7 +1117,7 @@ impl UblkCtrlInner {
         } else {
             // For multi-CPU mode, use kernel's full affinity
             let mut kernel_affinity = UblkQueueAffinity::new();
-            self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+            self.get_queue_affinity(qid, &mut kernel_affinity)?;
             Ok(kernel_affinity)
         }
     }
@@ -1137,7 +1137,7 @@ impl UblkCtrlInner {
         } else {
             // For multi-CPU mode, use kernel's full affinity
             let mut kernel_affinity = UblkQueueAffinity::new();
-            self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+            self.get_queue_affinity_async(qid, &mut kernel_affinity)
                 .await?;
             Ok(kernel_affinity)
         }
@@ -1189,15 +1189,15 @@ impl UblkCtrlInner {
     /// Create device info structure from parameters
     fn create_device_info(
         id: i32,
-        nr_queues: u32,
-        depth: u32,
+        nr_queues: u16,
+        depth: u16,
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
     ) -> sys::ublksrv_ctrl_dev_info {
         sys::ublksrv_ctrl_dev_info {
-            nr_hw_queues: nr_queues as u16,
-            queue_depth: depth as u16,
+            nr_hw_queues: nr_queues,
+            queue_depth: depth,
             max_io_buf_bytes: io_buf_bytes,
             dev_id: id as u32,
             ublksrv_pid: unsafe { libc::getpid() } as i32,
@@ -1217,7 +1217,7 @@ impl UblkCtrlInner {
     }
 
     /// Initialize queue data structures
-    fn init_queue_data(nr_queues: u32) -> (Vec<i32>, Vec<usize>) {
+    fn init_queue_data(nr_queues: u16) -> (Vec<i32>, Vec<usize>) {
         let queue_tids = vec![0; nr_queues as usize];
         let queue_selected_cpus = vec![0; nr_queues as usize];
         (queue_tids, queue_selected_cpus)
@@ -1374,8 +1374,8 @@ impl UblkCtrlInner {
     fn new_with_params(
         name: Option<String>,
         id: i32,
-        nr_queues: u32,
-        depth: u32,
+        nr_queues: u16,
+        depth: u16,
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
@@ -1399,8 +1399,8 @@ impl UblkCtrlInner {
     pub(crate) async fn new_with_params_async(
         name: Option<String>,
         id: i32,
-        nr_queues: u32,
-        depth: u32,
+        nr_queues: u16,
+        depth: u16,
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
@@ -2080,7 +2080,7 @@ impl UblkCtrlInner {
     }
 
     /// Prepare GET_QUEUE_AFFINITY command data
-    fn prepare_get_queue_affinity_cmd(q: u32, bm: &mut UblkQueueAffinity) -> UblkCtrlCmdData {
+    fn prepare_get_queue_affinity_cmd(q: u16, bm: &mut UblkQueueAffinity) -> UblkCtrlCmdData {
         UblkCtrlCmdData::new_data_buffer_cmd(
             sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
             q as u64,
@@ -2090,7 +2090,7 @@ impl UblkCtrlInner {
         )
     }
 
-    fn get_queue_affinity(&mut self, q: u32, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
+    fn get_queue_affinity(&mut self, q: u16, bm: &mut UblkQueueAffinity) -> Result<i32, UblkError> {
         let data = Self::prepare_get_queue_affinity_cmd(q, bm);
         self.ublk_ctrl_cmd(&data)
     }
@@ -2099,7 +2099,7 @@ impl UblkCtrlInner {
     ///
     pub(crate) async fn get_queue_affinity_async(
         &mut self,
-        q: u32,
+        q: u16,
         bm: &mut UblkQueueAffinity,
     ) -> Result<i32, UblkError> {
         let data = Self::prepare_get_queue_affinity_cmd(q, bm);
@@ -2391,8 +2391,8 @@ impl UblkCtrlInner {
         flags: u64,
         dev_flags: UblkFlags,
         id: i32,
-        nr_queues: u32,
-        depth: u32,
+        nr_queues: u16,
+        depth: u16,
         io_buf_bytes: u32,
     ) -> Result<(), UblkError> {
         Self::validate_param((flags & !Self::UBLK_DRV_F_ALL) == 0)?;
@@ -2415,8 +2415,8 @@ impl UblkCtrlInner {
         }
 
         Self::validate_param(id >= -1)?;
-        Self::validate_param(nr_queues <= sys::UBLK_MAX_NR_QUEUES)?;
-        Self::validate_param(depth <= sys::UBLK_MAX_QUEUE_DEPTH)?;
+        Self::validate_param(u32::from(nr_queues) <= sys::UBLK_MAX_NR_QUEUES)?;
+        Self::validate_param(u32::from(depth) <= sys::UBLK_MAX_QUEUE_DEPTH)?;
 
         let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         Self::validate_param(io_buf_bytes <= MAX_BUF_SZ && (io_buf_bytes & (page_sz - 1)) == 0)?;
@@ -2494,8 +2494,8 @@ impl UblkCtrl {
     pub fn new(
         name: Option<String>,
         id: i32,
-        nr_queues: u32,
-        depth: u32,
+        nr_queues: u16,
+        depth: u16,
         io_buf_bytes: u32,
         flags: u64,
         tgt_flags: u64,
@@ -2561,9 +2561,9 @@ impl UblkCtrl {
     ///
     /// * `qid`: queue id
     ///
-    pub fn get_queue_tid(&self, qid: u32) -> Result<i32, UblkError> {
+    pub fn get_queue_tid(&self, qid: u16) -> Result<i32, UblkError> {
         let ctrl = self.get_inner();
-        ctrl.json_manager.get_queue_tid_from_json(qid as u16)
+        ctrl.json_manager.get_queue_tid_from_json(qid)
     }
 
     /// Get target flags from exported json file for this device
@@ -2684,7 +2684,7 @@ impl UblkCtrl {
 
     /// Retrieving the specified queue's affinity from ublk driver
     ///
-    pub fn get_queue_affinity(&self, q: u32, bm: &mut UblkQueueAffinity) -> Result<(), UblkError> {
+    pub fn get_queue_affinity(&self, q: u16, bm: &mut UblkQueueAffinity) -> Result<(), UblkError> {
         self.get_inner_mut().get_queue_affinity(q, bm).map(drop)
     }
 
@@ -3049,7 +3049,7 @@ impl UblkCtrl {
             .unwrap_or_else(|_| {
                 // Fallback to kernel affinity if thread affinity creation fails
                 let mut affinity = UblkQueueAffinity::new();
-                self.get_queue_affinity(queue_id as u32, &mut affinity)
+                self.get_queue_affinity(queue_id, &mut affinity)
                     .unwrap_or_default();
                 affinity
             })
