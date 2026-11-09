@@ -301,7 +301,9 @@ fn lo_handle_io_cmd_sync(
             Some(slice) => __lo_make_io_sqe(op, off, bytes, slice.as_ptr() as *mut u8),
             None => __lo_make_io_sqe_zc(op, off, bytes, tag),
         };
-        q.ublk_submit_sqe_sync(sqe, data).unwrap();
+        // SAFETY: the SQE references this tag's queue-slot buffer (or
+        // the auto-registered slot `tag`), which outlives the queue.
+        unsafe { q.ublk_submit_sqe_sync(sqe, data) }.unwrap();
     }
 }
 

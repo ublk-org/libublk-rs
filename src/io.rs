@@ -2353,8 +2353,18 @@ impl UblkQueue {
     /// An SQE that posts several CQEs (multishot, `SEND_ZC`) invokes the
     /// IO closure once per CQE, each time with the same `data`;
     /// [`UblkIOCtx::has_more`] is false for the last one.
+    ///
+    /// # Safety
+    ///
+    /// Any memory the SQE references must stay valid until its last CQE
+    /// has been delivered to the IO closure -- the same contract as
+    /// [`Self::ublk_submit_sqe`] and [`crate::ops::submit_sqe`]. The
+    /// queue-slot buffers handed to
+    /// [`Self::submit_fetch_commands_unified`] satisfy it by
+    /// construction; anything else is the caller's to keep alive, and
+    /// nothing cancels the SQE if the closure stops being called.
     #[inline]
-    pub fn ublk_submit_sqe_sync(
+    pub unsafe fn ublk_submit_sqe_sync(
         &self,
         sqe: io_uring::squeue::Entry,
         data: u64,

@@ -1431,7 +1431,8 @@ mod integration {
                         .flags(TimeoutFlags::MULTISHOT)
                         .build();
                     let data = UblkIOCtx::build_user_data(tag, 0, 0, true);
-                    q.ublk_submit_sqe_sync(sqe, data).unwrap();
+                    // SAFETY: the timeout SQE references only the static TS
+                    unsafe { q.ublk_submit_sqe_sync(sqe, data) }.unwrap();
                     return;
                 }
 
