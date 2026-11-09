@@ -130,8 +130,8 @@
 //!
 //! async fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
-//!     let slice_desc = BufDesc::from_io_buf(&io_buf);
-//!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1, Some(&io_buf)).await?;
+//!     let buf_desc = BufDesc::Slice(io_buf.as_slice());
+//!     let result = queue.submit_io_prep_cmd(0, buf_desc).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -147,7 +147,7 @@
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
-//!     let result = queue.submit_io_prep_cmd(1, auto_desc, -1, None).await?;
+//!     let result = queue.submit_io_prep_cmd(1, auto_desc).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -409,6 +409,19 @@ pub enum BufDesc<'a> {
     /// Contains a reference to a buffer slice in userspace memory. Data is copied
     /// between this buffer and kernel buffers. Compatible with devices that have
     /// `UBLK_F_USER_COPY` enabled or devices without auto buffer registration.
+    ///
+    /// For [`UblkQueue::submit_io_prep_cmd`] a non-empty slice is the
+    /// tag's copy-mode buffer, whoever allocated it (an [`IoBuf`], a
+    /// pool, an mmap, memory from another allocator): the prep command
+    /// registers it for the tag before arming the FETCH, recording its
+    /// address so the device-start handshake counts it and locking the
+    /// range under `UBLK_DEV_F_MLOCK_IO_BUFFER` (unlocked again when a
+    /// prep or commit command for the tag fails, which is how a tag's
+    /// io ends; give each tag whole pages then, since a lock covers
+    /// pages). The caller keeps the memory valid until such a command
+    /// has failed (`QueueIsDown` at teardown); `unsafe {
+    /// std::slice::from_raw_parts(ptr, len) }` turns a raw address into
+    /// this form. An empty slice means `UBLK_F_USER_COPY`.
     Slice(&'a [u8]),
 
     /// Auto buffer registration for zero-copy operations
@@ -517,19 +530,9 @@ impl<'a> BufDesc<'a> {
         }
     }
 
-    /// Create a BufDesc from an IoBuf for migration compatibility
+    /// Create a buffer descriptor from an IoBuf
     ///
-    /// # Arguments
-    ///
-    /// * `io_buf`: Reference to an IoBuf instance
-    ///
-    /// # Returns
-    ///
-    /// A `BufDesc::Slice` containing a reference to the IoBuf's data
-    ///
-    /// This helper method facilitates migration from existing IoBuf-based code
-    /// to the new unified buffer descriptor system while maintaining zero-cost
-    /// abstraction principles.
+    /// The same as `BufDesc::Slice(io_buf.as_slice())`.
     #[inline]
     pub fn from_io_buf(io_buf: &'a IoBuf<u8>) -> Self {
         BufDesc::Slice(io_buf.as_slice())
@@ -1395,6 +1398,10 @@ pub struct UblkQueue {
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
+    /// Per tag, the length of the range at `bufs[tag]` that the prep
+    /// command locked under `UBLK_DEV_F_MLOCK_IO_BUFFER` and the queue
+    /// has to unlock; 0 when the queue holds no lock for the tag.
+    buf_locked_len: RefCell<Vec<usize>>,
     pub(crate) state: Rc<RefCell<UblkQueueState>>,
     /// Semaphore to coordinate buffer registrations
     /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
@@ -1680,6 +1687,7 @@ impl UblkQueue {
                 cmd_inflight: 0,
                 state: 0,
             })),
+            buf_locked_len: RefCell::new(vec![0; bufs.len()]),
             bufs: RefCell::new(bufs),
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
@@ -1814,13 +1822,12 @@ impl UblkQueue {
         buf_desc: &BufDesc,
     ) -> Result<(), UblkError> {
         if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
-            if let BufDesc::Slice(slice) = buf_desc {
-                if !slice.is_empty() {
-                    let expected_buf_addr = self.get_io_buf_addr(tag) as *const u8;
-                    if slice.as_ptr() != expected_buf_addr {
-                        return Err(UblkError::OtherError(-libc::EINVAL));
-                    }
-                }
+            let addr = match buf_desc {
+                BufDesc::Slice(slice) if !slice.is_empty() => slice.as_ptr(),
+                _ => return Ok(()),
+            };
+            if !std::ptr::eq(addr, self.get_io_buf_addr(tag)) {
+                return Err(UblkError::OtherError(-libc::EINVAL));
             }
         }
         Ok(())
@@ -1833,24 +1840,87 @@ impl UblkQueue {
         self.state.borrow().is_mlock_failed()
     }
 
-    fn register_io_buf_internal(&self, tag: u16, buf: &IoBuf<u8>) {
+    /// Register a slice as the tag's copy-mode buffer: lock the range
+    /// when the device asks for that, then record its address. The
+    /// queue owns the lock (the slice need not be an [`IoBuf`]) and
+    /// drops it in [`Self::munlock_slice_buf`], which the prep and
+    /// commit commands call when they fail.
+    fn register_slice_buf(&self, tag: u16, slice: &[u8]) {
         if self.support_auto_buf_zc() {
             return;
         }
 
-        if buf.as_ptr() == std::ptr::null() {
+        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
+            let addr = slice.as_ptr();
+            let same = std::ptr::eq(addr, self.bufs.borrow()[tag as usize])
+                && self.buf_locked_len.borrow()[tag as usize] == slice.len();
+            if !same {
+                self.munlock_slice_buf(tag);
+                // SAFETY: mlock only reads the range's page tables; a
+                // bad range fails with ENOMEM
+                if unsafe { libc::mlock(addr as *const libc::c_void, slice.len()) } == 0 {
+                    self.buf_locked_len.borrow_mut()[tag as usize] = slice.len();
+                } else {
+                    log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
+                    self.mark_mlock_failed();
+                }
+            }
+        }
+
+        self.register_buf_addr(tag, slice.as_ptr() as *mut u8);
+    }
+
+    /// Drop the lock [`Self::register_slice_buf`] took on the tag's
+    /// buffer. Only called while the caller still holds the buffer (it
+    /// is borrowed by the failing prep or commit command, or the caller
+    /// asked through [`Self::unregister_io_buf`]): the queue outlives
+    /// the io tasks that own the buffers, so unlocking from the queue's
+    /// drop would hit freed addresses, which may be someone else's
+    /// locked memory by then.
+    #[cold]
+    fn munlock_slice_buf(&self, tag: u16) {
+        let len = std::mem::take(&mut self.buf_locked_len.borrow_mut()[tag as usize]);
+        if len != 0 {
+            let addr = self.bufs.borrow()[tag as usize];
+            // SAFETY: munlock does not touch the memory
+            unsafe { libc::munlock(addr as *const libc::c_void, len) };
+        }
+    }
+
+    /// Register the tag's [`IoBuf`] for the sync loop: lock it when the
+    /// device asks for that (the `IoBuf` owns that lock), then record
+    /// its address.
+    fn register_io_buf_internal(&self, tag: u16, buf: &IoBuf<u8>) {
+        if self.support_auto_buf_zc() || buf.as_ptr().is_null() {
             return;
         }
 
         // Apply UBLK_DEV_F_MLOCK_IO_BUFFER if the flag is set
-        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
-            if !buf.mlock() {
-                log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
-                self.mark_mlock_failed();
-            }
+        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) && !buf.mlock() {
+            log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
+            self.mark_mlock_failed();
         }
 
-        self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
+        self.register_buf_addr(tag, buf.as_mut_ptr());
+    }
+
+    /// Record `addr` as the tag's copy-mode buffer and count it toward
+    /// the queue's registration handshake: once every tag this thread
+    /// serves has an address, the io tasks waiting in
+    /// [`Self::wait_for_all_buffer_registrations`] are released and the
+    /// device is told this queue is ready. The memory behind `addr` is
+    /// the caller's and must stay valid until the tag's io has ended.
+    fn register_buf_addr(&self, tag: u16, addr: *mut u8) {
+        if self.support_auto_buf_zc() || addr.is_null() {
+            return;
+        }
+
+        // Only a tag's first address counts: a second prep for the tag
+        // must not complete the handshake on behalf of another one.
+        let prev = std::mem::replace(&mut self.bufs.borrow_mut()[tag as usize], addr);
+        if !prev.is_null() {
+            return;
+        }
 
         // Increment the registration counter
         let mut counter = self.buf_reg_counter.borrow_mut();
@@ -1909,12 +1979,16 @@ impl UblkQueue {
 
     /// Unregister the IO buffer of `tag` (registered by
     /// [`submit_io_prep_cmd`](Self::submit_io_prep_cmd)), so that its
-    /// pages can be discarded while the queue is idle. No-op with
+    /// pages can be discarded while the queue is idle. The buffer must
+    /// still be valid: a lock the prep command took on it under
+    /// `UBLK_DEV_F_MLOCK_IO_BUFFER` is dropped here. No-op with
     /// `UBLK_F_AUTO_BUF_REG`.
     pub fn unregister_io_buf(&self, tag: u16) {
         if self.support_auto_buf_zc() {
             return;
         }
+
+        self.munlock_slice_buf(tag);
 
         // Only decrement counter if buffer was actually registered
         if !self.bufs.borrow()[tag as usize].is_null() {
@@ -2166,37 +2240,43 @@ impl UblkQueue {
     ///
     /// This function submits a fetch request to get a new I/O command from the kernel.
     /// It should typically be called once outside of loops for better performance.
-    /// If an IoBuf is provided, it will be automatically registered for the given tag.
     ///
-    /// The function includes synchronization to ensure all buffer registrations are
-    /// completed before any prep commands are submitted, providing similar behavior
-    /// to `submit_fetch_commands_unified()` where all registrations happen first.
+    /// The buffer descriptor says how this tag's data travels for the
+    /// life of the queue, and a copy-mode buffer is registered here:
     ///
-    /// The function performs cross-verification to ensure buffer descriptor alignment:
-    /// - `BufDesc::Slice` with `Some(io_buf)`: Slice must point to the same memory as IoBuf
-    /// - `BufDesc::Slice` with `None`: Slice must be empty (user_copy mode)
-    /// - `BufDesc::AutoReg` with `Some(io_buf)`: Invalid - returns error (mutually exclusive)
-    /// - `BufDesc::AutoReg` with `None`: Valid usage for zero-copy operations
+    /// - `BufDesc::Slice(buf)`, non-empty: copy mode. The slice is
+    ///   the tag's buffer, an `IoBuf` (`BufDesc::Slice(buf.as_slice())`)
+    ///   or memory the target allocated some other way. It is
+    ///   registered for the tag (its range mlocked under
+    ///   `UBLK_DEV_F_MLOCK_IO_BUFFER`, and unlocked when a prep or
+    ///   commit command for the tag fails), and the command waits until every tag of this
+    ///   thread's partition has registered its buffer, so no FETCH is
+    ///   armed before all buffers exist -- the ordering
+    ///   `submit_fetch_commands_unified()` gives the sync loop. The
+    ///   caller keeps the memory valid until a prep or commit command
+    ///   for the tag has failed (`QueueIsDown` at teardown).
+    /// - `BufDesc::Slice(&[])`: `UBLK_F_USER_COPY`, no buffer.
+    /// - `BufDesc::AutoReg(..)`: `UBLK_F_AUTO_BUF_REG` zero copy.
+    /// - `BufDesc::ZonedAppendLba(..)`: zoned devices (user copy).
     ///
     /// # Arguments
     ///
     /// * `tag` - The tag ID for the I/O command
     /// * `buf_desc` - Buffer descriptor for the I/O operation
-    /// * `result` - Result value (typically -1 for fetch operations)
-    /// * `io_buf` - Optional IoBuf to register for this tag
     ///
     /// # Returns
     ///
     /// Returns a Result containing the command result when complete.
-    /// Returns `Err(UblkError::OtherError(-EINVAL))` if buffer descriptor doesn't align with IoBuf.
+    /// Returns `Err(UblkError::OtherError(-EPERM))` when a buffer of
+    /// this device could not be mlocked under `UBLK_DEV_F_MLOCK_IO_BUFFER`.
     /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
     ///
     /// # Cancellation
     ///
     /// Once this future has armed the io command (its first poll after
     /// the registration wait), the kernel holds the address of the
-    /// `BufDesc::Slice` buffer until the command completes or the queue
-    /// is torn down. Dropping the future mid-await does NOT recall the
+    /// `BufDesc::Slice` buffer until the command
+    /// completes or the queue is torn down. Dropping the future mid-await does NOT recall the
     /// command — only a best-effort cancel is issued — so on a running
     /// device the buffer must stay alive until queue teardown, not
     /// merely until the drop. The canonical per-tag io task never drops
@@ -2206,45 +2286,28 @@ impl UblkQueue {
         &self,
         tag: u16,
         buf_desc: BufDesc<'_>,
-        result: i32,
-        io_buf: Option<&crate::helpers::IoBuf<u8>>,
     ) -> Result<i32, UblkError> {
-        // Cross-verify buffer descriptor alignment with IoBuf
-        match (&buf_desc, &io_buf) {
-            (BufDesc::Slice(slice), Some(buf)) => {
-                // Verify that the slice points to the same memory as the IoBuf
-                let buf_slice = buf.as_slice();
-                if slice.as_ptr() != buf_slice.as_ptr() || slice.len() != buf_slice.len() {
-                    return Err(UblkError::OtherError(-libc::EINVAL));
-                }
-            }
-            (BufDesc::Slice(slice), None) => {
-                // For user_copy mode, slice should be empty
-                if !slice.is_empty() {
-                    return Err(UblkError::OtherError(-libc::EINVAL));
-                }
-            }
-            (BufDesc::AutoReg(_), Some(_)) => {
-                // AutoReg should not be used with IoBuf - they are mutually exclusive
-                return Err(UblkError::OtherError(-libc::EINVAL));
-            }
-            (BufDesc::AutoReg(_), None) => {
-                // This is the correct usage for AutoReg
-            }
-            (BufDesc::ZonedAppendLba(_), _) | (BufDesc::RawAddress(_), _) => {
-                // These variants don't require specific verification with IoBuf
-            }
+        let res = self.prep_cmd(tag, buf_desc).await;
+        if res.is_err() {
+            // The task is about to drop its buffer: release the lock
+            // while the buffer is still borrowed.
+            self.munlock_slice_buf(tag);
         }
+        res
+    }
 
-        // Register the IoBuf (which mlocks it when the device asks for
-        // that) and wait for the whole queue's registrations BEFORE
-        // arming the FETCH command: once the SQE is pushed the kernel
-        // holds the buffer address, and failing out of this function
-        // with the command armed would let the buffer be freed while
-        // the (never-started) device still references it.
-        if let Some(buf) = io_buf {
-            self.register_io_buf_internal(tag, buf);
-            self.wait_for_all_buffer_registrations().await;
+    async fn prep_cmd(&self, tag: u16, buf_desc: BufDesc<'_>) -> Result<i32, UblkError> {
+        // Register the copy-mode buffer (mlocked when the device asks
+        // for that) and wait for the whole queue's
+        // registrations BEFORE arming the FETCH command: once the SQE is
+        // pushed the kernel holds the buffer address, and failing out of
+        // this function with the command armed would let the buffer be
+        // freed while the (never-started) device still references it.
+        if let BufDesc::Slice(slice) = &buf_desc {
+            if !slice.is_empty() {
+                self.register_slice_buf(tag, slice);
+                self.wait_for_all_buffer_registrations().await;
+            }
         }
 
         // Check if mlock failed and fail immediately if so, but only for FETCH_REQ operations
@@ -2261,7 +2324,8 @@ impl UblkQueue {
             return Err(UblkError::QueueIsDown);
         }
 
-        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
+        // FETCH_REQ carries no result; -1 is what the sync loop sends.
+        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, -1);
         match f {
             Ok(future) => {
                 let res = future.await;
@@ -2316,10 +2380,13 @@ impl UblkQueue {
             result,
         );
 
+        // On either failure the task is about to drop its buffer:
+        // release the prep command's lock while it is still borrowed.
         match f {
             Ok(future) => {
                 let res = future.await;
                 if res == crate::sys::UBLK_IO_RES_ABORT {
+                    self.munlock_slice_buf(tag);
                     Err(UblkError::QueueIsDown)
                 } else {
                     Ok(res)
@@ -2327,6 +2394,7 @@ impl UblkQueue {
             }
             Err(e) => {
                 self.mark_stopping();
+                self.munlock_slice_buf(tag);
                 Err(e)
             }
         }
@@ -3398,51 +3466,26 @@ mod tests {
         UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
     }
 
+    /// `from_io_buf` is `Slice(buf.as_slice())`, the copy-mode buffer.
     #[test]
-    fn test_submit_io_prep_cmd_verification() {
+    fn test_buf_desc_io_buf() {
         use crate::helpers::IoBuf;
         use crate::sys;
 
-        // Test verification logic with a mock setup (we don't need a real ublk device for verification tests)
-        let buf1 = IoBuf::<u8>::new(4096);
-        let buf2 = IoBuf::<u8>::new(2048);
+        let buf = IoBuf::<u8>::new(4096);
+        let desc = BufDesc::from_io_buf(&buf);
+        assert!(matches!(desc, BufDesc::Slice(s) if std::ptr::eq(s.as_ptr(), buf.as_ptr())));
 
-        // Test case 1: BufDesc::Slice with matching IoBuf (should be valid)
-        let slice1 = buf1.as_slice();
-        let _desc1 = BufDesc::Slice(slice1);
-        // This should pass verification (in real usage it would be tested in submit_io_prep_cmd)
-
-        // Test case 2: BufDesc::Slice with mismatched IoBuf (should fail verification)
-        let slice2 = buf2.as_slice();
-        let _desc2 = BufDesc::Slice(slice2);
-        // Using desc2 with buf1 would fail verification because pointers don't match
-
-        // Test case 3: BufDesc::Slice empty with None IoBuf (should be valid for user_copy)
-        let empty_slice: &[u8] = &[];
-        let _desc3 = BufDesc::Slice(empty_slice);
-        // This should pass verification when used with None IoBuf
-
-        // Test case 4: BufDesc::AutoReg with None IoBuf (should be valid)
-        let auto_reg = sys::ublk_auto_buf_reg {
-            index: 0,
-            flags: 0,
-            reserved0: 0,
-            reserved1: 0,
-        };
-        let _desc4 = BufDesc::AutoReg(auto_reg);
-        // This should pass verification when used with None IoBuf
-
-        // Test case 5: BufDesc::AutoReg with Some IoBuf (should fail verification)
-        // Using _desc4 with Some(&buf1) would fail verification because they're mutually exclusive
-
-        // Verify pointer matching logic
-        assert_eq!(slice1.as_ptr(), buf1.as_slice().as_ptr());
-        assert_eq!(slice1.len(), buf1.as_slice().len());
-        assert_ne!(slice2.as_ptr(), buf1.as_slice().as_ptr());
-        assert_ne!(slice2.len(), buf1.as_slice().len());
-        assert_eq!(empty_slice.len(), 0);
-
-        println!("Buffer descriptor verification test cases validated");
+        assert!(desc.validate_compatibility(0).is_ok());
+        assert!(desc
+            .validate_compatibility(sys::UBLK_F_USER_COPY as u64)
+            .is_ok());
+        assert!(desc
+            .validate_compatibility(sys::UBLK_F_AUTO_BUF_REG as u64)
+            .is_err());
+        assert!(desc
+            .validate_compatibility((sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64)
+            .is_ok());
     }
 
     #[test]

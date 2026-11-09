@@ -119,16 +119,14 @@ async fn __null_io_task(
     };
 
     let buf_desc = match buf {
-        Some(io_buf) => {
-            // Note: submit_io_prep_cmd will automatically register the buffer
-            BufDesc::Slice(io_buf.as_slice())
-        }
+        // registered by the prep command
+        Some(io_buf) => BufDesc::Slice(io_buf.as_slice()),
         None if user_copy => BufDesc::Slice(&[]),
         _ => BufDesc::AutoReg(auto_buf_reg),
     };
 
     // Submit initial prep command - any error will exit the function
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, buf).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone()).await?;
 
     loop {
         let res = get_io_cmd_result(&q, tag);

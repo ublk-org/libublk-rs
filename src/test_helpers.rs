@@ -31,14 +31,12 @@ pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue) -> Result<(), UblkError
     use crate::BufDesc;
 
     let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
-    let _buf = Some(buf);
     let iod = q.get_iod(tag);
-    let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
+    let buf_desc = BufDesc::Slice(buf.as_slice());
 
     // Submit initial prep command and handle any errors (including queue down)
-    // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, _buf.as_ref())
-        .await?;
+    // The IoBuf is registered by the prep command
+    q.submit_io_prep_cmd(tag, buf_desc.clone()).await?;
 
     loop {
         let res = (iod.nr_sectors << 9) as i32;

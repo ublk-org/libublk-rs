@@ -386,8 +386,8 @@ async fn lo_io_task_buf(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     let mut buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
     // Submit initial prep command - any error will exit the function
-    // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+    // The IoBuf is registered by the prep command
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()))
         .await?;
 
     loop {
@@ -409,7 +409,7 @@ async fn lo_io_task_buf(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
 async fn lo_io_task_zc(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     let buf_desc = BufDesc::AutoReg(lo_auto_buf_reg(tag));
 
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, None).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone()).await?;
 
     loop {
         let res = lo_handle_io_cmd_async(&q, tag, None).await;

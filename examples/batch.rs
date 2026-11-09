@@ -274,16 +274,14 @@ async fn batch_io_task(
     };
 
     let buf_desc = match buf {
-        Some(io_buf) => {
-            // Note: submit_io_prep_cmd will automatically register the buffer
-            BufDesc::Slice(io_buf.as_slice())
-        }
+        // registered by the prep command
+        Some(io_buf) => BufDesc::Slice(io_buf.as_slice()),
         None if zero_copy => BufDesc::AutoReg(auto_buf_reg),
         _ => BufDesc::Slice(&[]),
     };
 
     // Submit initial prep command
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, buf).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone()).await?;
 
     loop {
         // Handle batch coordination (if active)

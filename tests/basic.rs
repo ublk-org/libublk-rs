@@ -412,7 +412,7 @@ mod integration {
             let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
             // Submit initial prep command - any error will exit the function
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()))
                 .await?;
 
             loop {
@@ -480,6 +480,127 @@ mod integration {
         .unwrap();
     }
 
+    /// A copy-mode device whose io buffers the target owns: one pool
+    /// per queue thread, each tag's buffer a sub-slice of it, passed to
+    /// the prep command as a non-empty `BufDesc::Slice`. The prep must
+    /// register the address so device start sees every tag, and the
+    /// kernel must copy READ data out of the target's memory.
+    #[test]
+    fn test_ublk_null_async_target_buf() {
+        __test_ublk_null_async_target_buf(UblkFlags::UBLK_DEV_F_ADD_DEV);
+    }
+
+    /// Whether every mapping that overlaps `[addr, addr + len)` is
+    /// mlocked (`lo` in its `VmFlags` line of /proc/self/smaps). mlock
+    /// splits mappings at the range's page boundaries, so this is exact
+    /// for a page-aligned range whatever else the process has locked.
+    fn range_is_mlocked(addr: usize, len: usize) -> bool {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let (mut overlaps, mut seen, mut locked) = (false, false, true);
+        for line in smaps.lines() {
+            let first = line.split_whitespace().next().unwrap_or("");
+            if let Some((start, end)) = first.split_once('-') {
+                if let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                ) {
+                    overlaps = start < addr + len && addr < end;
+                    seen |= overlaps;
+                    continue;
+                }
+            }
+            if overlaps && first == "VmFlags:" {
+                locked &= line.split_whitespace().any(|flag| flag == "lo");
+            }
+        }
+        seen && locked
+    }
+
+    fn __test_ublk_null_async_target_buf(dev_flags: UblkFlags) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn test_io_task(q: &UblkQueue, tag: u16, buf: &[u8]) -> Result<(), UblkError> {
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf)).await?;
+            loop {
+                let iod = q.get_iod(tag);
+                let res = (iod.nr_sectors << 9) as i32;
+                q.submit_io_commit_cmd(tag, BufDesc::Slice(buf), res)
+                    .await?;
+            }
+        }
+
+        let depth = 16_u16;
+        let ctrl = UblkCtrlBuilder::default()
+            .name("null")
+            .nr_queues(2)
+            .depth(depth)
+            .id(-1)
+            .dev_flags(dev_flags)
+            .build()
+            .unwrap();
+
+        let tgt_init = |dev: &mut UblkDev| {
+            dev.set_default_params(250_u64 << 30);
+            Ok(())
+        };
+
+        let mlock = dev_flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
+        // (address, length) of each queue thread's pool
+        let pools = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        // pools still locked after their io tasks ended
+        let left_locked = Arc::new(AtomicUsize::new(0));
+
+        let q_fn = {
+            let (pools, left_locked) = (pools.clone(), left_locked.clone());
+            move |qid: u16, dev: &Arc<UblkDev>| {
+                let io_size = dev.dev_info.max_io_buf_bytes as usize;
+                let pool = Rc::new(IoBuf::<u8>::new(io_size * depth as usize));
+                let range = (pool.as_ptr() as usize, pool.len());
+                pools.lock().unwrap().push(range);
+                let task_pool = pool.clone();
+                libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
+                    let pool = task_pool.clone();
+                    async move {
+                        let off = tag as usize * io_size;
+                        let buf = &pool.as_slice()[off..off + io_size];
+                        test_io_task(&q, tag, buf).await
+                    }
+                })
+                .unwrap();
+                // every tag's command failed with QueueIsDown, which
+                // must have dropped the queue's lock on its range
+                if range_is_mlocked(range.0, range.1) {
+                    left_locked.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        };
+
+        ctrl.run_target(tgt_init, q_fn, move |ctrl: &UblkCtrl| {
+            // the device started, so every tag of every queue is
+            // registered: the whole of each pool is locked, or none
+            let pools = pools.lock().unwrap();
+            assert_eq!(pools.len(), 2);
+            for &(addr, len) in pools.iter() {
+                assert_eq!(range_is_mlocked(addr, len), mlock);
+            }
+            run_ublk_disk_sanity_test(ctrl, dev_flags);
+            read_ublk_disk(ctrl, true);
+            ctrl.kill_dev().unwrap();
+        })
+        .unwrap();
+        assert_eq!(left_locked.load(Ordering::Relaxed), 0);
+    }
+
+    /// The same target-owned pool on a `UBLK_DEV_F_MLOCK_IO_BUFFER`
+    /// device: the prep command locks each tag's range itself, since
+    /// the queue cannot rely on the slice being an `IoBuf`.
+    #[test]
+    fn test_ublk_null_async_target_buf_mlock() {
+        __test_ublk_null_async_target_buf(
+            UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER,
+        );
+    }
+
     /// Several io threads per queue (`UBLK_F_PER_IO_DAEMON`): each
     /// thread FETCHes and serves its own tag partition, every partition
     /// must be counted for device start, and IO must flow through all
@@ -503,7 +624,7 @@ mod integration {
             let tid = unsafe { libc::gettid() };
             tags_seen.lock().unwrap().push((q.get_qid(), tid, tag));
             let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()))
                 .await?;
             loop {
                 let iod = q.get_iod(tag);
@@ -682,7 +803,7 @@ mod integration {
         async fn io_task(q: Rc<UblkQueue>, tag: u16) -> Result<(), UblkError> {
             let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()))
                 .await?;
             loop {
                 let iod = q.get_iod(tag);
@@ -783,8 +904,7 @@ mod integration {
             };
 
             // Submit initial prep command - any error will exit the function
-            // AutoReg doesn't use IoBuf, so pass None
-            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg), 0, None)
+            q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_buf_reg))
                 .await?;
 
             loop {
@@ -961,13 +1081,13 @@ mod integration {
 
             // Submit initial prep command - any error will exit the function
             // The IoBuf is automatically registered
-            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+            q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()))
                 .await?;
 
             // If mlock is enabled, verify the buffer is mlocked after registration
             if mlock_enabled {
                 assert!(
-                    buf.is_mlocked(),
+                    range_is_mlocked(buf.as_ptr() as usize, buf.len()),
                     "Buffer should be mlocked when UBLK_DEV_F_MLOCK_IO_BUFFER is set"
                 );
             }
@@ -1163,7 +1283,7 @@ mod integration {
         let q_fn = move |qid: u16, dev: &Arc<UblkDev>| {
             libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| async move {
                 let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
-                q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+                q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()))
                     .await?;
                 loop {
                     let iod = q.get_iod(tag);

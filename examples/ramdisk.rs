@@ -83,8 +83,8 @@ async fn io_task(q: &UblkQueue, tag: u16, ramdisk_storage: &mut [u8]) -> Result<
     let mut buffer = IoBuf::<u8>::new(buf_size);
 
     // Submit initial prep command - any error will exit the function
-    // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), 0, Some(&buffer))
+    // The IoBuf is registered by the prep command
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()))
         .await?;
 
     loop {
