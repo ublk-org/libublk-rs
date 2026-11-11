@@ -15,6 +15,9 @@ CONFIG_BLK_DEV_UBLK.
 [libublk framework and core design](docs/framework.md): how the
 library is built and how a block request flows through it
 
+[CHANGELOG](CHANGELOG.md): what changed in each release, with a
+migration guide from 0.4 to 0.5
+
 [ublk doc
 links](https://github.com/ming1/ubdsrv/blob/master/doc/external_links.rst)
 
