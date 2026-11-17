@@ -83,11 +83,11 @@ async fn __null_io_task(q: &UblkQueue, tag: u16, buf: Option<&IoBuf<u8>>, user_c
     -> Result<(), UblkError>
 {
     let buf_desc = match buf {
-        Some(io_buf) => BufDesc::Slice(io_buf.as_slice()),   // copy mode
+        Some(io_buf) => BufDesc::Slice(io_buf.as_slice()),    // copy mode, registered by the prep (any target-owned memory works)
         None if user_copy => BufDesc::Slice(&[]),             // UBLK_F_USER_COPY
         _ => BufDesc::AutoReg(auto_buf_reg),                  // UBLK_F_AUTO_BUF_REG zero copy
     };
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, buf).await?;     // FETCH_REQ: wait for the 1st request
+    q.submit_io_prep_cmd(tag, buf_desc.clone()).await?;             // FETCH_REQ: wait for the 1st request
     loop {
         let res = get_io_cmd_result(&q, tag);                        // handle it
         q.submit_io_commit_cmd(tag, buf_desc.clone(), res).await?;  // COMMIT_AND_FETCH_REQ: answer + wait for the next
@@ -222,7 +222,7 @@ the data itself moves depends on the buffer mode (section 6.4).
 | `UblkTgt` (`src/io.rs`) | Target-visible parameters: `dev_size`, `ublk_params`, extra fixed fds (`fds[0]` is the char device, target files start at 1). Edited by `tgt_init`; serialized to the recovery JSON. |
 | `UblkQueue` (`src/io.rs`) | One queue, or one thread's share of it: the mapped descriptor array, the owned tag set, per-tag buffer pointers, the queue state. Builds and submits FETCH / COMMIT_AND_FETCH. `Rc`, not `Send`. |
 | `UblkQueueState` (`src/io.rs`) | `cmd_inflight` plus the STOPPING / IDLE / MLOCK_FAIL flags. Both processing models record completions here: `deliver_cqes` (sync loop) and `update_queue_state` (reactor). `is_stopping()` and `queue_is_done()` drive shutdown. |
-| `BufDesc` / `BufDescList` (`src/io.rs`) | Where a request's data lives: `Slice` (copy mode, or empty for user copy), `AutoReg` (kernel-registered buffer index), `ZonedAppendLba`, `RawAddress`. `validate_compatibility` rejects a variant the device flags do not support. |
+| `BufDesc` / `BufDescList` (`src/io.rs`) | Where a request's data lives: `Slice` (copy mode: the tag's buffer, an `IoBuf` or any other target-owned memory, which the prep command registers and, under `UBLK_DEV_F_MLOCK_IO_BUFFER`, locks; empty for user copy), `AutoReg` (kernel-registered buffer index), `ZonedAppendLba`. `validate_compatibility` rejects a variant the device flags do not support. |
 | `ublksrv_io_desc` (`ublk_cmd.h`) | The request, written by the kernel: `op_flags` (op in bits 0-7, flags above), `nr_sectors`, `start_sector`, `addr`. Read in place through `UblkQueue::get_iod(tag)`. |
 | `UblkIOCtx` (`src/io.rs`) | Sync model only: one completion plus its handler word, passed to the target's closure (section 6.3). |
 | `Op` / `OpEntry` / `RawOp` (`src/op.rs`, `src/ops.rs`) | One awaited `io_uring` operation. `OpEntry` is the slab slot (waker, inline result slots, owned resources); `Op` the crate-private handle; `RawOp` the public future yielding the CQE result. Created by `UblkQueue::submit_io_cmd_async` and every `ops::*` function. |
@@ -276,13 +276,14 @@ A control command travels like this (`ublk_submit_cmd_sync`):
    result; async ops completed in the same batch are woken too.
 4. An ioctl-encoded opcode rejected by an old kernel is retried once as
    the legacy one-byte opcode. A negative result becomes
-   `UblkError::UringIOError`; `-EBUSY` counts as success.
+   `UblkError::UringIOError`; only `start_user_recover` retries one
+   (`-EBUSY`, for up to 30 s).
 
 `UblkCtrlAsync` sends the same payloads through `ops::uring_cmd80` and
 `.await`s them. It has no `run_target`: the caller spawns the queue
-threads and calls `configure_queue_async` and `start_dev_async` itself,
-as [`examples/ramdisk.rs`](../examples/ramdisk.rs) does; pinning is
-available separately through `set_thread_affinity_async`.
+threads and calls `configure_queue` and `start_dev` itself, as
+[`examples/ramdisk.rs`](../examples/ramdisk.rs) does; pinning is
+available separately through `set_thread_affinity`.
 
 ### 5.3 Queues, threads, and start
 
@@ -502,8 +503,8 @@ file 0 (the char device) with a 16-byte payload, built by
 struct ublksrv_io_cmd { u16 q_id; u16 tag; s32 result; u64 addr; }
 ```
 
-`addr` is the copy-mode buffer, 0 for user copy and auto-buf-reg, the
-zone-append LBA for zoned devices, or a raw address. For
+`addr` is the copy-mode buffer, 0 for user copy and auto-buf-reg, or
+the zone-append LBA for zoned devices. For
 `BufDesc::AutoReg` the `ublk_auto_buf_reg` descriptor goes in
 `sqe->addr` instead. The opcode is `UBLK_U_IO_*` (ioctl-encoded),
 truncated to its low byte on kernels without
@@ -600,7 +601,7 @@ one.
 | Memory | Owner | Lifetime | Notes |
 |---|---|---|---|
 | Descriptor array (`io_cmd_buf`) | kernel; mapped read-only per `UblkQueue` | `UblkQueue::new` → `Drop` | `depth × 24` bytes rounded to a page |
-| Per-tag `IoBuf` | the io task (async) or the queue closure (sync) | must outlive the armed FETCH | `submit_io_prep_cmd` refuses a slice that is not the `IoBuf`. The kernel holds the address until the command is aborted; cancelling a FETCH does not release it. |
+| Per-tag `IoBuf` | the io task (async) or the queue closure (sync) | must outlive the armed FETCH | `submit_io_prep_cmd` takes it as `BufDesc::Slice(buf.as_slice())` and registers it for the tag. The kernel holds the address until the command is aborted; cancelling a FETCH does not release it. |
 | Fixed buffer table | queue ring (`register_buffers_sparse(depth)`) | `UblkQueue` lifetime | Auto-buf-reg only; slot = tag by convention |
 | `OpEntry` | op slab (thread-local) | submit → terminal CQE | 64 bytes, one cache line. In-flight entries are leaked at thread exit on purpose: the kernel may still write into their buffers. |
 | Shared-memory ZC mappings | `ShmemBufs` | until `unregister_shmem_buf` | Registered with the driver by index |

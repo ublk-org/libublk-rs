@@ -194,29 +194,37 @@ pub unsafe fn write_at_raw(
 /// Read from `file` at `offset` into the ring-registered fixed buffer
 /// `buf_index` (`IORING_OP_READ_FIXED`).
 ///
+/// `addr` follows the fixed-buffer convention of the registration type:
+/// an address inside a user-registered buffer, or the plain byte offset
+/// into a kernel-registered one (ublk `UBLK_F_AUTO_BUF_REG` request
+/// buffers, which have no userspace mapping: `0` is the start of the
+/// request's data). Every `_fixed` op takes `addr` this way.
+///
 /// # Safety
 ///
 /// The fixed-buffer slot must stay registered, and any memory it maps
-/// valid, until this op's CQE has been reaped. `ptr` addresses into the
-/// registered buffer; ublk `UBLK_F_AUTO_BUF_REG` slots take a null
-/// pointer.
+/// valid, until this op's CQE has been reaped.
 #[inline]
 pub unsafe fn read_at_fixed(
     file: TgtFd,
     buf_index: u16,
-    ptr: *mut u8,
+    addr: u64,
     len: u32,
     offset: u64,
 ) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(file, |fd| opcode::ReadFixed::new(
-        fd, ptr, len, buf_index
+        fd,
+        addr as *mut u8,
+        len,
+        buf_index
     )
     .offset(offset)
     .build()))
 }
 
 /// Write to `file` at `offset` from the ring-registered fixed buffer
-/// `buf_index` (`IORING_OP_WRITE_FIXED`).
+/// `buf_index` (`IORING_OP_WRITE_FIXED`); `addr` as for
+/// [`read_at_fixed`].
 ///
 /// # Safety
 ///
@@ -225,12 +233,15 @@ pub unsafe fn read_at_fixed(
 pub unsafe fn write_at_fixed(
     file: TgtFd,
     buf_index: u16,
-    ptr: *const u8,
+    addr: u64,
     len: u32,
     offset: u64,
 ) -> Result<RawOp, UblkError> {
     submit_raw(with_tgt_fd!(file, |fd| opcode::WriteFixed::new(
-        fd, ptr, len, buf_index
+        fd,
+        addr as *const u8,
+        len,
+        buf_index
     )
     .offset(offset)
     .build()))
@@ -418,12 +429,8 @@ pub unsafe fn recv_raw(fd: TgtFd, ptr: *mut u8, len: u32, flags: i32) -> Result<
 }
 
 /// Receive into the ring-registered fixed buffer `buf_index`. `addr`
-/// follows the fixed-buffer convention of the registration type: an
-/// address inside a user-registered buffer, or the plain byte offset
-/// for kernel-registered buffers (ublk `UBLK_F_AUTO_BUF_REG` request
-/// buffers, which have no userspace mapping) -- resuming a partial
-/// receive continues at the consumed byte count. `flags` as for
-/// [`recv`].
+/// as for [`read_at_fixed`] -- resuming a partial receive continues at
+/// the consumed byte count. `flags` as for [`recv`].
 ///
 /// # Safety
 ///
@@ -444,7 +451,9 @@ pub unsafe fn recv_fixed(
     submit_raw(sqe)
 }
 
-/// Send from caller-managed memory; `flags` as for [`recv`].
+/// Send from caller-managed memory; `flags` as for [`recv`], `linked`
+/// as for [`send_fixed`] (including the same-poll rule for the link
+/// partner).
 ///
 /// # Safety
 ///
@@ -455,18 +464,27 @@ pub unsafe fn send_raw(
     ptr: *const u8,
     len: u32,
     flags: i32,
+    linked: bool,
 ) -> Result<RawOp, UblkError> {
-    submit_raw(with_tgt_fd!(fd, |f| opcode::Send::new(f, ptr, len)
-        .flags(flags)
-        .build()))
+    let sqe = with_tgt_fd!(fd, |f| opcode::Send::new(f, ptr, len).flags(flags).build());
+    submit_raw(link_sqe(sqe, linked))
+}
+
+/// Chain `sqe` to the SQE pushed after it (`IOSQE_IO_LINK`) when `linked`.
+#[inline]
+fn link_sqe(sqe: squeue::Entry, linked: bool) -> squeue::Entry {
+    if linked {
+        sqe.flags(squeue::Flags::IO_LINK)
+    } else {
+        sqe
+    }
 }
 
 /// Send from the ring-registered fixed buffer `buf_index` with a plain
 /// single-completion send -- the zero-copy-registration write path for
-/// sockets where `SEND_ZC` is unavailable (AF_UNIX). `addr` follows the
-/// registration type's convention, as for [`recv_fixed`]; `flags` as
-/// for [`recv`]; `linked` chains the send before the next pushed SQE
-/// (`IOSQE_IO_LINK`).
+/// sockets where `SEND_ZC` is unavailable (AF_UNIX). `addr` as for
+/// [`read_at_fixed`]; `flags` as for [`recv`]; `linked` chains the send
+/// before the next pushed SQE (`IOSQE_IO_LINK`).
 ///
 /// A link partner must be pushed from the same poll, with no `await` in
 /// between. The library also pushes SQEs on the queue ring -- the
@@ -497,11 +515,7 @@ pub unsafe fn send_fixed(
     let sqe = with_tgt_fd!(fd, |f| opcode::Send::new(f, addr as *const u8, len)
         .flags(flags)
         .build());
-    let mut sqe = if linked {
-        sqe.flags(squeue::Flags::IO_LINK)
-    } else {
-        sqe
-    };
+    let mut sqe = link_sqe(sqe, linked);
     crate::override_sqe!(&mut sqe, ioprio, |=, IORING_RECVSEND_FIXED_BUF);
     crate::override_sqe!(&mut sqe, buf_index, buf_index);
     submit_raw(sqe)
@@ -639,9 +653,9 @@ pub unsafe fn send_zc(
 
 /// Zero-copy send from the ring-registered fixed buffer `buf_index`
 /// (`IORING_OP_SEND_ZC` with a registered buffer): the kernel reuses the
-/// registration instead of pinning pages per send. `addr` follows the
-/// registration type's convention, as for [`recv_fixed`]; `flags`,
-/// `linked` and the two-CQE completion are as for [`send_zc`].
+/// registration instead of pinning pages per send. `addr` as for
+/// [`read_at_fixed`]; `flags`, `linked` and the two-CQE completion are
+/// as for [`send_zc`].
 ///
 /// # Safety
 ///
@@ -675,12 +689,7 @@ unsafe fn send_zc_sqe(
             .flags(flags)
             .zc_flags(SEND_ZC_REPORT_USAGE)
             .build());
-        let sqe = if linked {
-            sqe.flags(squeue::Flags::IO_LINK)
-        } else {
-            sqe
-        };
-        sqe.user_data(key)
+        link_sqe(sqe, linked).user_data(key)
     })?;
     Ok(SendZcOp { op })
 }
@@ -688,7 +697,8 @@ unsafe fn send_zc_sqe(
 /// Vectored send described by a caller-managed `msghdr`
 /// (`IORING_OP_SENDMSG`) -- the gather primitive for stream protocols:
 /// one op ships many frames' headers and payloads in order. `flags` as
-/// for [`recv`] (`MSG_WAITALL` makes the kernel resume short sends).
+/// for [`recv`] (`MSG_WAITALL` makes the kernel resume short sends);
+/// `linked` as for [`send_fixed`].
 ///
 /// # Safety
 ///
@@ -698,14 +708,16 @@ pub unsafe fn sendmsg_raw(
     fd: TgtFd,
     msg: *const libc::msghdr,
     flags: i32,
+    linked: bool,
 ) -> Result<RawOp, UblkError> {
-    submit_raw(with_tgt_fd!(fd, |f| opcode::SendMsg::new(f, msg)
+    let sqe = with_tgt_fd!(fd, |f| opcode::SendMsg::new(f, msg)
         .flags(flags as u32)
-        .build()))
+        .build());
+    submit_raw(link_sqe(sqe, linked))
 }
 
-/// Zero-copy vectored send (`IORING_OP_SENDMSG_ZC`); two CQEs, as
-/// [`send_zc`].
+/// Zero-copy vectored send (`IORING_OP_SENDMSG_ZC`); two CQEs and
+/// `linked` as for [`send_zc`].
 ///
 /// # Safety
 ///
@@ -715,11 +727,13 @@ pub unsafe fn sendmsg_zc(
     fd: TgtFd,
     msg: *const libc::msghdr,
     flags: i32,
+    linked: bool,
 ) -> Result<SendZcOp, UblkError> {
     let op = MultiOp::submit(|key| {
-        let mut sqe = with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
+        let sqe = with_tgt_fd!(fd, |f| opcode::SendMsgZc::new(f, msg)
             .flags(flags as u32)
             .build());
+        let mut sqe = link_sqe(sqe, linked);
         // SENDMSG_ZC takes its zc flags in ioprio like SEND_ZC does; the
         // io-uring crate's SendMsgZc builder calls the field `ioprio`
         // rather than exposing a zc_flags() alias, so OR the bit in the

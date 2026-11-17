@@ -278,7 +278,7 @@ impl ShmemBufs {
     ///
     /// Dropping the returned future before it completes leaks `buf`'s
     /// mapping rather than unmapping it: the driver may still be pinning
-    /// those pages (see [`UblkCtrlAsync::register_shmem_buf_async`]).
+    /// those pages (see [`UblkCtrlAsync::register_shmem_buf`]).
     // The control lock is held across the await on purpose: it only
     // serializes register/unregister against each other, and the awaited
     // command is the very thing that needs serializing.
@@ -290,9 +290,7 @@ impl ShmemBufs {
     ) -> Result<u16, UblkError> {
         let _ctl = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
         let keep = KeepOnCancel(Some(buf));
-        let res = ctrl
-            .register_shmem_buf_async(keep.0.as_ref().unwrap())
-            .await;
+        let res = ctrl.register_shmem_buf(keep.0.as_ref().unwrap()).await;
         // completed (either way): the mapping is ours to drop again
         let buf = keep.take();
         let index = res?;
@@ -322,7 +320,7 @@ impl ShmemBufs {
     ) -> Result<ShmemBuf, UblkError> {
         let _ctl = self.ctl.lock().unwrap_or_else(|e| e.into_inner());
         self.check_registered(index)?;
-        ctrl.unregister_shmem_buf_async(index).await?;
+        ctrl.unregister_shmem_buf(index).await?;
         self.take(index).ok_or(UblkError::OtherError(-libc::ENOENT))
     }
 

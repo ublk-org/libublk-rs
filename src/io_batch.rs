@@ -1075,7 +1075,7 @@ fn parse_batch_user_data(user_data: u64, qid: u16) -> Option<(u32, u16)> {
     let reserved = 0x7f_u64 << 56;
     if user_data & target == 0
         || user_data & reserved != 0
-        || UblkIOCtx::user_data_to_tag(user_data) != qid as u32
+        || UblkIOCtx::user_data_to_tag(user_data) != qid
         || (user_data >> BATCH_USER_DATA_MAGIC_SHIFT) & 0xffff != BATCH_USER_DATA_MAGIC
     {
         return None;

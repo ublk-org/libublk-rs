@@ -231,10 +231,10 @@ async fn lo_handle_io_cmd_async(q: &UblkQueue, tag: u16, io_buf: Option<&mut [u8
         let f = match op {
             libublk::sys::UBLK_IO_OP_FLUSH => ops::sync_file_range(TgtFd::Fixed(1), off, bytes, 0),
             libublk::sys::UBLK_IO_OP_READ if zc => unsafe {
-                ops::read_at_fixed(TgtFd::Fixed(1), tag, std::ptr::null_mut(), bytes, off)
+                ops::read_at_fixed(TgtFd::Fixed(1), tag, 0, bytes, off)
             },
             libublk::sys::UBLK_IO_OP_WRITE if zc => unsafe {
-                ops::write_at_fixed(TgtFd::Fixed(1), tag, std::ptr::null(), bytes, off)
+                ops::write_at_fixed(TgtFd::Fixed(1), tag, 0, bytes, off)
             },
             libublk::sys::UBLK_IO_OP_READ => unsafe {
                 ops::read_at_raw(TgtFd::Fixed(1), buf_addr, bytes, off)
@@ -281,7 +281,7 @@ fn lo_handle_io_cmd_sync(
         let res = i.result();
         let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
 
-        assert!(cqe_tag == tag as u32);
+        assert!(cqe_tag == tag);
 
         if res != -(libc::EAGAIN) {
             q.complete_io_cmd_unified(tag, buf_desc, res).unwrap();
@@ -301,7 +301,9 @@ fn lo_handle_io_cmd_sync(
             Some(slice) => __lo_make_io_sqe(op, off, bytes, slice.as_ptr() as *mut u8),
             None => __lo_make_io_sqe_zc(op, off, bytes, tag),
         };
-        q.ublk_submit_sqe_sync(sqe, data).unwrap();
+        // SAFETY: the SQE references this tag's queue-slot buffer (or
+        // the auto-registered slot `tag`), which outlives the queue.
+        unsafe { q.ublk_submit_sqe_sync(sqe, data) }.unwrap();
     }
 }
 
@@ -384,8 +386,8 @@ async fn lo_io_task_buf(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     let mut buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
 
     // Submit initial prep command - any error will exit the function
-    // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(&buf))
+    // The IoBuf is registered by the prep command
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()))
         .await?;
 
     loop {
@@ -407,7 +409,7 @@ async fn lo_io_task_buf(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
 async fn lo_io_task_zc(q: &UblkQueue, tag: u16) -> Result<(), UblkError> {
     let buf_desc = BufDesc::AutoReg(lo_auto_buf_reg(tag));
 
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, None).await?;
+    q.submit_io_prep_cmd(tag, buf_desc.clone()).await?;
 
     loop {
         let res = lo_handle_io_cmd_async(&q, tag, None).await;

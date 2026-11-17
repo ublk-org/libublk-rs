@@ -47,7 +47,7 @@
 //! use libublk::UblkFlags;
 //!
 //! async fn example_async() -> Result<(), Box<dyn std::error::Error>> {
-//!     let ctrl = UblkCtrlAsync::new_async(
+//!     let ctrl = UblkCtrlAsync::new(
 //!         Some("example_async".to_string()),
 //!         -1, // Let driver allocate ID
 //!         1,  // nr_queues
@@ -130,8 +130,8 @@
 //!
 //! async fn example(queue: &UblkQueue) -> Result<(), libublk::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
-//!     let slice_desc = BufDesc::from_io_buf(&io_buf);
-//!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1, Some(&io_buf)).await?;
+//!     let buf_desc = BufDesc::Slice(io_buf.as_slice());
+//!     let result = queue.submit_io_prep_cmd(0, buf_desc).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -147,7 +147,7 @@
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
 //!     let auto_desc = BufDesc::AutoReg(auto_reg);
-//!     let result = queue.submit_io_prep_cmd(1, auto_desc, -1, None).await?;
+//!     let result = queue.submit_io_prep_cmd(1, auto_desc).await?;
 //!     // ... handle future
 //!     Ok(())
 //! }
@@ -171,7 +171,7 @@
 //!     // For zero-copy operations
 //!     let auto_regs: Vec<sys::ublk_auto_buf_reg> = (0..queue.get_depth())
 //!         .map(|i| sys::ublk_auto_buf_reg {
-//!             index: i as u16, flags: 0, reserved0: 0, reserved1: 0,
+//!             index: i, flags: 0, reserved0: 0, reserved1: 0,
 //!         })
 //!         .collect();
 //!     let auto_list = BufDescList::AutoRegs(&auto_regs);
@@ -409,6 +409,19 @@ pub enum BufDesc<'a> {
     /// Contains a reference to a buffer slice in userspace memory. Data is copied
     /// between this buffer and kernel buffers. Compatible with devices that have
     /// `UBLK_F_USER_COPY` enabled or devices without auto buffer registration.
+    ///
+    /// For [`UblkQueue::submit_io_prep_cmd`] a non-empty slice is the
+    /// tag's copy-mode buffer, whoever allocated it (an [`IoBuf`], a
+    /// pool, an mmap, memory from another allocator): the prep command
+    /// registers it for the tag before arming the FETCH, recording its
+    /// address so the device-start handshake counts it and locking the
+    /// range under `UBLK_DEV_F_MLOCK_IO_BUFFER` (unlocked again when a
+    /// prep or commit command for the tag fails, which is how a tag's
+    /// io ends; give each tag whole pages then, since a lock covers
+    /// pages). The caller keeps the memory valid until such a command
+    /// has failed (`QueueIsDown` at teardown); `unsafe {
+    /// std::slice::from_raw_parts(ptr, len) }` turns a raw address into
+    /// this form. An empty slice means `UBLK_F_USER_COPY`.
     Slice(&'a [u8]),
 
     /// Auto buffer registration for zero-copy operations
@@ -424,36 +437,6 @@ pub enum BufDesc<'a> {
     /// Only used for zone append operations and passed through the `addr` field
     /// of `ublksrv_io_desc` when using `submit_io_prep_cmd()`, `submit_io_commit_cmd()`, or `complete_io_cmd_unified()`.
     ZonedAppendLba(u64),
-
-    /// Raw memory address for unsafe low-level operations
-    ///
-    /// **WARNING: This variant should be avoided whenever possible.**
-    ///
-    /// Contains a raw pointer to memory that will be used directly without
-    /// safety checks or lifetime guarantees. This is an escape hatch for
-    /// cases where only a raw address is available and other buffer types
-    /// cannot be used.
-    ///
-    /// # Safety
-    ///
-    /// * The caller must ensure the memory pointed to by this address is valid
-    /// * The memory must remain valid for the entire duration of the I/O operation
-    /// * The memory must be properly aligned for the intended operations
-    /// * No bounds checking is performed - buffer overruns are possible
-    ///
-    /// # When to Use
-    ///
-    /// This variant should only be used as a last resort when:
-    /// * Interfacing with C libraries that only provide raw pointers
-    /// * Working with memory-mapped regions where slice creation is impractical
-    /// * Performance-critical code where slice overhead must be avoided
-    ///
-    /// # Preferred Alternatives
-    ///
-    /// * Use `Slice(&[u8])` when you have a safe slice reference
-    /// * Use `AutoReg(ublk_auto_buf_reg)` for zero-copy operations
-    /// * Consider creating a safe slice using `std::slice::from_raw_parts()` if length is known
-    RawAddress(*const u8),
 }
 
 impl<'a> BufDesc<'a> {
@@ -473,7 +456,6 @@ impl<'a> BufDesc<'a> {
     /// * `BufDesc::Slice` requires either no special flags or `UBLK_F_USER_COPY`
     /// * `BufDesc::AutoReg` requires `UBLK_F_AUTO_BUF_REG` to be enabled
     /// * `BufDesc::ZonedAppendLba` requires `UBLK_F_ZONED` to be enabled
-    /// * `BufDesc::RawAddress` is compatible with all device configurations (unsafe)
     #[inline]
     pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
         let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
@@ -508,28 +490,12 @@ impl<'a> BufDesc<'a> {
                     Err(UblkError::OtherError(-libc::ENOTSUP))
                 }
             }
-            BufDesc::RawAddress(_) => {
-                // RawAddress operations are compatible with all device configurations
-                // but provide no safety guarantees - the caller is responsible for
-                // ensuring the address is valid and properly aligned
-                Ok(())
-            }
         }
     }
 
-    /// Create a BufDesc from an IoBuf for migration compatibility
+    /// Create a buffer descriptor from an IoBuf
     ///
-    /// # Arguments
-    ///
-    /// * `io_buf`: Reference to an IoBuf instance
-    ///
-    /// # Returns
-    ///
-    /// A `BufDesc::Slice` containing a reference to the IoBuf's data
-    ///
-    /// This helper method facilitates migration from existing IoBuf-based code
-    /// to the new unified buffer descriptor system while maintaining zero-cost
-    /// abstraction principles.
+    /// The same as `BufDesc::Slice(io_buf.as_slice())`.
     #[inline]
     pub fn from_io_buf(io_buf: &'a IoBuf<u8>) -> Self {
         BufDesc::Slice(io_buf.as_slice())
@@ -547,7 +513,7 @@ pub enum BufDescList<'a> {
     /// List of IoBuf for traditional buffer management
     ///
     /// Contains an optional reference to a vector of `IoBuf<u8>` instances.
-    /// Used with submit_fetch_commands for copy-based operations where data
+    /// Used with `submit_fetch_commands_unified` for copy-based operations where data
     /// is explicitly transferred between userspace and kernel buffers.
     ///
     /// # When to Use
@@ -565,7 +531,7 @@ pub enum BufDescList<'a> {
     ///
     /// Contains a slice of `sys::ublk_auto_buf_reg` structures that define
     /// buffer registration parameters for high-performance zero-copy I/O.
-    /// Used with submit_fetch_commands_with_auto_buf_reg for direct kernel
+    /// Used with `submit_fetch_commands_unified` for direct kernel
     /// access to userspace buffers.
     ///
     /// # When to Use
@@ -723,7 +689,7 @@ impl<'a> UblkIOCtx<'a> {
     /// When target IO uses io_uring for handling IO, this tag should be inherited
     /// by passing `tag` via `Self::build_user_data()`
     #[inline(always)]
-    pub fn get_tag(&self) -> u32 {
+    pub fn get_tag(&self) -> u16 {
         UblkIOCtx::user_data_to_tag(self.1)
     }
 
@@ -828,8 +794,8 @@ impl<'a> UblkIOCtx<'a> {
 
     /// Extract tag from userdata
     #[inline(always)]
-    pub fn user_data_to_tag(user_data: u64) -> u32 {
-        (user_data & 0xffff) as u32
+    pub fn user_data_to_tag(user_data: u64) -> u16 {
+        (user_data & 0xffff) as u16
     }
 
     /// Extract operation code from userdata
@@ -850,6 +816,10 @@ impl<'a> UblkIOCtx<'a> {
 /// queue ring registers, and the ublk parameters. A target fills this
 /// in from its `tgt_init` closure; it is serialized into the device's
 /// JSON for recovery.
+///
+/// Non-exhaustive: targets assign the fields they need on `dev.tgt`
+/// rather than constructing the struct, so fields can be added.
+#[non_exhaustive]
 pub struct UblkTgt {
     /// target type
     pub tgt_type: String,
@@ -878,7 +848,8 @@ pub struct UblkTgt {
     /// Number of valid entries in [`Self::fds`].
     pub nr_fds: i32,
 
-    /// could become bigger, is it one issue?
+    /// Device parameters, sent to the driver with SET_PARAMS before
+    /// START_DEV.
     pub params: sys::ublk_params,
 }
 
@@ -905,7 +876,7 @@ pub struct UblkDev {
     /// feature flags.
     pub dev_info: sys::ublksrv_ctrl_dev_info,
 
-    /// reserved for supporting new features
+    /// The [`UblkFlags`] (`UBLK_DEV_F_*`) this device was built with.
     pub flags: UblkFlags,
 
     //fds[0] points to /dev/ublkcN
@@ -1021,13 +992,13 @@ impl UblkDev {
     ///
     /// # Arguments:
     ///
-    /// * `ops`: target operation functions
+    /// * `tgt_name`: target type name, such as "loop", "null", ...
+    /// * `ops`: target initialization closure, called with the new
+    ///   device to set its size and parameters
     /// * `ctrl`: control device reference
-    /// * `tgt_type`: target type, such as 'loop', 'null', ...
     ///
-    /// ublk device is abstraction for target, and prepare for setting
-    /// up target. Any target private data can be defined in the data
-    /// structure which implements UblkTgtImpl.
+    /// ublk device is the abstraction of a target, and prepares for
+    /// setting up the target.
     pub fn new<F>(tgt_name: String, ops: F, ctrl: &UblkCtrl) -> Result<UblkDev, UblkError>
     where
         F: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
@@ -1173,7 +1144,10 @@ impl UblkDev {
     ///
     /// Every io thread of every queue reports once, so the expected
     /// count is `nr_hw_queues * io_threads_per_queue`.
-    pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
+    pub(crate) fn wait_for_buffer_registration(
+        &self,
+        nr_hw_queues: usize,
+    ) -> Result<(), UblkError> {
         let nr_hw_queues = nr_hw_queues * self.io_threads_per_queue as usize;
         if (self.dev_info.flags
             & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64)
@@ -1208,7 +1182,7 @@ impl UblkDev {
     }
 
     /// Notify that a queue has completed buffer registration
-    pub fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
+    pub(crate) fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
         let (lock, cvar) = &*self.buf_reg_sync;
         let mut state = lock.lock().unwrap();
         state.registered_queues += 1;
@@ -1366,7 +1340,7 @@ impl Drop for PartitionClaim {
 pub struct UblkQueue {
     flags: UblkFlags,
     q_id: u16,
-    q_depth: u32,
+    q_depth: u16,
     /// First tag served by this queue instance's thread; it then owns
     /// every `tag_step`-th tag after it up to `tag_end`.
     tag_start: u16,
@@ -1378,7 +1352,7 @@ pub struct UblkQueue {
     tag_step: u16,
     /// Number of tags served by this queue instance's thread; equals
     /// `q_depth` unless the queue is split across several io threads.
-    nr_tags: u32,
+    nr_tags: u16,
     /// Hold on this thread's partition slot, released on drop.
     _partition_claim: PartitionClaim,
     io_cmd_buf: u64,
@@ -1387,12 +1361,16 @@ pub struct UblkQueue {
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
+    /// Per tag, the length of the range at `bufs[tag]` that the prep
+    /// command locked under `UBLK_DEV_F_MLOCK_IO_BUFFER` and the queue
+    /// has to unlock; 0 when the queue holds no lock for the tag.
+    buf_locked_len: RefCell<Vec<usize>>,
     pub(crate) state: Rc<RefCell<UblkQueueState>>,
     /// Semaphore to coordinate buffer registrations
     /// Initialized with queue depth permits, each submit_io_prep_cmd acquires a permit
     buf_reg_semaphore: Semaphore,
     /// Counter tracking number of registered buffers for optimization
-    buf_reg_counter: RefCell<u32>,
+    buf_reg_counter: RefCell<u16>,
 }
 
 impl AsRawFd for UblkQueue {
@@ -1508,25 +1486,26 @@ impl UblkQueue {
     /// rotating window exists and disjoint descriptor cache lines and one
     /// contiguous io-buffer range per thread are worth more.
     pub(crate) fn tag_partition(
-        depth: u32,
+        depth: u16,
         nr_threads: u16,
         idx: u16,
         sequential: bool,
-    ) -> (u16, u16, u32) {
-        let n = nr_threads.max(1) as u32;
-        let idx = idx as u32;
+    ) -> (u16, u16, u16) {
+        // Widen for the arithmetic; every result is at most `depth`.
+        let nr_threads = nr_threads.max(1);
+        let (depth, n, idx) = (u32::from(depth), u32::from(nr_threads), u32::from(idx));
         if sequential {
             let (base, rem) = (depth / n, depth % n);
             let first = idx * base + idx.min(rem);
             let count = base + u32::from(idx < rem);
-            (first as u16, 1, count)
+            (first as u16, 1, count as u16)
         } else {
             let count = if idx < depth {
                 (depth - idx).div_ceil(n)
             } else {
                 0
             };
-            (idx as u16, n as u16, count)
+            (idx as u16, nr_threads, count as u16)
         }
     }
 
@@ -1552,7 +1531,7 @@ impl UblkQueue {
             return Err(UblkError::OtherError(-libc::EINVAL));
         }
         let (tag_start, tag_step, nr_tags) = Self::tag_partition(
-            dev.dev_info.queue_depth as u32,
+            dev.dev_info.queue_depth,
             nr_threads,
             thread_idx,
             dev.flags
@@ -1564,8 +1543,9 @@ impl UblkQueue {
         }
         // One past the last owned tag, so tags() and owns_tag() need not
         // know which layout produced (tag_start, tag_step, nr_tags).
-        let tag_end = (tag_start as u32 + (nr_tags - 1) * tag_step as u32 + 1) as u16;
-        debug_assert!(tag_end as u32 <= dev.dev_info.queue_depth as u32);
+        let tag_end =
+            (u32::from(tag_start) + u32::from(nr_tags - 1) * u32::from(tag_step) + 1) as u16;
+        debug_assert!(tag_end <= dev.dev_info.queue_depth);
         // Released on drop, so every early return below gives the slot back.
         let partition_claim = dev.claim_partition(q_id, thread_idx)?;
         let cq_depth = tgt.cq_depth;
@@ -1574,9 +1554,9 @@ impl UblkQueue {
         // Users can call init_task_ring() before UblkQueue::new() to customize initialization
         init_task_ring_default(sq_depth as u32, cq_depth as u32)?;
 
-        let depth = dev.dev_info.queue_depth as u32;
+        let depth = dev.dev_info.queue_depth;
         let cdev_fd = dev.cdev_file.as_raw_fd();
-        let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
+        let cmd_buf_sz = UblkQueue::cmd_buf_sz(u32::from(depth)) as usize;
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
         // Register files and buffers with the thread-local ring
@@ -1604,7 +1584,7 @@ impl UblkQueue {
         if auto_buf_reg {
             if let Err(e) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                 ring.submitter()
-                    .register_buffers_sparse(depth)
+                    .register_buffers_sparse(u32::from(depth))
                     .map_err(UblkError::IOError)
             }) {
                 with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
@@ -1632,7 +1612,7 @@ impl UblkQueue {
             return Err(UblkError::IOError(e));
         }
 
-        let nr_ios = depth + tgt.extra_ios as u32;
+        let nr_ios = u32::from(depth) + u32::from(tgt.extra_ios);
         let mut bufs = Vec::<*mut u8>::with_capacity(nr_ios as usize);
         unsafe {
             bufs.set_len(nr_ios as usize);
@@ -1670,6 +1650,7 @@ impl UblkQueue {
                 cmd_inflight: 0,
                 state: 0,
             })),
+            buf_locked_len: RefCell::new(vec![0; bufs.len()]),
             bufs: RefCell::new(bufs),
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
@@ -1717,7 +1698,7 @@ impl UblkQueue {
     ///
     /// Queue depth decides the max count of inflight io command
     #[inline(always)]
-    pub fn get_depth(&self) -> u32 {
+    pub fn get_depth(&self) -> u16 {
         self.q_depth
     }
 
@@ -1743,7 +1724,7 @@ impl UblkQueue {
 
     /// Number of tags in [`Self::tags`].
     #[inline(always)]
-    pub fn nr_tags(&self) -> u32 {
+    pub fn nr_tags(&self) -> u16 {
         self.nr_tags
     }
 
@@ -1772,7 +1753,7 @@ impl UblkQueue {
     ///
     #[inline(always)]
     pub fn get_iod(&self, tag: u16) -> &sys::ublksrv_io_desc {
-        assert!((tag as u32) < self.q_depth);
+        assert!(tag < self.q_depth);
         let iod = (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc;
         unsafe { &*iod }
     }
@@ -1804,13 +1785,12 @@ impl UblkQueue {
         buf_desc: &BufDesc,
     ) -> Result<(), UblkError> {
         if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
-            if let BufDesc::Slice(slice) = buf_desc {
-                if !slice.is_empty() {
-                    let expected_buf_addr = self.get_io_buf_addr(tag) as *const u8;
-                    if slice.as_ptr() != expected_buf_addr {
-                        return Err(UblkError::OtherError(-libc::EINVAL));
-                    }
-                }
+            let addr = match buf_desc {
+                BufDesc::Slice(slice) if !slice.is_empty() => slice.as_ptr(),
+                _ => return Ok(()),
+            };
+            if !std::ptr::eq(addr, self.get_io_buf_addr(tag)) {
+                return Err(UblkError::OtherError(-libc::EINVAL));
             }
         }
         Ok(())
@@ -1823,24 +1803,87 @@ impl UblkQueue {
         self.state.borrow().is_mlock_failed()
     }
 
-    fn register_io_buf_internal(&self, tag: u16, buf: &IoBuf<u8>) {
+    /// Register a slice as the tag's copy-mode buffer: lock the range
+    /// when the device asks for that, then record its address. The
+    /// queue owns the lock (the slice need not be an [`IoBuf`]) and
+    /// drops it in [`Self::munlock_slice_buf`], which the prep and
+    /// commit commands call when they fail.
+    fn register_slice_buf(&self, tag: u16, slice: &[u8]) {
         if self.support_auto_buf_zc() {
             return;
         }
 
-        if buf.as_ptr() == std::ptr::null() {
+        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
+            let addr = slice.as_ptr();
+            let same = std::ptr::eq(addr, self.bufs.borrow()[tag as usize])
+                && self.buf_locked_len.borrow()[tag as usize] == slice.len();
+            if !same {
+                self.munlock_slice_buf(tag);
+                // SAFETY: mlock only reads the range's page tables; a
+                // bad range fails with ENOMEM
+                if unsafe { libc::mlock(addr as *const libc::c_void, slice.len()) } == 0 {
+                    self.buf_locked_len.borrow_mut()[tag as usize] = slice.len();
+                } else {
+                    log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
+                    self.mark_mlock_failed();
+                }
+            }
+        }
+
+        self.register_buf_addr(tag, slice.as_ptr() as *mut u8);
+    }
+
+    /// Drop the lock [`Self::register_slice_buf`] took on the tag's
+    /// buffer. Only called while the caller still holds the buffer (it
+    /// is borrowed by the failing prep or commit command, or the caller
+    /// asked through [`Self::unregister_io_buf`]): the queue outlives
+    /// the io tasks that own the buffers, so unlocking from the queue's
+    /// drop would hit freed addresses, which may be someone else's
+    /// locked memory by then.
+    #[cold]
+    fn munlock_slice_buf(&self, tag: u16) {
+        let len = std::mem::take(&mut self.buf_locked_len.borrow_mut()[tag as usize]);
+        if len != 0 {
+            let addr = self.bufs.borrow()[tag as usize];
+            // SAFETY: munlock does not touch the memory
+            unsafe { libc::munlock(addr as *const libc::c_void, len) };
+        }
+    }
+
+    /// Register the tag's [`IoBuf`] for the sync loop: lock it when the
+    /// device asks for that (the `IoBuf` owns that lock), then record
+    /// its address.
+    fn register_io_buf_internal(&self, tag: u16, buf: &IoBuf<u8>) {
+        if self.support_auto_buf_zc() || buf.as_ptr().is_null() {
             return;
         }
 
         // Apply UBLK_DEV_F_MLOCK_IO_BUFFER if the flag is set
-        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
-            if !buf.mlock() {
-                log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
-                self.mark_mlock_failed();
-            }
+        if self.flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) && !buf.mlock() {
+            log::warn!("{}: fail to mlock buffer of tag {}", "register_io_buf", tag);
+            self.mark_mlock_failed();
         }
 
-        self.bufs.borrow_mut()[tag as usize] = buf.as_mut_ptr();
+        self.register_buf_addr(tag, buf.as_mut_ptr());
+    }
+
+    /// Record `addr` as the tag's copy-mode buffer and count it toward
+    /// the queue's registration handshake: once every tag this thread
+    /// serves has an address, the io tasks waiting in
+    /// [`Self::wait_for_all_buffer_registrations`] are released and the
+    /// device is told this queue is ready. The memory behind `addr` is
+    /// the caller's and must stay valid until the tag's io has ended.
+    fn register_buf_addr(&self, tag: u16, addr: *mut u8) {
+        if self.support_auto_buf_zc() || addr.is_null() {
+            return;
+        }
+
+        // Only a tag's first address counts: a second prep for the tag
+        // must not complete the handshake on behalf of another one.
+        let prev = std::mem::replace(&mut self.bufs.borrow_mut()[tag as usize], addr);
+        if !prev.is_null() {
+            return;
+        }
 
         // Increment the registration counter
         let mut counter = self.buf_reg_counter.borrow_mut();
@@ -1897,12 +1940,18 @@ impl UblkQueue {
         self.buf_reg_semaphore.add_permits(self.nr_tags as usize);
     }
 
-    /// Register IO buffer, so that pages in this buffer can
-    /// be discarded in case queue becomes idle
+    /// Unregister the IO buffer of `tag` (registered by
+    /// [`submit_io_prep_cmd`](Self::submit_io_prep_cmd)), so that its
+    /// pages can be discarded while the queue is idle. The buffer must
+    /// still be valid: a lock the prep command took on it under
+    /// `UBLK_DEV_F_MLOCK_IO_BUFFER` is dropped here. No-op with
+    /// `UBLK_F_AUTO_BUF_REG`.
     pub fn unregister_io_buf(&self, tag: u16) {
         if self.support_auto_buf_zc() {
             return;
         }
+
+        self.munlock_slice_buf(tag);
 
         // Only decrement counter if buffer was actually registered
         if !self.bufs.borrow()[tag as usize].is_null() {
@@ -2107,7 +2156,6 @@ impl UblkQueue {
     ///
     /// * `BufDesc::Slice` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
     /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
-    /// * `BufDesc::RawAddress` - Compatible with all device configurations (unsafe)
     ///
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
@@ -2143,8 +2191,6 @@ impl UblkQueue {
             ),
             // For zoned append, the LBA rides the buffer address field
             BufDesc::ZonedAppendLba(lba) => (lba, None),
-            // SAFETY: the caller is responsible for the raw address' validity
-            BufDesc::RawAddress(addr) => (addr as u64, None),
         };
 
         self.submit_io_cmd_async(tag, cmd_op, buf_addr, sqe_addr, result)
@@ -2154,37 +2200,43 @@ impl UblkQueue {
     ///
     /// This function submits a fetch request to get a new I/O command from the kernel.
     /// It should typically be called once outside of loops for better performance.
-    /// If an IoBuf is provided, it will be automatically registered for the given tag.
     ///
-    /// The function includes synchronization to ensure all buffer registrations are
-    /// completed before any prep commands are submitted, providing similar behavior
-    /// to `submit_fetch_commands_unified()` where all registrations happen first.
+    /// The buffer descriptor says how this tag's data travels for the
+    /// life of the queue, and a copy-mode buffer is registered here:
     ///
-    /// The function performs cross-verification to ensure buffer descriptor alignment:
-    /// - `BufDesc::Slice` with `Some(io_buf)`: Slice must point to the same memory as IoBuf
-    /// - `BufDesc::Slice` with `None`: Slice must be empty (user_copy mode)
-    /// - `BufDesc::AutoReg` with `Some(io_buf)`: Invalid - returns error (mutually exclusive)
-    /// - `BufDesc::AutoReg` with `None`: Valid usage for zero-copy operations
+    /// - `BufDesc::Slice(buf)`, non-empty: copy mode. The slice is
+    ///   the tag's buffer, an `IoBuf` (`BufDesc::Slice(buf.as_slice())`)
+    ///   or memory the target allocated some other way. It is
+    ///   registered for the tag (its range mlocked under
+    ///   `UBLK_DEV_F_MLOCK_IO_BUFFER`, and unlocked when a prep or
+    ///   commit command for the tag fails), and the command waits until every tag of this
+    ///   thread's partition has registered its buffer, so no FETCH is
+    ///   armed before all buffers exist -- the ordering
+    ///   `submit_fetch_commands_unified()` gives the sync loop. The
+    ///   caller keeps the memory valid until a prep or commit command
+    ///   for the tag has failed (`QueueIsDown` at teardown).
+    /// - `BufDesc::Slice(&[])`: `UBLK_F_USER_COPY`, no buffer.
+    /// - `BufDesc::AutoReg(..)`: `UBLK_F_AUTO_BUF_REG` zero copy.
+    /// - `BufDesc::ZonedAppendLba(..)`: zoned devices (user copy).
     ///
     /// # Arguments
     ///
     /// * `tag` - The tag ID for the I/O command
     /// * `buf_desc` - Buffer descriptor for the I/O operation
-    /// * `result` - Result value (typically -1 for fetch operations)
-    /// * `io_buf` - Optional IoBuf to register for this tag
     ///
     /// # Returns
     ///
     /// Returns a Result containing the command result when complete.
-    /// Returns `Err(UblkError::OtherError(-EINVAL))` if buffer descriptor doesn't align with IoBuf.
+    /// Returns `Err(UblkError::OtherError(-EPERM))` when a buffer of
+    /// this device could not be mlocked under `UBLK_DEV_F_MLOCK_IO_BUFFER`.
     /// If the queue is down (UBLK_IO_RES_ABORT), returns `UblkError::QueueIsDown`.
     ///
     /// # Cancellation
     ///
     /// Once this future has armed the io command (its first poll after
     /// the registration wait), the kernel holds the address of the
-    /// `BufDesc::Slice` buffer until the command completes or the queue
-    /// is torn down. Dropping the future mid-await does NOT recall the
+    /// `BufDesc::Slice` buffer until the command
+    /// completes or the queue is torn down. Dropping the future mid-await does NOT recall the
     /// command — only a best-effort cancel is issued — so on a running
     /// device the buffer must stay alive until queue teardown, not
     /// merely until the drop. The canonical per-tag io task never drops
@@ -2194,45 +2246,28 @@ impl UblkQueue {
         &self,
         tag: u16,
         buf_desc: BufDesc<'_>,
-        result: i32,
-        io_buf: Option<&crate::helpers::IoBuf<u8>>,
     ) -> Result<i32, UblkError> {
-        // Cross-verify buffer descriptor alignment with IoBuf
-        match (&buf_desc, &io_buf) {
-            (BufDesc::Slice(slice), Some(buf)) => {
-                // Verify that the slice points to the same memory as the IoBuf
-                let buf_slice = buf.as_slice();
-                if slice.as_ptr() != buf_slice.as_ptr() || slice.len() != buf_slice.len() {
-                    return Err(UblkError::OtherError(-libc::EINVAL));
-                }
-            }
-            (BufDesc::Slice(slice), None) => {
-                // For user_copy mode, slice should be empty
-                if !slice.is_empty() {
-                    return Err(UblkError::OtherError(-libc::EINVAL));
-                }
-            }
-            (BufDesc::AutoReg(_), Some(_)) => {
-                // AutoReg should not be used with IoBuf - they are mutually exclusive
-                return Err(UblkError::OtherError(-libc::EINVAL));
-            }
-            (BufDesc::AutoReg(_), None) => {
-                // This is the correct usage for AutoReg
-            }
-            (BufDesc::ZonedAppendLba(_), _) | (BufDesc::RawAddress(_), _) => {
-                // These variants don't require specific verification with IoBuf
-            }
+        let res = self.prep_cmd(tag, buf_desc).await;
+        if res.is_err() {
+            // The task is about to drop its buffer: release the lock
+            // while the buffer is still borrowed.
+            self.munlock_slice_buf(tag);
         }
+        res
+    }
 
-        // Register the IoBuf (which mlocks it when the device asks for
-        // that) and wait for the whole queue's registrations BEFORE
-        // arming the FETCH command: once the SQE is pushed the kernel
-        // holds the buffer address, and failing out of this function
-        // with the command armed would let the buffer be freed while
-        // the (never-started) device still references it.
-        if let Some(buf) = io_buf {
-            self.register_io_buf_internal(tag, buf);
-            self.wait_for_all_buffer_registrations().await;
+    async fn prep_cmd(&self, tag: u16, buf_desc: BufDesc<'_>) -> Result<i32, UblkError> {
+        // Register the copy-mode buffer (mlocked when the device asks
+        // for that) and wait for the whole queue's
+        // registrations BEFORE arming the FETCH command: once the SQE is
+        // pushed the kernel holds the buffer address, and failing out of
+        // this function with the command armed would let the buffer be
+        // freed while the (never-started) device still references it.
+        if let BufDesc::Slice(slice) = &buf_desc {
+            if !slice.is_empty() {
+                self.register_slice_buf(tag, slice);
+                self.wait_for_all_buffer_registrations().await;
+            }
         }
 
         // Check if mlock failed and fail immediately if so, but only for FETCH_REQ operations
@@ -2249,7 +2284,8 @@ impl UblkQueue {
             return Err(UblkError::QueueIsDown);
         }
 
-        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
+        // FETCH_REQ carries no result; -1 is what the sync loop sends.
+        let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, -1);
         match f {
             Ok(future) => {
                 let res = future.await;
@@ -2304,10 +2340,13 @@ impl UblkQueue {
             result,
         );
 
+        // On either failure the task is about to drop its buffer:
+        // release the prep command's lock while it is still borrowed.
         match f {
             Ok(future) => {
                 let res = future.await;
                 if res == crate::sys::UBLK_IO_RES_ABORT {
+                    self.munlock_slice_buf(tag);
                     Err(UblkError::QueueIsDown)
                 } else {
                     Ok(res)
@@ -2315,6 +2354,7 @@ impl UblkQueue {
             }
             Err(e) => {
                 self.mark_stopping();
+                self.munlock_slice_buf(tag);
                 Err(e)
             }
         }
@@ -2343,8 +2383,18 @@ impl UblkQueue {
     /// An SQE that posts several CQEs (multishot, `SEND_ZC`) invokes the
     /// IO closure once per CQE, each time with the same `data`;
     /// [`UblkIOCtx::has_more`] is false for the last one.
+    ///
+    /// # Safety
+    ///
+    /// Any memory the SQE references must stay valid until its last CQE
+    /// has been delivered to the IO closure -- the same contract as
+    /// [`Self::ublk_submit_sqe`] and [`crate::ops::submit_sqe`]. The
+    /// queue-slot buffers handed to
+    /// [`Self::submit_fetch_commands_unified`] satisfy it by
+    /// construction; anything else is the caller's to keep alive, and
+    /// nothing cancels the SQE if the closure stops being called.
     #[inline]
-    pub fn ublk_submit_sqe_sync(
+    pub unsafe fn ublk_submit_sqe_sync(
         &self,
         sqe: io_uring::squeue::Entry,
         data: u64,
@@ -2604,7 +2654,6 @@ impl UblkQueue {
     ///
     /// * `BufDesc::Slice` - Compatible with traditional buffer management and `UBLK_F_USER_COPY`
     /// * `BufDesc::AutoReg` - Requires `UBLK_F_AUTO_BUF_REG` to be enabled
-    /// * `BufDesc::RawAddress` - Compatible with all device configurations (unsafe)
     ///
     /// The method validates buffer descriptor compatibility with device capabilities
     /// before dispatching to ensure type safety and prevent runtime errors.
@@ -2647,11 +2696,6 @@ impl UblkQueue {
             BufDesc::ZonedAppendLba(lba) => {
                 // For zoned append LBA, pass the LBA value as the buffer address
                 self.complete_io_cmd(tag, lba as *mut u8, res)
-            }
-            BufDesc::RawAddress(addr) => {
-                // For raw address operations, use the address directly
-                // SAFETY: The caller is responsible for ensuring the address is valid
-                self.complete_io_cmd(tag, addr as *mut u8, res)
             }
         }
     }
@@ -2709,13 +2753,13 @@ impl UblkQueue {
                     UblkIOCtx::user_data_to_op(data)
                 );
             }
-            ops(self, tag as u16, e);
+            ops(self, tag, e);
             return;
         }
 
         if res == sys::UBLK_IO_RES_OK as i32 {
             assert!(tag < self.q_depth);
-            ops(self, tag as u16, e);
+            ops(self, tag, e);
         }
     }
 
@@ -2734,7 +2778,7 @@ impl UblkQueue {
             .dev
             .flags
             .intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER)
-            && state.get_nr_cmd_inflight() == self.nr_tags
+            && state.get_nr_cmd_inflight() == u32::from(self.nr_tags)
             && !state.is_idle()
         {
             log::debug!(
@@ -2838,57 +2882,37 @@ impl UblkQueue {
         }
     }
 
-    /// Process the incoming IOs(io commands & target IOs) from io_uring
+    /// Wait and handle incoming IO (io commands and target IOs) from the
+    /// queue ring: the sync event loop.
     ///
     /// # Arguments:
     ///
-    /// * `ops`: IO handling Closure
+    /// * `ops`: IO handling closure, called for every incoming CQE
     ///
-    /// * `to_wait`: passed to io_uring_enter(), wait until how many events are
-    /// available
+    /// Called in queue context. Does not return until the queue is down
+    /// or an error is observed.
     ///
-    /// When either io command or target io is coming, we are called for
-    /// handling both. Basically the IO handling closure is called for
-    /// every incoming io_uring CQE.
+    /// # The IO handling closure
     ///
-    /// About IO handling Closure
+    /// Target IO handling is implemented in the closure. If an IO is
+    /// fast to complete (ramdisk, null), it can be handled right there
+    /// and the io command completed with the raw result (bytes
+    /// transferred, or a negative errno) via
+    /// [`complete_io_cmd_unified`](Self::complete_io_cmd_unified).
     ///
-    /// Target IO handling needs target code to implement the IO handling
-    /// closure.
-    ///
-    /// If IO is super fast to complete, such as ramdisk, this request can
-    /// be handled directly in the closure, and the io command originated
-    /// from ublk driver is completed with the raw result (bytes
-    /// transferred, or a negative errno). Another example is null
-    /// target(null.rs).
-    ///
-    /// Most of times, IO is slow, so it needs to be handled asynchronously.
-    /// The preferred way is to submit target IO by io_uring in IO handling
-    /// closure by using the same IO slot(represented by `tag`). After this
-    /// target IO is completed, one io_uring CQE will be received, and the
-    /// same IO closure is called for handling this target IO, which can be
-    /// checked by `UblkIOCtx::is_tgt_io()` method. Finally if the coming
-    /// target IO completion means the original IO command is done, the io
-    /// command is completed with the raw result, otherwise the IO handling
-    /// closure can continue to submit IO or whatever for driving its IO
+    /// Most IO is slow and is handled asynchronously: submit the target
+    /// IO through the queue ring from the closure with
+    /// [`ublk_submit_sqe_sync`](Self::ublk_submit_sqe_sync), keyed by a
+    /// `user_data` built with [`UblkIOCtx::build_user_data`] on the same
+    /// tag. When that target IO completes, the closure is called again
+    /// with its CQE, recognisable by [`UblkIOCtx::is_tgt_io`]; it then
+    /// either completes the io command or submits more IO to drive its
     /// logic.
     ///
-    /// Not all target IO logics can be done by io_uring, such as some
-    /// handling needs extra computation, which often require to offload IO
-    /// in another context. However, when target IO is done in remote offload
-    /// context, the io command has to be completed from the queue/
-    /// io_uring context. One approach is to use eventfd to wakeup & notify
-    /// ublk queue/io_uring. Here, eventfd can be thought as one special target
-
-    /// Wait and handle incoming IO
-    ///
-    /// # Arguments:
-    ///
-    /// * `ops`: IO handling closure
-    ///
-    /// Called in queue context. won't return unless error is observed.
-    /// Wait and handle any incoming cqe until queue is down.
-    ///
+    /// Work that cannot be done through io_uring (extra computation,
+    /// IO offloaded to another thread) still has to complete the io
+    /// command from the queue context: poll an eventfd through the ring
+    /// and complete the commands from the closure when it fires.
     pub fn wait_and_handle_io<F>(&self, mut ops: F)
     where
         F: FnMut(&UblkQueue, u16, &UblkIOCtx),
@@ -3282,16 +3306,6 @@ mod tests {
             .validate_compatibility(auto_buf_reg_flags)
             .is_ok());
 
-        // Test RawAddress variant (should be compatible with all configurations)
-        let raw_addr_desc = BufDesc::RawAddress(buffer.as_ptr());
-        assert!(raw_addr_desc.validate_compatibility(no_flags).is_ok());
-        assert!(raw_addr_desc
-            .validate_compatibility(user_copy_flags)
-            .is_ok());
-        assert!(raw_addr_desc
-            .validate_compatibility(auto_buf_reg_flags)
-            .is_ok());
-
         // Test with UBLK_F_USER_COPY and UBLK_F_AUTO_BUF_REG
         let zc_uc_flags = (sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64;
         assert!(slice_desc.validate_compatibility(zc_uc_flags).is_ok());
@@ -3316,9 +3330,6 @@ mod tests {
         // Test from_io_buf helper
         let io_buf = IoBuf::<u8>::new(512);
         let _desc_from_io_buf = BufDesc::from_io_buf(&io_buf);
-
-        // Test RawAddress variant
-        let _raw_addr_desc = BufDesc::RawAddress(buffer.as_ptr());
     }
 
     #[test]
@@ -3396,51 +3407,26 @@ mod tests {
         UblkDev::new(ctrl.get_name(), tgt_init, &ctrl).unwrap();
     }
 
+    /// `from_io_buf` is `Slice(buf.as_slice())`, the copy-mode buffer.
     #[test]
-    fn test_submit_io_prep_cmd_verification() {
+    fn test_buf_desc_io_buf() {
         use crate::helpers::IoBuf;
         use crate::sys;
 
-        // Test verification logic with a mock setup (we don't need a real ublk device for verification tests)
-        let buf1 = IoBuf::<u8>::new(4096);
-        let buf2 = IoBuf::<u8>::new(2048);
+        let buf = IoBuf::<u8>::new(4096);
+        let desc = BufDesc::from_io_buf(&buf);
+        assert!(matches!(desc, BufDesc::Slice(s) if std::ptr::eq(s.as_ptr(), buf.as_ptr())));
 
-        // Test case 1: BufDesc::Slice with matching IoBuf (should be valid)
-        let slice1 = buf1.as_slice();
-        let _desc1 = BufDesc::Slice(slice1);
-        // This should pass verification (in real usage it would be tested in submit_io_prep_cmd)
-
-        // Test case 2: BufDesc::Slice with mismatched IoBuf (should fail verification)
-        let slice2 = buf2.as_slice();
-        let _desc2 = BufDesc::Slice(slice2);
-        // Using desc2 with buf1 would fail verification because pointers don't match
-
-        // Test case 3: BufDesc::Slice empty with None IoBuf (should be valid for user_copy)
-        let empty_slice: &[u8] = &[];
-        let _desc3 = BufDesc::Slice(empty_slice);
-        // This should pass verification when used with None IoBuf
-
-        // Test case 4: BufDesc::AutoReg with None IoBuf (should be valid)
-        let auto_reg = sys::ublk_auto_buf_reg {
-            index: 0,
-            flags: 0,
-            reserved0: 0,
-            reserved1: 0,
-        };
-        let _desc4 = BufDesc::AutoReg(auto_reg);
-        // This should pass verification when used with None IoBuf
-
-        // Test case 5: BufDesc::AutoReg with Some IoBuf (should fail verification)
-        // Using _desc4 with Some(&buf1) would fail verification because they're mutually exclusive
-
-        // Verify pointer matching logic
-        assert_eq!(slice1.as_ptr(), buf1.as_slice().as_ptr());
-        assert_eq!(slice1.len(), buf1.as_slice().len());
-        assert_ne!(slice2.as_ptr(), buf1.as_slice().as_ptr());
-        assert_ne!(slice2.len(), buf1.as_slice().len());
-        assert_eq!(empty_slice.len(), 0);
-
-        println!("Buffer descriptor verification test cases validated");
+        assert!(desc.validate_compatibility(0).is_ok());
+        assert!(desc
+            .validate_compatibility(sys::UBLK_F_USER_COPY as u64)
+            .is_ok());
+        assert!(desc
+            .validate_compatibility(sys::UBLK_F_AUTO_BUF_REG as u64)
+            .is_err());
+        assert!(desc
+            .validate_compatibility((sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_USER_COPY) as u64)
+            .is_ok());
     }
 
     #[test]
@@ -3636,7 +3622,7 @@ mod tag_partition_tests {
     #[test]
     fn tag_partition_covers_depth_once() {
         for sequential in [false, true] {
-            for depth in [1u32, 2, 3, 64, 65, 100, 128, 4096] {
+            for depth in [1u16, 2, 3, 64, 65, 100, 128, 4096] {
                 for n in [1u16, 2, 3, 4, 7, 8, 16] {
                     let mut seen = vec![0u32; depth as usize];
                     let mut sizes = Vec::new();
@@ -3644,13 +3630,14 @@ mod tag_partition_tests {
                     for k in 0..n {
                         let (first, step, count) =
                             UblkQueue::tag_partition(depth, n, k, sequential);
-                        let tags: Vec<u32> =
-                            (0..count).map(|i| first as u32 + i * step as u32).collect();
+                        let tags: Vec<u32> = (0..count)
+                            .map(|i| u32::from(first) + u32::from(i) * u32::from(step))
+                            .collect();
                         if sequential {
                             assert_eq!(step, 1);
                             if count > 0 {
                                 assert_eq!(first as u32, next_first, "depth {depth} n {n} k {k}");
-                                next_first += count;
+                                next_first += u32::from(count);
                             }
                         } else {
                             assert_eq!((first, step), (k, n));

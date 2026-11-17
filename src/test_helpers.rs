@@ -31,14 +31,12 @@ pub(crate) async fn io_async_fn(tag: u16, q: &UblkQueue) -> Result<(), UblkError
     use crate::BufDesc;
 
     let buf = IoBuf::<u8>::new(q.dev().dev_info.max_io_buf_bytes as usize);
-    let _buf = Some(buf);
     let iod = q.get_iod(tag);
-    let buf_desc = BufDesc::Slice(_buf.as_ref().unwrap().as_slice());
+    let buf_desc = BufDesc::Slice(buf.as_slice());
 
     // Submit initial prep command and handle any errors (including queue down)
-    // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, buf_desc.clone(), 0, _buf.as_ref())
-        .await?;
+    // The IoBuf is registered by the prep command
+    q.submit_io_prep_cmd(tag, buf_desc.clone()).await?;
 
     loop {
         let res = (iod.nr_sectors << 9) as i32;
@@ -108,16 +106,16 @@ pub(crate) async fn device_handler_async(dev_flags: UblkFlags) -> Result<(), Ubl
     });
 
     // Avoid to leak device
-    if let Err(_) = ctrl.start_dev_async(dev_arc).await {
+    if let Err(_) = ctrl.start_dev(dev_arc).await {
         log::warn!("device_handler_async: fail to start device(async)");
     }
 
-    ctrl.dump_async().await?;
-    ctrl.kill_dev_async().await?;
+    ctrl.dump().await?;
+    ctrl.kill_dev().await?;
 
     // async/await needs to delete device by itself, otherwise we
     // may hang in Drop() of UblkCtrlInner.
-    ctrl.del_dev_async_await().await?;
+    ctrl.del_dev().await?;
 
     if let Err(e) = tokio::task::spawn_blocking(move || qh.join())
         .await

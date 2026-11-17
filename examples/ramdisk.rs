@@ -83,8 +83,8 @@ async fn io_task(q: &UblkQueue, tag: u16, ramdisk_storage: &mut [u8]) -> Result<
     let mut buffer = IoBuf::<u8>::new(buf_size);
 
     // Submit initial prep command - any error will exit the function
-    // The IoBuf is automatically registered
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), 0, Some(&buffer))
+    // The IoBuf is registered by the prep command
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()))
         .await?;
 
     loop {
@@ -234,14 +234,10 @@ fn rd_add_dev(dev_id: i32, ramdisk_storage: &mut [u8], size: u64, for_add: bool,
             // Report the outcome either way. The parent blocks on this eventfd,
             // so any path that returns without writing hangs `ramdisk add`.
             let started = async {
-                let r = ctrl_clone
-                    .configure_queue_async(&dev_clone, 0, unsafe { libc::gettid() })
+                ctrl_clone
+                    .configure_queue(&dev_clone, 0, unsafe { libc::gettid() })
                     .await?;
-                if r < 0 {
-                    return Err(UblkError::OtherError(r));
-                }
-                ctrl_clone.start_dev_async(&dev_clone).await?;
-                Ok::<(), UblkError>(())
+                ctrl_clone.start_dev(&dev_clone).await
             }
             .await;
 
