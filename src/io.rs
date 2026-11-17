@@ -2324,8 +2324,29 @@ impl UblkQueue {
     /// consistently and prevents potential memory safety issues. Returns
     /// `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match.
     ///
+    /// Any `Err`, this `-EINVAL` included, drops the lock the prep
+    /// command took on the tag's registered buffer.
+    ///
     #[inline]
     pub async fn submit_io_commit_cmd(
+        &self,
+        tag: u16,
+        buf_desc: BufDesc<'_>,
+        result: i32,
+    ) -> Result<i32, UblkError> {
+        let res = self.commit_cmd(tag, buf_desc, result).await;
+        if res.is_err() {
+            // Whatever failed, the task is about to drop its buffer:
+            // release the prep command's lock while it is still
+            // borrowed. Done here, around the whole command, so that no
+            // error return of `commit_cmd` can miss it.
+            self.munlock_slice_buf(tag);
+        }
+        res
+    }
+
+    #[inline]
+    async fn commit_cmd(
         &self,
         tag: u16,
         buf_desc: BufDesc<'_>,
@@ -2340,13 +2361,10 @@ impl UblkQueue {
             result,
         );
 
-        // On either failure the task is about to drop its buffer:
-        // release the prep command's lock while it is still borrowed.
         match f {
             Ok(future) => {
                 let res = future.await;
                 if res == crate::sys::UBLK_IO_RES_ABORT {
-                    self.munlock_slice_buf(tag);
                     Err(UblkError::QueueIsDown)
                 } else {
                     Ok(res)
@@ -2354,7 +2372,6 @@ impl UblkQueue {
             }
             Err(e) => {
                 self.mark_stopping();
-                self.munlock_slice_buf(tag);
                 Err(e)
             }
         }
@@ -2663,6 +2680,9 @@ impl UblkQueue {
     /// stored in `UblkQueue::bufs[tag]`. This ensures mlock'd buffers are used
     /// consistently and prevents potential memory safety issues. Returns
     /// `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match.
+    ///
+    /// Any `Err`, this `-EINVAL` included, drops the lock the prep
+    /// command took on the tag's registered buffer.
     ///
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
     #[inline]

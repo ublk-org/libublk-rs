@@ -487,7 +487,7 @@ mod integration {
     /// kernel must copy READ data out of the target's memory.
     #[test]
     fn test_ublk_null_async_target_buf() {
-        __test_ublk_null_async_target_buf(UblkFlags::UBLK_DEV_F_ADD_DEV);
+        __test_ublk_null_async_target_buf(UblkFlags::UBLK_DEV_F_ADD_DEV, false);
     }
 
     /// Whether every mapping that overlaps `[addr, addr + len)` is
@@ -516,11 +516,37 @@ mod integration {
         seen && locked
     }
 
-    fn __test_ublk_null_async_target_buf(dev_flags: UblkFlags) {
+    fn __test_ublk_null_async_target_buf(dev_flags: UblkFlags, wrong_buf_commit: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        async fn test_io_task(q: &UblkQueue, tag: u16, buf: &[u8]) -> Result<(), UblkError> {
+        /// Tags whose commit with a foreign buffer was refused, and how
+        /// many of them still had their range locked afterwards.
+        #[derive(Default)]
+        struct WrongBufStats {
+            refused: AtomicUsize,
+            left_locked: AtomicUsize,
+        }
+
+        async fn test_io_task(
+            q: &UblkQueue,
+            tag: u16,
+            buf: &[u8],
+            wrong_buf: Option<&WrongBufStats>,
+        ) -> Result<(), UblkError> {
             q.submit_io_prep_cmd(tag, BufDesc::Slice(buf)).await?;
+            if let Some(stats) = wrong_buf {
+                // Not the registered buffer: refused before anything
+                // is submitted, so the tag's io command is still ours
+                // and the loop below serves it from the right buffer.
+                let other = [0_u8; 512];
+                let res = q.submit_io_commit_cmd(tag, BufDesc::Slice(&other), 0).await;
+                assert!(matches!(res, Err(UblkError::OtherError(e)) if e == -libc::EINVAL));
+                stats.refused.fetch_add(1, Ordering::Relaxed);
+                // a failed commit command must have dropped the lock
+                if range_is_mlocked(buf.as_ptr() as usize, buf.len()) {
+                    stats.left_locked.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             loop {
                 let iod = q.get_iod(tag);
                 let res = (iod.nr_sectors << 9) as i32;
@@ -549,21 +575,26 @@ mod integration {
         let pools = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
         // pools still locked after their io tasks ended
         let left_locked = Arc::new(AtomicUsize::new(0));
+        let wrong_buf = Arc::new(WrongBufStats::default());
 
         let q_fn = {
             let (pools, left_locked) = (pools.clone(), left_locked.clone());
+            let wrong_buf = wrong_buf.clone();
             move |qid: u16, dev: &Arc<UblkDev>| {
                 let io_size = dev.dev_info.max_io_buf_bytes as usize;
                 let pool = Rc::new(IoBuf::<u8>::new(io_size * depth as usize));
                 let range = (pool.as_ptr() as usize, pool.len());
                 pools.lock().unwrap().push(range);
                 let task_pool = pool.clone();
+                let wrong_buf = wrong_buf.clone();
                 libublk::UblkRuntime::run_io_tasks(dev, qid, move |q, tag| {
                     let pool = task_pool.clone();
+                    let wrong_buf = wrong_buf.clone();
                     async move {
                         let off = tag as usize * io_size;
                         let buf = &pool.as_slice()[off..off + io_size];
-                        test_io_task(&q, tag, buf).await
+                        let stats = wrong_buf_commit.then_some(&*wrong_buf);
+                        test_io_task(&q, tag, buf, stats).await
                     }
                 })
                 .unwrap();
@@ -580,8 +611,11 @@ mod integration {
             // registered: the whole of each pool is locked, or none
             let pools = pools.lock().unwrap();
             assert_eq!(pools.len(), 2);
-            for &(addr, len) in pools.iter() {
-                assert_eq!(range_is_mlocked(addr, len), mlock);
+            // (a refused commit unlocks its tag as soon as io arrives)
+            if !wrong_buf_commit {
+                for &(addr, len) in pools.iter() {
+                    assert_eq!(range_is_mlocked(addr, len), mlock);
+                }
             }
             run_ublk_disk_sanity_test(ctrl, dev_flags);
             read_ublk_disk(ctrl, true);
@@ -589,6 +623,11 @@ mod integration {
         })
         .unwrap();
         assert_eq!(left_locked.load(Ordering::Relaxed), 0);
+        if wrong_buf_commit {
+            // the sanity io reached at least one tag
+            assert_ne!(wrong_buf.refused.load(Ordering::Relaxed), 0);
+            assert_eq!(wrong_buf.left_locked.load(Ordering::Relaxed), 0);
+        }
     }
 
     /// The same target-owned pool on a `UBLK_DEV_F_MLOCK_IO_BUFFER`
@@ -598,6 +637,19 @@ mod integration {
     fn test_ublk_null_async_target_buf_mlock() {
         __test_ublk_null_async_target_buf(
             UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER,
+            false,
+        );
+    }
+
+    /// A commit command refused with `-EINVAL` because its slice is not
+    /// the tag's registered buffer is a failed commit command like any
+    /// other: it drops the lock the prep command took on the tag's
+    /// range, so a task that returns on the error leaves nothing locked.
+    #[test]
+    fn test_ublk_null_async_mlock_wrong_buf_commit() {
+        __test_ublk_null_async_target_buf(
+            UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER,
+            true,
         );
     }
 
