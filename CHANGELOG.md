@@ -4,7 +4,7 @@ Notable changes to the `libublk` crate. The FFI crate `libublk-rs-sys`
 is versioned separately (currently 0.1.2) and only changes when
 `ublk_cmd.h` does.
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-11-19)
 
 0.5 replaces the executor-coupled `uring_async` layer of 0.4 with an
 executor-agnostic core:
@@ -28,7 +28,8 @@ per-queue event loop and in how target IO is submitted.
 `rublk` ported its event loop and target IO in one commit; see
 [rublk `c4bdde5`](https://github.com/ublk-org/rublk/commit/c4bdde59888d5d70b6192d163bc8b25a6fca9575)
 for a complete, real-world diff (null, loop, zoned, qcow2, compress,
-vram targets). It predates the signature changes in sections 8 to 11.
+vram targets). It predates the `unsafe` on `ublk_submit_sqe_sync`
+(section 4) and the signature changes in sections 8 to 11.
 
 See [docs/framework.md](docs/framework.md) for how the new pieces fit
 together.
@@ -224,7 +225,8 @@ The `UblkCtrl` methods that send a control command or wrap one
 (`read_dev_info`, `get_params`, `set_params`, `get_queue_affinity`,
 `get_queue_effective_affinity`, `configure_queue`, `start_dev`,
 `start_dev_async`, `start_user_recover`, `stop_dev`, `kill_dev`,
-`quiesce_dev`, `update_size`, `del_dev`, `del_dev_async`, `run_target`)
+`quiesce_dev`, `update_size`, `del_dev`, `del_dev_async`, `run_target`,
+`flush_json`, `reload_json`)
 and their `UblkCtrlAsync` counterparts returned `Result<i32, UblkError>`
 whose `Ok` value was always `0`, except that a command failing with
 `-EBUSY` came back as `Ok(-EBUSY)`. They return `Result<(), UblkError>`
@@ -266,10 +268,11 @@ q.submit_io_prep_cmd(tag, BufDesc::AutoReg(reg)).await?;
 The prep command registers a non-empty `BufDesc::Slice` as the tag's
 copy-mode buffer itself: it records the address, so device start counts
 the tag, and under `UBLK_DEV_F_MLOCK_IO_BUFFER` it locks the slice's
-range and unlocks it when a prep or commit command for the tag fails
-(`QueueIsDown` at teardown). The slice need not be an `IoBuf`: a piece
+range and unlocks it when a prep or commit command for the tag returns
+`Err` (`QueueIsDown` at teardown; a negative `Ok` value is a result,
+not a failure). The slice need not be an `IoBuf`: a piece
 of a pool, an mmap or memory from another allocator works the same way,
-as long as the target keeps it valid until such a command has failed,
+as long as the target keeps it valid until such a command has returned `Err`,
 which is when an io task returns anyway. 0.4 accepted such a buffer only as
 `BufDesc::RawAddress`, and without registering it, so device start
 never completed on a plain copy-mode device. One visible difference
