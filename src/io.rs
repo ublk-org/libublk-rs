@@ -2209,8 +2209,9 @@ impl UblkQueue {
     ///   or memory the target allocated some other way. It is
     ///   registered for the tag (its range mlocked under
     ///   `UBLK_DEV_F_MLOCK_IO_BUFFER`, and unlocked when a prep or
-    ///   commit command for the tag fails), and the command waits until every tag of this
-    ///   thread's partition has registered its buffer, so no FETCH is
+    ///   commit command for the tag returns `Err`), and the command
+    ///   waits until every tag of this thread's partition has
+    ///   registered its buffer, so no FETCH is
     ///   armed before all buffers exist -- the ordering
     ///   `submit_fetch_commands_unified()` gives the sync loop. The
     ///   caller keeps the memory valid until a prep or commit command
@@ -2680,9 +2681,6 @@ impl UblkQueue {
     /// stored in `UblkQueue::bufs[tag]`. This ensures mlock'd buffers are used
     /// consistently and prevents potential memory safety issues. Returns
     /// `Err(UblkError::OtherError(-EINVAL))` if buffer addresses don't match.
-    ///
-    /// Any `Err`, this `-EINVAL` included, drops the lock the prep
-    /// command took on the tag's registered buffer.
     ///
     /// When calling this API, target code has to make sure that q_ring won't be borrowed.
     #[inline]
